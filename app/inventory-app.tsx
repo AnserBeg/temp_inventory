@@ -128,6 +128,12 @@ type Activity = {
   tone: Severity;
 };
 
+type Partner = {
+  id: string;
+  name: string;
+  type: "vendor" | "customer";
+};
+
 type Snapshot = {
   summary: {
     lateReceipts: number;
@@ -143,6 +149,7 @@ type Snapshot = {
   movements: Movement[];
   bills: Bill[];
   activities: Activity[];
+  partners: Partner[];
 };
 
 type ViewKey =
@@ -169,6 +176,7 @@ type CommandKind =
   | "reopen"
   | "reverse"
   | "vendor-return"
+  | "reserve"
   | "ship"
   | "customer-return"
   | "count";
@@ -547,6 +555,14 @@ const fallbackSnapshot: Snapshot = {
       tone: "info",
     },
   ],
+  partners: [
+    { id: "vendor-allweather", name: "All Weather Windows", type: "vendor" },
+    { id: "vendor-andersen", name: "Andersen Distribution", type: "vendor" },
+    { id: "vendor-jeldwen", name: "JELD-WEN Canada", type: "vendor" },
+    { id: "customer-westside", name: "Westside Homes", type: "customer" },
+    { id: "customer-northridge", name: "North Ridge Renovations", type: "customer" },
+    { id: "customer-prairie", name: "Prairie Build Group", type: "customer" },
+  ],
 };
 
 const navGroups: Array<{ label?: string; items: Array<{ key: ViewKey; label: string; glyph: string }> }> = [
@@ -622,6 +638,7 @@ export function InventoryApp() {
   const [selectedSoId, setSelectedSoId] = useState<string | null>(null);
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [activeCommand, setActiveCommand] = useState<ActiveCommand | null>(null);
+  const [createOrder, setCreateOrder] = useState<"purchaseOrder" | "salesOrder" | null>(null);
   const [loading, setLoading] = useState(true);
   const [source, setSource] = useState<"server" | "demo">("demo");
   const [query, setQuery] = useState("");
@@ -730,6 +747,7 @@ export function InventoryApp() {
       reopen: "reopenRemainder",
       reverse: "reverseReceipt",
       "vendor-return": payload.disposition === "allowance" ? "priceOnlyCredit" : "vendorReturn",
+      reserve: "reserveSale",
       ship: "shipSale",
       "customer-return": "customerReturn",
       count: "inventoryAdjustment",
@@ -748,8 +766,9 @@ export function InventoryApp() {
       apiPayload.locationId = "loc-a01";
       apiPayload.countedQuantity = Math.max(0, product.onHand + Number(payload.quantity ?? 0));
     }
+    let response: Response;
     try {
-      const response = await fetch("/api/commands", {
+      response = await fetch("/api/commands", {
         method: "POST",
         headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
         body: JSON.stringify({
@@ -760,18 +779,42 @@ export function InventoryApp() {
           version: apiVersion,
         }),
       });
-      const result = (await response.json()) as { snapshot?: unknown; message?: string; error?: string | { message?: string } };
-      if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message || "The command could not be completed.");
-      if (result.snapshot) setSnapshot(normalizeSnapshot(result.snapshot));
-      else await loadSnapshot();
-      setSource("server");
-      setToast(result.message || `${entityNumber} was updated.`);
     } catch (error) {
       setSnapshot((current) => applyLocalCommand(current, kind, entityId, payload));
       setSource("demo");
       setToast(`${entityNumber} updated in this preview session. ${error instanceof Error ? error.message : ""}`.trim());
-    } finally {
       setActiveCommand(null);
+      return;
+    }
+    const result = (await response.json()) as { snapshot?: unknown; message?: string; error?: string | { message?: string } };
+    if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message || "The command could not be completed.");
+    if (result.snapshot) setSnapshot(normalizeSnapshot(result.snapshot));
+    else await loadSnapshot();
+    setSource("server");
+    setToast(result.message || `${entityNumber} was updated.`);
+    setActiveCommand(null);
+  };
+
+  const createOperationalOrder = async (type: "purchaseOrder" | "salesOrder", payload: Record<string, unknown>) => {
+    const idempotencyKey = crypto.randomUUID();
+    const response = await fetch("/api/records", {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+      body: JSON.stringify({ type, payload, idempotencyKey }),
+    });
+    const result = (await response.json()) as { snapshot?: unknown; recordId?: string; message?: string; error?: string | { message?: string } };
+    if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message || "The order could not be created.");
+    if (result.snapshot) setSnapshot(normalizeSnapshot(result.snapshot));
+    else await loadSnapshot();
+    setSource("server");
+    setToast(result.message || "Order created.");
+    setCreateOrder(null);
+    if (type === "purchaseOrder") {
+      navigate("purchase-orders");
+      if (result.recordId) setSelectedPoId(result.recordId);
+    } else {
+      navigate("sales-orders");
+      if (result.recordId) setSelectedSoId(result.recordId);
     }
   };
 
@@ -841,7 +884,7 @@ export function InventoryApp() {
               <h1>{viewTitles[view].title}</h1>
               <p>{viewTitles[view].description}</p>
             </div>
-            <PageActions view={view} onNavigate={navigate} />
+            <PageActions view={view} onNavigate={navigate} onCreate={setCreateOrder} />
           </div>
 
           {loading ? <LoadingState /> : (
@@ -857,7 +900,7 @@ export function InventoryApp() {
               {view === "vendor-returns" && <VendorReturnsView orders={snapshot.purchaseOrders} onReturn={(po) => setActiveCommand({ kind: "vendor-return", entityId: po.id, entityNumber: po.number })} />}
               {(view === "sales-orders" || view === "fulfillment") && (
                 selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} onBack={() => setSelectedSoId(null)} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} />
+                  <SalesOrderDetail so={selectedSo} onBack={() => setSelectedSoId(null)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} mode={view} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} />
                 )
@@ -913,6 +956,16 @@ export function InventoryApp() {
         />
       )}
 
+      {createOrder && (
+        <CreateOrderDialog
+          type={createOrder}
+          partners={snapshot.partners}
+          products={snapshot.products}
+          onClose={() => setCreateOrder(null)}
+          onSubmit={(payload) => createOperationalOrder(createOrder, payload)}
+        />
+      )}
+
       {toast && <div className="toast" role="status"><span aria-hidden="true">✓</span>{toast}</div>}
       {mobileNavOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
     </div>
@@ -923,10 +976,10 @@ function isTypingTarget(target: EventTarget | null) {
   return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
 }
 
-function PageActions({ view, onNavigate }: { view: ViewKey; onNavigate: (view: ViewKey) => void }) {
+function PageActions({ view, onNavigate, onCreate }: { view: ViewKey; onNavigate: (view: ViewKey) => void; onCreate: (type: "purchaseOrder" | "salesOrder") => void }) {
   if (view === "home") return <button className="button secondary" onClick={() => onNavigate("reports")}>View reports</button>;
-  if (view === "purchase-orders") return <button className="button primary">Create purchase order</button>;
-  if (view === "sales-orders") return <button className="button primary">Create sales order</button>;
+  if (view === "purchase-orders") return <button className="button primary" onClick={() => onCreate("purchaseOrder")}>Create purchase order</button>;
+  if (view === "sales-orders") return <button className="button primary" onClick={() => onCreate("salesOrder")}>Create sales order</button>;
   if (view === "stock") return <button className="button secondary" onClick={() => onNavigate("counts")}>Start inventory count</button>;
   if (view === "warehouse") return <span className="connection server"><span /> Online</span>;
   return null;
@@ -1085,8 +1138,8 @@ function SalesOrdersView({ orders, mode, onOpen, onShip }: { orders: SalesOrder[
   return <section className="panel worklist"><div className="saved-view-row"><div className="view-tabs"><button className="active">{mode === "fulfillment" ? "Ready and partially ready" : "Open orders"}</button><button>Shortages</button><button>Special orders received</button><button>Customer pickup</button></div><button className="text-button">Save view</button></div><FilterBar placeholder="Search SO, customer, project, or customer PO"><button className="filter-button">Requested date</button><button className="filter-button">Route</button></FilterBar><div className="responsive-table"><table><caption className="sr-only">Sales orders</caption><thead><tr><th>Exception</th><th>SO</th><th>Customer / project</th><th>Requested</th><th>Availability</th><th>Fulfillment</th><th>Invoice</th><th className="numeric">Total</th><th><span className="sr-only">Action</span></th></tr></thead><tbody>{visible.map((so) => <tr key={so.id}><td>{so.exception ? <span className={`exception-cell ${so.shortage > 0 ? "danger" : "warning"}`}>!</span> : "—"}</td><td><button className="table-link" onClick={() => onOpen(so.id)}>{so.number}</button><small>{so.route}</small></td><td><strong>{so.customer}</strong><small>{so.project}</small></td><td>{formatDate(so.requestedDate)}</td><td><div className="availability-mini"><strong>{so.availableNow} now</strong><span>{so.incomingBeforeDate} incoming</span>{so.shortage > 0 && <b>{so.shortage} short</b>}</div></td><td><StatusBadge>{so.fulfillment}</StatusBadge></td><td><StatusBadge>{so.billing}</StatusBadge></td><td className="numeric strong">{money.format(so.total)}</td><td>{so.reserved > so.shipped ? <button className="row-action" onClick={() => onShip(so)}>Post shipment</button> : <button className="row-action" onClick={() => onOpen(so.id)}>Open</button>}</td></tr>)}</tbody></table></div></section>;
 }
 
-function SalesOrderDetail({ so, onBack, onShip }: { so: SalesOrder; onBack: () => void; onShip: () => void }) {
-  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{so.customer} · {so.project}</p></div><div className="object-total"><span>Total</span><strong>{money.format(so.total)}</strong></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}<div className="object-actions"><button className="button primary" onClick={onShip} disabled={so.reserved <= so.shipped}>Post shipment</button><button className="button secondary">Reserve available stock</button><button className="button ghost">Resolve shortage</button></div></section>
+function SalesOrderDetail({ so, onBack, onReserve, onShip }: { so: SalesOrder; onBack: () => void; onReserve: () => void; onShip: () => void }) {
+  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{so.customer} · {so.project}</p></div><div className="object-total"><span>Total</span><strong>{money.format(so.total)}</strong></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}<div className="object-actions"><button className="button primary" onClick={onShip} disabled={so.reserved <= so.shipped}>Post shipment</button><button className="button secondary" onClick={onReserve} disabled={so.open <= so.reserved || so.availableNow <= 0}>Reserve available stock</button><button className="button ghost">Resolve shortage</button></div></section>
     <section className="panel availability-panel"><PanelHeading title="Availability for requested date" detail={`Requested ${formatDate(so.requestedDate)}`} /><div className="availability-grid"><MetricDisplay label="Required" value={so.open} /><MetricDisplay label="Available now" value={so.availableNow} tone="success" /><MetricDisplay label="Incoming before date" value={so.incomingBeforeDate} tone="info" /><MetricDisplay label="Shortage" value={so.shortage} tone={so.shortage > 0 ? "danger" : "neutral"} /></div>{so.linkedPo && <div className="linked-supply"><span className="section-kicker">Linked supply</span><strong>{so.linkedPo} · vendor confirmed</strong><p>{so.incomingBeforeDate} units expected before the customer&apos;s requested date.</p></div>}</section>
     <div className="detail-columns"><section className="panel"><PanelHeading title="Fulfillment quantities" /><dl className="definition-list"><div><dt>Ordered</dt><dd>{so.ordered}</dd></div><div><dt>Reserved</dt><dd>{so.reserved}</dd></div><div><dt>Net shipped</dt><dd>{so.shipped}</dd></div><div><dt>Open to ship</dt><dd>{so.open}</dd></div></dl></section><section className="panel"><PanelHeading title="Customer delivery" /><dl className="definition-list"><div><dt>Method</dt><dd>{so.route}</dd></div><div><dt>Requested</dt><dd>{formatDate(so.requestedDate)}</dd></div><div><dt>Job site</dt><dd>{so.project}</dd></div><div><dt>Billing policy</dt><dd>Delivered quantity</dd></div></dl></section></div>
   </div>;
@@ -1146,6 +1199,72 @@ function WarehouseView({ orders, onReceive }: { orders: PurchaseOrder[]; onRecei
   return <div className="warehouse-shell"><div className="warehouse-header"><div><span className="connection server"><span /> Online</span><h2>Main Warehouse</h2><p>Choose a task. Instructions will guide you one step at a time.</p></div><div className="warehouse-user"><span>JL</span><div><strong>Jordan Lee</strong><small>Receiver</small></div></div></div><section className="warehouse-launcher" aria-label="Warehouse tasks">{tasks.map((task) => <button key={task.label}><span className="task-glyph" aria-hidden="true">{task.glyph}</span><strong>{task.label}</strong><small>{task.count} assigned</small><b aria-hidden="true">→</b></button>)}</section><section className="warehouse-next"><div className="step-header"><span>Next task</span><StatusBadge tone="danger">4 days late</StatusBadge></div><h3>Receive {orders[0]?.number}</h3><p>{orders[0]?.vendor} · {orders[0]?.customerRef}</p><div className="scan-zone"><span aria-hidden="true">▤</span><div><strong>Scan the purchase order or packing slip</strong><small>Scanner focus is ready. Manual entry is also available.</small></div><input aria-label="Scan purchase order or packing slip" placeholder="Scan or type code" autoComplete="off" /></div><button className="warehouse-primary" onClick={() => orders[0] && onReceive(orders[0])}>Start receiving {orders[0]?.number}</button></section></div>;
 }
 
+function CreateOrderDialog({ type, partners, products, onClose, onSubmit }: { type: "purchaseOrder" | "salesOrder"; partners: Partner[]; products: Product[]; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
+  const isPurchase = type === "purchaseOrder";
+  const eligiblePartners = partners.filter((partner) => partner.type === (isPurchase ? "vendor" : "customer"));
+  const [partnerId, setPartnerId] = useState(eligiblePartners[0]?.id ?? "");
+  const [productId, setProductId] = useState(products[0]?.id ?? "");
+  const [quantity, setQuantity] = useState(1);
+  const [unitAmount, setUnitAmount] = useState(isPurchase ? 650 : 1150);
+  const [date, setDate] = useState(futureDate(isPurchase ? 14 : 21));
+  const [projectReference, setProjectReference] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const selectedProduct = products.find((product) => product.id === productId);
+  const total = Math.round(quantity * unitAmount * 100);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!partnerId || !productId) return setError(`Select a ${isPurchase ? "vendor" : "customer"} and product.`);
+    if (!Number.isFinite(quantity) || quantity <= 0) return setError("Quantity must be greater than zero.");
+    if (!Number.isFinite(unitAmount) || unitAmount < 0) return setError("Enter a valid unit amount.");
+    if (!date) return setError(`Enter the ${isPurchase ? "expected" : "requested"} date.`);
+    setSubmitting(true);
+    setError("");
+    try {
+      await onSubmit({
+        ...(isPurchase ? { vendorId: partnerId, unitCostCents: Math.round(unitAmount * 100), expectedDate: date } : { customerId: partnerId, unitPriceCents: Math.round(unitAmount * 100), requestedDate: date }),
+        productId,
+        quantity,
+        projectReference,
+        actor: "Sam Carter",
+      });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The order could not be created.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const impact = isPurchase
+    ? [
+        { category: "Physical inventory", label: "On-hand inventory", after: "No change" },
+        { category: "Commercial commitment", label: "Expected incoming", before: 0, after: quantity, tone: "info" as Severity },
+        { category: "Financial effect", label: "Authorized purchase value", before: money.format(0), after: money.format(total / 100) },
+      ]
+    : [
+        { category: "Physical inventory", label: "On-hand inventory", after: "No change" },
+        { category: "Commercial commitment", label: "Customer demand", before: 0, after: quantity, tone: "info" as Severity },
+        { category: "Allocations", label: "Reservation", after: "Created separately after availability review" },
+        { category: "Financial effect", label: "Order value", before: money.format(0), after: money.format(total / 100) },
+      ];
+
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog create-order-dialog" role="dialog" aria-modal="true" aria-labelledby="create-order-title"><div className="dialog-header"><div><span className="section-kicker">New commercial commitment</span><h2 id="create-order-title">Create {isPurchase ? "purchase order" : "sales order"}</h2></div><button className="icon-button" aria-label="Close dialog" onClick={onClose}>×</button></div><form onSubmit={submit}>
+    {error && <div className="error-summary" role="alert"><strong>Review the order</strong><p>{error}</p></div>}
+    <div className="command-form form-grid">
+      <label>{isPurchase ? "Vendor" : "Customer"}<select value={partnerId} onChange={(event) => setPartnerId(event.target.value)}>{eligiblePartners.map((partner) => <option key={partner.id} value={partner.id}>{partner.name}</option>)}</select></label>
+      <label>{isPurchase ? "Expected delivery" : "Requested delivery"}<input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label>
+      <label className="full-field">Product / configuration<select value={productId} onChange={(event) => setProductId(event.target.value)}>{products.map((product) => <option key={product.id} value={product.id}>{product.sku} · {product.name}</option>)}</select><small>{selectedProduct?.specification}</small></label>
+      <label>Quantity<input type="number" min="1" step="1" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} /></label>
+      <label>{isPurchase ? "Unit cost (CAD)" : "Unit price (CAD)"}<input type="number" min="0" step="0.01" value={unitAmount} onChange={(event) => setUnitAmount(Number(event.target.value))} /></label>
+      <label className="full-field">Customer / project reference<input value={projectReference} onChange={(event) => setProjectReference(event.target.value)} placeholder={isPurchase ? "Optional linked sales order or project" : "Job site, room, or customer PO"} /></label>
+    </div>
+    <div className="simplified-policy"><span aria-hidden="true">i</span><p><strong>Focused launch policy:</strong> this order will be created directly as {isPurchase ? "approved" : "confirmed"}. It creates {isPurchase ? "incoming supply" : "customer demand"}, but does not move physical inventory.</p></div>
+    <ImpactPreview lines={impact} />
+    <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Go back</button><button type="submit" className="button primary" disabled={submitting}>{submitting ? "Creating order…" : `Create ${isPurchase ? "approved purchase order" : "confirmed sales order"}`}</button></div>
+  </form></section></div>;
+}
+
 function CommandPanel({ command, po, so, products, onClose, onSubmit }: { command: ActiveCommand; po?: PurchaseOrder; so?: SalesOrder; products: Product[]; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
   const defaults = commandDefaults(command.kind, po, so, products);
   const [quantity, setQuantity] = useState(defaults.quantity);
@@ -1167,8 +1286,13 @@ function CommandPanel({ command, po, so, products, onClose, onSubmit }: { comman
     if (["close", "reopen", "reverse", "vendor-return", "customer-return", "count"].includes(command.kind) && !reason.trim()) return setError("Select or enter a reason before continuing.");
     setSubmitting(true);
     setError("");
-    await onSubmit({ quantity, quarantineQuantity: secondaryQuantity, reason, disposition, expectedDate });
-    setSubmitting(false);
+    try {
+      await onSubmit({ quantity, quarantineQuantity: secondaryQuantity, reason, disposition, expectedDate });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The command could not be completed.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return <div className="modal-overlay" role="presentation"><section className="command-dialog" role="dialog" aria-modal="true" aria-labelledby="command-title"><div className="dialog-header"><div><span className="section-kicker">{command.entityNumber}</span><h2 id="command-title">{title}</h2></div><button className="icon-button" aria-label="Close dialog" onClick={onClose}>×</button></div><form onSubmit={submit}>
@@ -1181,7 +1305,7 @@ function CommandPanel({ command, po, so, products, onClose, onSubmit }: { comman
 
 function CommandFields({ kind, po, so, quantity, secondaryQuantity, setQuantity, setSecondaryQuantity, reason, setReason, disposition, setDisposition, expectedDate, setExpectedDate, max }: { kind: CommandKind; po?: PurchaseOrder; so?: SalesOrder; quantity: number; secondaryQuantity: number; setQuantity: (value: number) => void; setSecondaryQuantity: (value: number) => void; reason: string; setReason: (value: string) => void; disposition: string; setDisposition: (value: string) => void; expectedDate: string; setExpectedDate: (value: string) => void; max: number }) {
   if (kind === "receive") return <div className="command-form"><div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{po?.open ?? 0} open to receive</strong><small>{po?.lines[0]?.specification}</small></div><div className="form-grid"><label>Arrived at dock<input type="number" min="1" max={max || undefined} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Accepted into quarantine<input type="number" min="0" max={quantity} value={secondaryQuantity} onChange={(e) => setSecondaryQuantity(Number(e.target.value))} /></label><label>Rejected at dock<input value="0" readOnly /></label><label>Destination<select><option>Main / Rack A / Bay 03</option><option>Main / Special Orders / Bay S-12</option></select></label></div><p className="formula-note">Available inventory = arrived − quarantine − rejected. The quantity distribution must balance.</p></div>;
-  if (kind === "ship") return <div className="command-form"><div className="line-context"><span>{so?.customer} · {so?.project}</span><strong>{so?.reserved ?? 0} reserved</strong><small>{so?.route}</small></div><label>Quantity to ship<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Staging location<select><option>Main / Customer Staging / ST-02</option><option>Main / Pickup Staging / PU-01</option></select></label><label>Carrier or pickup reference<input placeholder="Optional reference" /></label></div>;
+  if (kind === "ship" || kind === "reserve") return <div className="command-form"><div className="line-context"><span>{so?.customer} · {so?.project}</span><strong>{kind === "reserve" ? `${so?.availableNow ?? 0} available now` : `${so?.reserved ?? 0} reserved`}</strong><small>{so?.route}</small></div><label>{kind === "reserve" ? "Quantity to reserve" : "Quantity to ship"}<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>{kind === "reserve" ? "Reserve from location" : "Staging location"}<select><option>{kind === "reserve" ? "Main / Rack A / Bay 01" : "Main / Customer Staging / ST-02"}</option><option>{kind === "reserve" ? "Main / Rack B / Bay 07" : "Main / Pickup Staging / PU-01"}</option></select></label>{kind === "ship" && <label>Carrier or pickup reference<input placeholder="Optional reference" /></label>}</div>;
   if (kind === "vendor-return") return <div className="command-form"><div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} eligible to return</strong><small>Source: {po?.number} · RCPT-0098</small></div><label>Quantity to return<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><fieldset><legend>What should happen after the vendor receives these goods?</legend>{[["replacement", "Replace the returned quantity"], ["refund", "Issue a credit; no replacement"], ["repair", "Repair and return the same unit"], ["allowance", "No physical return; issue a price allowance"]].map(([value, label]) => <label className="radio-row" key={value}><input type="radio" name="disposition" value={value} checked={disposition === value} onChange={(e) => setDisposition(e.target.value)} /><span>{label}</span></label>)}</fieldset><label>Return reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Damaged on arrival</option><option>Wrong specification</option><option>Warranty issue</option><option>Customer cancellation</option></select></label></div>;
   if (kind === "customer-return") return <div className="command-form"><div className="line-context"><span>{so?.customer} · {so?.number}</span><strong>{max} eligible to return</strong><small>Physical and financial decisions are reviewed separately.</small></div><label>Quantity received back<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Physical disposition<select value={disposition} onChange={(e) => setDisposition(e.target.value)}><option value="quarantine">Receive into quarantine</option><option value="available">Return to available stock</option><option value="damaged">Damaged / discounted stock</option><option value="scrap">Scrap after inspection</option></select></label><label>Customer resolution<select><option>Issue customer credit</option><option>Create replacement order</option><option>Repair</option><option>No credit</option></select></label><label>Return reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Damage</option><option>Incorrect item</option><option>Customer changed mind</option><option>Warranty</option></select></label></div>;
   if (kind === "count") return <div className="command-form"><div className="line-context"><span>Main / Rack B</span><strong>2 variance lines</strong><small>COUNT-0043 · blind count completed by Jordan Lee</small></div><label>Net quantity adjustment<input type="number" value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Variance reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Found in adjacent bay</option><option>Unrecorded damage</option><option>Counting error confirmed</option></select></label></div>;
@@ -1199,17 +1323,18 @@ function commandDefaults(kind: CommandKind, po?: PurchaseOrder, so?: SalesOrder,
   if (kind === "reopen") return { quantity: Math.min(20, po?.closed || 1), secondaryQuantity: 0, max: po?.closed || 0, disposition: "reopen" };
   if (kind === "reverse") return { quantity: Math.min(10, po?.received || 1), secondaryQuantity: 0, max: (po?.received || 0) - (po?.returned || 0), disposition: "reopen" };
   if (kind === "vendor-return") return { quantity: 1, secondaryQuantity: 0, max: (po?.received || 0) - (po?.returned || 0), disposition: "replacement" };
+  if (kind === "reserve") return { quantity: Math.max(1, Math.min(so?.availableNow || 0, (so?.open || 0) - (so?.reserved || 0))), secondaryQuantity: 0, max: Math.max(0, Math.min(so?.availableNow || 0, (so?.open || 0) - (so?.reserved || 0))), disposition: "reserve" };
   if (kind === "ship") return { quantity: Math.max(1, (so?.reserved || 0) - (so?.shipped || 0)), secondaryQuantity: 0, max: Math.max(0, (so?.reserved || 0) - (so?.shipped || 0)), disposition: "ship" };
   if (kind === "customer-return") return { quantity: 1, secondaryQuantity: 0, max: so?.shipped || so?.reserved || 1, disposition: "quarantine" };
   return { quantity: 1, secondaryQuantity: 0, max: products?.reduce((sum, product) => sum + product.onHand, 0) || 1, disposition: "adjust" };
 }
 
 function commandTitle(kind: CommandKind) {
-  return ({ receive: "Post receipt", close: "Close unreceived quantity", reopen: "Reopen quantity to receive", reverse: "Reverse incorrect receipt", "vendor-return": "Return to vendor", ship: "Post shipment", "customer-return": "Post customer return", count: "Approve inventory adjustment" } as Record<CommandKind, string>)[kind];
+  return ({ receive: "Post receipt", close: "Close unreceived quantity", reopen: "Reopen quantity to receive", reverse: "Reverse incorrect receipt", "vendor-return": "Return to vendor", reserve: "Reserve available stock", ship: "Post shipment", "customer-return": "Post customer return", count: "Approve inventory adjustment" } as Record<CommandKind, string>)[kind];
 }
 
 function finalCommandLabel(kind: CommandKind, quantity: number) {
-  return ({ receive: `Post receipt of ${quantity}`, close: `Close ${quantity} without receipt`, reopen: `Reopen ${quantity} to receive`, reverse: `Reverse ${quantity} received units`, "vendor-return": `Post vendor return of ${quantity}`, ship: `Post shipment of ${quantity}`, "customer-return": `Post customer return of ${quantity}`, count: "Approve and post inventory adjustment" } as Record<CommandKind, string>)[kind];
+  return ({ receive: `Post receipt of ${quantity}`, close: `Close ${quantity} without receipt`, reopen: `Reopen ${quantity} to receive`, reverse: `Reverse ${quantity} received units`, "vendor-return": `Post vendor return of ${quantity}`, reserve: `Reserve ${quantity} units`, ship: `Post shipment of ${quantity}`, "customer-return": `Post customer return of ${quantity}`, count: "Approve and post inventory adjustment" } as Record<CommandKind, string>)[kind];
 }
 
 function commandImpact(kind: CommandKind, quantity: number, secondary: number, po?: PurchaseOrder, so?: SalesOrder, disposition?: string) {
@@ -1223,6 +1348,7 @@ function commandImpact(kind: CommandKind, quantity: number, secondary: number, p
   if (kind === "reopen") return [{ category: "Physical inventory", label: "On-hand inventory", after: "No change" }, { category: "Commercial commitment", label: "Expected incoming", before: po?.open ?? 0, after: (po?.open ?? 0) + quantity, tone: "info" as Severity }, { category: "Commercial commitment", label: "Closed without receipt", before: po?.closed ?? 0, after: Math.max((po?.closed ?? 0) - quantity, 0) }, { category: "Commercial commitment", label: "Purchase-order revision", before: po?.revision ?? 1, after: (po?.revision ?? 1) + 1 }];
   if (kind === "reverse") return [{ category: "Physical inventory", label: "Available inventory", before: po?.received ?? 0, after: Math.max((po?.received ?? 0) - quantity, 0), tone: "danger" as Severity }, { category: "Commercial commitment", label: "Net received", before: (po?.received ?? 0) - (po?.returned ?? 0), after: Math.max((po?.received ?? 0) - (po?.returned ?? 0) - quantity, 0) }, { category: "Commercial commitment", label: disposition === "reopen" ? "Open to receive" : "Closed without receipt", before: disposition === "reopen" ? po?.open ?? 0 : po?.closed ?? 0, after: (disposition === "reopen" ? po?.open ?? 0 : po?.closed ?? 0) + quantity }];
   if (kind === "vendor-return") return disposition === "allowance" ? [{ category: "Physical inventory", label: "On-hand inventory", after: "No change" }, { category: "Commercial commitment", label: "PO fulfillment", after: "No change" }, { category: "Financial effect", label: "Vendor credit", after: "Price-only credit expected", tone: "info" as Severity }] : [{ category: "Physical inventory", label: "Internal inventory", before: (po?.received ?? 0) - (po?.returned ?? 0), after: Math.max((po?.received ?? 0) - (po?.returned ?? 0) - quantity, 0), tone: "danger" as Severity }, { category: "Commercial commitment", label: disposition === "replacement" ? "Replacement supply" : "Closed without replacement", before: 0, after: quantity, tone: disposition === "replacement" ? "info" as Severity : "warning" as Severity }, { category: "Financial effect", label: "Vendor credit expected", after: "Yes" }];
+  if (kind === "reserve") return [{ category: "Physical inventory", label: "On-hand inventory", after: "No change" }, { category: "Commercial commitment", label: "Customer allocation", before: so?.reserved ?? 0, after: (so?.reserved ?? 0) + quantity, tone: "info" as Severity }, { category: "Allocations", label: "Available inventory", before: so?.availableNow ?? 0, after: Math.max((so?.availableNow ?? 0) - quantity, 0), tone: "warning" as Severity }, { category: "Financial effect", label: "Customer invoice", after: "No change" }];
   if (kind === "ship") return [{ category: "Physical inventory", label: "Main warehouse on hand", before: so?.reserved ?? 0, after: Math.max((so?.reserved ?? 0) - quantity, 0), tone: "danger" as Severity }, { category: "Commercial commitment", label: "Sales order shipped", before: so?.shipped ?? 0, after: (so?.shipped ?? 0) + quantity, tone: "success" as Severity }, { category: "Allocations", label: "Reservations released", before: so?.reserved ?? 0, after: Math.max((so?.reserved ?? 0) - quantity, 0) }, { category: "Financial eligibility", label: "Quantity eligible to invoice", before: so?.shipped ?? 0, after: (so?.shipped ?? 0) + quantity }];
   if (kind === "customer-return") return [{ category: "Physical inventory", label: disposition === "available" ? "Available stock" : "Returns / quarantine", before: 0, after: quantity, tone: disposition === "available" ? "success" as Severity : "warning" as Severity }, { category: "Commercial commitment", label: "Replacement demand", after: "Explicit only; not automatic" }, { category: "Financial effect", label: "Customer credit", after: "Created separately after review", tone: "info" as Severity }];
   return [{ category: "Physical inventory", label: "Inventory adjustment", before: 0, after: quantity, tone: quantity < 0 ? "danger" as Severity : "success" as Severity }, { category: "Financial effect", label: "Estimated value effect", after: money.format(quantity * 800) }, { category: "Audit", label: "Linked adjustment movement", after: "Will be created" }];
@@ -1244,6 +1370,7 @@ function applyLocalCommand(snapshot: Snapshot, kind: CommandKind, entityId: stri
     po.version += 1;
   }
   if (so && kind === "ship") { so.shipped += quantity; so.reserved -= quantity; so.open = Math.max(so.open - quantity, 0); so.fulfillment = so.open ? "Partially shipped" : "Fully shipped"; so.version += 1; }
+  if (so && kind === "reserve") { so.reserved += quantity; so.availableNow = Math.max(so.availableNow - quantity, 0); so.fulfillment = "Reserved"; so.version += 1; }
   next.activities.unshift({ id: crypto.randomUUID(), time: "Just now", title: `${commandTitle(kind)} completed`, detail: `${quantity} unit${quantity === 1 ? "" : "s"} processed for ${po?.number ?? so?.number ?? "COUNT-0043"}.`, tone: "success" });
   return next;
 }
@@ -1407,6 +1534,15 @@ function normalizeSnapshot(input: unknown): Snapshot {
     };
   });
 
+  const partners: Partner[] = asRows(raw.partners).map((item, index) => {
+    const kind = text(item.partnerType).toLowerCase();
+    return {
+      id: text(item.id, `partner-${index}`),
+      name: text(item.name, "Business partner"),
+      type: kind.includes("vendor") ? "vendor" : "customer",
+    };
+  });
+
   return {
     summary: {
       lateReceipts: number(summary.latePurchaseOrders, purchaseOrders.filter((po) => po.daysLate > 0).length),
@@ -1422,6 +1558,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
     movements: movements.length ? movements : fallbackSnapshot.movements,
     bills: bills.length ? bills : fallbackSnapshot.bills,
     activities: activities.length ? activities : fallbackSnapshot.activities,
+    partners: partners.length ? partners : fallbackSnapshot.partners,
   };
 }
 

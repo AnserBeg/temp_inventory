@@ -2,8 +2,6 @@ import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
-const root = new URL("../", import.meta.url);
-
 test("ships PaneFlow product metadata and removes starter preview infrastructure", async () => {
   const [page, layout, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
@@ -31,6 +29,11 @@ test("exposes the required operational language and impact previews", async () =
     "Reverse incorrect receipt",
     "Return to vendor",
     "Post shipment",
+    "Reserve available stock",
+    "Create purchase order",
+    "Create sales order",
+    "approved purchase order",
+    "confirmed sales order",
     "Physical inventory",
     "Commercial commitment",
     "Financial effect",
@@ -55,14 +58,17 @@ test("includes responsive, focus-visible, reduced-motion, and print behavior", a
   assert.match(css, /min-height: 54px/);
 });
 
-test("declares durable D1 data and explicit command APIs", async () => {
-  const [hosting, snapshotRoute, commandRoute] = await Promise.all([
+test("declares durable D1 data and explicit command and record APIs", async () => {
+  const [hosting, snapshotRoute, commandRoute, recordsRoute] = await Promise.all([
     readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"),
     readFile(new URL("../app/api/snapshot/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/commands/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/records/route.ts", import.meta.url), "utf8"),
   ]);
   assert.deepEqual(JSON.parse(hosting).d1, "DB");
   assert.match(snapshotRoute, /getInventorySnapshot/);
   assert.match(commandRoute, /executeInventoryCommand/);
   assert.match(commandRoute, /idempotency|InventoryCommand/i);
+  assert.match(recordsRoute, /createOrderRecord/);
+  assert.match(recordsRoute, /export async function POST/);
 });

@@ -22,7 +22,7 @@ const schemaStatements = [
     id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, vendor_id TEXT NOT NULL,
     lifecycle_status TEXT NOT NULL DEFAULT 'approved', billing_status TEXT NOT NULL DEFAULT 'not_billed',
     expected_date TEXT, currency TEXT NOT NULL DEFAULT 'CAD', total_cents INTEGER NOT NULL,
-    buyer_name TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+    buyer_name TEXT, project_reference TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS purchase_order_lines (
     id TEXT PRIMARY KEY, purchase_order_id TEXT NOT NULL, product_id TEXT NOT NULL,
@@ -42,7 +42,7 @@ const schemaStatements = [
     id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, customer_id TEXT NOT NULL,
     lifecycle_status TEXT NOT NULL DEFAULT 'confirmed', billing_status TEXT NOT NULL DEFAULT 'not_invoiced',
     requested_date TEXT, currency TEXT NOT NULL DEFAULT 'CAD', total_cents INTEGER NOT NULL,
-    owner_name TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+    owner_name TEXT, project_reference TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS sales_order_lines (
     id TEXT PRIMARY KEY, sales_order_id TEXT NOT NULL, product_id TEXT NOT NULL,
@@ -300,11 +300,20 @@ async function seedDatabase(db: D1Database) {
   await db.prepare("PRAGMA optimize").run();
 }
 
+async function ensureColumn(db: D1Database, table: string, column: string, definition: string) {
+  const info = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+  if (!info.results.some((item) => item.name === column)) {
+    await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+  }
+}
+
 export async function ensureDatabase() {
   if (!ready) {
     ready = (async () => {
       const db = getD1();
       await db.batch(schemaStatements.map((sql) => db.prepare(sql)));
+      await ensureColumn(db, "purchase_orders", "project_reference", "TEXT");
+      await ensureColumn(db, "sales_orders", "project_reference", "TEXT");
       await seedDatabase(db);
     })().catch((error) => {
       ready = undefined;

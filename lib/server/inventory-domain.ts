@@ -685,6 +685,7 @@ export async function getInventorySnapshot() {
     )
     SELECT po.id, po.number, po.lifecycle_status AS lifecycleStatus, po.billing_status AS billingStatus,
            po.expected_date AS expectedDate, po.currency, po.total_cents AS totalCents, po.buyer_name AS buyerName,
+           po.project_reference AS projectReference,
            po.version, bp.id AS vendorId, bp.name AS vendorName,
            lr.id AS latestReceiptId, lr.version AS latestReceiptVersion,
            COALESCE(lt.ordered_qty, 0) AS orderedQuantity, COALESCE(mt.gross_received_qty, 0) AS grossReceivedQuantity,
@@ -746,6 +747,7 @@ export async function getInventorySnapshot() {
     )
     SELECT so.id, so.number, so.lifecycle_status AS lifecycleStatus, so.billing_status AS billingStatus,
            so.requested_date AS requestedDate, so.currency, so.total_cents AS totalCents, so.owner_name AS ownerName,
+           so.project_reference AS projectReference,
            so.version, bp.id AS customerId, bp.name AS customerName,
            COALESCE(lt.ordered_qty,0) AS orderedQuantity, COALESCE(mt.shipped_qty,0) AS shippedQuantity,
            COALESCE(mt.returned_qty,0) AS returnedQuantity, COALESCE(r.reserved_qty,0) AS reservedQuantity,

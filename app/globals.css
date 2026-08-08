@@ -514,6 +514,11 @@ select { min-height: 34px; padding: 5px 26px 5px 8px; border: 1px solid var(--li
 .radio-row:has(input:checked) { border-color: #9fc6bb; background: var(--brand-soft); color: var(--brand-dark); }
 .radio-row input { accent-color: var(--brand); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.form-grid .full-field { grid-column: 1 / -1; }
+.form-grid label small { color: var(--ink-soft); font-size: 9px; font-weight: 450; }
+.simplified-policy { display: flex; align-items: flex-start; gap: 9px; margin-top: 14px; padding: 10px 12px; border: 1px solid #c5d8e3; border-radius: 6px; background: var(--info-soft); color: #315a74; }
+.simplified-policy > span { width: 19px; height: 19px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 50%; background: var(--info); color: #fff; font-size: 10px; font-weight: 750; }
+.simplified-policy p { margin: 0; font-size: 10px; }
 .line-context { display: grid; grid-template-columns: 1fr auto; gap: 2px 14px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 6px; background: #f7f8f6; }
 .line-context span { font-weight: 680; }
 .line-context strong { color: var(--brand); font-variant-numeric: tabular-nums; }
