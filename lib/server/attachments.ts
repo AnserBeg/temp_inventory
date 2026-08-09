@@ -79,7 +79,15 @@ export async function downloadAttachment(id: string) {
   if (!metadata) throw new AttachmentError("NOT_FOUND", "Attachment was not found.", 404);
   const object = await bucket().get(metadata.objectKey);
   if (!object) throw new AttachmentError("OBJECT_NOT_FOUND", "Attachment bytes are unavailable.", 404);
-  return new Response(object.body, { headers: { "Content-Type": metadata.contentType, "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(metadata.fileName)}`, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" } });
+  return new Response(object.body, { headers: {
+    "Content-Type": metadata.contentType,
+    "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(metadata.fileName)}`,
+    "Cache-Control": "private, no-store",
+    "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox; frame-ancestors 'none'",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+  } });
 }
 
 export async function deleteAttachment(actor: ActorIdentity, id: string) {

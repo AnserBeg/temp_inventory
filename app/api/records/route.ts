@@ -1,4 +1,3 @@
-import { getInventorySnapshot } from "@/lib/server/inventory-domain";
 import { createOrderRecord, RecordValidationError, type CreateOrderInput } from "@/lib/server/inventory-records";
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
 
@@ -14,8 +13,7 @@ export async function POST(request: Request) {
     payload.actorId = actor.id;
     payload.actorEmail = actor.email;
     const result = await createOrderRecord(payload);
-    const snapshot = await getInventorySnapshot();
-    return Response.json({ ...result, snapshot }, {
+    return Response.json(result, {
       status: 201,
       headers: { "Cache-Control": "no-store" },
     });

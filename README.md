@@ -54,7 +54,11 @@ npm run dev
 
 The local Sites configuration provides D1 and R2 bindings. Development-only sample records are gated from production; a hosted empty database starts with the authenticated administrator bootstrap and master-data setup flow.
 
-Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Production deployments should omit it or set it to `false`; `ENVIRONMENT=development` also enables the local bootstrap and must not be used in production.
+Copy `.env.example` for explicit local flags. Set `ALLOW_LOCAL_DEV_AUTH=true` only for a private local process; host names and `Host` headers never enable authentication bypass. Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Production deployments must keep both values `false`; `ENVIRONMENT=development` also enables the sample-data bootstrap and must not be used in production.
+
+## Database migrations
+
+`db/schema.ts` and the ordered SQL files in `drizzle/` are the canonical schema. Runtime startup only verifies the migrated contract and never creates or alters tables. Generate a new migration with `npm run db:generate` whenever the Drizzle schema changes, review the SQL, and commit both the SQL and `drizzle/meta` updates. Sites applies the committed migration chain before starting the deployed application.
 
 ## Verification
 
@@ -62,9 +66,10 @@ Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Produc
 npm run test:domain
 npm test
 npm run lint
+npm run typecheck
 ```
 
-`npm test` performs a production build and runs the full contract/domain suite.
+`npm test` performs a production build and runs the full contract suite, including a clean migration bootstrap and production-module integration tests against a D1-compatible SQLite adapter.
 
 ## Deliberate boundaries
 

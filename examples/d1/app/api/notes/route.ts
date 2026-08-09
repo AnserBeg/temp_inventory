@@ -1,6 +1,12 @@
 import { desc } from "drizzle-orm";
-import { getDb } from "../../../../../db";
+import { drizzle } from "drizzle-orm/d1";
+import { env } from "cloudflare:workers";
 import { notes } from "../../../db/schema";
+
+function getDb() {
+  if (!env.DB) throw new Error("Cloudflare D1 binding `DB` is unavailable.");
+  return drizzle(env.DB, { schema: { notes } });
+}
 
 function toRouteErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : "Unexpected error";

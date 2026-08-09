@@ -36,6 +36,20 @@
       "when": 1786235231732,
       "tag": "0004_useful_nomad",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1786243889336,
+      "tag": "0005_exotic_toad",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1786243913240,
+      "tag": "0006_runtime-integrity",
+      "breakpoints": true
     }
   ]
 }

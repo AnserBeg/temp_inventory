@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const domain = readFileSync(new URL("../lib/server/inventory-domain.ts", import.meta.url), "utf8");
-const runtime = readFileSync(new URL("../lib/server/inventory-db.ts", import.meta.url), "utf8");
 const schema = readFileSync(new URL("../db/schema.ts", import.meta.url), "utf8");
 
 test("all outbound legacy postings couple stock, layers, and immutable value entries", () => {
@@ -44,7 +43,7 @@ test("count approvals are scoped and single-use", () => {
   assert.match(domain, /APPROVAL_SCOPE_MISMATCH/);
   assert.match(domain, /consumed_at IS NULL/);
   for (const column of ["consumedAt", "consumedBy", "consumedEntityId"]) assert.match(schema, new RegExp(column));
-  for (const column of ["consumed_at", "consumed_by", "consumed_entity_id"]) assert.match(runtime, new RegExp(column));
+  for (const column of ["consumed_at", "consumed_by", "consumed_entity_id"]) assert.match(domain, new RegExp(column));
 });
 
 test("physical postings emit both audit and transactional outbox records", () => {

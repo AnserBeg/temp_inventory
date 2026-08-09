@@ -2,6 +2,7 @@ import type { ActorIdentity } from "./auth";
 import { all, ensureDatabase, getD1, newId } from "./inventory-db";
 
 export type ExportType = "inventory" | "movements" | "purchase-orders" | "vendor-bills" | "customer-invoices" | "audit" | "accounting" | "quickbooks";
+export type ExportRange = { from: string; to: string };
 
 const queries: Record<Exclude<ExportType, "accounting" | "quickbooks">, string> = {
   inventory: `SELECT p.sku,p.name,l.code AS location,l.inventory_status AS status,ib.on_hand_qty AS on_hand,ib.reserved_qty AS reserved,ib.on_hand_qty-ib.reserved_qty AS available,p.base_uom_id AS uom FROM inventory_balances ib JOIN products p ON p.id=ib.product_id JOIN locations l ON l.id=ib.location_id ORDER BY p.sku,l.code`,
@@ -165,46 +166,64 @@ function returnableLine(input: {
 
 function base(value:number, exchange:number){ return Math.round(value * exchange); }
 
-async function accountingRows() {
+function validateDocument(document: DocumentRow) {
+  if (!Number.isFinite(document.exchange) || document.exchange <= 0) throw new Error(`Export blocked because ${document.number} has an invalid exchange rate.`);
+  if (document.subtotal + document.tax !== document.total) throw new Error(`Export blocked because ${document.number} subtotal and tax do not equal its total.`);
+  const expectedBase = base(document.total, document.exchange);
+  if (document.baseTotal !== expectedBase) throw new Error(`Export blocked because ${document.number} base total is ${document.baseTotal}; expected ${expectedBase}.`);
+}
+
+function addRoundingLine(rows: AccountingRow[], document: DocumentRow, documentType: string, difference: number, normalSide: "debit" | "credit") {
+  if (!difference) return;
+  if (Math.abs(difference) > 3) throw new Error(`Export blocked because ${document.number} has an unexplained base-currency difference of ${difference} cents.`);
+  rows.push(splitLine(document, documentType, "Foreign exchange rounding", difference, 0, normalSide));
+}
+
+async function accountingRows(range: ExportRange) {
   const rows: AccountingRow[] = [];
   const bills = await all<DocumentRow>(`SELECT vb.id,vb.number,vb.invoice_date AS postingDate,vb.subtotal_cents AS subtotal,vb.tax_cents AS tax,vb.total_cents AS total,vb.base_total_cents AS baseTotal,vb.currency,vb.exchange_rate_to_base AS exchange,bp.name AS partnerName,
       COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='vendor_bill' AND dc.document_id=vb.id AND dc.refundable=1),0) AS refundable,
       COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='vendor_bill' AND dc.document_id=vb.id AND dc.refundable=0),0) AS otherCharges
-    FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id WHERE vb.status<>'void' ORDER BY vb.invoice_date,vb.number`);
+    FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id WHERE vb.status<>'void' AND substr(vb.invoice_date,1,10) BETWEEN ? AND ? ORDER BY vb.invoice_date,vb.number`, range.from, range.to);
   for (const bill of bills) {
+    validateDocument(bill);
     const refundable=Number(bill.refundable??0),otherCharges=Number(bill.otherCharges??0),items=bill.subtotal-refundable-otherCharges;
-    const itemBase=base(items,bill.exchange),refundableBase=base(refundable,bill.exchange),otherBase=base(otherCharges,bill.exchange); const taxBase=bill.baseTotal-itemBase-refundableBase-otherBase;
+    const itemBase=base(items,bill.exchange),refundableBase=base(refundable,bill.exchange),otherBase=base(otherCharges,bill.exchange),taxBase=base(bill.tax,bill.exchange);
     if(itemBase) rows.push(splitLine(bill,"vendor_bill","Inventory clearing",itemBase,items,"debit"));
     if(refundableBase) rows.push(splitLine(bill,"vendor_bill","Refundable returnable deposits receivable",refundableBase,refundable,"debit"));
     if(otherBase) rows.push(splitLine(bill,"vendor_bill","Landed cost clearing",otherBase,otherCharges,"debit"));
     if(taxBase) rows.push(splitLine(bill,"vendor_bill","Recoverable tax",taxBase,bill.tax,"debit"));
+    addRoundingLine(rows,bill,"vendor_bill",bill.baseTotal-itemBase-refundableBase-otherBase-taxBase,"debit");
     rows.push(line(bill,"vendor_bill","Accounts payable",0,bill.baseTotal,bill.total));
   }
   const invoices = await all<DocumentRow>(`SELECT ci.id,ci.number,ci.invoice_date AS postingDate,ci.subtotal_cents AS subtotal,ci.tax_cents AS tax,ci.total_cents AS total,ci.base_total_cents AS baseTotal,ci.currency,ci.exchange_rate_to_base AS exchange,bp.name AS partnerName,
       COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='customer_invoice' AND dc.document_id=ci.id AND dc.refundable=1),0) AS refundable,
       COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='customer_invoice' AND dc.document_id=ci.id AND dc.refundable=0),0) AS otherCharges
-    FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id WHERE ci.status<>'void' ORDER BY ci.invoice_date,ci.number`);
+    FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id WHERE ci.status<>'void' AND substr(ci.invoice_date,1,10) BETWEEN ? AND ? ORDER BY ci.invoice_date,ci.number`, range.from, range.to);
   for (const invoice of invoices) {
+    validateDocument(invoice);
     const refundable=Number(invoice.refundable??0),otherCharges=Number(invoice.otherCharges??0),items=invoice.subtotal-refundable-otherCharges;
-    const itemBase=base(items,invoice.exchange),refundableBase=base(refundable,invoice.exchange),otherBase=base(otherCharges,invoice.exchange); const taxBase=invoice.baseTotal-itemBase-refundableBase-otherBase;
+    const itemBase=base(items,invoice.exchange),refundableBase=base(refundable,invoice.exchange),otherBase=base(otherCharges,invoice.exchange),taxBase=base(invoice.tax,invoice.exchange);
     rows.push(line(invoice,"customer_invoice","Accounts receivable",invoice.baseTotal,0,invoice.total));
     if(itemBase) rows.push(splitLine(invoice,"customer_invoice","Sales revenue",itemBase,items,"credit"));
     if(refundableBase) rows.push(splitLine(invoice,"customer_invoice","Refundable returnable deposits payable",refundableBase,refundable,"credit"));
     if(otherBase) rows.push(splitLine(invoice,"customer_invoice","Distribution fees revenue",otherBase,otherCharges,"credit"));
     if(taxBase) rows.push(splitLine(invoice,"customer_invoice","Tax payable",taxBase,invoice.tax,"credit"));
+    addRoundingLine(rows,invoice,"customer_invoice",invoice.baseTotal-itemBase-refundableBase-otherBase-taxBase,"credit");
   }
-  const credits=await all<Record<string,unknown>>(`SELECT vc.posted_at AS postingDate,'vendor_credit' AS kind,vc.id,vc.number,vc.amount_cents AS amount,vc.base_amount_cents AS base,vc.currency,vc.exchange_rate_to_base AS exchange,bp.name AS partnerName FROM vendor_credits vc JOIN business_partners bp ON bp.id=vc.vendor_id WHERE vc.status='posted' UNION ALL SELECT cc.posted_at,'customer_credit',cc.id,cc.number,cc.amount_cents,cc.base_amount_cents,cc.currency,cc.exchange_rate_to_base,bp.name FROM customer_credits cc JOIN business_partners bp ON bp.id=cc.customer_id WHERE cc.status='posted'`);
-  for(const credit of credits){const d:DocumentRow={id:String(credit.id),number:String(credit.number),postingDate:String(credit.postingDate),subtotal:Number(credit.amount),tax:0,total:Number(credit.amount),baseTotal:Number(credit.base),currency:String(credit.currency),exchange:Number(credit.exchange),partnerName:String(credit.partnerName??"")};if(credit.kind==="vendor_credit"){rows.push(line(d,"vendor_credit","Accounts payable",d.baseTotal,0,d.total),line(d,"vendor_credit","Purchase returns / allowances",0,d.baseTotal,d.total));}else{rows.push(line(d,"customer_credit","Sales returns / allowances",d.baseTotal,0,d.total),line(d,"customer_credit","Accounts receivable",0,d.baseTotal,d.total));}}
-  const payments=await all<Record<string,unknown>>("SELECT p.id,p.number,p.direction,p.document_type AS documentType,p.document_id AS documentId,p.payment_date AS postingDate,p.amount_cents AS amount,p.base_amount_cents AS base,p.currency,p.exchange_rate_to_base AS exchange,bp.name AS partnerName FROM payments p JOIN business_partners bp ON bp.id=p.partner_id ORDER BY p.payment_date,p.number");
+  const credits=await all<Record<string,unknown>>(`SELECT vc.posted_at AS postingDate,'vendor_credit' AS kind,vc.id,vc.number,vc.amount_cents AS amount,vc.base_amount_cents AS base,vc.currency,vc.exchange_rate_to_base AS exchange,bp.name AS partnerName FROM vendor_credits vc JOIN business_partners bp ON bp.id=vc.vendor_id WHERE vc.status='posted' AND substr(vc.posted_at,1,10) BETWEEN ? AND ? UNION ALL SELECT cc.posted_at,'customer_credit',cc.id,cc.number,cc.amount_cents,cc.base_amount_cents,cc.currency,cc.exchange_rate_to_base,bp.name FROM customer_credits cc JOIN business_partners bp ON bp.id=cc.customer_id WHERE cc.status='posted' AND substr(cc.posted_at,1,10) BETWEEN ? AND ?`,range.from,range.to,range.from,range.to);
+  for(const credit of credits){const d:DocumentRow={id:String(credit.id),number:String(credit.number),postingDate:String(credit.postingDate),subtotal:Number(credit.amount),tax:0,total:Number(credit.amount),baseTotal:Number(credit.base),currency:String(credit.currency),exchange:Number(credit.exchange),partnerName:String(credit.partnerName??"")};validateDocument(d);if(credit.kind==="vendor_credit"){rows.push(line(d,"vendor_credit","Accounts payable",d.baseTotal,0,d.total),line(d,"vendor_credit","Purchase returns / allowances",0,d.baseTotal,d.total));}else{rows.push(line(d,"customer_credit","Sales returns / allowances",d.baseTotal,0,d.total),line(d,"customer_credit","Accounts receivable",0,d.baseTotal,d.total));}}
+  const payments=await all<Record<string,unknown>>("SELECT p.id,p.number,p.direction,p.document_type AS documentType,p.document_id AS documentId,p.payment_date AS postingDate,p.amount_cents AS amount,p.base_amount_cents AS base,p.currency,p.exchange_rate_to_base AS exchange,bp.name AS partnerName FROM payments p JOIN business_partners bp ON bp.id=p.partner_id WHERE substr(p.payment_date,1,10) BETWEEN ? AND ? ORDER BY p.payment_date,p.number",range.from,range.to);
   for(const payment of payments){
     const d:DocumentRow={id:String(payment.id),number:String(payment.number),postingDate:String(payment.postingDate),subtotal:Number(payment.amount),tax:0,total:Number(payment.amount),baseTotal:Number(payment.base),currency:String(payment.currency),exchange:Number(payment.exchange),partnerName:String(payment.partnerName??"")};
+    validateDocument(d);
     if(payment.documentType==="returnable_deposit"){
       if(payment.direction==="inbound") rows.push(line(d,"returnable_deposit_refund","Cash",d.baseTotal,0,d.total),line(d,"returnable_deposit_refund","Refundable returnable deposits receivable",0,d.baseTotal,d.total));
       else rows.push(line(d,"returnable_deposit_refund","Refundable returnable deposits payable",d.baseTotal,0,d.total),line(d,"returnable_deposit_refund","Cash",0,d.baseTotal,d.total));
     } else if(payment.direction==="inbound") rows.push(line(d,"payment","Cash",d.baseTotal,0,d.total),line(d,"payment","Accounts receivable",0,d.baseTotal,d.total));
     else rows.push(line(d,"payment","Accounts payable",d.baseTotal,0,d.total),line(d,"payment","Cash",0,d.baseTotal,d.total));
   }
-  const values=await all<Record<string,unknown>>("SELECT ive.id,ive.posted_at AS postingDate,ive.entry_type AS entryType,ive.reference_type AS referenceType,ive.reference_id AS referenceId,ive.value_cents AS value,ive.quantity,ive.cost_method AS costMethod,p.sku FROM inventory_value_entries ive JOIN products p ON p.id=ive.product_id ORDER BY ive.posted_at,ive.id");
+  const values=await all<Record<string,unknown>>("SELECT ive.id,ive.posted_at AS postingDate,ive.entry_type AS entryType,ive.reference_type AS referenceType,ive.reference_id AS referenceId,ive.value_cents AS value,ive.quantity,ive.cost_method AS costMethod,p.sku FROM inventory_value_entries ive JOIN products p ON p.id=ive.product_id WHERE substr(ive.posted_at,1,10) BETWEEN ? AND ? ORDER BY ive.posted_at,ive.id",range.from,range.to);
   for(const value of values){
     const amount=Math.abs(Number(value.value));if(!amount)continue;
     const d:DocumentRow={id:String(value.id),number:String(value.id),postingDate:String(value.postingDate),subtotal:amount,tax:0,total:amount,baseTotal:amount,currency:"BASE",exchange:1};
@@ -221,7 +240,7 @@ async function accountingRows() {
       : Number(value.value)>0 ? ["Inventory", "Inventory clearing"] : ["Inventory adjustment expense", "Inventory"];
     rows.push(line(d,"inventory_value_entry",accounts[0],amount,0,amount),line(d,"inventory_value_entry",accounts[1],0,amount,amount));
   }
-  const landed=await all<Record<string,unknown>>("SELECT id,number,posted_at AS postingDate,amount_cents AS amount FROM landed_cost_allocations ORDER BY posted_at,number");
+  const landed=await all<Record<string,unknown>>("SELECT id,number,posted_at AS postingDate,amount_cents AS amount FROM landed_cost_allocations WHERE substr(posted_at,1,10) BETWEEN ? AND ? ORDER BY posted_at,number",range.from,range.to);
   for(const entry of landed){const d:DocumentRow={id:String(entry.id),number:String(entry.number),postingDate:String(entry.postingDate),subtotal:Number(entry.amount),tax:0,total:Number(entry.amount),baseTotal:Number(entry.amount),currency:"BASE",exchange:1};rows.push(line(d,"landed_cost","Inventory",d.baseTotal,0,d.total),line(d,"landed_cost","Landed cost accrual",0,d.baseTotal,d.total));}
   const obligations = await all<ReturnableObligationRow>(`SELECT
     ro.id,
@@ -235,7 +254,8 @@ async function accountingRows() {
     FROM returnable_obligations ro
     JOIN business_partners bp ON bp.id=ro.partner_id
     JOIN returnable_asset_types rat ON rat.id=ro.asset_type_id
-    ORDER BY postingDate,ro.id`);
+    WHERE substr(COALESCE((SELECT MAX(re.posted_at) FROM returnable_events re WHERE re.obligation_id=ro.id),ro.created_at),1,10) BETWEEN ? AND ?
+    ORDER BY postingDate,ro.id`,range.from,range.to);
   for (const obligation of obligations) {
     const customerHolds = obligation.direction === "customer_holds";
     const outstandingQuantity = Number(obligation.issued)-Number(obligation.returned)-Number(obligation.forfeited);
@@ -289,7 +309,8 @@ async function accountingRows() {
     JOIN returnable_obligations ro ON ro.id=re.obligation_id
     JOIN business_partners bp ON bp.id=ro.partner_id
     JOIN returnable_asset_types rat ON rat.id=ro.asset_type_id
-    ORDER BY re.posted_at,re.id`);
+    WHERE substr(re.posted_at,1,10) BETWEEN ? AND ?
+    ORDER BY re.posted_at,re.id`,range.from,range.to);
   for (const event of returnableEvents) {
     const customerHolds = event.direction === "customer_holds";
     const depositClass = customerHolds ? "refundable_deposit_liability" : "refundable_deposit_asset";
@@ -344,8 +365,8 @@ async function accountingRows() {
   return rows;
 }
 
-async function quickBooksRows() {
-  const journalRows = (await accountingRows()).filter((row) => row.row_class === "journal_entry");
+async function quickBooksRows(range: ExportRange) {
+  const journalRows = (await accountingRows(range)).filter((row) => row.row_class === "journal_entry");
   const balances = new Map<string, number>();
   for (const row of journalRows) {
     const key = `${row.document_type}:${row.source_id}`;
@@ -369,11 +390,12 @@ async function quickBooksRows() {
   }));
 }
 
-export async function buildExport(type: ExportType, actor: ActorIdentity) {
+export async function buildExport(type: ExportType, actor: ActorIdentity, range?: ExportRange) {
   await ensureDatabase();
-  const rows = type === "accounting" ? await accountingRows() : type === "quickbooks" ? await quickBooksRows() : await all<Record<string, unknown>>(queries[type]);
+  if ((type === "accounting" || type === "quickbooks") && !range) throw new Error("Accounting exports require a bounded from/to date range.");
+  const rows = type === "accounting" ? await accountingRows(range!) : type === "quickbooks" ? await quickBooksRows(range!) : await all<Record<string, unknown>>(queries[type]);
   const when = new Date().toISOString();
-  const metadata={ type,rowCount:rows.length,role:actor.role };
+  const metadata={ type,rowCount:rows.length,role:actor.role,range };
   await getD1().batch([
     getD1().prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at) VALUES (?,'export',?,'export_generated',?,?,?,?,?,?)`).bind(newId("audit"),type,`${type} CSV export generated.`,actor.label,actor.id,actor.email,JSON.stringify(metadata),when),
     getD1().prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at) VALUES (?,'export.generated','export',?,?,'pending',0,?,?)`).bind(newId("outbox"),type,JSON.stringify(metadata),when,when),

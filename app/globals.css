@@ -858,6 +858,8 @@ select { min-height: 34px; padding: 5px 26px 5px 8px; border: 1px solid var(--li
 .workflow-impact-line.info strong { color: var(--info); }
 .workflow-toast { position: fixed; z-index: 210; right: 18px; bottom: 18px; max-width: 420px; display: flex; align-items: center; gap: 9px; padding: 12px 14px; border: 1px solid #b9d8c5; border-radius: 8px; background: #f1fbf5; color: #225d42; box-shadow: var(--shadow); font-size: 10px; font-weight: 700; }
 .workflow-toast > span { width: 19px; height: 19px; display: grid; place-items: center; border-radius: 50%; background: var(--success); color: #fff; }
+.snapshot-pagination { display: flex; align-items: center; justify-content: center; gap: 14px; margin: 20px 0 8px; color: var(--ink-soft); font-size: 10px; font-weight: 700; }
+.snapshot-pagination .button { min-width: 88px; }
 
 .commercial-composer { width: min(1040px, 100%); }
 .commercial-composer .dialog-header p { margin: 3px 0 0; color: var(--ink-soft); font-size: 9px; }

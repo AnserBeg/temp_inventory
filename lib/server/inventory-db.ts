@@ -2,360 +2,12 @@ import { env } from "cloudflare:workers";
 
 type SqlValue = string | number | null;
 
-const schemaStatements = [
-  `CREATE TABLE IF NOT EXISTS business_partners (
-    id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-    partner_type TEXT NOT NULL, email TEXT, phone TEXT, payment_terms TEXT,
-    currency TEXT NOT NULL DEFAULT 'CAD', active INTEGER NOT NULL DEFAULT 1,
-    version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS products (
-    id TEXT PRIMARY KEY, sku TEXT NOT NULL UNIQUE, manufacturer_sku TEXT, name TEXT NOT NULL,
-    category TEXT NOT NULL, material TEXT NOT NULL, dimensions TEXT NOT NULL, finish TEXT NOT NULL,
-    tracking_policy TEXT NOT NULL DEFAULT 'quantity', inventory_policy TEXT NOT NULL DEFAULT 'stocked',
-    standard_cost_cents INTEGER NOT NULL, selling_price_cents INTEGER NOT NULL,
-    reorder_point REAL NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
-    version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS locations (
-    id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-    location_type TEXT NOT NULL, inventory_status TEXT NOT NULL DEFAULT 'usable',
-    active INTEGER NOT NULL DEFAULT 1, version INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS purchase_orders (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, vendor_id TEXT NOT NULL,
-    lifecycle_status TEXT NOT NULL DEFAULT 'approved', billing_status TEXT NOT NULL DEFAULT 'not_billed',
-    expected_date TEXT, currency TEXT NOT NULL DEFAULT 'CAD', total_cents INTEGER NOT NULL,
-    buyer_name TEXT, project_reference TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS purchase_order_lines (
-    id TEXT PRIMARY KEY, purchase_order_id TEXT NOT NULL, product_id TEXT NOT NULL,
-    ordered_qty REAL NOT NULL, closed_qty REAL NOT NULL DEFAULT 0,
-    unit_cost_cents INTEGER NOT NULL, configuration_snapshot TEXT
-  )`,
-  `CREATE TABLE IF NOT EXISTS receipts (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, purchase_order_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'posted', posted_at TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS receipt_lines (
-    id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL, purchase_order_line_id TEXT NOT NULL,
-    product_id TEXT NOT NULL, location_id TEXT NOT NULL, quantity REAL NOT NULL,
-    condition TEXT NOT NULL DEFAULT 'usable'
-  )`,
-  `CREATE TABLE IF NOT EXISTS sales_orders (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, customer_id TEXT NOT NULL,
-    lifecycle_status TEXT NOT NULL DEFAULT 'confirmed', billing_status TEXT NOT NULL DEFAULT 'not_invoiced',
-    requested_date TEXT, currency TEXT NOT NULL DEFAULT 'CAD', total_cents INTEGER NOT NULL,
-    owner_name TEXT, project_reference TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS sales_order_lines (
-    id TEXT PRIMARY KEY, sales_order_id TEXT NOT NULL, product_id TEXT NOT NULL,
-    ordered_qty REAL NOT NULL, canceled_qty REAL NOT NULL DEFAULT 0,
-    unit_price_cents INTEGER NOT NULL, configuration_snapshot TEXT
-  )`,
-  `CREATE TABLE IF NOT EXISTS reservations (
-    id TEXT PRIMARY KEY, sales_order_line_id TEXT NOT NULL, product_id TEXT NOT NULL,
-    location_id TEXT NOT NULL, quantity REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active',
-    created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS shipments (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, sales_order_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'posted', posted_at TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS shipment_lines (
-    id TEXT PRIMARY KEY, shipment_id TEXT NOT NULL, sales_order_line_id TEXT NOT NULL,
-    product_id TEXT NOT NULL, location_id TEXT NOT NULL, quantity REAL NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vendor_returns (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL, purchase_order_id TEXT NOT NULL,
-    purchase_order_line_id TEXT NOT NULL, product_id TEXT NOT NULL, location_id TEXT NOT NULL,
-    quantity REAL NOT NULL, disposition TEXT NOT NULL, posted_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS customer_returns (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL, sales_order_id TEXT NOT NULL,
-    sales_order_line_id TEXT NOT NULL, product_id TEXT NOT NULL, location_id TEXT NOT NULL,
-    quantity REAL NOT NULL, condition TEXT NOT NULL, financial_resolution TEXT NOT NULL DEFAULT 'pending',
-    posted_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS drop_ship_deliveries (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE,
-    purchase_order_id TEXT NOT NULL, purchase_order_line_id TEXT NOT NULL,
-    sales_order_id TEXT NOT NULL, sales_order_line_id TEXT NOT NULL, product_id TEXT NOT NULL,
-    quantity REAL NOT NULL CHECK(quantity > 0), reversed_qty REAL NOT NULL DEFAULT 0 CHECK(reversed_qty >= 0 AND reversed_qty <= quantity),
-    status TEXT NOT NULL DEFAULT 'posted' CHECK(status IN ('posted','partially_reversed','reversed')),
-    delivery_date TEXT NOT NULL, external_reference TEXT NOT NULL,
-    posted_at TEXT NOT NULL, posted_by TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
-    FOREIGN KEY(purchase_order_id) REFERENCES purchase_orders(id),
-    FOREIGN KEY(purchase_order_line_id) REFERENCES purchase_order_lines(id),
-    FOREIGN KEY(sales_order_id) REFERENCES sales_orders(id),
-    FOREIGN KEY(sales_order_line_id) REFERENCES sales_order_lines(id),
-    FOREIGN KEY(product_id) REFERENCES products(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS stock_movements (
-    id TEXT PRIMARY KEY, movement_type TEXT NOT NULL, product_id TEXT NOT NULL, quantity REAL NOT NULL,
-    from_location_id TEXT, to_location_id TEXT, inventory_status TEXT NOT NULL,
-    source_document_type TEXT NOT NULL, source_document_id TEXT NOT NULL, source_line_id TEXT,
-    purchase_order_line_id TEXT, sales_order_line_id TEXT, reversal_of_movement_id TEXT,
-    posted_at TEXT NOT NULL, posted_by TEXT NOT NULL, unit_cost_cents INTEGER NOT NULL DEFAULT 0,
-    currency TEXT NOT NULL DEFAULT 'CAD', idempotency_key TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS inventory_balances (
-    product_id TEXT NOT NULL, location_id TEXT NOT NULL, on_hand_qty REAL NOT NULL DEFAULT 0,
-    reserved_qty REAL NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (product_id, location_id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS inventory_counts (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL, product_id TEXT NOT NULL, location_id TEXT NOT NULL,
-    recorded_qty REAL NOT NULL, counted_qty REAL NOT NULL, variance_qty REAL NOT NULL,
-    status TEXT NOT NULL DEFAULT 'posted', reason TEXT NOT NULL, counted_at TEXT NOT NULL,
-    counted_by TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vendor_bills (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL, vendor_id TEXT NOT NULL, purchase_order_id TEXT,
-    status TEXT NOT NULL, match_status TEXT NOT NULL, total_cents INTEGER NOT NULL,
-    due_date TEXT, currency TEXT NOT NULL DEFAULT 'CAD', version INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS command_log (
-    idempotency_key TEXT PRIMARY KEY, command TEXT NOT NULL, entity_id TEXT NOT NULL,
-    response_json TEXT NOT NULL, request_hash TEXT, claim_token TEXT, created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS audit_events (
-    id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL,
-    summary TEXT NOT NULL, actor TEXT NOT NULL, actor_id TEXT, actor_email TEXT,
-    metadata_json TEXT, created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS app_users (
-    user_id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, full_name TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer','operator','accounting','manager','administrator')),
-    active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS purchase_order_revisions (
-    id TEXT PRIMARY KEY, purchase_order_id TEXT NOT NULL, revision_number INTEGER NOT NULL,
-    lifecycle_status TEXT NOT NULL, snapshot_json TEXT NOT NULL, reason TEXT NOT NULL,
-    created_by TEXT NOT NULL, created_at TEXT NOT NULL,
-    UNIQUE(purchase_order_id, revision_number), FOREIGN KEY(purchase_order_id) REFERENCES purchase_orders(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS system_settings (
-    key TEXT PRIMARY KEY, value_json TEXT NOT NULL, description TEXT NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS approvals (
-    id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, request_type TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','canceled')),
-    requested_by TEXT NOT NULL, requested_reason TEXT NOT NULL, requested_at TEXT NOT NULL,
-    decided_by TEXT, decision_reason TEXT, decided_at TEXT,
-    consumed_at TEXT, consumed_by TEXT, consumed_entity_id TEXT,
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    version INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS period_locks (
-    id TEXT PRIMARY KEY, module TEXT NOT NULL, locked_through TEXT NOT NULL, reason TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1, version INTEGER NOT NULL DEFAULT 1,
-    created_by TEXT NOT NULL, created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS inventory_lots (
-    id TEXT PRIMARY KEY, product_id TEXT NOT NULL, lot_number TEXT NOT NULL, vendor_id TEXT,
-    manufactured_date TEXT, expiry_date TEXT, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
-    UNIQUE(product_id, lot_number), FOREIGN KEY(product_id) REFERENCES products(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS inventory_units (
-    id TEXT PRIMARY KEY, product_id TEXT NOT NULL, serial_number TEXT NOT NULL, lot_id TEXT,
-    location_id TEXT NOT NULL, inventory_status TEXT NOT NULL DEFAULT 'usable',
-    lifecycle_status TEXT NOT NULL DEFAULT 'on_hand', allocated_sales_order_line_id TEXT,
-    version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
-    UNIQUE(product_id, serial_number), FOREIGN KEY(product_id) REFERENCES products(id),
-    FOREIGN KEY(lot_id) REFERENCES inventory_lots(id), FOREIGN KEY(location_id) REFERENCES locations(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS movement_assignments (
-    id TEXT PRIMARY KEY, movement_id TEXT NOT NULL, lot_id TEXT, inventory_unit_id TEXT,
-    quantity REAL NOT NULL CHECK(quantity > 0), FOREIGN KEY(movement_id) REFERENCES stock_movements(id),
-    FOREIGN KEY(lot_id) REFERENCES inventory_lots(id), FOREIGN KEY(inventory_unit_id) REFERENCES inventory_units(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS document_charges (
-    id TEXT PRIMARY KEY, document_type TEXT NOT NULL, document_id TEXT NOT NULL,
-    charge_type TEXT NOT NULL, description TEXT NOT NULL, amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
-    direction TEXT NOT NULL DEFAULT 'add' CHECK(direction IN ('add','subtract')),
-    taxable INTEGER NOT NULL DEFAULT 0, refundable INTEGER NOT NULL DEFAULT 0,
-    tax_code TEXT, created_at TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS vendor_bill_lines (
-    id TEXT PRIMARY KEY, vendor_bill_id TEXT NOT NULL, purchase_order_line_id TEXT, product_id TEXT,
-    quantity REAL NOT NULL CHECK(quantity > 0), unit_cost_cents INTEGER NOT NULL CHECK(unit_cost_cents >= 0),
-    line_total_cents INTEGER NOT NULL, match_status TEXT NOT NULL, match_details_json TEXT NOT NULL DEFAULT '{}',
-    FOREIGN KEY(vendor_bill_id) REFERENCES vendor_bills(id), FOREIGN KEY(purchase_order_line_id) REFERENCES purchase_order_lines(id),
-    FOREIGN KEY(product_id) REFERENCES products(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS vendor_credits (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, vendor_id TEXT NOT NULL, vendor_bill_id TEXT,
-    purchase_order_id TEXT, amount_cents INTEGER NOT NULL CHECK(amount_cents > 0), reason TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'posted', posted_at TEXT NOT NULL, posted_by TEXT NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(vendor_bill_id) REFERENCES vendor_bills(id),
-    FOREIGN KEY(purchase_order_id) REFERENCES purchase_orders(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS customer_invoices (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, customer_id TEXT NOT NULL, sales_order_id TEXT,
-    status TEXT NOT NULL DEFAULT 'posted', invoice_date TEXT NOT NULL, due_date TEXT NOT NULL,
-    subtotal_cents INTEGER NOT NULL, tax_cents INTEGER NOT NULL DEFAULT 0, total_cents INTEGER NOT NULL,
-    paid_cents INTEGER NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'CAD',
-    posted_at TEXT NOT NULL, posted_by TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
-    FOREIGN KEY(sales_order_id) REFERENCES sales_orders(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS customer_invoice_lines (
-    id TEXT PRIMARY KEY, customer_invoice_id TEXT NOT NULL, sales_order_line_id TEXT NOT NULL,
-    product_id TEXT NOT NULL, quantity REAL NOT NULL CHECK(quantity > 0), unit_price_cents INTEGER NOT NULL,
-    line_total_cents INTEGER NOT NULL, FOREIGN KEY(customer_invoice_id) REFERENCES customer_invoices(id),
-    FOREIGN KEY(sales_order_line_id) REFERENCES sales_order_lines(id), FOREIGN KEY(product_id) REFERENCES products(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS customer_credits (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, customer_id TEXT NOT NULL, customer_invoice_id TEXT,
-    sales_order_id TEXT, amount_cents INTEGER NOT NULL CHECK(amount_cents > 0), reason TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'posted', posted_at TEXT NOT NULL, posted_by TEXT NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(customer_invoice_id) REFERENCES customer_invoices(id),
-    FOREIGN KEY(sales_order_id) REFERENCES sales_orders(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS payments (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, direction TEXT NOT NULL,
-    partner_id TEXT NOT NULL, document_type TEXT NOT NULL, document_id TEXT NOT NULL,
-    amount_cents INTEGER NOT NULL CHECK(amount_cents > 0), payment_date TEXT NOT NULL,
-    method TEXT NOT NULL, reference TEXT, posted_at TEXT NOT NULL, posted_by TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS returnable_asset_types (
-    id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL, asset_class TEXT NOT NULL,
-    unit_deposit_cents INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
-    version INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS returnable_obligations (
-    id TEXT PRIMARY KEY, partner_id TEXT NOT NULL, asset_type_id TEXT NOT NULL,
-    direction TEXT NOT NULL, issued_qty REAL NOT NULL DEFAULT 0, returned_qty REAL NOT NULL DEFAULT 0,
-    forfeited_qty REAL NOT NULL DEFAULT 0, deposit_charged_cents INTEGER NOT NULL DEFAULT 0,
-    deposit_refunded_cents INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open',
-    version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
-    FOREIGN KEY(asset_type_id) REFERENCES returnable_asset_types(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS returnable_events (
-    id TEXT PRIMARY KEY, obligation_id TEXT NOT NULL, event_type TEXT NOT NULL,
-    quantity REAL NOT NULL CHECK(quantity >= 0), amount_cents INTEGER NOT NULL DEFAULT 0,
-    reason TEXT NOT NULL, posted_at TEXT NOT NULL, posted_by TEXT NOT NULL,
-    FOREIGN KEY(obligation_id) REFERENCES returnable_obligations(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS valuation_policies (
-    product_id TEXT PRIMARY KEY, method TEXT NOT NULL DEFAULT 'fifo' CHECK(method IN ('fifo','average','standard')),
-    standard_cost_cents INTEGER NOT NULL DEFAULT 0, average_cost_cents INTEGER NOT NULL DEFAULT 0,
-    version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL,
-    FOREIGN KEY(product_id) REFERENCES products(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS cost_layers (
-    id TEXT PRIMARY KEY, product_id TEXT NOT NULL, receipt_movement_id TEXT,
-    received_qty REAL NOT NULL CHECK(received_qty > 0), remaining_qty REAL NOT NULL CHECK(remaining_qty >= 0),
-    unit_cost_cents INTEGER NOT NULL, landed_cost_cents INTEGER NOT NULL DEFAULT 0,
-    received_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
-    FOREIGN KEY(product_id) REFERENCES products(id), FOREIGN KEY(receipt_movement_id) REFERENCES stock_movements(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS inventory_value_entries (
-    id TEXT PRIMARY KEY, product_id TEXT NOT NULL, movement_id TEXT, entry_type TEXT NOT NULL,
-    quantity REAL NOT NULL, unit_cost_cents INTEGER NOT NULL, value_cents INTEGER NOT NULL,
-    cost_method TEXT NOT NULL, reference_type TEXT NOT NULL, reference_id TEXT NOT NULL,
-    posted_at TEXT NOT NULL, posted_by TEXT NOT NULL, FOREIGN KEY(product_id) REFERENCES products(id),
-    FOREIGN KEY(movement_id) REFERENCES stock_movements(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS landed_cost_allocations (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, source_document_type TEXT NOT NULL,
-    source_document_id TEXT NOT NULL, amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
-    allocation_basis TEXT NOT NULL, posted_at TEXT NOT NULL, posted_by TEXT NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS landed_cost_allocation_lines (
-    id TEXT PRIMARY KEY, allocation_id TEXT NOT NULL, cost_layer_id TEXT NOT NULL,
-    allocated_cents INTEGER NOT NULL, FOREIGN KEY(allocation_id) REFERENCES landed_cost_allocations(id),
-    FOREIGN KEY(cost_layer_id) REFERENCES cost_layers(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS outbox_events (
-    id TEXT PRIMARY KEY, event_type TEXT NOT NULL, aggregate_type TEXT NOT NULL,
-    aggregate_id TEXT NOT NULL, payload_json TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','processed','failed')),
-    attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, locked_at TEXT,
-    last_error TEXT, created_at TEXT NOT NULL, processed_at TEXT
-  )`,
-  `CREATE TABLE IF NOT EXISTS attachments (
-    id TEXT PRIMARY KEY, document_type TEXT NOT NULL, document_id TEXT NOT NULL,
-    file_name TEXT NOT NULL, object_key TEXT NOT NULL UNIQUE, content_type TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0), category TEXT NOT NULL DEFAULT 'document',
-    owner_id TEXT NOT NULL, owner_email TEXT NOT NULL, uploaded_at TEXT NOT NULL,
-    deleted_at TEXT, version INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS warehouses (
-    id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-    timezone TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, version INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS units_of_measure (
-    id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-    dimension TEXT NOT NULL DEFAULT 'quantity', precision INTEGER NOT NULL DEFAULT 3,
-    active INTEGER NOT NULL DEFAULT 1
-  )`,
-  `CREATE TABLE IF NOT EXISTS uom_conversions (
-    id TEXT PRIMARY KEY, product_id TEXT, from_uom_id TEXT NOT NULL, to_uom_id TEXT NOT NULL,
-    numerator INTEGER NOT NULL CHECK(numerator > 0), denominator INTEGER NOT NULL CHECK(denominator > 0),
-    rounding_mode TEXT NOT NULL DEFAULT 'nearest', UNIQUE(product_id, from_uom_id, to_uom_id),
-    FOREIGN KEY(product_id) REFERENCES products(id), FOREIGN KEY(from_uom_id) REFERENCES units_of_measure(id),
-    FOREIGN KEY(to_uom_id) REFERENCES units_of_measure(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS inventory_transfers (
-    id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE,
-    transfer_type TEXT NOT NULL CHECK(transfer_type IN ('intra_warehouse','inter_warehouse')),
-    status TEXT NOT NULL DEFAULT 'posted', from_warehouse_id TEXT NOT NULL, to_warehouse_id TEXT NOT NULL,
-    in_transit_location_id TEXT, posted_at TEXT NOT NULL, posted_by TEXT NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(from_warehouse_id) REFERENCES warehouses(id),
-    FOREIGN KEY(to_warehouse_id) REFERENCES warehouses(id), FOREIGN KEY(in_transit_location_id) REFERENCES locations(id)
-  )`,
-  `CREATE TABLE IF NOT EXISTS inventory_transfer_lines (
-    id TEXT PRIMARY KEY, transfer_id TEXT NOT NULL, product_id TEXT NOT NULL,
-    from_location_id TEXT NOT NULL, to_location_id TEXT NOT NULL, quantity REAL NOT NULL CHECK(quantity > 0),
-    lot_id TEXT, inventory_unit_id TEXT, FOREIGN KEY(transfer_id) REFERENCES inventory_transfers(id),
-    FOREIGN KEY(product_id) REFERENCES products(id), FOREIGN KEY(from_location_id) REFERENCES locations(id),
-    FOREIGN KEY(to_location_id) REFERENCES locations(id), FOREIGN KEY(lot_id) REFERENCES inventory_lots(id),
-    FOREIGN KEY(inventory_unit_id) REFERENCES inventory_units(id)
-  )`,
-  "CREATE INDEX IF NOT EXISTS idx_approvals_entity_status ON approvals(entity_type, entity_id, status)",
-  "CREATE INDEX IF NOT EXISTS idx_movement_assignments_movement ON movement_assignments(movement_id)",
-  "CREATE INDEX IF NOT EXISTS idx_document_charges_document ON document_charges(document_type, document_id)",
-  "CREATE INDEX IF NOT EXISTS idx_vendor_bill_lines_bill ON vendor_bill_lines(vendor_bill_id)",
-  "CREATE INDEX IF NOT EXISTS idx_customer_invoice_lines_invoice ON customer_invoice_lines(customer_invoice_id)",
-  "CREATE INDEX IF NOT EXISTS idx_returnable_obligations_partner_status ON returnable_obligations(partner_id, status)",
-  "CREATE INDEX IF NOT EXISTS idx_cost_layers_product_received ON cost_layers(product_id, received_at)",
-  "CREATE INDEX IF NOT EXISTS idx_value_entries_product_posted ON inventory_value_entries(product_id, posted_at)",
-  "CREATE INDEX IF NOT EXISTS idx_outbox_status_available ON outbox_events(status, available_at)",
-  "CREATE INDEX IF NOT EXISTS idx_attachments_document ON attachments(document_type, document_id, deleted_at)",
-  "CREATE INDEX IF NOT EXISTS idx_drop_ship_deliveries_purchase_line ON drop_ship_deliveries(purchase_order_line_id, status)",
-  "CREATE INDEX IF NOT EXISTS idx_drop_ship_deliveries_sales_line ON drop_ship_deliveries(sales_order_line_id, status)",
-  `CREATE TRIGGER IF NOT EXISTS inventory_balances_nonnegative_insert
-     BEFORE INSERT ON inventory_balances
-     WHEN NEW.on_hand_qty < 0 OR NEW.reserved_qty < 0 OR NEW.reserved_qty > NEW.on_hand_qty
-     BEGIN SELECT RAISE(ABORT, 'inventory balance invariant violated'); END`,
-  `CREATE TRIGGER IF NOT EXISTS inventory_balances_nonnegative_update
-     BEFORE UPDATE ON inventory_balances
-     WHEN NEW.on_hand_qty < 0 OR NEW.reserved_qty < 0 OR NEW.reserved_qty > NEW.on_hand_qty
-     BEGIN SELECT RAISE(ABORT, 'inventory balance invariant violated'); END`,
-  `CREATE TRIGGER IF NOT EXISTS stock_movements_immutable_update
-     BEFORE UPDATE ON stock_movements BEGIN SELECT RAISE(ABORT, 'stock movement ledger is immutable'); END`,
-  `CREATE TRIGGER IF NOT EXISTS stock_movements_immutable_delete
-     BEFORE DELETE ON stock_movements BEGIN SELECT RAISE(ABORT, 'stock movement ledger is immutable'); END`,
-  "CREATE INDEX IF NOT EXISTS idx_purchase_orders_vendor_status ON purchase_orders(vendor_id, lifecycle_status)",
-  "CREATE INDEX IF NOT EXISTS idx_purchase_order_lines_order ON purchase_order_lines(purchase_order_id)",
-  "CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_order_lines_source_sales_line ON purchase_order_lines(source_sales_order_line_id)",
-  "CREATE INDEX IF NOT EXISTS idx_receipts_purchase_order ON receipts(purchase_order_id)",
-  "CREATE INDEX IF NOT EXISTS idx_receipt_lines_receipt ON receipt_lines(receipt_id)",
-  "CREATE INDEX IF NOT EXISTS idx_sales_orders_customer_status ON sales_orders(customer_id, lifecycle_status)",
-  "CREATE INDEX IF NOT EXISTS idx_sales_order_lines_order ON sales_order_lines(sales_order_id)",
-  "CREATE INDEX IF NOT EXISTS idx_reservations_line_status ON reservations(sales_order_line_id, status)",
-  "CREATE INDEX IF NOT EXISTS idx_reservations_product_location_status ON reservations(product_id, location_id, status)",
-  "CREATE INDEX IF NOT EXISTS idx_shipments_sales_order ON shipments(sales_order_id)",
-  "CREATE INDEX IF NOT EXISTS idx_shipment_lines_shipment ON shipment_lines(shipment_id)",
-  "CREATE INDEX IF NOT EXISTS idx_stock_movements_product_posted ON stock_movements(product_id, posted_at)",
-  "CREATE INDEX IF NOT EXISTS idx_stock_movements_po_line ON stock_movements(purchase_order_line_id)",
-  "CREATE INDEX IF NOT EXISTS idx_stock_movements_so_line ON stock_movements(sales_order_line_id)",
-  "CREATE INDEX IF NOT EXISTS idx_stock_movements_source ON stock_movements(source_document_type, source_document_id)",
-  "CREATE INDEX IF NOT EXISTS idx_stock_movements_reversal ON stock_movements(reversal_of_movement_id)",
-  "CREATE INDEX IF NOT EXISTS idx_audit_events_entity_created ON audit_events(entity_type, entity_id, created_at)",
-] as const;
+export type CommandClaim = {
+  idempotencyKey: string;
+  claimToken?: string;
+};
+
+const commandGuardTag = "/* paneflow-command-claim */";
 
 let ready: Promise<void> | undefined;
 
@@ -364,6 +16,44 @@ export function getD1(): D1Database {
     throw new Error("Cloudflare D1 binding `DB` is unavailable. The logical D1 binding must be configured as DB.");
   }
   return env.DB;
+}
+
+export function commandGuardSql() {
+  return `EXISTS (SELECT 1 FROM command_log WHERE idempotency_key = ? AND claim_token = ?) ${commandGuardTag}`;
+}
+
+/**
+ * Returns a request-scoped D1 facade that appends the command claim bindings
+ * to statements containing commandGuardSql(). The SQL text remains static, so
+ * D1 can cache the prepared statement and user input never enters SQL source.
+ */
+export function commandD1(command: CommandClaim): D1Database {
+  const db = getD1();
+  const claimToken = command.claimToken;
+  if (!command.idempotencyKey || !claimToken) {
+    throw new Error("A command claim requires both an idempotency key and claim token.");
+  }
+  return new Proxy(db, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (sql: string) => {
+          const prepared = target.prepare(sql);
+          if (!sql.includes(commandGuardTag)) return prepared;
+          return new Proxy(prepared, {
+            get(statementTarget, statementProperty) {
+              if (statementProperty === "bind") {
+                return (...values: unknown[]) => statementTarget.bind(...values, command.idempotencyKey, claimToken);
+              }
+              const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+              return typeof value === "function" ? value.bind(statementTarget) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 function demoBootstrapEnabled() {
@@ -543,13 +233,6 @@ async function seedDatabase(db: D1Database) {
   await db.prepare("PRAGMA optimize").run();
 }
 
-async function ensureColumn(db: D1Database, table: string, column: string, definition: string) {
-  const info = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
-  if (!info.results.some((item) => item.name === column)) {
-    await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
-  }
-}
-
 async function seedAdvancedDatabase(db: D1Database) {
   const now = new Date().toISOString();
   const statements = [
@@ -588,42 +271,19 @@ async function seedAdvancedDatabase(db: D1Database) {
     db.prepare("UPDATE cost_layers SET remaining_qty=0,status='consumed' WHERE id='layer-mov-open-cas-q' AND EXISTS (SELECT 1 FROM inventory_value_entries WHERE id='value-mov-ship-2087')"),
     db.prepare("UPDATE cost_layers SET remaining_qty=22,status='open' WHERE id='layer-mov-rcv-1048' AND EXISTS (SELECT 1 FROM inventory_value_entries WHERE id='value-mov-ship-2087')"),
     db.prepare("INSERT OR IGNORE INTO purchase_order_revisions (id, purchase_order_id, revision_number, lifecycle_status, snapshot_json, reason, created_by, created_at) SELECT 'revision-' || id || '-1', id, 1, lifecycle_status, json_object('number',number,'vendorId',vendor_id,'expectedDate',expected_date,'totalCents',total_cents), 'Initial approved commitment', COALESCE(buyer_name,'System'), created_at FROM purchase_orders"),
-    db.prepare("UPDATE vendor_bills SET vendor_invoice_number=COALESCE(vendor_invoice_number, number), invoice_date=COALESCE(invoice_date, '2026-08-01'), posted_at=COALESCE(posted_at, ?), subtotal_cents=CASE WHEN subtotal_cents=0 THEN total_cents ELSE subtotal_cents END WHERE vendor_invoice_number IS NULL OR posted_at IS NULL").bind(now),
+    db.prepare("UPDATE purchase_orders SET base_total_cents=ROUND(total_cents*COALESCE(NULLIF(exchange_rate_to_base,0),1)) WHERE base_total_cents=0 AND total_cents<>0"),
+    db.prepare("UPDATE sales_orders SET base_total_cents=ROUND(total_cents*COALESCE(NULLIF(exchange_rate_to_base,0),1)) WHERE base_total_cents=0 AND total_cents<>0"),
+    db.prepare("UPDATE vendor_bills SET vendor_invoice_number=COALESCE(vendor_invoice_number, number), invoice_date=COALESCE(invoice_date, '2026-08-01'), posted_at=COALESCE(posted_at, ?), subtotal_cents=CASE WHEN subtotal_cents=0 THEN total_cents ELSE subtotal_cents END, base_total_cents=ROUND(total_cents*COALESCE(NULLIF(exchange_rate_to_base,0),1)) WHERE vendor_invoice_number IS NULL OR posted_at IS NULL OR (base_total_cents=0 AND total_cents<>0)").bind(now),
     db.prepare("INSERT OR IGNORE INTO vendor_bill_lines (id, vendor_bill_id, purchase_order_line_id, product_id, quantity, unit_cost_cents, line_total_cents, match_status, match_details_json) VALUES ('vbl-8871-1','bill-8871','pol-1048-1','prod-casement-3648',24,41700,1000800,'matched','{}')"),
     db.prepare("INSERT OR IGNORE INTO vendor_bill_lines (id, vendor_bill_id, purchase_order_line_id, product_id, quantity, unit_cost_cents, line_total_cents, match_status, match_details_json) VALUES ('vbl-8844-1','bill-8844','pol-1045-1','prod-slider-6048',12,53600,643200,'matched','{}')"),
     db.prepare("INSERT OR IGNORE INTO vendor_bill_lines (id, vendor_bill_id, purchase_order_line_id, product_id, quantity, unit_cost_cents, line_total_cents, match_status, match_details_json) VALUES ('vbl-8890-1','bill-8890','pol-1051-1','prod-patio-6068',6,121417,728502,'blocked',?)").bind(JSON.stringify({ exceptions: [{ code: 'BILL_BEFORE_RECEIPT', severity: 'blocking' }, { code: 'UNIT_PRICE_VARIANCE', severity: 'approval', varianceCents: 2917 }] })),
     db.prepare("INSERT OR IGNORE INTO document_charges (id, document_type, document_id, charge_type, description, amount_cents, direction, taxable, refundable, tax_code, created_at) VALUES ('charge-8890-freight','vendor_bill','bill-8890','freight','Inbound freight',18500,'add',1,0,'GST',?)").bind(now),
     db.prepare("INSERT OR IGNORE INTO customer_invoices (id, number, customer_id, sales_order_id, status, invoice_date, due_date, subtotal_cents, tax_cents, total_cents, paid_cents, currency, posted_at, posted_by, version) VALUES ('invoice-5008','INV-5008','customer-ridgeview','so-2087','partially_paid','2026-08-01','2026-08-31',131800,6590,138390,70000,'CAD',?,'Morgan Liu',1)").bind(now),
+    db.prepare("UPDATE customer_invoices SET base_total_cents=ROUND(total_cents*COALESCE(NULLIF(exchange_rate_to_base,0),1)) WHERE base_total_cents=0 AND total_cents<>0"),
     db.prepare("INSERT OR IGNORE INTO customer_invoice_lines (id, customer_invoice_id, sales_order_line_id, product_id, quantity, unit_price_cents, line_total_cents) VALUES ('cil-5008-1','invoice-5008','sol-2087-1','prod-casement-3648',2,65900,131800)"),
     db.prepare("INSERT OR IGNORE INTO payments (id, number, direction, partner_id, document_type, document_id, amount_cents, payment_date, method, reference, posted_at, posted_by) VALUES ('payment-7008','PAY-7008','inbound','customer-ridgeview','customer_invoice','invoice-5008',70000,'2026-08-06','eft','Ridgeview EFT 0806',?,'Morgan Liu')").bind(now),
+    db.prepare("UPDATE payments SET base_amount_cents=ROUND(amount_cents*COALESCE(NULLIF(exchange_rate_to_base,0),1)) WHERE base_amount_cents=0 AND amount_cents<>0"),
   ];
-  await db.batch(statements);
-}
-
-async function backfillOpeningValuation(db: D1Database) {
-  const result = await db.prepare(`SELECT p.id AS productId,p.standard_cost_cents AS standardCost,
-    COALESCE(vp.method,'fifo') AS method,COALESCE(SUM(ib.on_hand_qty),0) AS onHand
-    FROM products p JOIN inventory_balances ib ON ib.product_id=p.id
-    LEFT JOIN valuation_policies vp ON vp.product_id=p.id
-    WHERE NOT EXISTS (SELECT 1 FROM cost_layers cl WHERE cl.product_id=p.id)
-    GROUP BY p.id HAVING COALESCE(SUM(ib.on_hand_qty),0)>0`)
-    .all<{ productId: string; standardCost: number; method: string; onHand: number }>();
-  if (!result.results.length) return;
-  const now = new Date().toISOString();
-  const statements: D1PreparedStatement[] = [];
-  for (const row of result.results) {
-    const layerId = `layer-migration-opening-${row.productId}`;
-    const valueId = `value-migration-opening-${row.productId}`;
-    const referenceId = `migration-opening-${row.productId}`;
-    const valueCents = Math.round(row.onHand * row.standardCost);
-    statements.push(
-      db.prepare("INSERT OR IGNORE INTO valuation_policies (product_id,method,standard_cost_cents,average_cost_cents,version,updated_at,updated_by) VALUES (?,'fifo',?,?,1,?,'System migration')").bind(row.productId,row.standardCost,row.standardCost,now),
-      db.prepare("INSERT OR IGNORE INTO cost_layers (id,product_id,receipt_movement_id,received_qty,remaining_qty,unit_cost_cents,landed_cost_cents,received_at,status) VALUES (?,?,NULL,?,?,?,?,?,'open')").bind(layerId,row.productId,row.onHand,row.onHand,row.standardCost,0,now),
-      db.prepare("INSERT OR IGNORE INTO inventory_value_entries (id,product_id,movement_id,entry_type,quantity,unit_cost_cents,value_cents,cost_method,reference_type,reference_id,posted_at,posted_by) VALUES (?,?,NULL,'migration_opening_balance',?,?,?,?,'system_migration',?,?,'System migration')").bind(valueId,row.productId,row.onHand,row.standardCost,valueCents,row.method,referenceId,now),
-      db.prepare("INSERT OR IGNORE INTO audit_events (id,entity_type,entity_id,action,summary,actor,metadata_json,created_at) VALUES (?,'product',?,'opening_valuation_backfilled','Opening valuation reconstructed from existing on-hand during schema upgrade.','System migration',?,?)").bind(`audit-migration-opening-${row.productId}`,row.productId,JSON.stringify({quantity:row.onHand,unitCostCents:row.standardCost,valueCents,source:"existing_inventory_balances"}),now),
-      db.prepare("INSERT OR IGNORE INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at) VALUES (?,'valuation.opening_backfilled','product',?,?,'pending',0,?,?)").bind(`outbox-migration-opening-${row.productId}`,row.productId,JSON.stringify({quantity:row.onHand,valueCents,referenceId}),now,now),
-    );
-  }
   await db.batch(statements);
 }
 
@@ -631,87 +291,11 @@ export async function ensureDatabase() {
   if (!ready) {
     ready = (async () => {
       const db = getD1();
-      await db.batch(schemaStatements.map((sql) => db.prepare(sql)));
-      await ensureColumn(db, "purchase_orders", "project_reference", "TEXT");
-      await ensureColumn(db, "purchase_orders", "revision_number", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "purchase_orders", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1");
-      await ensureColumn(db, "purchase_orders", "base_total_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "purchase_orders", "payment_terms", "TEXT");
-      await ensureColumn(db, "purchase_orders", "due_date", "TEXT");
-      await ensureColumn(db, "sales_orders", "project_reference", "TEXT");
-      await ensureColumn(db, "sales_orders", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1");
-      await ensureColumn(db, "sales_orders", "base_total_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "sales_orders", "payment_terms", "TEXT");
-      await ensureColumn(db, "sales_orders", "due_date", "TEXT");
-      await ensureColumn(db, "products", "base_uom_id", "TEXT NOT NULL DEFAULT 'uom-each'");
-      await ensureColumn(db, "products", "purchase_uom_id", "TEXT NOT NULL DEFAULT 'uom-each'");
-      await ensureColumn(db, "products", "sales_uom_id", "TEXT NOT NULL DEFAULT 'uom-each'");
-      await ensureColumn(db, "business_partners", "payment_terms", "TEXT");
-      await ensureColumn(db, "business_partners", "currency", "TEXT NOT NULL DEFAULT 'CAD'");
-      await ensureColumn(db, "business_partners", "active", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "business_partners", "version", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "products", "version", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "locations", "warehouse_id", "TEXT NOT NULL DEFAULT 'warehouse-main'");
-      await ensureColumn(db, "locations", "parent_location_id", "TEXT");
-      await ensureColumn(db, "locations", "active", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "locations", "version", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "warehouses", "version", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "returnable_asset_types", "version", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "purchase_order_lines", "fulfillment_route", "TEXT NOT NULL DEFAULT 'stock'");
-      await ensureColumn(db, "purchase_order_lines", "source_sales_order_line_id", "TEXT");
-      await ensureColumn(db, "sales_order_lines", "fulfillment_route", "TEXT NOT NULL DEFAULT 'stock'");
-      await ensureColumn(db, "sales_order_lines", "project_reference", "TEXT");
-      await ensureColumn(db, "sales_order_lines", "linked_purchase_order_line_id", "TEXT");
-      await ensureColumn(db, "sales_order_lines", "discount_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "sales_order_lines", "taxable", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "sales_order_lines", "tax_rate_bps", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "inventory_transfer_lines", "received_qty", "REAL NOT NULL DEFAULT 0");
-      await ensureColumn(db, "stock_movements", "lot_id", "TEXT");
-      await ensureColumn(db, "stock_movements", "inventory_unit_id", "TEXT");
-      await ensureColumn(db, "vendor_bills", "vendor_invoice_number", "TEXT");
-      await ensureColumn(db, "vendor_bills", "invoice_date", "TEXT");
-      await ensureColumn(db, "vendor_bills", "posted_at", "TEXT");
-      await ensureColumn(db, "vendor_bills", "subtotal_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "vendor_bills", "tax_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "vendor_bills", "paid_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "vendor_bills", "hold_reason", "TEXT");
-      await ensureColumn(db, "vendor_bills", "approved_at", "TEXT");
-      await ensureColumn(db, "vendor_bills", "approved_by", "TEXT");
-      await ensureColumn(db, "vendor_bills", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1");
-      await ensureColumn(db, "vendor_bills", "base_total_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "vendor_bills", "tax_rate_bps", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "vendor_bills", "tax_code", "TEXT");
-      await ensureColumn(db, "vendor_bills", "payment_terms", "TEXT");
-      await ensureColumn(db, "document_charges", "tax_rate_bps", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "document_charges", "tax_amount_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "vendor_credits", "currency", "TEXT NOT NULL DEFAULT 'CAD'");
-      await ensureColumn(db, "vendor_credits", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1");
-      await ensureColumn(db, "vendor_credits", "base_amount_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "customer_invoices", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1");
-      await ensureColumn(db, "customer_invoices", "base_total_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "customer_invoices", "tax_rate_bps", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "customer_invoices", "tax_code", "TEXT");
-      await ensureColumn(db, "customer_invoices", "payment_terms", "TEXT");
-      await ensureColumn(db, "customer_credits", "currency", "TEXT NOT NULL DEFAULT 'CAD'");
-      await ensureColumn(db, "customer_credits", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1");
-      await ensureColumn(db, "customer_credits", "base_amount_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "payments", "currency", "TEXT NOT NULL DEFAULT 'CAD'");
-      await ensureColumn(db, "payments", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1");
-      await ensureColumn(db, "payments", "base_amount_cents", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn(db, "audit_events", "actor_id", "TEXT");
-      await ensureColumn(db, "audit_events", "actor_email", "TEXT");
-      await ensureColumn(db, "command_log", "request_hash", "TEXT");
-      await ensureColumn(db, "command_log", "claim_token", "TEXT");
-      await ensureColumn(db, "app_users", "version", "INTEGER NOT NULL DEFAULT 1");
-      await ensureColumn(db, "approvals", "consumed_at", "TEXT");
-      await ensureColumn(db, "approvals", "consumed_by", "TEXT");
-      await ensureColumn(db, "approvals", "consumed_entity_id", "TEXT");
-      await db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_vendor_bills_vendor_invoice ON vendor_bills(vendor_id, vendor_invoice_number)").run();
+      await db.prepare("SELECT source_sales_order_line_id FROM purchase_order_lines LIMIT 0").run();
       if (demoBootstrapEnabled()) {
         await seedDatabase(db);
         await seedAdvancedDatabase(db);
       }
-      await backfillOpeningValuation(db);
     })().catch((error) => {
       ready = undefined;
       throw error;
@@ -725,7 +309,8 @@ export function newId(prefix: string) {
 }
 
 export function documentNumber(prefix: string) {
-  return `${prefix}-${Date.now().toString().slice(-7)}`;
+  const date = new Date().toISOString().slice(2, 10).replaceAll("-", "");
+  return `${prefix}-${date}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 }
 
 export function roundQuantity(value: number) {

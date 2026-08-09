@@ -1,5 +1,6 @@
-import { all, documentNumber, ensureDatabase, first, getD1, newId, roundQuantity, statement } from "./inventory-db";
+import { all, commandD1, commandGuardSql, documentNumber, ensureDatabase, first, newId, roundQuantity, statement } from "./inventory-db";
 import { assertPeriodOpen } from "./policy";
+import type { AppCapability } from "./auth";
 
 type CommandPayload = Record<string, unknown>;
 
@@ -58,6 +59,24 @@ function requiredText(payload: CommandPayload, key: string) {
 function optionalText(payload: CommandPayload, key: string, fallback: string) {
   const value = typeof payload[key] === "string" ? payload[key].trim() : "";
   return value || fallback;
+}
+
+function postingDateValue(payload: CommandPayload) {
+  const value = typeof payload.postingDate === "string" && payload.postingDate.trim()
+    ? payload.postingDate.trim()
+    : new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new DomainError("VALIDATION_ERROR", "postingDate must use YYYY-MM-DD format.");
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new DomainError("VALIDATION_ERROR", "postingDate must be a valid calendar date.");
+  }
+  return value;
+}
+
+function postingTimestamp(payload: CommandPayload) {
+  return `${postingDateValue(payload)}${new Date().toISOString().slice(10)}`;
 }
 
 function auditMetadata(payload: CommandPayload, metadata: Record<string, unknown>) {
@@ -200,7 +219,7 @@ function auditPrepared(
 ) {
   const payload = input.payload ?? {};
   const actor = actorDetails(payload);
-  return getD1().prepare(`INSERT INTO audit_events
+  return commandD1(input).prepare(`INSERT INTO audit_events
     (id, entity_type, entity_id, action, summary, actor, actor_id, actor_email, metadata_json, created_at)
     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${commandExistsPrepared(input)}`)
     .bind(newId("audit"), entityType, entityId, action, summary, actor.label, actor.id, actor.email, auditMetadata(payload, metadata), when);
@@ -214,7 +233,7 @@ function outboxPrepared(
   payload: Record<string, unknown>,
   when: string
 ) {
-  return getD1().prepare(`INSERT INTO outbox_events
+  return commandD1(input).prepare(`INSERT INTO outbox_events
     (id, event_type, aggregate_type, aggregate_id, payload_json, status, attempts, available_at, created_at)
     SELECT ?, ?, ?, ?, ?, 'pending', 0, ?, ? WHERE ${commandExistsPrepared(input)}`)
     .bind(newId("outbox"), eventType, aggregateType, aggregateId, JSON.stringify(payload), when, when);
@@ -323,7 +342,7 @@ function layerClaimBindings(layers: CostLayerAllocation[]) {
 
 function layerConsumptionPrepared(input: InventoryCommand, layers: CostLayerAllocation[]) {
   const marker = commandExistsPrepared(input);
-  return layers.map((layer) => getD1().prepare(`UPDATE cost_layers
+  return layers.map((layer) => commandD1(input).prepare(`UPDATE cost_layers
     SET remaining_qty = remaining_qty - ?,
         status = CASE WHEN remaining_qty - ? = 0 THEN 'consumed' ELSE 'open' END
     WHERE id = ? AND remaining_qty >= ? AND ${marker}`)
@@ -346,7 +365,7 @@ function valueEntryPrepared(
     postedBy: string;
   }
 ) {
-  return getD1().prepare(`INSERT INTO inventory_value_entries
+  return commandD1(input).prepare(`INSERT INTO inventory_value_entries
     (id, product_id, movement_id, entry_type, quantity, unit_cost_cents, value_cents, cost_method,
      reference_type, reference_id, posted_at, posted_by)
     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${commandExistsPrepared(input)}`)
@@ -428,6 +447,38 @@ function normalizeCommand(command: string) {
   return command.trim().toLowerCase().replaceAll(/[_\s-]/g, "");
 }
 
+export const inventoryCommandCapabilities = {
+  receive: "operationalWrite",
+  postReceipt: "operationalWrite",
+  closeRemainder: "operationalWrite",
+  closePurchaseOrder: "operationalWrite",
+  reopenRemainder: "operationalWrite",
+  reopenPurchaseOrder: "operationalWrite",
+  reverseReceipt: "operationalWrite",
+  vendorReturn: "operationalWrite",
+  postVendorReturn: "operationalWrite",
+  priceOnlyCredit: "financialWrite",
+  vendorPriceAllowance: "financialWrite",
+  reserve: "operationalWrite",
+  reserveSale: "operationalWrite",
+  ship: "operationalWrite",
+  shipSale: "operationalWrite",
+  postShipment: "operationalWrite",
+  reverseShipment: "operationalWrite",
+  customerReturn: "operationalWrite",
+  postCustomerReturn: "operationalWrite",
+  inventoryAdjustment: "operationalWrite",
+  postInventoryAdjustment: "operationalWrite",
+} as const satisfies Record<string, AppCapability>;
+
+const inventoryCapabilityByCommand = new Map(
+  Object.entries(inventoryCommandCapabilities).map(([command, capability]) => [normalizeCommand(command), capability] as const),
+);
+
+export function inventoryCommandCapability(command: string): AppCapability | undefined {
+  return inventoryCapabilityByCommand.get(normalizeCommand(command));
+}
+
 function logPrepared(input: InventoryCommand, result: CommandResult, entityTable: "purchase_orders" | "receipts" | "sales_orders" | "inventory_balances", extraPredicate = "", extraBindings: Array<string | number | null> = []) {
   const now = new Date().toISOString();
   let predicate: string;
@@ -456,9 +507,8 @@ function logPrepared(input: InventoryCommand, result: CommandResult, entityTable
 }
 
 function commandExistsPrepared(input: InventoryCommand) {
-  const key = input.idempotencyKey.replaceAll("'", "''");
-  const claim = (input.claimToken ?? "").replaceAll("'", "''");
-  return `EXISTS (SELECT 1 FROM command_log WHERE idempotency_key = '${key}' AND claim_token = '${claim}')`;
+  void input;
+  return commandGuardSql();
 }
 
 async function currentOrConflict(input: InventoryCommand) {
@@ -582,7 +632,7 @@ async function postReceipt(input: InventoryCommand): Promise<CommandResult> {
   const damagedLineId = newId("receipt-line");
   const usableMovementId = newId("movement");
   const damagedMovementId = newId("movement");
-  const now = new Date().toISOString();
+  const now = postingTimestamp(payload);
   const valuation = await valuationForReceipt(line.productId, quantity, line.unitCostCents);
   const tracking = await incomingTracking(line.productId, quantity, payload);
   if (tracking.policy === "serial" && damagedQuantity !== 0 && damagedQuantity !== 1) throw new DomainError("SERIAL_CONDITION_SPLIT", "A serial-tracked unit must be entirely usable or entirely damaged.", 409);
@@ -601,7 +651,7 @@ async function postReceipt(input: InventoryCommand): Promise<CommandResult> {
     },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
+  const db = commandD1(input);
   const commands: D1PreparedStatement[] = [
     logPrepared(input, result, "purchase_orders", `AND COALESCE((SELECT version FROM valuation_policies WHERE product_id = ?), 0) = ?${overReceiptApproval?" AND EXISTS (SELECT 1 FROM approvals WHERE id=? AND version=? AND status='approved' AND consumed_at IS NULL)":""}${tracking.claimSql}`, [line.productId, valuation.version,...(overReceiptApproval?[overReceiptApproval.id,overReceiptApproval.version]:[]),...tracking.claimBindings]),
     db.prepare(`UPDATE purchase_orders SET version = version + 1 WHERE id = ? AND version = ? AND ${exists}`).bind(input.entityId, input.version),
@@ -698,7 +748,7 @@ async function closeRemainder(input: InventoryCommand): Promise<CommandResult> {
     impact: { physical: "On-hand inventory is unchanged.", commercial: `Incoming forecast decreased by ${quantity}.`, financial: "No financial posting was created.", onHandDelta: 0, incomingDelta: -quantity, reservedDelta: 0, availableDelta: 0 },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
+  const db = commandD1(input);
   const now = new Date().toISOString();
   const commands: D1PreparedStatement[] = [
     logPrepared(input, result, "purchase_orders"),
@@ -727,7 +777,7 @@ async function reopenRemainder(input: InventoryCommand): Promise<CommandResult> 
     impact: { physical: "On-hand inventory is unchanged.", commercial: `Incoming forecast increased by ${quantity}.`, financial: "No financial posting was created.", onHandDelta: 0, incomingDelta: quantity, reservedDelta: 0, availableDelta: 0 },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
+  const db = commandD1(input);
   const now = new Date().toISOString();
   const commands: D1PreparedStatement[] = [
     logPrepared(input, result, "purchase_orders"),
@@ -837,8 +887,8 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
     impact: { physical: `${quantity} units removed from on-hand inventory.`, commercial: `Open incoming may increase by up to ${quantity}.`, financial: `Inventory value decreased by ${valueCents} cents from the original receipt layer, including landed cost; AP compatibility was verified before posting.`, onHandDelta: -quantity, incomingDelta: quantity, reservedDelta: 0, availableDelta: -quantity },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
-  const now = new Date().toISOString();
+  const db = commandD1(input);
+  const now = postingTimestamp(payload);
   const commands: D1PreparedStatement[] = [
     logPrepared(input, result, "receipts",
       `AND EXISTS (SELECT 1 FROM inventory_balances WHERE product_id = ? AND location_id = ? AND on_hand_qty - reserved_qty >= ?)
@@ -906,7 +956,7 @@ async function postVendorReturn(input: InventoryCommand): Promise<CommandResult>
   const returnId = newId("vendor-return");
   const movementId = newId("movement");
   const returnNumber = documentNumber("VRT");
-  const now = new Date().toISOString();
+  const now = postingTimestamp(payload);
   const result: CommandResult = {
     message: `${returnNumber} posted for ${quantity} unit${quantity === 1 ? "" : "s"}.`,
     impact: {
@@ -920,7 +970,7 @@ async function postVendorReturn(input: InventoryCommand): Promise<CommandResult>
     },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
+  const db = commandD1(input);
   const commands: D1PreparedStatement[] = [
     logPrepared(input, result, "purchase_orders",
       `AND EXISTS (SELECT 1 FROM inventory_balances WHERE product_id = ? AND location_id = ? AND on_hand_qty - reserved_qty >= ?) ${layerClaimPredicate(valuation.layers)}${tracking.claimSql}`,
@@ -983,8 +1033,8 @@ async function postPriceOnlyCredit(input: InventoryCommand): Promise<CommandResu
       availableDelta: 0,
     },
   };
-  const db = getD1();
-  const now = new Date().toISOString();
+  const db = commandD1(input);
+  const now = postingTimestamp(payload);
   await db.batch([
     logPrepared(input, result, "purchase_orders"),
     auditPrepared(input, "purchase_order", input.entityId, "price_only_credit_recorded", result.message,
@@ -1043,10 +1093,8 @@ async function reserveSale(input: InventoryCommand): Promise<CommandResult> {
     message: `${quantity} unit${quantity === 1 ? "" : "s"} reserved for this sales order.`,
     impact: { physical: "On-hand inventory is unchanged.", commercial: `${quantity} units allocated to customer demand.`, financial: "No invoice was created.", onHandDelta: 0, incomingDelta: 0, reservedDelta: quantity, availableDelta: -quantity },
   };
-  const availability = "AND EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id = sales_orders.id)";
-  void availability;
   const exists = commandExistsPrepared(input);
-  const db = getD1();
+  const db = commandD1(input);
   await db.batch([
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
                 SELECT ?, ?, ?, ?, ?, ?, ? FROM sales_orders so
@@ -1074,59 +1122,90 @@ async function shipSale(input: InventoryCommand): Promise<CommandResult> {
   if(line.fulfillmentRoute==="drop_ship")throw new DomainError("FULFILLMENT_ROUTE_BLOCKED","Drop-ship lines cannot post an internal stock shipment.",409,line.version);
   if(line.fulfillmentRoute==="special_order"&&!line.linkedPurchaseOrderLineId)throw new DomainError("SUPPLY_LINK_REQUIRED","Special-order shipment requires an explicit linked purchase-order line.",409,line.version);
   if (line.version !== input.version) throw new DomainError("VERSION_CONFLICT", "The sales order changed. Refresh before shipping.", 409, line.version);
-  const reservation = await first<{ id: string; locationId: string; quantity: number }>(
+  const activeReservations = await all<{ id: string; locationId: string; quantity: number }>(
     `SELECT id, location_id AS locationId, quantity FROM reservations
-      WHERE sales_order_line_id = ? AND status = 'active' AND quantity >= ?
-      ORDER BY created_at LIMIT 1`, line.id, quantity
+      WHERE sales_order_line_id = ? AND status = 'active' AND quantity > 0
+      ORDER BY created_at, id`, line.id
   );
-  if (!reservation) throw new DomainError("NOT_RESERVED", "Reserve the requested quantity before posting shipment.", 409, line.version);
-  const tracking = await outgoingTracking(line.productId, reservation.locationId, quantity, payload);
+  let remaining = quantity;
+  const allocations = activeReservations.flatMap((reservation) => {
+    if (remaining <= 0) return [];
+    const allocated = roundQuantity(Math.min(reservation.quantity, remaining));
+    remaining = roundQuantity(remaining - allocated);
+    return allocated > 0 ? [{ ...reservation, allocated }] : [];
+  });
+  if (remaining > 0) throw new DomainError("NOT_RESERVED", "Reserve the requested quantity before posting shipment.", 409, line.version);
+  const trackingPolicy = await first<{ policy: string }>("SELECT tracking_policy AS policy FROM products WHERE id=?", line.productId);
+  if (allocations.length > 1 && trackingPolicy?.policy !== "quantity") {
+    throw new DomainError("TRACKING_SELECTION_REQUIRED", "Split-location shipments for lot- or serial-tracked products require separate tracked shipment commands.", 409, line.version);
+  }
+  const trackedAllocations = await Promise.all(allocations.map(async (allocation) => ({
+    ...allocation,
+    tracking: await outgoingTracking(line.productId, allocation.locationId, allocation.allocated, payload),
+    shipmentLineId: newId("shipment-line"),
+    movementId: newId("movement"),
+  })));
   const valuation = await valuationForIssue(line.productId, quantity);
   const actor = optionalText(payload, "actor", "Avery Morgan");
   const shipmentId = newId("shipment");
-  const shipmentLineId = newId("shipment-line");
-  const movementId = newId("movement");
   const shipmentNumber = documentNumber("SHP");
-  const now = new Date().toISOString();
+  const now = postingTimestamp(payload);
   const result: CommandResult = {
     message: `${shipmentNumber} posted for ${quantity} unit${quantity === 1 ? "" : "s"}.`,
     impact: { physical: `${quantity} units removed from on-hand inventory.`, commercial: `${quantity} reserved units fulfilled.`, financial: `COGS of ${valuation.valueCents} cents was recorded; no customer invoice was created.`, onHandDelta: -quantity, incomingDelta: 0, reservedDelta: -quantity, availableDelta: 0 },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
-  await db.batch([
+  const db = commandD1(input);
+  const reservationClaims = trackedAllocations.map(() => `EXISTS (SELECT 1 FROM reservations r WHERE r.id = ? AND r.status = 'active' AND r.quantity >= ?)
+    AND EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id = ? AND ib.location_id = ? AND ib.on_hand_qty >= ? AND ib.reserved_qty >= ?)`).join(" AND ");
+  const reservationClaimBindings = trackedAllocations.flatMap((allocation) => [
+    allocation.id, allocation.allocated, line.productId, allocation.locationId, allocation.allocated, allocation.allocated,
+  ]);
+  const trackingClaimSql = trackedAllocations.map((allocation) => allocation.tracking.claimSql).join("");
+  const trackingClaimBindings = trackedAllocations.flatMap((allocation) => allocation.tracking.claimBindings);
+  const commands: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
                 SELECT ?, ?, ?, ?, ?, ?, ? FROM sales_orders so
                  WHERE so.id = ? AND so.version = ?
-                   AND EXISTS (SELECT 1 FROM reservations r WHERE r.id = ? AND r.status = 'active' AND r.quantity >= ?)
-                    AND EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id = ? AND ib.location_id = ? AND ib.on_hand_qty >= ? AND ib.reserved_qty >= ?)
-                     ${layerClaimPredicate(valuation.layers)}${tracking.claimSql}`)
-      .bind(input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, now, input.entityId, input.version, reservation.id, quantity, line.productId, reservation.locationId, quantity, quantity, ...layerClaimBindings(valuation.layers), ...tracking.claimBindings),
-    db.prepare(`UPDATE reservations SET quantity = quantity - ?, status = CASE WHEN quantity - ? = 0 THEN 'consumed' ELSE 'active' END
-                WHERE id = ? AND ${exists}`).bind(quantity, quantity, reservation.id),
-    db.prepare(`UPDATE inventory_balances SET on_hand_qty = on_hand_qty - ?, reserved_qty = reserved_qty - ?, version = version + 1
-                WHERE product_id = ? AND location_id = ? AND ${exists}`).bind(quantity, quantity, line.productId, reservation.locationId),
+                    AND ${reservationClaims}${layerClaimPredicate(valuation.layers)}${trackingClaimSql}`)
+      .bind(input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, now, input.entityId, input.version, ...reservationClaimBindings, ...layerClaimBindings(valuation.layers), ...trackingClaimBindings),
     db.prepare(`UPDATE sales_orders SET version = version + 1 WHERE id = ? AND version = ? AND ${exists}`).bind(input.entityId, input.version),
     db.prepare(`INSERT INTO shipments (id, number, sales_order_id, status, posted_at, version)
                 SELECT ?, ?, ?, 'posted', ?, 1 WHERE ${exists}`).bind(shipmentId, shipmentNumber, input.entityId, now),
-    db.prepare(`INSERT INTO shipment_lines (id, shipment_id, sales_order_line_id, product_id, location_id, quantity)
-                SELECT ?, ?, ?, ?, ?, ? WHERE ${exists}`).bind(shipmentLineId, shipmentId, line.id, line.productId, reservation.locationId, quantity),
-    db.prepare(`INSERT INTO stock_movements
-      (id, movement_type, product_id, quantity, from_location_id, inventory_status, source_document_type,
-       source_document_id, source_line_id, sales_order_line_id, posted_at, posted_by, unit_cost_cents, idempotency_key)
-      SELECT ?, 'sales_shipment', ?, ?, ?, 'usable', 'shipment', ?, ?, ?, ?, ?, ?, ? WHERE ${exists}`)
-      .bind(movementId, line.productId, -quantity, reservation.locationId, shipmentId, shipmentLineId, line.id, now, actor, valuation.unitCostCents, input.idempotencyKey),
-    valueEntryPrepared(input, { productId: line.productId, movementId, entryType: "shipment",
-      quantity: -quantity, unitCostCents: valuation.unitCostCents, valueCents: -valuation.valueCents,
-      method: valuation.method, referenceType: "shipment", referenceId: shipmentId, postedAt: now, postedBy: actor }),
+  ];
+  let allocatedValue = 0;
+  trackedAllocations.forEach((allocation, index) => {
+    const valueCents = index === trackedAllocations.length - 1
+      ? valuation.valueCents - allocatedValue
+      : Math.round(valuation.valueCents * allocation.allocated / quantity);
+    allocatedValue += valueCents;
+    commands.push(
+      db.prepare(`UPDATE reservations SET quantity = quantity - ?, status = CASE WHEN quantity - ? = 0 THEN 'consumed' ELSE 'active' END
+                  WHERE id = ? AND ${exists}`).bind(allocation.allocated, allocation.allocated, allocation.id),
+      db.prepare(`UPDATE inventory_balances SET on_hand_qty = on_hand_qty - ?, reserved_qty = reserved_qty - ?, version = version + 1
+                  WHERE product_id = ? AND location_id = ? AND ${exists}`).bind(allocation.allocated, allocation.allocated, line.productId, allocation.locationId),
+      db.prepare(`INSERT INTO shipment_lines (id, shipment_id, sales_order_line_id, product_id, location_id, quantity)
+                  SELECT ?, ?, ?, ?, ?, ? WHERE ${exists}`).bind(allocation.shipmentLineId, shipmentId, line.id, line.productId, allocation.locationId, allocation.allocated),
+      db.prepare(`INSERT INTO stock_movements
+        (id, movement_type, product_id, quantity, from_location_id, inventory_status, source_document_type,
+         source_document_id, source_line_id, sales_order_line_id, posted_at, posted_by, unit_cost_cents, idempotency_key)
+        SELECT ?, 'sales_shipment', ?, ?, ?, 'usable', 'shipment', ?, ?, ?, ?, ?, ?, ? WHERE ${exists}`)
+        .bind(allocation.movementId, line.productId, -allocation.allocated, allocation.locationId, shipmentId, allocation.shipmentLineId, line.id, now, actor, valuation.unitCostCents, input.idempotencyKey),
+      valueEntryPrepared(input, { productId: line.productId, movementId: allocation.movementId, entryType: "shipment",
+        quantity: -allocation.allocated, unitCostCents: valuation.unitCostCents, valueCents: -valueCents,
+        method: valuation.method, referenceType: "shipment", referenceId: shipmentId, postedAt: now, postedBy: actor }),
+    );
+    if (allocation.tracking.policy !== "quantity") commands.push(db.prepare(`INSERT INTO movement_assignments (id,movement_id,lot_id,inventory_unit_id,quantity) SELECT ?,?,?,?,? WHERE ${exists}`).bind(newId("assignment"), allocation.movementId, allocation.tracking.lotId, allocation.tracking.unitId, allocation.allocated));
+    if (allocation.tracking.policy === "serial") commands.push(db.prepare(`UPDATE inventory_units SET lifecycle_status='shipped',version=version+1 WHERE id=? AND product_id=? AND location_id=? AND inventory_status='usable' AND lifecycle_status='on_hand' AND allocated_sales_order_line_id IS NULL AND version=? AND ${exists}`).bind(allocation.tracking.unitId, line.productId, allocation.locationId, allocation.tracking.unitVersion));
+  });
+  commands.push(
     ...layerConsumptionPrepared(input, valuation.layers),
-    ...(tracking.policy === "quantity" ? [] : [db.prepare(`INSERT INTO movement_assignments (id,movement_id,lot_id,inventory_unit_id,quantity) SELECT ?,?,?,?,? WHERE ${exists}`).bind(newId("assignment"), movementId, tracking.lotId, tracking.unitId, quantity)]),
-    ...(tracking.policy === "serial" ? [db.prepare(`UPDATE inventory_units SET lifecycle_status='shipped',version=version+1 WHERE id=? AND product_id=? AND location_id=? AND inventory_status='usable' AND lifecycle_status='on_hand' AND allocated_sales_order_line_id IS NULL AND version=? AND ${exists}`).bind(tracking.unitId, line.productId, reservation.locationId, tracking.unitVersion)] : []),
     auditPrepared(input, "sales_order", input.entityId, "shipment_posted", result.message,
-      { quantity, shipmentId, movementId, cogsCents: valuation.valueCents, costMethod: valuation.method }, now),
+      { quantity, shipmentId, allocations: trackedAllocations.map(({ locationId, allocated, movementId }) => ({ locationId, quantity: allocated, movementId })), cogsCents: valuation.valueCents, costMethod: valuation.method }, now),
     outboxPrepared(input, "inventory.shipment_posted", "shipment", shipmentId,
       { salesOrderId: input.entityId, productId: line.productId, quantity, cogsCents: valuation.valueCents }, now),
-  ]);
+  );
+  await db.batch(commands);
   return requireLogged(input, "Reservation, inventory, or the sales order changed before shipment could be posted.");
 }
 
@@ -1197,13 +1276,13 @@ async function reverseShipment(input: InventoryCommand): Promise<CommandResult> 
   const nextAverageCostCents = Math.round(((Number(total?.onHandQty ?? 0) * currentPolicy.averageCostCents) + valueCents) / (Number(total?.onHandQty ?? 0) + quantity));
   const actor = optionalText(payload, "actor", "Avery Morgan");
   const movementId = newId("movement");
-  const now = new Date().toISOString();
+  const now = postingTimestamp(payload);
   const result: CommandResult = {
     message: `${quantity} unit${quantity === 1 ? "" : "s"} reversed from the posted shipment.`,
     impact: { physical: `${quantity} units restored to on-hand inventory.`, commercial: `${quantity} units reopened to ship and were not automatically re-reserved.`, financial: `COGS was reversed by ${valueCents} cents; invoices remain separate.`, onHandDelta: quantity, incomingDelta: 0, reservedDelta: 0, availableDelta: quantity },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
+  const db = commandD1(input);
   const commands: D1PreparedStatement[] = [db.prepare(`INSERT OR IGNORE INTO command_log
       (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
     SELECT ?, ?, ?, ?, ?, ?, ? FROM shipments sh
@@ -1277,13 +1356,13 @@ async function postCustomerReturn(input: InventoryCommand): Promise<CommandResul
   const returnId = newId("customer-return");
   const movementId = newId("movement");
   const returnNumber = documentNumber("RMA");
-  const now = new Date().toISOString();
+  const now = postingTimestamp(payload);
   const result: CommandResult = {
     message: `${returnNumber} received for ${quantity} unit${quantity === 1 ? "" : "s"}.`,
     impact: { physical: `${quantity} units added to ${condition === "usable" ? "usable" : "quarantine"} on-hand inventory.`, commercial: "Original shipped quantity remains fulfilled; replacement demand is separate.", financial: `Inventory value increased by ${valuation.valueCents} cents; refund or credit remains a separate financial decision.`, onHandDelta: quantity, incomingDelta: 0, reservedDelta: 0, availableDelta: condition === "usable" ? quantity : 0 },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
+  const db = commandD1(input);
   const commands: D1PreparedStatement[] = [
     logPrepared(input, result, "sales_orders", `AND COALESCE((SELECT version FROM valuation_policies WHERE product_id = ?), 0) = ?${tracking.claimSql}`, [line.productId, valuation.version, ...tracking.claimBindings]),
     db.prepare(`UPDATE sales_orders SET version = version + 1 WHERE id = ? AND version = ? AND ${exists}`).bind(input.entityId, input.version),
@@ -1357,13 +1436,13 @@ async function postInventoryAdjustment(input: InventoryCommand): Promise<Command
   const countId = newId("count");
   const movementId = newId("movement");
   const countNumber = documentNumber("CNT");
-  const now = new Date().toISOString();
+  const now = postingTimestamp(payload);
   const result: CommandResult = {
     message: delta === 0 ? `${countNumber} posted with no variance.` : `${countNumber} posted with a ${delta > 0 ? "+" : ""}${delta} unit variance.`,
     impact: { physical: delta === 0 ? "Ledger and physical count agree; no movement created." : `${Math.abs(delta)} unit ${delta > 0 ? "gain" : "loss"} posted.`, commercial: "Orders and commitments are unchanged.", financial: `Inventory value changed by ${inventoryValueDeltaCents} cents; no invoice or bill was created.`, onHandDelta: delta, incomingDelta: 0, reservedDelta: 0, availableDelta: delta },
   };
   const exists = commandExistsPrepared(input);
-  const db = getD1();
+  const db = commandD1(input);
   let claimPredicate = "AND on_hand_qty >= reserved_qty";
   const claimBindings: Array<string | number> = [];
   if (lossValuation) {
@@ -1449,7 +1528,7 @@ export async function executeInventoryCommand(input: InventoryCommand): Promise<
   const prior = await currentOrConflict(input);
   if (prior) return prior;
   const normalizedCommand = normalizeCommand(input.command);
-  const postingDate = new Date().toISOString().slice(0, 10);
+  const postingDate = postingDateValue(input.payload ?? {});
   if (["receive", "postreceipt", "reversereceipt", "vendorreturn", "postvendorreturn", "ship", "shipsale", "postshipment", "reverseshipment", "customerreturn", "postcustomerreturn", "inventoryadjustment", "postinventoryadjustment"].includes(normalizedCommand)) {
     await assertPeriodOpen("inventory", postingDate);
   }
@@ -1480,11 +1559,23 @@ export async function executeInventoryCommand(input: InventoryCommand): Promise<
   }
 }
 
-export async function getInventorySnapshot() {
-  await ensureDatabase();
+export type SnapshotPage = { page?: number; pageSize?: number };
 
-  const [purchaseOrders, purchaseLines, products, salesOrders, salesLines, movements, bills, activities, counts, locations, partners, inventoryBalances] = await Promise.all([
-    all<Record<string, unknown>>(`WITH line_totals AS (
+export function normalizeSnapshotPage(input: SnapshotPage = {}) {
+  const page = Number.isInteger(input.page) && Number(input.page) > 0 ? Number(input.page) : 1;
+  const pageSize = Number.isInteger(input.pageSize) ? Math.min(Math.max(Number(input.pageSize), 1), 100) : 50;
+  return { page, pageSize, offset: (page - 1) * pageSize };
+}
+
+export async function getInventorySnapshot(input: SnapshotPage = {}) {
+  await ensureDatabase();
+  const { page, pageSize, offset } = normalizeSnapshotPage(input);
+  const pageAll = <T>(sql: string) => all<T>(`${sql}\nLIMIT ? OFFSET ?`, pageSize, offset);
+  const referenceAll = <T>(sql: string) => all<T>(`${sql}\nLIMIT ?`, 250);
+  const childLimit = Math.min(pageSize * 20, 1000);
+
+  const [purchaseOrders, purchaseLines, products, salesOrders, salesLines, movements, bills, activities, counts, locations, partners, inventoryBalances, aggregate] = await Promise.all([
+    pageAll<Record<string, unknown>>(`WITH line_totals AS (
       SELECT purchase_order_id, SUM(ordered_qty) ordered_qty, SUM(closed_qty) closed_qty FROM purchase_order_lines GROUP BY purchase_order_id
     ), movement_totals AS (
       SELECT pol.purchase_order_id, SUM(sm.quantity) net_received_qty,
@@ -1525,8 +1616,10 @@ export async function getInventorySnapshot() {
       pol.unit_cost_cents AS unitCostCents, pol.configuration_snapshot AS configurationSnapshot,
       pol.fulfillment_route AS fulfillmentRoute, pol.source_sales_order_line_id AS sourceSalesOrderLineId
       FROM purchase_order_lines pol JOIN products p ON p.id=pol.product_id
-      LEFT JOIN stock_movements sm ON sm.purchase_order_line_id=pol.id GROUP BY pol.id ORDER BY pol.id`),
-    all<Record<string, unknown>>(`WITH balance AS (
+      LEFT JOIN stock_movements sm ON sm.purchase_order_line_id=pol.id
+      WHERE pol.purchase_order_id IN (SELECT id FROM purchase_orders ORDER BY expected_date,number LIMIT ? OFFSET ?)
+      GROUP BY pol.id ORDER BY pol.id LIMIT ?`, pageSize, offset, childLimit),
+    pageAll<Record<string, unknown>>(`WITH balance AS (
       SELECT ib.product_id, SUM(ib.on_hand_qty) on_hand_qty, SUM(ib.reserved_qty) reserved_qty,
              SUM(CASE WHEN l.inventory_status='usable' THEN ib.on_hand_qty ELSE 0 END) usable_qty,
              SUM(CASE WHEN l.inventory_status!='usable' THEN ib.on_hand_qty ELSE 0 END) quarantine_qty,
@@ -1551,8 +1644,8 @@ export async function getInventorySnapshot() {
       FROM products p LEFT JOIN balance b ON b.product_id=p.id LEFT JOIN incoming i ON i.product_id=p.id
       LEFT JOIN (SELECT product_id, SUM(value_cents) AS inventory_value_cents
                    FROM inventory_value_entries GROUP BY product_id) v ON v.product_id=p.id
-      WHERE p.active=1 ORDER BY p.name`),
-    all<Record<string, unknown>>(`WITH line_totals AS (
+       WHERE p.active=1 ORDER BY p.name`),
+    pageAll<Record<string, unknown>>(`WITH line_totals AS (
       SELECT sales_order_id, SUM(ordered_qty) ordered_qty, SUM(canceled_qty) canceled_qty FROM sales_order_lines GROUP BY sales_order_id
     ), movement_totals AS (
       SELECT sol.sales_order_id,
@@ -1584,7 +1677,7 @@ export async function getInventorySnapshot() {
                 WHEN COALESCE(r.reserved_qty,0)>0 THEN 'reserved' ELSE 'unreserved' END AS fulfillmentStatus
       FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id
       LEFT JOIN line_totals lt ON lt.sales_order_id=so.id LEFT JOIN movement_totals mt ON mt.sales_order_id=so.id
-      LEFT JOIN reserved r ON r.sales_order_id=so.id LEFT JOIN invoiced inv ON inv.sales_order_id=so.id ORDER BY so.requested_date, so.number`),
+       LEFT JOIN reserved r ON r.sales_order_id=so.id LEFT JOIN invoiced inv ON inv.sales_order_id=so.id ORDER BY so.requested_date, so.number`),
     all<Record<string, unknown>>(`SELECT sol.id, sol.sales_order_id AS salesOrderId, sol.product_id AS productId,
       p.sku, p.name AS productName, sol.ordered_qty AS orderedQuantity, sol.canceled_qty AS canceledQuantity,
       COALESCE(SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity
@@ -1593,39 +1686,63 @@ export async function getInventorySnapshot() {
       sol.unit_price_cents AS unitPriceCents, sol.configuration_snapshot AS configurationSnapshot,
       sol.fulfillment_route AS fulfillmentRoute, sol.linked_purchase_order_line_id AS linkedPurchaseOrderLineId
       FROM sales_order_lines sol JOIN products p ON p.id=sol.product_id
-      LEFT JOIN stock_movements sm ON sm.sales_order_line_id=sol.id GROUP BY sol.id ORDER BY sol.id`),
-    all<Record<string, unknown>>(`SELECT sm.id, sm.movement_type AS type, sm.quantity, sm.inventory_status AS inventoryStatus,
+      LEFT JOIN stock_movements sm ON sm.sales_order_line_id=sol.id
+      WHERE sol.sales_order_id IN (SELECT id FROM sales_orders ORDER BY requested_date,number LIMIT ? OFFSET ?)
+      GROUP BY sol.id ORDER BY sol.id LIMIT ?`, pageSize, offset, childLimit),
+    pageAll<Record<string, unknown>>(`SELECT sm.id, sm.movement_type AS type, sm.quantity, sm.inventory_status AS inventoryStatus,
       sm.source_document_type AS sourceDocumentType, sm.source_document_id AS sourceDocumentId,
       sm.posted_at AS postedAt, sm.posted_by AS postedBy, sm.reversal_of_movement_id AS reversalOfMovementId,
       sm.unit_cost_cents AS unitCostCents, COALESCE((SELECT SUM(ive.value_cents) FROM inventory_value_entries ive WHERE ive.movement_id=sm.id),0) AS inventoryValueCents,
       p.id AS productId, p.sku, p.name AS productName,
       fl.code AS fromLocationCode, tl.code AS toLocationCode
       FROM stock_movements sm JOIN products p ON p.id=sm.product_id
-      LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id
-      ORDER BY sm.posted_at DESC, sm.id DESC LIMIT 40`),
-    all<Record<string, unknown>>(`SELECT vb.id, vb.number, vb.status, vb.match_status AS matchStatus,
+       LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id
+       ORDER BY sm.posted_at DESC, sm.id DESC`),
+    pageAll<Record<string, unknown>>(`SELECT vb.id, vb.number, vb.status, vb.match_status AS matchStatus,
       vb.total_cents AS totalCents, vb.due_date AS dueDate, vb.currency, vb.version,
       bp.id AS vendorId, bp.name AS vendorName, po.number AS purchaseOrderNumber
-      FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id
-      LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id ORDER BY vb.due_date`),
-    all<Record<string, unknown>>(`SELECT id, entity_type AS entityType, entity_id AS entityId, action, summary,
-      actor, metadata_json AS metadataJson, created_at AS createdAt
-      FROM audit_events ORDER BY created_at DESC, id DESC LIMIT 30`),
-    all<Record<string, unknown>>(`SELECT ic.id, ic.number, ic.status, ic.recorded_qty AS recordedQuantity,
+       FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id
+       LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id ORDER BY vb.due_date`),
+    pageAll<Record<string, unknown>>(`SELECT id, entity_type AS entityType, entity_id AS entityId, action, summary,
+       actor, metadata_json AS metadataJson, created_at AS createdAt
+       FROM audit_events ORDER BY created_at DESC, id DESC`),
+    pageAll<Record<string, unknown>>(`SELECT ic.id, ic.number, ic.status, ic.recorded_qty AS recordedQuantity,
       ic.counted_qty AS countedQuantity, ic.variance_qty AS varianceQuantity, ic.reason,
       ic.counted_at AS countedAt, ic.counted_by AS countedBy,
       p.id AS productId, p.sku, p.name AS productName, l.id AS locationId, l.code AS locationCode
-      FROM inventory_counts ic JOIN products p ON p.id=ic.product_id JOIN locations l ON l.id=ic.location_id
-      ORDER BY ic.counted_at DESC LIMIT 20`),
-    all<Record<string, unknown>>("SELECT id, code, name, location_type AS locationType, inventory_status AS inventoryStatus FROM locations ORDER BY code"),
-    all<Record<string, unknown>>("SELECT id, code, name, partner_type AS partnerType, email, phone FROM business_partners ORDER BY name"),
+       FROM inventory_counts ic JOIN products p ON p.id=ic.product_id JOIN locations l ON l.id=ic.location_id
+       ORDER BY ic.counted_at DESC`),
+    referenceAll<Record<string, unknown>>("SELECT id, code, name, location_type AS locationType, inventory_status AS inventoryStatus FROM locations ORDER BY code"),
+    referenceAll<Record<string, unknown>>("SELECT id, code, name, partner_type AS partnerType, email, phone FROM business_partners ORDER BY name"),
     all<Record<string, unknown>>(`SELECT ib.product_id AS productId, ib.location_id AS locationId,
       ib.on_hand_qty AS recordedQuantity, ib.reserved_qty AS reservedQuantity, ib.version,
       l.code AS locationCode, l.name AS locationName, l.inventory_status AS inventoryStatus,
       w.id AS warehouseId, w.code AS warehouseCode, w.name AS warehouseName
       FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id
       JOIN warehouses w ON w.id=l.warehouse_id
-      WHERE l.active=1 AND w.active=1 ORDER BY w.code,l.code,ib.product_id`),
+      WHERE l.active=1 AND w.active=1
+        AND ib.product_id IN (SELECT id FROM products WHERE active=1 ORDER BY name LIMIT ? OFFSET ?)
+      ORDER BY w.code,l.code,ib.product_id LIMIT ?`, pageSize, offset, childLimit),
+    first<Record<string, unknown>>(`SELECT
+      (SELECT COUNT(*) FROM products WHERE active=1) AS skuCount,
+      (SELECT COALESCE(SUM(on_hand_qty),0) FROM inventory_balances) AS onHand,
+      (SELECT COALESCE(SUM(ib.on_hand_qty),0) FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id WHERE l.inventory_status='usable') AS usable,
+      (SELECT COALESCE(SUM(reserved_qty),0) FROM inventory_balances) AS reserved,
+      (SELECT COALESCE(SUM(ib.on_hand_qty-ib.reserved_qty),0) FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id WHERE l.inventory_status='usable') AS available,
+      (SELECT COALESCE(SUM(MAX(pol.ordered_qty-pol.closed_qty-COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0)),0) FROM purchase_order_lines pol JOIN purchase_orders po ON po.id=pol.purchase_order_id WHERE po.lifecycle_status='approved') AS incoming,
+      (SELECT COALESCE(SUM(ib.on_hand_qty),0) FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id WHERE l.inventory_status<>'usable') AS quarantine,
+      (SELECT COALESCE(SUM(value_cents),0) FROM inventory_value_entries) AS inventoryValueCents,
+      (SELECT COUNT(*) FROM purchase_orders po WHERE po.lifecycle_status='approved' AND EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id=po.id AND pol.ordered_qty-pol.closed_qty-COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0)>0)) AS openPurchaseOrders,
+      (SELECT COUNT(*) FROM purchase_orders po WHERE po.lifecycle_status='approved' AND po.expected_date<date('now') AND EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id=po.id AND pol.ordered_qty-pol.closed_qty-COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0)>0)) AS latePurchaseOrders,
+      (SELECT COUNT(*) FROM sales_orders so WHERE so.lifecycle_status='confirmed' AND EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.sales_order_id=so.id AND sol.ordered_qty-sol.canceled_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0)>0)) AS openSalesOrders,
+      (SELECT COUNT(DISTINCT sol.sales_order_id) FROM reservations r JOIN sales_order_lines sol ON sol.id=r.sales_order_line_id WHERE r.status='active' AND r.quantity>0) AS readyToShip,
+      (SELECT COUNT(*) FROM vendor_bills WHERE match_status<>'matched') AS matchExceptions,
+      (SELECT COUNT(*) FROM purchase_orders) AS purchaseOrderCount,
+      (SELECT COUNT(*) FROM sales_orders) AS salesOrderCount,
+      (SELECT COUNT(*) FROM stock_movements) AS movementCount,
+      (SELECT COUNT(*) FROM vendor_bills) AS billCount,
+      (SELECT COUNT(*) FROM audit_events) AS activityCount,
+      (SELECT COUNT(*) FROM inventory_counts) AS countCount`),
   ]);
 
   const linesByPo = new Map<string, Array<Record<string, unknown>>>();
@@ -1642,21 +1759,7 @@ export async function getInventorySnapshot() {
   salesOrders.forEach((order) => { order.lines = linesBySo.get(String(order.id)) ?? []; });
 
   const numeric = (value: unknown) => Number(value ?? 0);
-  const summary = {
-    skuCount: products.length,
-    onHand: products.reduce((sum, product) => sum + numeric(product.onHand), 0),
-    usable: products.reduce((sum, product) => sum + numeric(product.usable), 0),
-    reserved: products.reduce((sum, product) => sum + numeric(product.reserved), 0),
-    available: products.reduce((sum, product) => sum + numeric(product.available), 0),
-    incoming: products.reduce((sum, product) => sum + numeric(product.incoming), 0),
-    quarantine: products.reduce((sum, product) => sum + numeric(product.quarantine), 0),
-    inventoryValueCents: products.reduce((sum, product) => sum + numeric(product.inventoryValueCents), 0),
-    openPurchaseOrders: purchaseOrders.filter((order) => order.lifecycleStatus === "approved" && numeric(order.openToReceiveQuantity) > 0).length,
-    latePurchaseOrders: purchaseOrders.filter((order) => order.lifecycleStatus === "approved" && typeof order.expectedDate === "string" && order.expectedDate < new Date().toISOString().slice(0, 10) && numeric(order.openToReceiveQuantity) > 0).length,
-    openSalesOrders: salesOrders.filter((order) => order.lifecycleStatus === "confirmed" && numeric(order.openToShipQuantity) > 0).length,
-    readyToShip: salesOrders.filter((order) => order.lifecycleStatus === "confirmed" && numeric(order.reservedQuantity) > 0).length,
-    matchExceptions: bills.filter((bill) => bill.matchStatus !== "matched").length,
-  };
+  const summary = Object.fromEntries(Object.entries(aggregate ?? {}).map(([key,value])=>[key,numeric(value)]));
 
   return {
     generatedAt: new Date().toISOString(),
@@ -1671,5 +1774,40 @@ export async function getInventorySnapshot() {
     locations,
     partners,
     inventoryBalances,
+    pagination: {
+      page,
+      pageSize,
+      totals: {
+        purchaseOrders: numeric(aggregate?.purchaseOrderCount),
+        products: numeric(aggregate?.skuCount),
+        salesOrders: numeric(aggregate?.salesOrderCount),
+        movements: numeric(aggregate?.movementCount),
+        bills: numeric(aggregate?.billCount),
+        activities: numeric(aggregate?.activityCount),
+        counts: numeric(aggregate?.countCount),
+      },
+    },
   };
+}
+
+export async function searchInventoryRecords(search: string, limit = 20) {
+  await ensureDatabase();
+  const term = search.trim();
+  if (!term) return { purchaseOrders: [], salesOrders: [], products: [] };
+  const boundedLimit = Math.min(Math.max(Math.trunc(limit), 1), 50);
+  const like = `%${term.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+  const [purchaseOrders, salesOrders, products] = await Promise.all([
+    all<Record<string, unknown>>(`SELECT po.id,po.number,bp.name AS vendorName,po.project_reference AS projectReference
+      FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id
+      WHERE po.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.project_reference,'') LIKE ? ESCAPE '\\'
+      ORDER BY po.created_at DESC LIMIT ?`, like, like, like, boundedLimit),
+    all<Record<string, unknown>>(`SELECT so.id,so.number,bp.name AS customerName,so.project_reference AS projectReference
+      FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id
+      WHERE so.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(so.project_reference,'') LIKE ? ESCAPE '\\'
+      ORDER BY so.created_at DESC LIMIT ?`, like, like, like, boundedLimit),
+    all<Record<string, unknown>>(`SELECT id,sku,name,dimensions,finish,material FROM products
+      WHERE active=1 AND (sku LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR dimensions LIKE ? ESCAPE '\\')
+      ORDER BY name LIMIT ?`, like, like, like, boundedLimit),
+  ]);
+  return { purchaseOrders, salesOrders, products };
 }

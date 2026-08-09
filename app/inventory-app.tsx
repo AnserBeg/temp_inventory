@@ -185,6 +185,11 @@ type Snapshot = {
   bills: Bill[];
   activities: Activity[];
   partners: Partner[];
+  pagination: {
+    page: number;
+    pageSize: number;
+    totals: Record<string, number>;
+  };
 };
 
 const emptySnapshot: Snapshot = {
@@ -197,6 +202,7 @@ const emptySnapshot: Snapshot = {
   bills: [],
   activities: [],
   partners: [],
+  pagination: { page: 1, pageSize: 50, totals: {} },
 };
 
 type ComposerLine = {
@@ -230,6 +236,8 @@ type ViewKey =
   | "partners"
   | "reports"
   | "warehouse";
+
+type SearchResult = { type: string; id: string; label: string; detail: string; view: ViewKey };
 
 type CommandKind =
   | "receive"
@@ -356,7 +364,9 @@ export function InventoryApp() {
   const [loading, setLoading] = useState(true);
   const [source, setSource] = useState<"loading" | "server" | "unavailable">("loading");
   const [workflowRefreshToken, setWorkflowRefreshToken] = useState(0);
+  const [page, setPage] = useState(1);
   const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchOpen, setSearchOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -365,7 +375,7 @@ export function InventoryApp() {
 
   const loadSnapshot = useCallback(async () => {
     try {
-      const response = await fetch("/api/snapshot", { cache: "no-store" });
+      const response = await fetch(`/api/snapshot?page=${page}&pageSize=50`, { cache: "no-store" });
       if (!response.ok) throw new Error("Snapshot unavailable");
       const data = await response.json();
       const normalized = normalizeSnapshot(data);
@@ -377,7 +387,7 @@ export function InventoryApp() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [page]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -428,6 +438,7 @@ export function InventoryApp() {
 
   const navigate = (next: ViewKey) => {
     setView(next);
+    setPage(1);
     setSelectedPoId(null);
     setSelectedSoId(null);
     setSelectedProductId(null);
@@ -458,7 +469,15 @@ export function InventoryApp() {
     return items.slice(0, 4);
   }, [snapshot]);
 
-  const searchResults = useMemo(() => {
+  const pageTotalKey: Partial<Record<ViewKey, string>> = {
+    "purchase-orders": "purchaseOrders", "expected-receipts": "purchaseOrders", "vendor-returns": "purchaseOrders",
+    "sales-orders": "salesOrders", fulfillment: "salesOrders", "customer-returns": "salesOrders", "customer-invoices": "salesOrders",
+    stock: "products", products: "products", counts: "products", movements: "movements", "vendor-bills": "bills",
+  };
+  const pageTotal = snapshot.pagination.totals[pageTotalKey[view] ?? ""] ?? 0;
+  const pageCount = Math.max(1, Math.ceil(pageTotal / snapshot.pagination.pageSize));
+
+  const localSearchResults = useMemo(() => {
     const term = query.trim().toLowerCase();
     if (!term) return [];
     return [
@@ -473,6 +492,29 @@ export function InventoryApp() {
         .map((item) => ({ type: "Product / unit", id: item.id, label: item.sku, detail: item.name, view: "stock" as ViewKey })),
     ].slice(0, 10);
   }, [query, snapshot]);
+
+  useEffect(() => {
+    const term = query.trim();
+    if (!term) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetch(`/api/snapshot?q=${encodeURIComponent(term)}&limit=10`, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error("Search unavailable");
+        const raw = await response.json() as Record<string, unknown>;
+        setSearchResults([
+          ...asRows(raw.purchaseOrders).map((item) => ({ type: "Purchase order", id: text(item.id), label: text(item.number), detail: text(item.vendorName), view: "purchase-orders" as ViewKey })),
+          ...asRows(raw.salesOrders).map((item) => ({ type: "Sales order", id: text(item.id), label: text(item.number), detail: [text(item.customerName), text(item.projectReference)].filter(Boolean).join(" · "), view: "sales-orders" as ViewKey })),
+          ...asRows(raw.products).map((item) => ({ type: "Product / unit", id: text(item.id), label: text(item.sku), detail: text(item.name), view: "stock" as ViewKey })),
+        ].slice(0, 10));
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) setSearchResults(localSearchResults);
+      }
+    }, 200);
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [query, localSearchResults]);
+
+  const displayedSearchResults = query.trim() ? searchResults : [];
 
   const runCommand = async (kind: CommandKind, entityId: string, entityNumber: string, payload: Record<string, unknown>) => {
     const idempotencyKey = crypto.randomUUID();
@@ -553,6 +595,13 @@ export function InventoryApp() {
     };
   };
 
+  const fetchCountApproval = async (approvalId: string) => {
+    const response = await fetch("/api/workflows?page=1&pageSize=100", { cache: "no-store" });
+    const result = await response.json() as { error?: string | { message?: string } };
+    if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "Approval status could not be refreshed.");
+    return countApprovalFromResponse(result, approvalId);
+  };
+
   const requestCountApproval = async (entityId: string, payload: Record<string, unknown>) => {
     const product = snapshot.products.find((item) => item.id === entityId);
     if (!product) throw new Error("The counted product is no longer available. Refresh and try again.");
@@ -574,7 +623,7 @@ export function InventoryApp() {
     });
     const result = await response.json() as { recordId?: string; message?: string; error?: string | { message?: string } };
     if (!response.ok || !result.recordId) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "Approval could not be requested.");
-    return { approval: countApprovalFromResponse(result, result.recordId), message: result.message ?? "Manager approval requested." };
+    return { approval: await fetchCountApproval(result.recordId), message: result.message ?? "Manager approval requested." };
   };
 
   const decideCountApproval = async (approval: CountApproval, reason: string) => {
@@ -586,14 +635,11 @@ export function InventoryApp() {
     });
     const result = await response.json() as { message?: string; error?: string | { message?: string } };
     if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "Approval could not be completed.");
-    return { approval: countApprovalFromResponse(result, approval.id), message: result.message ?? "Count variance approved." };
+    return { approval: await fetchCountApproval(approval.id), message: result.message ?? "Count variance approved." };
   };
 
   const refreshCountApproval = async (approval: CountApproval) => {
-    const response = await fetch("/api/workflows", { cache: "no-store" });
-    const result = await response.json() as { error?: string | { message?: string } };
-    if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "Approval status could not be refreshed.");
-    return countApprovalFromResponse(result, approval.id);
+    return fetchCountApproval(approval.id);
   };
 
   const createOperationalOrder = async (type: "purchaseOrder" | "salesOrder", payload: Record<string, unknown>) => {
@@ -738,6 +784,7 @@ export function InventoryApp() {
               {view === "warehouse" && <WarehouseView snapshot={snapshot} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} />}
             </>
           )}
+          {source === "server" && pageCount > 1 ? <nav className="snapshot-pagination" aria-label="Record pages"><button className="button secondary" disabled={page <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button><span>Page {page} of {pageCount}</span><button className="button secondary" disabled={page >= pageCount} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>Next</button></nav> : null}
         </main>
       </div>
 
@@ -747,8 +794,8 @@ export function InventoryApp() {
             <div className="command-input-row"><span aria-hidden="true">⌕</span><input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by document, SKU, barcode, customer, or dimensions" aria-label="Global search" /><kbd>Esc</kbd></div>
             <div className="search-results">
               {!query && <div className="search-hint"><strong>Find anything operational</strong><span>Search a document number, SKU, customer, project, dimension, or inventory-unit ID.</span></div>}
-              {query && searchResults.length === 0 && <div className="empty-inline">No records match “{query}”.</div>}
-              {searchResults.map((result) => (
+              {query && displayedSearchResults.length === 0 && <div className="empty-inline">No records match “{query}”.</div>}
+              {displayedSearchResults.map((result) => (
                 <button key={`${result.type}-${result.id}`} onClick={() => {
                   navigate(result.view);
                   if (result.view === "purchase-orders") setSelectedPoId(result.id);
@@ -1015,6 +1062,8 @@ function InvoicesView({ salesOrders }: { salesOrders: SalesOrder[] }) {
 
 function ReportsView({ snapshot }: { snapshot: Snapshot }) {
   const [scope, setScope] = useState<"all" | "risk">("all");
+  const exportTo = new Date().toISOString().slice(0, 10);
+  const exportFrom = `${exportTo.slice(0, 4)}-01-01`;
   const products = scope === "risk" ? snapshot.products.filter((product) => product.projected < 0 || product.available <= product.reorderPoint) : snapshot.products;
   const exportCsv = () => {
     const rows = [["SKU", "Product", "Usable", "Incoming", "Demand", "Projected"], ...products.map((product) => [product.sku, product.name, product.usable, product.incoming, product.demand, product.projected])];
@@ -1023,7 +1072,7 @@ function ReportsView({ snapshot }: { snapshot: Snapshot }) {
     const link = document.createElement("a"); link.href = url; link.download = `paneflow-availability-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url);
   };
   const reports = [{ title: "Late purchase orders", detail: `${snapshot.summary.lateReceipts} POs currently late`, tone: "danger" as Severity }, { title: "Available versus reserved", detail: `${snapshot.products.reduce((sum, product) => sum + product.available, 0)} available · ${snapshot.products.reduce((sum, product) => sum + product.reserved, 0)} reserved`, tone: "info" as Severity }, { title: "Three-way-match exceptions", detail: `${snapshot.bills.filter((bill) => bill.variance).length} bill requires review`, tone: "warning" as Severity }, { title: "Special-order inventory", detail: `${snapshot.products.filter((product) => product.customerRef).length} customer-specific units`, tone: "success" as Severity }];
-  return <div className="stack"><section className="report-grid" aria-label="Report summaries">{reports.map((report) => <article className={`report-card ${report.tone}`} key={report.title}><span className="report-icon" aria-hidden="true">▥</span><strong>{report.title}</strong><p>{report.detail}</p><b>Current live snapshot</b></article>)}</section><section className="panel"><PanelHeading title="Projected availability" detail="Exact current values with downloadable operational and accounting handoffs." /><div className="report-filters"><label>Scope<select value={scope} onChange={(event) => setScope(event.target.value as "all" | "risk")}><option value="all">All products</option><option value="risk">Risks only</option></select></label><span className="read-only-label">Current live snapshot · all configured locations</span><button className="button secondary" onClick={exportCsv}>Export current table</button><a className="button secondary" href="/api/export?type=accounting">Accounting control export</a><a className="button primary" href="/api/export?type=quickbooks">Export QuickBooks journal</a></div><p className="read-only-label">PaneFlow exports an audited journal handoff; QuickBooks remains the general ledger and system of record for statutory accounting.</p><div className="responsive-table"><table><caption className="sr-only">Projected product availability</caption><thead><tr><th>Product</th><th className="numeric">Usable now</th><th className="numeric">Incoming</th><th className="numeric">Open demand</th><th className="numeric">Projected</th><th>Risk</th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><strong>{product.name}</strong><small>{product.sku}</small></td><td className="numeric">{product.usable}</td><td className="numeric">{product.incoming}</td><td className="numeric">{product.demand}</td><td className={`numeric strong ${product.projected < 0 ? "text-danger" : ""}`}>{product.projected}</td><td>{product.projected < 0 ? <StatusBadge tone="danger">Demand exceeds supply</StatusBadge> : <StatusBadge tone="success">Covered</StatusBadge>}</td></tr>)}{!products.length ? <tr><td colSpan={6}><div className="empty-inline">No products are available in this scope.</div></td></tr> : null}</tbody></table></div></section></div>;
+  return <div className="stack"><section className="report-grid" aria-label="Report summaries">{reports.map((report) => <article className={`report-card ${report.tone}`} key={report.title}><span className="report-icon" aria-hidden="true">▥</span><strong>{report.title}</strong><p>{report.detail}</p><b>Current live snapshot</b></article>)}</section><section className="panel"><PanelHeading title="Projected availability" detail="Exact current values with downloadable operational and accounting handoffs." /><div className="report-filters"><label>Scope<select value={scope} onChange={(event) => setScope(event.target.value as "all" | "risk")}><option value="all">All products</option><option value="risk">Risks only</option></select></label><span className="read-only-label">Current live snapshot · all configured locations</span><button className="button secondary" onClick={exportCsv}>Export current table</button><a className="button secondary" href={`/api/export?type=accounting&from=${exportFrom}&to=${exportTo}`}>Accounting control export</a><a className="button primary" href={`/api/export?type=quickbooks&from=${exportFrom}&to=${exportTo}`}>Export QuickBooks journal</a></div><p className="read-only-label">PaneFlow exports an audited journal handoff for {exportFrom} through {exportTo}; QuickBooks remains the general ledger and system of record for statutory accounting.</p><div className="responsive-table"><table><caption className="sr-only">Projected product availability</caption><thead><tr><th>Product</th><th className="numeric">Usable now</th><th className="numeric">Incoming</th><th className="numeric">Open demand</th><th className="numeric">Projected</th><th>Risk</th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><strong>{product.name}</strong><small>{product.sku}</small></td><td className="numeric">{product.usable}</td><td className="numeric">{product.incoming}</td><td className="numeric">{product.demand}</td><td className={`numeric strong ${product.projected < 0 ? "text-danger" : ""}`}>{product.projected}</td><td>{product.projected < 0 ? <StatusBadge tone="danger">Demand exceeds supply</StatusBadge> : <StatusBadge tone="success">Covered</StatusBadge>}</td></tr>)}{!products.length ? <tr><td colSpan={6}><div className="empty-inline">No products are available in this scope.</div></td></tr> : null}</tbody></table></div></section></div>;
 }
 
 function WarehouseView({ snapshot, onReceive }: { snapshot: Snapshot; onReceive: (po: PurchaseOrder) => void }) {
@@ -1528,6 +1577,11 @@ function normalizeSnapshot(input: unknown): Snapshot {
     bills,
     activities,
     partners,
+    pagination: {
+      page: number(asRecord(raw.pagination).page, 1),
+      pageSize: number(asRecord(raw.pagination).pageSize, 50),
+      totals: Object.fromEntries(Object.entries(asRecord(asRecord(raw.pagination).totals)).map(([key, value]) => [key, number(value)])),
+    },
   };
 }
 

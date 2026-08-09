@@ -259,7 +259,7 @@ export const shipmentLines = sqliteTable(
 
 export const vendorReturns = sqliteTable("vendor_returns", {
   id: text("id").primaryKey(),
-  number: text("number").notNull(),
+  number: text("number").notNull().unique(),
   purchaseOrderId: text("purchase_order_id").notNull(),
   purchaseOrderLineId: text("purchase_order_line_id").notNull(),
   productId: text("product_id").notNull(),
@@ -271,7 +271,7 @@ export const vendorReturns = sqliteTable("vendor_returns", {
 
 export const customerReturns = sqliteTable("customer_returns", {
   id: text("id").primaryKey(),
-  number: text("number").notNull(),
+  number: text("number").notNull().unique(),
   salesOrderId: text("sales_order_id").notNull(),
   salesOrderLineId: text("sales_order_line_id").notNull(),
   productId: text("product_id").notNull(),
@@ -333,7 +333,7 @@ export const inventoryBalances = sqliteTable(
 
 export const inventoryCounts = sqliteTable("inventory_counts", {
   id: text("id").primaryKey(),
-  number: text("number").notNull(),
+  number: text("number").notNull().unique(),
   productId: text("product_id").notNull(),
   locationId: text("location_id").notNull(),
   recordedQty: real("recorded_qty").notNull(),
@@ -347,7 +347,7 @@ export const inventoryCounts = sqliteTable("inventory_counts", {
 
 export const vendorBills = sqliteTable("vendor_bills", {
   id: text("id").primaryKey(),
-  number: text("number").notNull(),
+  number: text("number").notNull().unique(),
   vendorId: text("vendor_id").notNull(),
   purchaseOrderId: text("purchase_order_id"),
   status: text("status").notNull(),

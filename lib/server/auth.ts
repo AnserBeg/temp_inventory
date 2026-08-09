@@ -1,4 +1,5 @@
 import { ensureDatabase, first, getD1 } from "./inventory-db";
+import { env } from "cloudflare:workers";
 
 export type AppRole = "viewer" | "operator" | "accounting" | "manager" | "administrator";
 export type ActorIdentity = {
@@ -16,9 +17,15 @@ export class AuthorizationError extends Error {
   }
 }
 
-function decodeName(value: string | null) {
-  if (!value) return "Authenticated user";
+function decodeName(request: Request) {
+  const value = request.headers.get("oai-authenticated-user-full-name");
+  const encoding = request.headers.get("oai-authenticated-user-full-name-encoding");
+  if (!value || encoding !== "percent-encoded-utf-8") return "Authenticated user";
   try { return decodeURIComponent(value); } catch { return value; }
+}
+
+export function localDevelopmentAuthEnabled() {
+  return String(env.ALLOW_LOCAL_DEV_AUTH ?? "").trim().toLowerCase() === "true";
 }
 
 export async function resolveActor(request: Request): Promise<ActorIdentity> {
@@ -26,9 +33,7 @@ export async function resolveActor(request: Request): Promise<ActorIdentity> {
   const id = request.headers.get("oai-authenticated-user-id")?.trim();
   const email = request.headers.get("oai-authenticated-user-email")?.trim().toLowerCase();
   if (!id || !email) {
-    const hostname = new URL(request.url).hostname.toLowerCase();
-    const isLocalDevelopment = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname.endsWith(".local");
-    if (!isLocalDevelopment) {
+    if (!localDevelopmentAuthEnabled()) {
       throw new AuthorizationError("Authenticated user headers are required for hosted write operations.");
     }
     return {
@@ -42,14 +47,17 @@ export async function resolveActor(request: Request): Promise<ActorIdentity> {
   }
 
   const mapped = await first<{ fullName: string; role: AppRole; active: number }>(
-    "SELECT full_name AS fullName, role, active FROM app_users WHERE user_id = ? OR email = ? LIMIT 1",
-    id,
-    email
+    "SELECT full_name AS fullName, role, active FROM app_users WHERE user_id = ? LIMIT 1",
+    id
   );
   if (mapped && !mapped.active) throw new AuthorizationError("Your PaneFlow access is disabled.");
-  const name = mapped?.fullName || decodeName(request.headers.get("oai-authenticated-user-full-name"));
+  const name = mapped?.fullName || decodeName(request);
   let role = mapped?.role ?? "viewer";
   if (!mapped) {
+    const emailOwner = await first<{ userId: string }>("SELECT user_id AS userId FROM app_users WHERE email = ? LIMIT 1", email);
+    if (emailOwner && emailOwner.userId !== id) {
+      throw new AuthorizationError("This email is already mapped to another identity. An administrator must update the user mapping.");
+    }
     const now = new Date().toISOString();
     const db = getD1();
     const bootstrapAuditId = `audit-auth-bootstrap-${crypto.randomUUID()}`;
@@ -74,17 +82,23 @@ export async function resolveActor(request: Request): Promise<ActorIdentity> {
   return { id, email, name, role, label: `${name} <${email}>`, localDevelopment: false };
 }
 
-const capabilityRoles: Record<string, AppRole[]> = {
+export const capabilityRoles = {
   read: ["viewer", "operator", "accounting", "manager", "administrator"],
   export: ["viewer", "operator", "accounting", "manager", "administrator"],
   operationalWrite: ["operator", "manager", "administrator"],
   financialWrite: ["accounting", "manager", "administrator"],
   approve: ["manager", "administrator"],
   administer: ["administrator"],
-};
+} satisfies Record<string, AppRole[]>;
 
-export function requireCapability(actor: ActorIdentity, capability: keyof typeof capabilityRoles) {
-  if (!capabilityRoles[capability].includes(actor.role)) {
+export type AppCapability = keyof typeof capabilityRoles;
+
+export function hasCapability(actor: ActorIdentity, capability: AppCapability) {
+  return (capabilityRoles[capability] as readonly AppRole[]).includes(actor.role);
+}
+
+export function requireCapability(actor: ActorIdentity, capability: AppCapability) {
+  if (!hasCapability(actor, capability)) {
     throw new AuthorizationError(`Role ${actor.role} cannot perform this ${capability.replace("Write", " write")} action.`);
   }
 }

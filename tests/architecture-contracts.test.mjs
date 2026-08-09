@@ -33,20 +33,21 @@ test("application routes enforce identity and capability checks", async () => {
     assert.match(route, /resolveActor/);
     assert.match(route, /requireCapability/);
   }
-  assert.match(workflow, /updateuserrole/);
-  assert.match(workflow, /masterData/);
-  const financialCommands = workflow.match(/const financial = \[([^\]]+)\]/)?.[1] ?? "";
-  assert.match(financialCommands, /refundreturnabledeposit/);
+  assert.match(workflow, /workflowCapability/);
+  assert.match(workflow, /UNKNOWN_COMMAND/);
+  const advanced = await read("lib/server/advanced-domain.ts");
+  assert.match(advanced, /updateUserRole:\s*"administer"/);
+  assert.match(advanced, /refundReturnableDeposit:\s*"financialWrite"/);
 });
 
 test("runtime storage preserves inventory, upload, and onboarding invariants", async () => {
-  const [database, auth, attachments] = await Promise.all([
-    read("lib/server/inventory-db.ts"), read("lib/server/auth.ts"), read("lib/server/attachments.ts"),
+  const [database, migration, auth, attachments] = await Promise.all([
+    read("lib/server/inventory-db.ts"), read("drizzle/0006_runtime-integrity.sql"), read("lib/server/auth.ts"), read("lib/server/attachments.ts"),
   ]);
-  assert.match(database, /inventory_balances_nonnegative_insert/);
-  assert.match(database, /NEW\.reserved_qty\s*>\s*NEW\.on_hand_qty/);
-  assert.match(database, /CREATE TABLE IF NOT EXISTS cost_layers/);
-  assert.match(database, /CREATE TABLE IF NOT EXISTS outbox_events/);
+  assert.match(migration, /inventory_balances_nonnegative_insert/);
+  assert.match(migration, /NEW\.`reserved_qty`\s*>\s*NEW\.`on_hand_qty`/);
+  assert.doesNotMatch(database, /CREATE TABLE IF NOT EXISTS/);
+  assert.match(database, /SELECT source_sales_order_line_id FROM purchase_order_lines LIMIT 0/);
   assert.match(auth, /first_administrator_bootstrapped/);
   assert.match(auth, /'viewer'/);
   assert.match(attachments, /MAX_BYTES\s*=\s*10\s*\*\s*1024\s*\*\s*1024/);
@@ -87,8 +88,8 @@ test("schema covers the operational subledgers and audit trail", async () => {
 });
 
 test("tracked physical postings and drop-ship fulfillment preserve their separate ledgers", async () => {
-  const [advanced, core, database] = await Promise.all([
-    read("lib/server/advanced-domain.ts"), read("lib/server/inventory-domain.ts"), read("lib/server/inventory-db.ts"),
+  const [advanced, core, migration] = await Promise.all([
+    read("lib/server/advanced-domain.ts"), read("lib/server/inventory-domain.ts"), read("drizzle/0004_useful_nomad.sql"),
   ]);
   assert.match(advanced, /LOT_QUANTITY_SHORTAGE/);
   assert.match(advanced, /SERIAL_QUANTITY_INVALID/);
@@ -106,5 +107,5 @@ test("tracked physical postings and drop-ship fulfillment preserve their separat
   assert.match(core, /receipt_reversed/);
   assert.match(core, /returned_to_vendor/);
   assert.match(core, /INSERT INTO movement_assignments/);
-  assert.match(database, /idx_purchase_order_lines_source_sales_line/);
+  assert.match(migration, /idx_purchase_order_lines_source_sales_line/);
 });

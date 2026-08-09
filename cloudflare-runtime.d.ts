@@ -36,5 +36,12 @@ interface Fetcher {
 }
 
 declare module "cloudflare:workers" {
-  export const env: { DB?: D1Database; FILES?: R2Bucket; [key: string]: unknown };
+  export const env: {
+    DB?: D1Database;
+    FILES?: R2Bucket;
+    ALLOW_LOCAL_DEV_AUTH?: string;
+    BOOTSTRAP_DEMO_DATA?: string;
+    ENVIRONMENT?: string;
+    [key: string]: unknown;
+  };
 }
