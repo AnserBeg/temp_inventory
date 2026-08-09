@@ -5,6 +5,7 @@ import {
   ReactNode,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -27,8 +28,12 @@ type PurchaseLine = {
   closed: number;
   open: number;
   unitCost: number;
+  orderedUomId?: string;
+  orderedUomCode?: string;
+  uomFactorToBase: number;
   location: string;
   fulfillmentRoute?: string;
+  version: number;
 };
 
 type SalesLine = {
@@ -42,8 +47,15 @@ type SalesLine = {
   shipped: number;
   open: number;
   unitPrice: number;
+  orderedUomId?: string;
+  orderedUomCode?: string;
+  uomFactorToBase: number;
   fulfillmentRoute: string;
   linkedPurchaseOrderLineId?: string;
+  projectReference?: string;
+  discountCents: number;
+  taxable: boolean;
+  taxRateBps: number;
 };
 
 type PurchaseOrder = {
@@ -88,8 +100,25 @@ type Product = {
   demand: number;
   projected: number;
   reorderPoint: number;
+  standardCost: number;
+  sellingPrice: number;
+  baseUomId: string;
+  baseUomCode: string;
+  purchaseUomId: string;
+  purchaseUomCode: string;
+  salesUomId: string;
+  salesUomCode: string;
+  quantityPrecision: number;
   customerRef?: string;
   version?: number;
+};
+
+type LocationOption = {
+  id: string;
+  code: string;
+  name: string;
+  warehouseName: string;
+  inventoryStatus: string;
 };
 
 type InventoryLocationBalance = {
@@ -106,6 +135,7 @@ type InventoryLocationBalance = {
 type SalesOrder = {
   id: string;
   number: string;
+  customerId: string;
   customer: string;
   project: string;
   requestedDate: string;
@@ -121,6 +151,18 @@ type SalesOrder = {
   incomingBeforeDate: number;
   shortage: number;
   total: number;
+  currency: string;
+  exchangeRateToBase: number;
+  paymentTerms?: string;
+  dueDate?: string;
+  shipToName?: string;
+  shipToAddressLine1?: string;
+  shipToAddressLine2?: string;
+  shipToCity?: string;
+  shipToRegion?: string;
+  shipToPostalCode?: string;
+  shipToCountry?: string;
+  deliveryInstructions?: string;
   route: string;
   linkedPo?: string;
   exception?: string;
@@ -163,9 +205,17 @@ type Activity = {
 type Partner = {
   id: string;
   name: string;
-  type: "vendor" | "customer";
+  type: "vendor" | "customer" | "both";
   email?: string;
   phone?: string;
+  addressLine1?: string;
+  addressLine2?: string;
+  city?: string;
+  region?: string;
+  postalCode?: string;
+  country?: string;
+  creditLimitCents?: number;
+  creditHold?: boolean;
 };
 
 type Snapshot = {
@@ -176,6 +226,21 @@ type Snapshot = {
     dueReceipts: number;
     readyToShip: number;
     pickups: number;
+    onHand: number;
+    usable: number;
+    reserved: number;
+    available: number;
+    incoming: number;
+    openDemand: number;
+    openReceiptUnits: number;
+    readyToShipUnits: number;
+    inventoryRisks: number;
+    matchExceptions: number;
+    specialOrderInventory: number;
+    orphanedBalanceRows: number;
+    orphanedBalanceUnits: number;
+    orphanedMovementCount: number;
+    orphanedInventoryValueCents: number;
   };
   purchaseOrders: PurchaseOrder[];
   products: Product[];
@@ -185,15 +250,17 @@ type Snapshot = {
   bills: Bill[];
   activities: Activity[];
   partners: Partner[];
+  locations: LocationOption[];
   pagination: {
     page: number;
     pageSize: number;
     totals: Record<string, number>;
+    filteredTotal: number | null;
   };
 };
 
 const emptySnapshot: Snapshot = {
-  summary: { lateReceipts: 0, approvals: 0, blockedSales: 0, dueReceipts: 0, readyToShip: 0, pickups: 0 },
+  summary: { lateReceipts: 0, approvals: 0, blockedSales: 0, dueReceipts: 0, readyToShip: 0, pickups: 0, onHand: 0, usable: 0, reserved: 0, available: 0, incoming: 0, openDemand: 0, openReceiptUnits: 0, readyToShipUnits: 0, inventoryRisks: 0, matchExceptions: 0, specialOrderInventory: 0, orphanedBalanceRows: 0, orphanedBalanceUnits: 0, orphanedMovementCount: 0, orphanedInventoryValueCents: 0 },
   purchaseOrders: [],
   products: [],
   inventoryBalances: [],
@@ -202,7 +269,8 @@ const emptySnapshot: Snapshot = {
   bills: [],
   activities: [],
   partners: [],
-  pagination: { page: 1, pageSize: 50, totals: {} },
+  locations: [],
+  pagination: { page: 1, pageSize: 50, totals: {}, filteredTotal: null },
 };
 
 type ComposerLine = {
@@ -210,6 +278,9 @@ type ComposerLine = {
   productId: string;
   quantity: number;
   unitAmount: number;
+  uomId: string;
+  uomCode: string;
+  priceSource: string;
   discountRate: number;
   taxCode: string;
   taxRate: number;
@@ -237,7 +308,12 @@ type ViewKey =
   | "reports"
   | "warehouse";
 
-type SearchResult = { type: string; id: string; label: string; detail: string; view: ViewKey };
+type SearchResult = { type: string; id: string; label: string; detail: string; view: ViewKey; page?: number };
+type LookupOption = {
+  id: string; label: string; detail: string; unitAmount?: number;
+  uomId?: string; uomCode?: string; priceSource?: string; factorToBase?: number;
+  addressLine1?: string; addressLine2?: string; city?: string; region?: string; postalCode?: string; country?: string;
+};
 
 type CommandKind =
   | "receive"
@@ -361,11 +437,16 @@ export function InventoryApp() {
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [activeCommand, setActiveCommand] = useState<ActiveCommand | null>(null);
   const [createOrder, setCreateOrder] = useState<"purchaseOrder" | "salesOrder" | null>(null);
+  const [editingSalesOrder, setEditingSalesOrder] = useState<SalesOrder | null>(null);
   const [loading, setLoading] = useState(true);
   const [source, setSource] = useState<"loading" | "server" | "unavailable">("loading");
   const [workflowRefreshToken, setWorkflowRefreshToken] = useState(0);
   const [page, setPage] = useState(1);
   const [query, setQuery] = useState("");
+  const [worklistQuery, setWorklistQuery] = useState("");
+  const [appliedWorklistQuery, setAppliedWorklistQuery] = useState("");
+  const [worklistStatus, setWorklistStatus] = useState("");
+  const [worklistSort, setWorklistSort] = useState("priority");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchOpen, setSearchOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -375,7 +456,8 @@ export function InventoryApp() {
 
   const loadSnapshot = useCallback(async () => {
     try {
-      const response = await fetch(`/api/snapshot?page=${page}&pageSize=50`, { cache: "no-store" });
+      const params = new URLSearchParams({ page: String(page), pageSize: "50", scope: view, worklistQuery: appliedWorklistQuery, status: worklistStatus, sort: worklistSort });
+      const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store" });
       if (!response.ok) throw new Error("Snapshot unavailable");
       const data = await response.json();
       const normalized = normalizeSnapshot(data);
@@ -387,7 +469,12 @@ export function InventoryApp() {
     } finally {
       setLoading(false);
     }
-  }, [page]);
+  }, [appliedWorklistQuery, page, view, worklistSort, worklistStatus]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { setPage(1); setAppliedWorklistQuery(worklistQuery.trim()); }, 220);
+    return () => window.clearTimeout(timer);
+  }, [worklistQuery]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -442,6 +529,7 @@ export function InventoryApp() {
     setSelectedPoId(null);
     setSelectedSoId(null);
     setSelectedProductId(null);
+    setWorklistQuery(""); setAppliedWorklistQuery(""); setWorklistStatus(""); setWorklistSort("priority");
     setMobileNavOpen(false);
     const url = new URL(window.location.href);
     if (next === "home") url.searchParams.delete("view");
@@ -472,9 +560,9 @@ export function InventoryApp() {
   const pageTotalKey: Partial<Record<ViewKey, string>> = {
     "purchase-orders": "purchaseOrders", "expected-receipts": "purchaseOrders", "vendor-returns": "purchaseOrders",
     "sales-orders": "salesOrders", fulfillment: "salesOrders", "customer-returns": "salesOrders", "customer-invoices": "salesOrders",
-    stock: "products", products: "products", counts: "products", movements: "movements", "vendor-bills": "bills",
+    stock: "products", products: "products", partners: "partners", counts: "products", movements: "movements", "vendor-bills": "bills",
   };
-  const pageTotal = snapshot.pagination.totals[pageTotalKey[view] ?? ""] ?? 0;
+  const pageTotal = snapshot.pagination.filteredTotal ?? snapshot.pagination.totals[pageTotalKey[view] ?? ""] ?? 0;
   const pageCount = Math.max(1, Math.ceil(pageTotal / snapshot.pagination.pageSize));
 
   const localSearchResults = useMemo(() => {
@@ -483,15 +571,18 @@ export function InventoryApp() {
     return [
       ...snapshot.purchaseOrders
         .filter((item) => `${item.number} ${item.vendor} ${item.customerRef ?? ""}`.toLowerCase().includes(term))
-        .map((item) => ({ type: "Purchase order", id: item.id, label: item.number, detail: item.vendor, view: "purchase-orders" as ViewKey })),
+        .map((item) => ({ type: "Purchase order", id: item.id, label: item.number, detail: item.vendor, view: "purchase-orders" as ViewKey, page })),
       ...snapshot.salesOrders
         .filter((item) => `${item.number} ${item.customer} ${item.project}`.toLowerCase().includes(term))
-        .map((item) => ({ type: "Sales order", id: item.id, label: item.number, detail: `${item.customer} · ${item.project}`, view: "sales-orders" as ViewKey })),
+        .map((item) => ({ type: "Sales order", id: item.id, label: item.number, detail: `${item.customer} · ${item.project}`, view: "sales-orders" as ViewKey, page })),
       ...snapshot.products
         .filter((item) => `${item.sku} ${item.name} ${item.specification} ${item.customerRef ?? ""}`.toLowerCase().includes(term))
-        .map((item) => ({ type: "Product / unit", id: item.id, label: item.sku, detail: item.name, view: "stock" as ViewKey })),
+        .map((item) => ({ type: "Product / unit", id: item.id, label: item.sku, detail: item.name, view: "stock" as ViewKey, page })),
+      ...snapshot.partners
+        .filter((item) => `${item.name} ${item.email ?? ""} ${item.phone ?? ""}`.toLowerCase().includes(term))
+        .map((item) => ({ type: "Business partner", id: item.id, label: item.name, detail: titleCase(item.type), view: "partners" as ViewKey, page })),
     ].slice(0, 10);
-  }, [query, snapshot]);
+  }, [page, query, snapshot]);
 
   useEffect(() => {
     const term = query.trim();
@@ -503,9 +594,10 @@ export function InventoryApp() {
         if (!response.ok) throw new Error("Search unavailable");
         const raw = await response.json() as Record<string, unknown>;
         setSearchResults([
-          ...asRows(raw.purchaseOrders).map((item) => ({ type: "Purchase order", id: text(item.id), label: text(item.number), detail: text(item.vendorName), view: "purchase-orders" as ViewKey })),
-          ...asRows(raw.salesOrders).map((item) => ({ type: "Sales order", id: text(item.id), label: text(item.number), detail: [text(item.customerName), text(item.projectReference)].filter(Boolean).join(" · "), view: "sales-orders" as ViewKey })),
-          ...asRows(raw.products).map((item) => ({ type: "Product / unit", id: text(item.id), label: text(item.sku), detail: text(item.name), view: "stock" as ViewKey })),
+          ...asRows(raw.purchaseOrders).map((item) => ({ type: "Purchase order", id: text(item.id), label: text(item.number), detail: text(item.vendorName), view: "purchase-orders" as ViewKey, page: number(item.page, 1) })),
+          ...asRows(raw.salesOrders).map((item) => ({ type: "Sales order", id: text(item.id), label: text(item.number), detail: [text(item.customerName), text(item.projectReference)].filter(Boolean).join(" · "), view: "sales-orders" as ViewKey, page: number(item.page, 1) })),
+          ...asRows(raw.products).map((item) => ({ type: "Product / unit", id: text(item.id), label: text(item.sku), detail: text(item.name), view: "stock" as ViewKey, page: number(item.page, 1) })),
+          ...asRows(raw.partners).map((item) => ({ type: "Business partner", id: text(item.id), label: text(item.name), detail: [text(item.code), titleCase(text(item.partnerType))].filter(Boolean).join(" · "), view: "partners" as ViewKey, page: number(item.page, 1) })),
         ].slice(0, 10));
       } catch (error) {
         if (!(error instanceof DOMException && error.name === "AbortError")) setSearchResults(localSearchResults);
@@ -522,7 +614,7 @@ export function InventoryApp() {
     const so = snapshot.salesOrders.find((item) => item.id === entityId);
     const product = snapshot.products.find((item) => item.id === entityId);
     const commandMap: Record<CommandKind, string> = {
-      receive: "postReceipt",
+      receive: Array.isArray(payload.lines) ? "postReceiptBatch" : "postReceipt",
       close: "closeRemainder",
       reopen: "reopenRemainder",
       reverse: "reverseReceipt",
@@ -537,12 +629,14 @@ export function InventoryApp() {
       ? po?.latestReceiptVersion ?? 1
       : kind === "count"
         ? Number(payload.balanceVersion ?? 0)
-        : po?.version ?? so?.version ?? product?.version ?? 1;
+        : kind === "receive"
+          ? Array.isArray(payload.lines) ? 1 : po?.lines.find((line) => line.id === payload.lineId)?.version ?? 1
+          : po?.version ?? so?.version ?? product?.version ?? 1;
     const apiPayload: Record<string, unknown> = {
       ...payload,
       damagedQuantity: payload.quarantineQuantity,
       replacementExpected: payload.disposition === "replacement",
-      condition: payload.disposition === "available" ? "usable" : "quarantine",
+      condition: payload.disposition === "available" ? "usable" : payload.disposition === "damaged" ? "damaged" : "quarantine",
       allowOverReceipt: kind === "receive" && Number(payload.quantity ?? 0) > (po?.open ?? 0),
       overReceiptPolicy: "2% or 1 unit; buyer approval above tolerance",
     };
@@ -665,6 +759,21 @@ export function InventoryApp() {
     }
   };
 
+  const updateOperationalSalesOrder = async (order: SalesOrder, payload: Record<string, unknown>) => {
+    const idempotencyKey = crypto.randomUUID();
+    const response = await fetch("/api/workflows", {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+      body: JSON.stringify({ command: "updateSalesOrderDraft", entityId: order.id, version: order.version, payload, idempotencyKey }),
+    });
+    const result = await response.json() as { message?: string; error?: string | { message?: string } };
+    if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message || "The sales-order draft could not be updated.");
+    await loadSnapshot();
+    setWorkflowRefreshToken((current) => current + 1);
+    setToast(result.message || "Sales-order draft updated.");
+    setEditingSalesOrder(null);
+  };
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">Skip to content</a>
@@ -706,7 +815,7 @@ export function InventoryApp() {
             <span aria-hidden="true">⌕</span><span>Search orders, products, customers…</span><kbd>Ctrl K</kbd>
           </button>
           <div className="topbar-actions">
-            <button className="warehouse-selector"><span className="online-dot" />All locations</button>
+            <span className="warehouse-selector"><span className="online-dot" />All active locations</span>
             <button className="icon-button notification-button" aria-label="Open notifications" onClick={() => setNotificationsOpen((open) => !open)}>
               ♧{operationalNotifications.length ? <span className="notification-count">{operationalNotifications.length}</span> : null}
             </button>
@@ -731,6 +840,7 @@ export function InventoryApp() {
             </div>
             <PageActions view={view} onNavigate={navigate} onCreate={setCreateOrder} />
           </div>
+          {pageTotalKey[view] ? <ServerWorklistControls view={view} query={worklistQuery} setQuery={setWorklistQuery} status={worklistStatus} setStatus={(value) => { setPage(1); setWorklistStatus(value); }} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} total={pageTotal} /> : null}
 
           {loading ? <LoadingState /> : (
             <>
@@ -755,7 +865,7 @@ export function InventoryApp() {
               {view === "sales-orders" && (
                 <OperationsWorkspace workspace="sales" onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken}>
                 {selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} onBack={() => setSelectedSoId(null)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} />
+                  <SalesOrderDetail so={selectedSo} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} mode={view} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} />
                 )}
@@ -763,7 +873,7 @@ export function InventoryApp() {
               )}
               {view === "fulfillment" && (
                 selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} onBack={() => setSelectedSoId(null)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} />
+                  <SalesOrderDetail so={selectedSo} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} mode={view} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} />
                 )
@@ -771,10 +881,10 @@ export function InventoryApp() {
               {view === "customer-returns" && <CustomerReturnsView orders={snapshot.salesOrders} onReturn={(so) => setActiveCommand({ kind: "customer-return", entityId: so.id, entityNumber: so.number })} />}
               {view === "stock" && (
                 <OperationsWorkspace workspace="inventory" onDurableRefresh={loadSnapshot}>
-                  {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} onBack={() => setSelectedProductId(null)} /> : <InventoryView products={snapshot.products} onOpen={setSelectedProductId} />}
+                  {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} onBack={() => setSelectedProductId(null)} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} />}
                 </OperationsWorkspace>
               )}
-              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} onBack={() => setSelectedProductId(null)} /> : <InventoryView products={snapshot.products} onOpen={setSelectedProductId} />)}
+              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} onBack={() => setSelectedProductId(null)} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} />)}
               {view === "movements" && <MovementsView movements={snapshot.movements} />}
               {view === "counts" && <OperationsWorkspace workspace="inventory" onDurableRefresh={loadSnapshot}><CountsView products={snapshot.products} balances={snapshot.inventoryBalances} onCount={(product, balance) => setActiveCommand({ kind: "count", entityId: product.id, entityNumber: `COUNT · ${product.sku}`, locationId: balance.locationId, locationLabel: `${balance.warehouseName} / ${balance.locationCode}`, recordedQuantity: balance.recordedQuantity, balanceVersion: balance.version })} /></OperationsWorkspace>}
               {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" onDurableRefresh={loadSnapshot}><VendorBillsView bills={snapshot.bills} /></OperationsWorkspace>}
@@ -798,6 +908,7 @@ export function InventoryApp() {
               {displayedSearchResults.map((result) => (
                 <button key={`${result.type}-${result.id}`} onClick={() => {
                   navigate(result.view);
+                  setPage(result.page ?? 1);
                   if (result.view === "purchase-orders") setSelectedPoId(result.id);
                   if (result.view === "sales-orders") setSelectedSoId(result.id);
                   if (result.view === "stock") setSelectedProductId(result.id);
@@ -818,6 +929,7 @@ export function InventoryApp() {
           po={snapshot.purchaseOrders.find((item) => item.id === activeCommand.entityId)}
           so={snapshot.salesOrders.find((item) => item.id === activeCommand.entityId)}
           products={snapshot.products}
+          locations={snapshot.locations}
           countBalances={snapshot.inventoryBalances.filter((item) => item.productId === activeCommand.entityId)}
           onClose={() => setActiveCommand(null)}
           onSubmit={(payload) => runCommand(activeCommand.kind, activeCommand.entityId, activeCommand.entityNumber, payload)}
@@ -834,6 +946,17 @@ export function InventoryApp() {
           products={snapshot.products}
           onClose={() => setCreateOrder(null)}
           onSubmit={(payload) => createOperationalOrder(createOrder, payload)}
+        />
+      )}
+
+      {editingSalesOrder && (
+        <AdvancedCreateOrderDialog
+          type="salesOrder"
+          initialOrder={editingSalesOrder}
+          partners={snapshot.partners}
+          products={snapshot.products}
+          onClose={() => setEditingSalesOrder(null)}
+          onSubmit={(payload) => updateOperationalSalesOrder(editingSalesOrder, payload)}
         />
       )}
 
@@ -858,9 +981,6 @@ function PageActions({ view, onNavigate, onCreate }: { view: ViewKey; onNavigate
 
 function Dashboard({ snapshot, navigate, openPo }: { snapshot: Snapshot; navigate: (view: ViewKey) => void; openPo: (id: string) => void }) {
   const due = snapshot.purchaseOrders.filter((po) => po.open > 0 || po.daysLate > 0).slice(0, 4);
-  const openReceiptUnits = snapshot.purchaseOrders.reduce((sum, po) => sum + po.open, 0);
-  const readyUnits = snapshot.salesOrders.reduce((sum, so) => sum + Math.max(so.reserved - so.shipped, 0), 0);
-  const inventoryRisks = snapshot.products.filter((product) => product.projected < 0 || product.available <= product.reorderPoint || product.usable < product.onHand);
   const specialOrder = snapshot.products.find((product) => product.customerRef);
   return (
     <div className="dashboard-grid">
@@ -874,10 +994,10 @@ function Dashboard({ snapshot, navigate, openPo }: { snapshot: Snapshot; navigat
       </section>
 
       <section className="metric-row" aria-label="Today's work">
-        <MetricCard label="Receipts due" value={snapshot.summary.dueReceipts} detail={`${openReceiptUnits} total units open`} tone="info" onClick={() => navigate("expected-receipts")} />
-        <MetricCard label="Ready to ship" value={snapshot.summary.readyToShip} detail={`${readyUnits} reserved units ready`} tone="success" onClick={() => navigate("fulfillment")} />
+        <MetricCard label="Receipts due" value={snapshot.summary.dueReceipts} detail={`${snapshot.summary.openReceiptUnits} total units open`} tone="info" onClick={() => navigate("expected-receipts")} />
+        <MetricCard label="Ready to ship" value={snapshot.summary.readyToShip} detail={`${snapshot.summary.readyToShipUnits} reserved units ready`} tone="success" onClick={() => navigate("fulfillment")} />
         <MetricCard label="Customer pickups" value={snapshot.summary.pickups} detail="Current pickup worklist" tone="neutral" onClick={() => navigate("fulfillment")} />
-        <MetricCard label="Inventory risks" value={inventoryRisks.length} detail="Below target, short, or on hold" tone="warning" onClick={() => navigate("stock")} />
+        <MetricCard label="Inventory risks" value={snapshot.summary.inventoryRisks} detail="Below target, short, or on hold" tone="warning" onClick={() => navigate("stock")} />
       </section>
 
       <section className="panel today-panel">
@@ -943,17 +1063,32 @@ function inferTone(label: string): Severity {
   return "info";
 }
 
-function FilterBar({ placeholder = "Search this worklist", children }: { placeholder?: string; children?: ReactNode }) {
-  return <div className="filter-bar"><label className="list-search"><span aria-hidden="true">⌕</span><input placeholder={placeholder} aria-label={placeholder} /></label>{children}</div>;
+function FilterBar({ placeholder = "Search this worklist", value = "", onChange, children }: { placeholder?: string; value?: string; onChange?: (value: string) => void; children?: ReactNode }) {
+  if (!onChange) return null;
+  return <div className="filter-bar"><label className="list-search"><span aria-hidden="true">⌕</span><input placeholder={placeholder} aria-label={placeholder} value={value} onChange={(event) => onChange?.(event.target.value)} /></label>{children}</div>;
+}
+
+function ServerWorklistControls({ view, query, setQuery, status, setStatus, sort, setSort, total }: { view: ViewKey; query: string; setQuery: (value: string) => void; status: string; setStatus: (value: string) => void; sort: string; setSort: (value: string) => void; total: number }) {
+  const statusOptions: Partial<Record<ViewKey, Array<[string, string]>>> = {
+    "purchase-orders": [["", "All states"], ["draft", "Draft"], ["pending_approval", "Pending approval"], ["approved", "Approved"]],
+    "expected-receipts": [["", "All states"], ["approved", "Approved"], ["pending_approval", "Pending approval"]],
+    "vendor-returns": [["", "All states"], ["approved", "Approved"]],
+    "sales-orders": [["", "All states"], ["draft", "Draft"], ["confirmed", "Confirmed"], ["canceled", "Canceled"]],
+    fulfillment: [["", "All states"], ["confirmed", "Confirmed"]],
+    "customer-returns": [["", "All states"], ["confirmed", "Confirmed"]],
+    stock: [["", "All policies"], ["stocked", "Stocked"], ["special_order", "Special order"], ["drop_ship", "Drop ship"], ["serial", "Serial tracked"], ["lot", "Lot tracked"]],
+    products: [["", "All policies"], ["stocked", "Stocked"], ["special_order", "Special order"], ["drop_ship", "Drop ship"], ["serial", "Serial tracked"], ["lot", "Lot tracked"]],
+    movements: [["", "All movement types"], ["purchase_receipt", "Purchase receipt"], ["sales_shipment", "Sales shipment"], ["internal_transfer", "Internal transfer"], ["customer_return", "Customer return"], ["vendor_return", "Vendor return"]],
+    "vendor-bills": [["", "All states"], ["posted", "Posted"], ["on_hold", "On hold"], ["matched", "Matched"], ["exception", "Match exception"]],
+    partners: [["", "All partner types"], ["customer", "Customers"], ["vendor", "Vendors"]],
+  };
+  const sortOptions = [view === "products" || view === "stock" ? ["priority", "Product name"] : ["priority", "Operational priority"], ["newest", "Newest first"], ["name", "Name"], ...(view === "movements" ? [["oldest", "Oldest first"]] : []), ...(view === "products" || view === "stock" ? [["sku", "SKU"], ["availability", "Availability"]] : [])] as Array<[string, string]>;
+  return <div className="filter-bar server-worklist-controls"><label className="list-search"><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search the full database worklist" aria-label="Search the full database worklist" /></label>{statusOptions[view] ? <label><span className="sr-only">Filter status</span><select value={status} onChange={(event) => setStatus(event.target.value)}>{statusOptions[view]?.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label> : null}<label><span className="sr-only">Sort worklist</span><select value={sort} onChange={(event) => setSort(event.target.value)}>{sortOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><span className="read-only-label">{total} matching record{total === 1 ? "" : "s"}</span></div>;
 }
 
 function PurchaseOrdersView({ orders, mode, onOpen, onReceive }: { orders: PurchaseOrder[]; mode: "purchase-orders" | "expected-receipts"; onOpen: (id: string) => void; onReceive: (po: PurchaseOrder) => void }) {
-  const [filter, setFilter] = useState(mode === "expected-receipts" ? "Due and late" : "All open");
-  const visible = mode === "expected-receipts" ? orders.filter((po) => po.open > 0 || po.daysLate > 0) : orders;
+  const visible = orders.filter((po) => mode !== "expected-receipts" || po.open > 0 || po.daysLate > 0);
   return <section className="panel worklist">
-    <div className="saved-view-row"><div className="view-tabs">{[mode === "expected-receipts" ? "Due and late" : "All open", "Partially received", "Closed short", "Awaiting approval"].map((label) => <button key={label} className={filter === label ? "active" : ""} onClick={() => setFilter(label)}>{label}{label === "Closed short" && <span>1</span>}</button>)}</div><button className="text-button">Save view</button></div>
-    <FilterBar placeholder={mode === "expected-receipts" ? "Search PO, vendor, or customer" : "Search purchase orders"}><button className="filter-button">All warehouses</button><button className="filter-button">Status</button><button className="filter-button">Expected date</button></FilterBar>
-    <div className="active-filters"><span>{filter}<button aria-label={`Remove ${filter} filter`}>×</button></span><button>Clear all</button></div>
     <div className="responsive-table"><table><caption className="sr-only">Purchase orders</caption><thead><tr><th>Exception</th><th>PO</th><th>Vendor</th><th>Expected</th><th className="numeric">Ordered</th><th className="numeric">Net received</th><th className="numeric">Closed</th><th className="numeric">Open</th><th>Billing</th><th><span className="sr-only">Action</span></th></tr></thead><tbody>{visible.map((po) => <tr key={po.id}>
       <td>{po.exception ? <span className={`exception-cell ${po.daysLate > 0 ? "danger" : "warning"}`} title={po.exception}>!</span> : <span className="muted">—</span>}</td>
       <td><button className="table-link" onClick={() => onOpen(po.id)}>{po.number}</button><small>Rev {po.revision}</small></td>
@@ -963,7 +1098,6 @@ function PurchaseOrdersView({ orders, mode, onOpen, onReceive }: { orders: Purch
       <td><StatusBadge>{po.billing}</StatusBadge></td>
       <td>{po.open > 0 ? <button className="row-action" onClick={() => onReceive(po)}>Receive</button> : <button className="row-action" onClick={() => onOpen(po.id)}>Open</button>}</td>
     </tr>)}</tbody></table></div>
-    <div className="table-footer"><span>Showing {visible.length} of {visible.length} records</span><div><button disabled>Previous</button><button disabled>Next</button></div></div>
   </section>;
 }
 
@@ -1005,14 +1139,14 @@ function VendorReturnsView({ orders, onReturn }: { orders: PurchaseOrder[]; onRe
 }
 
 function SalesOrdersView({ orders, mode, onOpen, onShip }: { orders: SalesOrder[]; mode: "sales-orders" | "fulfillment"; onOpen: (id: string) => void; onShip: (so: SalesOrder) => void }) {
-  const visible = mode === "fulfillment" ? orders.filter((so) => so.reserved > so.shipped) : orders;
-  return <section className="panel worklist"><div className="saved-view-row"><div className="view-tabs"><button className="active">{mode === "fulfillment" ? "Ready and partially ready" : "Open orders"}</button><button>Shortages</button><button>Special orders received</button><button>Customer pickup</button></div><button className="text-button">Save view</button></div><FilterBar placeholder="Search SO, customer, project, or customer PO"><button className="filter-button">Requested date</button><button className="filter-button">Route</button></FilterBar><div className="responsive-table"><table><caption className="sr-only">Sales orders</caption><thead><tr><th>Exception</th><th>SO</th><th>Customer / project</th><th>Requested</th><th>Availability</th><th>Fulfillment</th><th>Invoice</th><th className="numeric">Total</th><th><span className="sr-only">Action</span></th></tr></thead><tbody>{visible.map((so) => <tr key={so.id}><td>{so.exception ? <span className={`exception-cell ${so.shortage > 0 ? "danger" : "warning"}`}>!</span> : "—"}</td><td><button className="table-link" onClick={() => onOpen(so.id)}>{so.number}</button><small>{so.route}</small></td><td><strong>{so.customer}</strong><small>{so.project}</small></td><td>{formatDate(so.requestedDate)}</td><td><div className="availability-mini"><strong>{so.availableNow} now</strong><span>{so.incomingBeforeDate} incoming</span>{so.shortage > 0 && <b>{so.shortage} short</b>}</div></td><td><StatusBadge>{so.fulfillment}</StatusBadge></td><td><StatusBadge>{so.billing}</StatusBadge></td><td className="numeric strong">{money.format(so.total)}</td><td>{so.reserved > so.shipped ? <button className="row-action" onClick={() => onShip(so)}>Post shipment</button> : <button className="row-action" onClick={() => onOpen(so.id)}>Open</button>}</td></tr>)}</tbody></table></div></section>;
+  const visible = orders.filter((so) => mode !== "fulfillment" || so.reserved > so.shipped);
+  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Sales orders</caption><thead><tr><th>Exception</th><th>SO</th><th>Customer / project</th><th>Requested</th><th>Availability</th><th>Fulfillment</th><th>Invoice</th><th className="numeric">Total</th><th><span className="sr-only">Action</span></th></tr></thead><tbody>{visible.map((so) => <tr key={so.id}><td>{so.exception ? <span className={`exception-cell ${so.shortage > 0 ? "danger" : "warning"}`}>!</span> : "—"}</td><td><button className="table-link" onClick={() => onOpen(so.id)}>{so.number}</button><small>{so.route}</small></td><td><strong>{so.customer}</strong><small>{so.project}</small></td><td>{formatDate(so.requestedDate)}</td><td><div className="availability-mini"><strong>{so.availableNow} now</strong><span>{so.incomingBeforeDate} incoming</span>{so.shortage > 0 && <b>{so.shortage} short</b>}</div></td><td><StatusBadge>{so.fulfillment}</StatusBadge></td><td><StatusBadge>{so.billing}</StatusBadge></td><td className="numeric strong">{money.format(so.total)}</td><td>{so.reserved > so.shipped ? <button className="row-action" onClick={() => onShip(so)}>Post shipment</button> : <button className="row-action" onClick={() => onOpen(so.id)}>Open</button>}</td></tr>)}</tbody></table></div></section>;
 }
 
-function SalesOrderDetail({ so, onBack, onReserve, onShip }: { so: SalesOrder; onBack: () => void; onReserve: () => void; onShip: () => void }) {
-  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{so.customer} · {so.project}</p></div><div className="object-total"><span>Total</span><strong>{money.format(so.total)}</strong></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}<div className="object-actions"><button className="button primary" onClick={onShip} disabled={so.reserved <= so.shipped}>Post shipment</button><button className="button secondary" onClick={onReserve} disabled={so.open <= so.reserved || so.availableNow <= 0}>Reserve available stock</button><button className="button ghost">Resolve shortage</button></div></section>
+function SalesOrderDetail({ so, onBack, onEdit, onReserve, onShip }: { so: SalesOrder; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void }) {
+  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{so.customer} · {so.project}</p></div><div className="object-total"><span>Total</span><strong>{money.format(so.total)}</strong></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}<div className="object-actions">{so.lifecycle.toLowerCase() === "draft" ? <button className="button primary" onClick={onEdit}>Edit draft lines</button> : null}<button className="button primary" onClick={onShip} disabled={so.reserved <= so.shipped}>Post shipment</button><button className="button secondary" onClick={onReserve} disabled={so.open <= so.reserved || so.availableNow <= 0}>Reserve available stock</button></div></section>
     <section className="panel availability-panel"><PanelHeading title="Availability for requested date" detail={`Requested ${formatDate(so.requestedDate)}`} /><div className="availability-grid"><MetricDisplay label="Required" value={so.open} /><MetricDisplay label="Available now" value={so.availableNow} tone="success" /><MetricDisplay label="Incoming before date" value={so.incomingBeforeDate} tone="info" /><MetricDisplay label="Shortage" value={so.shortage} tone={so.shortage > 0 ? "danger" : "neutral"} /></div>{so.linkedPo && <div className="linked-supply"><span className="section-kicker">Linked supply</span><strong>{so.linkedPo} · vendor confirmed</strong><p>{so.incomingBeforeDate} units expected before the customer&apos;s requested date.</p></div>}</section>
-    <div className="detail-columns"><section className="panel"><PanelHeading title="Fulfillment quantities" /><dl className="definition-list"><div><dt>Ordered</dt><dd>{so.ordered}</dd></div><div><dt>Reserved</dt><dd>{so.reserved}</dd></div><div><dt>Net shipped</dt><dd>{so.shipped}</dd></div><div><dt>Open to ship</dt><dd>{so.open}</dd></div></dl></section><section className="panel"><PanelHeading title="Customer delivery" /><dl className="definition-list"><div><dt>Method</dt><dd>{so.route}</dd></div><div><dt>Requested</dt><dd>{formatDate(so.requestedDate)}</dd></div><div><dt>Job site</dt><dd>{so.project}</dd></div><div><dt>Billing policy</dt><dd>Delivered quantity</dd></div></dl></section></div>
+    <div className="detail-columns"><section className="panel"><PanelHeading title="Fulfillment quantities" /><dl className="definition-list"><div><dt>Ordered</dt><dd>{so.ordered}</dd></div><div><dt>Reserved</dt><dd>{so.reserved}</dd></div><div><dt>Net shipped</dt><dd>{so.shipped}</dd></div><div><dt>Open to ship</dt><dd>{so.open}</dd></div></dl></section><section className="panel"><PanelHeading title="Customer delivery" /><dl className="definition-list"><div><dt>Method</dt><dd>{so.route}</dd></div><div><dt>Requested</dt><dd>{formatDate(so.requestedDate)}</dd></div><div><dt>Ship to</dt><dd>{so.shipToName ?? so.customer}<br />{[so.shipToAddressLine1, so.shipToAddressLine2, so.shipToCity, so.shipToRegion, so.shipToPostalCode, so.shipToCountry].filter(Boolean).join(", ") || "Address required before confirmation"}</dd></div><div><dt>Instructions</dt><dd>{so.deliveryInstructions ?? "None"}</dd></div><div><dt>Billing policy</dt><dd>Delivered quantity</dd></div></dl></section></div>
   </div>;
 }
 
@@ -1020,17 +1154,37 @@ function CustomerReturnsView({ orders, onReturn }: { orders: SalesOrder[]; onRet
   return <section className="panel worklist"><div className="info-banner"><span aria-hidden="true">i</span><p><strong>Physical and financial outcomes are separate.</strong> Receiving a return changes stock; issuing a credit changes the customer balance.</p></div><FilterBar placeholder="Search shipment, invoice, sales order, or customer" /><div className="record-cards">{orders.filter((so) => so.shipped > 0 || so.fulfillment.includes("Ready")).map((so) => <article className="record-card" key={so.id}><div><span className="section-kicker">{so.number}</span><h3>{so.customer}</h3><p>{so.project}</p></div><div className="card-metrics"><span><small>Shipped</small><strong>{so.shipped || so.reserved}</strong></span><span><small>Eligible return</small><strong>{so.shipped || so.reserved}</strong></span></div><button className="button secondary" onClick={() => onReturn(so)}>Create customer return</button></article>)}</div></section>;
 }
 
-function InventoryView({ products, onOpen }: { products: Product[]; onOpen: (id: string) => void }) {
-  const onHand = products.reduce((sum, item) => sum + item.onHand, 0);
-  const available = products.reduce((sum, item) => sum + item.available, 0);
-  const reserved = products.reduce((sum, item) => sum + item.reserved, 0);
-  const incoming = products.reduce((sum, item) => sum + item.incoming, 0);
-  return <div className="stack"><section className="metric-row object-metrics"><MetricDisplay label="On hand" value={onHand} /><MetricDisplay label="Usable" value={products.reduce((sum, item) => sum + item.usable, 0)} /><MetricDisplay label="Reserved" value={reserved} tone="info" /><MetricDisplay label="Available now" value={available} tone="success" /><MetricDisplay label="Incoming" value={incoming} tone="info" /></section><section className="panel worklist"><FilterBar placeholder="Search SKU, manufacturer, dimensions, unit ID, or allocation"><button className="filter-button">All warehouses</button><button className="filter-button">All statuses</button><button className="filter-button">All locations</button></FilterBar><div className="responsive-table"><table><caption className="sr-only">Inventory balances by product</caption><thead><tr><th>Product / configuration</th><th>Warehouse location</th><th className="numeric">On hand</th><th className="numeric">Usable</th><th className="numeric">Reserved</th><th className="numeric">Available</th><th className="numeric">Incoming</th><th className="numeric">Demand</th><th className="numeric">Projected</th><th>Exception</th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><button className="table-link" onClick={() => onOpen(product.id)}>{product.name}</button><small>{product.sku} · {product.specification}</small>{product.customerRef && <span className="allocation-tag">{product.customerRef}</span>}</td><td><strong>{product.locationCode}</strong><small>{product.location}</small></td><td className="numeric">{product.onHand}</td><td className="numeric">{product.usable}</td><td className="numeric">{product.reserved}</td><td className="numeric strong">{product.available}</td><td className="numeric">{product.incoming}</td><td className="numeric">{product.demand}</td><td className={`numeric strong ${product.projected < 0 ? "text-danger" : ""}`}>{product.projected}</td><td>{product.projected < 0 ? <StatusBadge tone="danger">Shortage {Math.abs(product.projected)}</StatusBadge> : product.available <= product.reorderPoint ? <StatusBadge tone="warning">Below target</StatusBadge> : <StatusBadge tone="success">Healthy</StatusBadge>}</td></tr>)}</tbody></table></div></section></div>;
+function InventoryView({ snapshot, onOpen }: { snapshot: Snapshot; onOpen: (id: string) => void }) {
+  const { products, summary } = snapshot;
+  return <div className="stack">{summary.orphanedBalanceRows > 0 ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Inventory reconciliation failed</strong><p>{summary.orphanedBalanceUnits} units across {summary.orphanedBalanceRows} balance row(s) reference missing locations; {money.format(summary.orphanedInventoryValueCents / 100)} of movement value is affected. Posting to unknown locations is now blocked.</p></div></div> : null}<section className="metric-row object-metrics"><MetricDisplay label="On hand" value={summary.onHand} /><MetricDisplay label="Usable" value={summary.usable} /><MetricDisplay label="Reserved" value={summary.reserved} tone="info" /><MetricDisplay label="Available now" value={summary.available} tone="success" /><MetricDisplay label="Incoming" value={summary.incoming} tone="info" /></section><section className="panel worklist"><FilterBar placeholder="Search SKU, manufacturer, dimensions, unit ID, or allocation"><button className="filter-button">All warehouses</button><button className="filter-button">All statuses</button><button className="filter-button">All locations</button></FilterBar><div className="responsive-table"><table><caption className="sr-only">Inventory balances by product</caption><thead><tr><th>Product / configuration</th><th>Warehouse location</th><th className="numeric">On hand</th><th className="numeric">Usable</th><th className="numeric">Reserved</th><th className="numeric">Available</th><th className="numeric">Incoming</th><th className="numeric">Demand</th><th className="numeric">Projected</th><th>Exception</th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><button className="table-link" onClick={() => onOpen(product.id)}>{product.name}</button><small>{product.sku} · {product.specification}</small>{product.customerRef && <span className="allocation-tag">{product.customerRef}</span>}</td><td><strong>{product.locationCode}</strong><small>{product.location}</small></td><td className="numeric">{product.onHand}</td><td className="numeric">{product.usable}</td><td className="numeric">{product.reserved}</td><td className="numeric strong">{product.available}</td><td className="numeric">{product.incoming}</td><td className="numeric">{product.demand}</td><td className={`numeric strong ${product.projected < 0 ? "text-danger" : ""}`}>{product.projected}</td><td>{product.projected < 0 ? <StatusBadge tone="danger">Shortage {Math.abs(product.projected)}</StatusBadge> : product.available <= product.reorderPoint ? <StatusBadge tone="warning">Below target</StatusBadge> : <StatusBadge tone="success">Healthy</StatusBadge>}</td></tr>)}</tbody></table></div></section></div>;
 }
 
 function ProductDetail({ product, movements, onBack }: { product: Product; movements: Movement[]; onBack: () => void }) {
-  const productMovements = movements.filter((movement) => movement.product === product.sku);
-  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to inventory</button><section className="object-header panel product-header"><div className="window-thumb large" aria-hidden="true"><span /><span /><span /><span /></div><div className="object-title"><div><span className="section-kicker">{product.policy}</span><h2>{product.name}</h2><p>{product.specification}</p><code>{product.sku}</code></div></div>{product.customerRef && <div className="exception-banner info"><span>↗</span><div><strong>Customer-specific allocation</strong><p>{product.customerRef}</p></div></div>}</section><section className="metric-row object-metrics"><MetricDisplay label="On hand" value={product.onHand} /><MetricDisplay label="Usable" value={product.usable} /><MetricDisplay label="Reserved" value={product.reserved} tone="info" /><MetricDisplay label="Available now" value={product.available} tone="success" /><MetricDisplay label="Incoming" value={product.incoming} tone="info" /><MetricDisplay label="Projected" value={product.projected} tone={product.projected < 0 ? "danger" : "neutral"} /></section><div className="detail-columns"><section className="panel"><PanelHeading title="Current location" detail="Human-readable path and scannable code" /><div className="location-card"><span className="location-code">{product.locationCode}</span><div><strong>{product.location}</strong><p>Condition: Available</p></div><button className="button secondary">Transfer inventory</button></div></section><section className="panel"><PanelHeading title="Allocation" /><dl className="definition-list"><div><dt>Policy</dt><dd>{product.policy}</dd></div><div><dt>Customer / project</dt><dd>{product.customerRef ?? "Unallocated stock"}</dd></div><div><dt>Reorder point</dt><dd>{product.reorderPoint}</dd></div></dl></section></div><section className="panel"><PanelHeading title="Movement history" detail="These posted records reconstruct the displayed on-hand quantity." />{productMovements.length ? <MovementsTable movements={productMovements} /> : <div className="empty-inline">No movement records match this product in the current view.</div>}</section></div>;
+  const [movementPage, setMovementPage] = useState(1);
+  const [movementTotal, setMovementTotal] = useState(0);
+  const [productMovements, setProductMovements] = useState<Movement[]>(movements.filter((movement) => movement.product === product.sku));
+  const [balances, setBalances] = useState<Array<InventoryLocationBalance & { inventoryStatus: string }>>([]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      const params = new URLSearchParams({ detail: "product", productId: product.id, page: String(movementPage), pageSize: "50" });
+      const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store", signal: controller.signal });
+      if (!response.ok) throw new Error("Product history unavailable");
+      const raw = await response.json() as Record<string, unknown>;
+      setProductMovements(asRows(raw.movements).map((item, index) => ({ id: text(item.id, `movement-${index}`), time: displayTimestamp(text(item.postedAt)), type: titleCase(text(item.type)), document: `${titleCase(text(item.sourceDocumentType))} · ${text(item.sourceDocumentId)}`, product: product.sku, quantity: number(item.quantity), from: text(item.fromLocationCode, "External"), to: text(item.toLocationCode, "External"), user: text(item.postedBy, "System") })));
+      setBalances(asRows(raw.balances).map((item) => ({ productId: product.id, locationId: text(item.locationId), recordedQuantity: number(item.recordedQuantity), reservedQuantity: number(item.reservedQuantity), version: number(item.version), locationCode: text(item.locationCode, "Missing location"), locationName: text(item.locationName, "Referenced location no longer exists"), warehouseName: text(item.warehouseName, "Unreconciled"), inventoryStatus: text(item.inventoryStatus, "orphaned") })));
+      setMovementTotal(number(asRecord(raw.pagination).total));
+    })().catch(() => { if (!controller.signal.aborted) setMovementTotal(movements.filter((movement) => movement.product === product.sku).length); });
+    return () => controller.abort();
+  }, [movementPage, movements, product.id, product.sku]);
+  const movementPages = Math.max(1, Math.ceil(movementTotal / 50));
+  return <div className="object-page">
+    <button className="back-button" onClick={onBack}>← Back to inventory</button>
+    <section className="object-header panel product-header"><div className="window-thumb large" aria-hidden="true"><span /><span /><span /><span /></div><div className="object-title"><div><span className="section-kicker">{product.policy}</span><h2>{product.name}</h2><p>{product.specification}</p><code>{product.sku}</code></div></div></section>
+    <section className="metric-row object-metrics"><MetricDisplay label="On hand" value={product.onHand} /><MetricDisplay label="Usable" value={product.usable} /><MetricDisplay label="Reserved" value={product.reserved} tone="info" /><MetricDisplay label="Available now" value={product.available} tone="success" /><MetricDisplay label="Incoming" value={product.incoming} tone="info" /><MetricDisplay label="Projected" value={product.projected} tone={product.projected < 0 ? "danger" : "neutral"} /></section>
+    <section className="panel"><PanelHeading title="Location balances" detail="Every durable product/location balance, including unresolved legacy references." /><div className="responsive-table"><table><thead><tr><th>Warehouse</th><th>Location</th><th>Status</th><th className="numeric">On hand</th><th className="numeric">Reserved</th><th className="numeric">Available</th></tr></thead><tbody>{balances.map((balance) => <tr key={balance.locationId}><td>{balance.warehouseName}</td><td><strong>{balance.locationCode}</strong><small>{balance.locationName}</small></td><td><StatusBadge tone={balance.inventoryStatus === "orphaned" ? "danger" : balance.inventoryStatus === "usable" ? "success" : "warning"}>{titleCase(balance.inventoryStatus)}</StatusBadge></td><td className="numeric">{balance.recordedQuantity}</td><td className="numeric">{balance.reservedQuantity}</td><td className="numeric strong">{balance.recordedQuantity - balance.reservedQuantity}</td></tr>)}</tbody></table></div></section>
+    <section className="panel"><PanelHeading title="Movement history" detail={`${movementTotal} immutable posted record${movementTotal === 1 ? "" : "s"} for this product.`} />{productMovements.length ? <MovementsTable movements={productMovements} /> : <div className="empty-inline">No movement records exist for this product.</div>}{movementPages > 1 ? <nav className="snapshot-pagination" aria-label="Product movement pages"><button className="button secondary" disabled={movementPage <= 1} onClick={() => setMovementPage((current) => current - 1)}>Previous</button><span>Page {movementPage} of {movementPages}</span><button className="button secondary" disabled={movementPage >= movementPages} onClick={() => setMovementPage((current) => current + 1)}>Next</button></nav> : null}</section>
+  </div>;
 }
 
 function MovementsView({ movements }: { movements: Movement[] }) {
@@ -1038,7 +1192,7 @@ function MovementsView({ movements }: { movements: Movement[] }) {
 }
 
 function MovementsTable({ movements }: { movements: Movement[] }) {
-  return <div className="responsive-table"><table><caption className="sr-only">Posted inventory movements</caption><thead><tr><th>Date and time</th><th>Movement</th><th>Source document</th><th>Product / unit</th><th className="numeric">Quantity</th><th>From</th><th>To</th><th>Posted by</th></tr></thead><tbody>{movements.map((movement) => <tr key={movement.id}><td>{movement.time}</td><td><StatusBadge>{movement.type}</StatusBadge></td><td><button className="table-link">{movement.document}</button></td><td><code>{movement.product}</code></td><td className={`numeric strong ${movement.quantity < 0 ? "text-danger" : "text-success"}`}>{movement.quantity > 0 ? "+" : ""}{movement.quantity}</td><td>{movement.from}</td><td>{movement.to}</td><td>{movement.user}</td></tr>)}</tbody></table></div>;
+  return <div className="responsive-table"><table><caption className="sr-only">Posted inventory movements</caption><thead><tr><th>Date and time</th><th>Movement</th><th>Source document</th><th>Product / unit</th><th className="numeric">Quantity</th><th>From</th><th>To</th><th>Posted by</th></tr></thead><tbody>{movements.map((movement) => <tr key={movement.id}><td>{movement.time}</td><td><StatusBadge>{movement.type}</StatusBadge></td><td><span className="table-link">{movement.document}</span></td><td><code>{movement.product}</code></td><td className={`numeric strong ${movement.quantity < 0 ? "text-danger" : "text-success"}`}>{movement.quantity > 0 ? "+" : ""}{movement.quantity}</td><td>{movement.from}</td><td>{movement.to}</td><td>{movement.user}</td></tr>)}</tbody></table></div>;
 }
 
 function CountsView({ products, balances, onCount }: { products: Product[]; balances: InventoryLocationBalance[]; onCount: (product: Product, balance: InventoryLocationBalance) => void }) {
@@ -1048,7 +1202,7 @@ function CountsView({ products, balances, onCount }: { products: Product[]; bala
 
 
 function PartnersView({ partners }: { partners: Partner[] }) {
-  return <section className="panel worklist"><FilterBar placeholder="Search customer, vendor, contact, or account"><button className="filter-button">All partner types</button></FilterBar><div className="responsive-table"><table><caption className="sr-only">Customers and vendors from the live partner registry</caption><thead><tr><th>Partner</th><th>Type</th><th>Email</th><th>Phone</th><th>Record ID</th></tr></thead><tbody>{partners.map((partner) => <tr key={partner.id}><td><strong>{partner.name}</strong></td><td>{titleCase(partner.type)}</td><td>{partner.email || "—"}</td><td>{partner.phone || "—"}</td><td><small>{partner.id}</small></td></tr>)}{!partners.length ? <tr><td colSpan={5}><div className="empty-inline">No business partners have been created yet.</div></td></tr> : null}</tbody></table></div></section>;
+  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Customers and vendors from the live partner registry</caption><thead><tr><th>Partner</th><th>Type</th><th>Contact</th><th>Address</th><th>Credit control</th></tr></thead><tbody>{partners.map((partner) => <tr key={partner.id}><td><strong>{partner.name}</strong><small>{partner.id}</small></td><td>{titleCase(partner.type)}</td><td>{partner.email || "—"}<small>{partner.phone || ""}</small></td><td>{[partner.addressLine1, partner.city, partner.region, partner.postalCode, partner.country].filter(Boolean).join(", ") || "Not recorded"}</td><td>{partner.creditHold ? <StatusBadge tone="danger">Credit hold</StatusBadge> : partner.creditLimitCents ? money.format(partner.creditLimitCents / 100) : "No limit"}</td></tr>)}{!partners.length ? <tr><td colSpan={5}><div className="empty-inline">No business partners match this view.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
 
@@ -1071,7 +1225,7 @@ function ReportsView({ snapshot }: { snapshot: Snapshot }) {
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
     const link = document.createElement("a"); link.href = url; link.download = `paneflow-availability-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url);
   };
-  const reports = [{ title: "Late purchase orders", detail: `${snapshot.summary.lateReceipts} POs currently late`, tone: "danger" as Severity }, { title: "Available versus reserved", detail: `${snapshot.products.reduce((sum, product) => sum + product.available, 0)} available · ${snapshot.products.reduce((sum, product) => sum + product.reserved, 0)} reserved`, tone: "info" as Severity }, { title: "Three-way-match exceptions", detail: `${snapshot.bills.filter((bill) => bill.variance).length} bill requires review`, tone: "warning" as Severity }, { title: "Special-order inventory", detail: `${snapshot.products.filter((product) => product.customerRef).length} customer-specific units`, tone: "success" as Severity }];
+  const reports = [{ title: "Late purchase orders", detail: `${snapshot.summary.lateReceipts} POs currently late`, tone: "danger" as Severity }, { title: "Available versus reserved", detail: `${snapshot.summary.available} available · ${snapshot.summary.reserved} reserved`, tone: "info" as Severity }, { title: "Three-way-match exceptions", detail: `${snapshot.summary.matchExceptions} bill${snapshot.summary.matchExceptions === 1 ? "" : "s"} require review`, tone: "warning" as Severity }, { title: "Special-order inventory", detail: `${snapshot.summary.specialOrderInventory} stocked special-order SKU${snapshot.summary.specialOrderInventory === 1 ? "" : "s"}`, tone: "success" as Severity }];
   return <div className="stack"><section className="report-grid" aria-label="Report summaries">{reports.map((report) => <article className={`report-card ${report.tone}`} key={report.title}><span className="report-icon" aria-hidden="true">▥</span><strong>{report.title}</strong><p>{report.detail}</p><b>Current live snapshot</b></article>)}</section><section className="panel"><PanelHeading title="Projected availability" detail="Exact current values with downloadable operational and accounting handoffs." /><div className="report-filters"><label>Scope<select value={scope} onChange={(event) => setScope(event.target.value as "all" | "risk")}><option value="all">All products</option><option value="risk">Risks only</option></select></label><span className="read-only-label">Current live snapshot · all configured locations</span><button className="button secondary" onClick={exportCsv}>Export current table</button><a className="button secondary" href={`/api/export?type=accounting&from=${exportFrom}&to=${exportTo}`}>Accounting control export</a><a className="button primary" href={`/api/export?type=quickbooks&from=${exportFrom}&to=${exportTo}`}>Export QuickBooks journal</a></div><p className="read-only-label">PaneFlow exports an audited journal handoff for {exportFrom} through {exportTo}; QuickBooks remains the general ledger and system of record for statutory accounting.</p><div className="responsive-table"><table><caption className="sr-only">Projected product availability</caption><thead><tr><th>Product</th><th className="numeric">Usable now</th><th className="numeric">Incoming</th><th className="numeric">Open demand</th><th className="numeric">Projected</th><th>Risk</th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><strong>{product.name}</strong><small>{product.sku}</small></td><td className="numeric">{product.usable}</td><td className="numeric">{product.incoming}</td><td className="numeric">{product.demand}</td><td className={`numeric strong ${product.projected < 0 ? "text-danger" : ""}`}>{product.projected}</td><td>{product.projected < 0 ? <StatusBadge tone="danger">Demand exceeds supply</StatusBadge> : <StatusBadge tone="success">Covered</StatusBadge>}</td></tr>)}{!products.length ? <tr><td colSpan={6}><div className="empty-inline">No products are available in this scope.</div></td></tr> : null}</tbody></table></div></section></div>;
 }
 
@@ -1085,24 +1239,137 @@ function WarehouseView({ snapshot, onReceive }: { snapshot: Snapshot; onReceive:
 }
 
 
-function AdvancedCreateOrderDialog({ type, partners, products, onClose, onSubmit }: { type: "purchaseOrder" | "salesOrder"; partners: Partner[]; products: Product[]; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
+function ReferenceSearchSelect({ kind, role, partnerId, quantity = 1, value, initialOptions, onSelect, placeholder }: { kind: "products" | "partners" | "locations"; role?: "vendor" | "customer" | "usable" | "quarantine" | "damaged" | "in_transit" | "return_pending" | "non_usable"; partnerId?: string; quantity?: number; value: string; initialOptions: LookupOption[]; onSelect: (option: LookupOption) => void; placeholder: string }) {
+  const listboxId = useId();
+  const selected = initialOptions.find((option) => option.id === value);
+  const [query, setQuery] = useState(selected?.label ?? "");
+  const [options, setOptions] = useState<LookupOption[]>(initialOptions.slice(0, 20));
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setLoading(true);
+      try {
+        const params = new URLSearchParams({ lookup: kind, q: query, limit: "20" });
+        if (role) params.set("role", role);
+        if (kind === "products" && partnerId) params.set("partnerId", partnerId);
+        if (kind === "products") params.set("quantity", String(Math.max(quantity, 1)));
+        const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error("Reference lookup unavailable");
+        const raw = await response.json() as Record<string, unknown>;
+        const mapped = asRows(raw.items).map((item): LookupOption => kind === "products" ? {
+          id: text(item.id),
+          label: `${text(item.sku)} · ${text(item.name)}`,
+          detail: [text(item.dimensions), text(item.finish), text(item.material)].filter(Boolean).join(" · "),
+          unitAmount: number(item.effectiveUnitAmountCents, number(role === "vendor" ? item.standardCostCents : item.sellingPriceCents)) / 100,
+          uomId: text(item.selectedUomId) || undefined,
+          uomCode: text(item.selectedUomCode) || undefined,
+          priceSource: text(item.priceSource) || undefined,
+          factorToBase: number(item.factorToBase, 1),
+        } : kind === "locations" ? {
+          id: text(item.id),
+          label: `${text(item.warehouseCode)} · ${text(item.code)} · ${text(item.name)}`,
+          detail: `${text(item.warehouseName)} · ${titleCase(text(item.inventoryStatus))}`,
+        } : {
+          id: text(item.id),
+          label: text(item.name),
+          detail: [text(item.code), text(item.email), titleCase(text(item.partnerType))].filter(Boolean).join(" · "),
+          addressLine1: text(item.addressLine1) || undefined,
+          addressLine2: text(item.addressLine2) || undefined,
+          city: text(item.city) || undefined,
+          region: text(item.region) || undefined,
+          postalCode: text(item.postalCode) || undefined,
+          country: text(item.country, "CA"),
+        });
+        setOptions(mapped);
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) setOptions(initialOptions.slice(0, 20));
+      } finally {
+        setLoading(false);
+      }
+    }, 180);
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [initialOptions, kind, open, partnerId, quantity, query, role]);
+
+  return <div className="reference-search"><input role="combobox" value={query} placeholder={placeholder} autoComplete="off" aria-controls={listboxId} aria-expanded={open} aria-autocomplete="list" onFocus={() => setOpen(true)} onChange={(event) => { setQuery(event.target.value); setOpen(true); }} onBlur={() => window.setTimeout(() => setOpen(false), 120)} />{open ? <div id={listboxId} className="reference-results" role="listbox">{loading ? <span className="reference-status">Searching…</span> : options.length ? options.map((option) => <button type="button" role="option" aria-selected={option.id === value} key={option.id} onMouseDown={(event) => event.preventDefault()} onClick={() => { onSelect(option); setQuery(option.label); setOpen(false); }}><strong>{option.label}</strong><small>{option.detail}</small></button>) : <span className="reference-status">No matching active records</span>}</div> : null}</div>;
+}
+
+function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, onClose, onSubmit }: { type: "purchaseOrder" | "salesOrder"; initialOrder?: SalesOrder; partners: Partner[]; products: Product[]; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
   const isPurchase = type === "purchaseOrder";
-  const eligiblePartners = partners.filter((partner) => partner.type === (isPurchase ? "vendor" : "customer"));
-  const initialLine = (): ComposerLine => ({ id: crypto.randomUUID(), productId: products[0]?.id ?? "", quantity: 1, unitAmount: isPurchase ? 650 : 1150, discountRate: 0, taxCode: "GST", taxRate: 5, route: "stock", projectReference: "", sourceSalesOrderLineId: "", linkedPurchaseOrderLineId: "" });
-  const [partnerId, setPartnerId] = useState(eligiblePartners[0]?.id ?? "");
-  const [date, setDate] = useState(futureDate(isPurchase ? 14 : 21));
-  const [currency, setCurrency] = useState("CAD");
-  const [exchangeRate, setExchangeRate] = useState(1);
-  const [terms, setTerms] = useState(isPurchase ? "Net 30" : "Net 15");
-  const [dueDate, setDueDate] = useState(futureDate(isPurchase ? 44 : 36));
+  const editing = Boolean(initialOrder);
+  const partnerRole = isPurchase ? "vendor" : "customer";
+  const eligiblePartners = partners.filter((partner) => partner.type === partnerRole || partner.type === "both");
+  const initialPartnerOptions: LookupOption[] = eligiblePartners.map((partner) => ({ id: partner.id, label: partner.name, detail: [partner.email, titleCase(partner.type)].filter(Boolean).join(" · "), addressLine1: partner.addressLine1, addressLine2: partner.addressLine2, city: partner.city, region: partner.region, postalCode: partner.postalCode, country: partner.country }));
+  if (initialOrder?.customerId && !initialPartnerOptions.some((option) => option.id === initialOrder.customerId)) initialPartnerOptions.unshift({ id: initialOrder.customerId, label: initialOrder.customer, detail: "Current customer", addressLine1: initialOrder.shipToAddressLine1, addressLine2: initialOrder.shipToAddressLine2, city: initialOrder.shipToCity, region: initialOrder.shipToRegion, postalCode: initialOrder.shipToPostalCode, country: initialOrder.shipToCountry });
+  const initialProductOptions: LookupOption[] = products.map((product) => ({
+    id: product.id,
+    label: `${product.sku} · ${product.name}`,
+    detail: product.specification,
+    unitAmount: isPurchase ? product.standardCost : product.sellingPrice,
+    uomId: isPurchase ? product.purchaseUomId : product.salesUomId,
+    uomCode: isPurchase ? product.purchaseUomCode : product.salesUomCode,
+    priceSource: isPurchase ? "Catalog standard cost" : "Catalog selling price",
+  }));
+  initialOrder?.lines?.forEach((line) => { if (!initialProductOptions.some((option) => option.id === line.productId)) initialProductOptions.push({ id: line.productId, label: `${line.sku} · ${line.product}`, detail: line.projectReference ?? "Current draft line" }); });
+  const initialLine = (): ComposerLine => {
+    const product = products[0];
+    return { id: crypto.randomUUID(), productId: product?.id ?? "", quantity: 1, unitAmount: product ? (isPurchase ? product.standardCost : product.sellingPrice) : 0, uomId: product ? (isPurchase ? product.purchaseUomId : product.salesUomId) : "", uomCode: product ? (isPurchase ? product.purchaseUomCode : product.salesUomCode) : "", priceSource: product ? (isPurchase ? "Catalog standard cost" : "Catalog selling price") : "Select a product", discountRate: 0, taxCode: "GST", taxRate: 5, route: "stock", projectReference: "", sourceSalesOrderLineId: "", linkedPurchaseOrderLineId: "" };
+  };
+  const existingLines = initialOrder?.lines?.map((line): ComposerLine => ({ id: line.id, productId: line.productId, quantity: line.ordered, unitAmount: line.unitPrice, uomId: line.orderedUomId ?? products.find((product) => product.id === line.productId)?.salesUomId ?? "", uomCode: line.orderedUomCode ?? products.find((product) => product.id === line.productId)?.salesUomCode ?? "", priceSource: "Saved order price", discountRate: line.ordered * line.unitPrice > 0 ? line.discountCents / (line.ordered * line.unitPrice) : 0, taxCode: line.taxable ? "GST" : "Exempt", taxRate: line.taxRateBps / 100, route: line.fulfillmentRoute.replaceAll("_", "-"), projectReference: line.projectReference ?? initialOrder.project, sourceSalesOrderLineId: "", linkedPurchaseOrderLineId: line.linkedPurchaseOrderLineId ?? "" })) ?? [];
+  const [partnerId, setPartnerId] = useState(initialOrder?.customerId ?? eligiblePartners[0]?.id ?? "");
+  const [date, setDate] = useState(initialOrder?.requestedDate ?? futureDate(isPurchase ? 14 : 21));
+  const [currency, setCurrency] = useState(initialOrder?.currency ?? "CAD");
+  const [exchangeRate, setExchangeRate] = useState(initialOrder?.exchangeRateToBase ?? 1);
+  const [terms, setTerms] = useState(initialOrder?.paymentTerms ?? (isPurchase ? "Net 30" : "Net 15"));
+  const [dueDate, setDueDate] = useState(initialOrder?.dueDate ?? futureDate(isPurchase ? 44 : 36));
+  const [shipToName, setShipToName] = useState(initialOrder?.shipToName ?? initialOrder?.customer ?? eligiblePartners[0]?.name ?? "");
+  const [shipToAddressLine1, setShipToAddressLine1] = useState(initialOrder?.shipToAddressLine1 ?? eligiblePartners[0]?.addressLine1 ?? "");
+  const [shipToAddressLine2, setShipToAddressLine2] = useState(initialOrder?.shipToAddressLine2 ?? eligiblePartners[0]?.addressLine2 ?? "");
+  const [shipToCity, setShipToCity] = useState(initialOrder?.shipToCity ?? eligiblePartners[0]?.city ?? "");
+  const [shipToRegion, setShipToRegion] = useState(initialOrder?.shipToRegion ?? eligiblePartners[0]?.region ?? "");
+  const [shipToPostalCode, setShipToPostalCode] = useState(initialOrder?.shipToPostalCode ?? eligiblePartners[0]?.postalCode ?? "");
+  const [shipToCountry, setShipToCountry] = useState(initialOrder?.shipToCountry ?? eligiblePartners[0]?.country ?? "CA");
+  const [deliveryInstructions, setDeliveryInstructions] = useState(initialOrder?.deliveryInstructions ?? "");
   const [freight, setFreight] = useState(0);
   const [fees, setFees] = useState(0);
   const [deposit, setDeposit] = useState(0);
-  const [lines, setLines] = useState<ComposerLine[]>([initialLine()]);
+  const [lines, setLines] = useState<ComposerLine[]>(existingLines.length ? existingLines : [initialLine()]);
+  const [productOptions, setProductOptions] = useState<Record<string, LookupOption>>(() => Object.fromEntries(initialProductOptions.map((option) => [option.id, option])));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => { closeRef.current?.focus(); }, []);
+  useEffect(() => {
+    if (isPurchase || !partnerId) return;
+    const controller = new AbortController();
+    void (async () => {
+      const priced = await Promise.all(lines.map(async (line) => {
+        if (line.priceSource === "Manual override" || line.priceSource === "Saved order price") return null;
+        const sku = productOptions[line.productId]?.label.split(" · ")[0] ?? "";
+        if (!sku) return null;
+        const params = new URLSearchParams({ lookup: "products", role: "customer", partnerId, q: sku, quantity: String(Math.max(line.quantity, 1)), limit: "10" });
+        const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) return null;
+        const item = asRows((await response.json() as Record<string, unknown>).items).find((candidate) => text(candidate.id) === line.productId);
+        return item ? { id: line.id, unitAmount: number(item.effectiveUnitAmountCents) / 100, uomId: text(item.selectedUomId), uomCode: text(item.selectedUomCode), priceSource: text(item.priceSource, "Catalog selling price") } : null;
+      }));
+      if (!controller.signal.aborted) setLines((current) => {
+        let changed = false;
+        const next = current.map((line) => {
+          const update = priced.find((item) => item?.id === line.id);
+          if (!update || line.priceSource === "Manual override" || line.priceSource === "Saved order price") return line;
+          if (line.unitAmount === update.unitAmount && line.uomId === update.uomId && line.uomCode === update.uomCode && line.priceSource === update.priceSource) return line;
+          changed = true;
+          return { ...line, unitAmount: update.unitAmount, uomId: update.uomId, uomCode: update.uomCode, priceSource: update.priceSource };
+        });
+        return changed ? next : current;
+      });
+    })().catch((caught) => { if (!(caught instanceof DOMException && caught.name === "AbortError")) setError("Customer pricing could not be refreshed; catalog prices remain visible for review."); });
+    return () => controller.abort();
+  }, [isPurchase, lines, partnerId, productOptions]);
 
   const itemSubtotal = lines.reduce((sum, line) => sum + line.quantity * line.unitAmount, 0);
   const discountTotal = lines.reduce((sum, line) => sum + line.quantity * line.unitAmount * line.discountRate / 100, 0);
@@ -1115,22 +1382,23 @@ function AdvancedCreateOrderDialog({ type, partners, products, onClose, onSubmit
     event.preventDefault();
     setError("");
     if (!partnerId) return setError(`Select a ${isPurchase ? "vendor" : "customer"}.`);
-    if (!lines.length || lines.some((line) => !line.productId || line.quantity <= 0 || line.unitAmount < 0)) return setError("Every line needs a product, positive quantity, and valid unit amount.");
+    if (!lines.length || lines.some((line) => !line.productId || !line.uomId || line.quantity <= 0 || line.unitAmount < 0)) return setError("Every line needs a product with a configured unit, positive quantity, and valid unit amount.");
     if (isPurchase && lines.some((line) => line.route !== "stock" && !line.sourceSalesOrderLineId.trim())) return setError("Every special-order or drop-ship purchase line must link to its source sales-order line ID.");
     if (!date || !dueDate) return setError("Enter delivery and due dates.");
+    if (!isPurchase && (!shipToName.trim() || !shipToAddressLine1.trim() || !shipToCity.trim() || !shipToRegion.trim() || !shipToPostalCode.trim() || !shipToCountry.trim())) return setError("Enter a complete ship-to name and address before saving the sales-order draft.");
     if (currency !== "CAD" && exchangeRate <= 0) return setError("Enter a positive exchange rate for the foreign currency.");
     setSubmitting(true);
     try {
       const normalizedLines = lines.map((line) => {
-        const product = products.find((item) => item.id === line.productId);
-        return { kind: "item", productId: line.productId, quantity: line.quantity, unitCostCents: isPurchase ? Math.round(line.unitAmount * 100) : undefined, unitPriceCents: isPurchase ? undefined : Math.round(line.unitAmount * 100), discountCents: Math.round(line.quantity * line.unitAmount * line.discountRate), taxable: line.taxRate > 0, taxCode: line.taxCode, taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: line.route.replaceAll("-", "_"), projectReference: line.projectReference, sourceSalesOrderLineId: isPurchase && line.route !== "stock" ? line.sourceSalesOrderLineId.trim() : undefined, linkedPurchaseOrderLineId: !isPurchase && line.linkedPurchaseOrderLineId.trim() ? line.linkedPurchaseOrderLineId.trim() : undefined, configurationSnapshot: product ? `${product.sku} · ${product.name} · ${product.specification}` : undefined };
+        const product = productOptions[line.productId];
+        return { kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId, unitCostCents: isPurchase ? Math.round(line.unitAmount * 100) : undefined, unitPriceCents: isPurchase ? undefined : Math.round(line.unitAmount * 100), discountCents: Math.round(line.quantity * line.unitAmount * line.discountRate), taxable: line.taxRate > 0, taxCode: line.taxCode, taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: line.route.replaceAll("-", "_"), projectReference: line.projectReference, sourceSalesOrderLineId: isPurchase && line.route !== "stock" ? line.sourceSalesOrderLineId.trim() : undefined, linkedPurchaseOrderLineId: !isPurchase && line.linkedPurchaseOrderLineId.trim() ? line.linkedPurchaseOrderLineId.trim() : undefined, configurationSnapshot: product ? `${product.label} · ${product.detail}` : undefined };
       });
       const chargeLines = [
         freight > 0 ? { kind: "charge", chargeType: "freight", description: "Freight", amountCents: Math.round(freight * 100), direction: "add", taxable: true, refundable: false, taxCode: "GST", taxRateBps: 500 } : null,
         fees > 0 ? { kind: "charge", chargeType: "fee", description: "Other fees", amountCents: Math.round(fees * 100), direction: "add", taxable: true, refundable: false, taxCode: "GST", taxRateBps: 500 } : null,
         deposit > 0 ? { kind: "charge", chargeType: "returnable_deposit", description: "Refundable core / empty deposit", amountCents: Math.round(deposit * 100), direction: "add", taxable: false, refundable: true, taxCode: "EXEMPT", taxRateBps: 0 } : null,
       ].filter(Boolean);
-      await onSubmit({ ...(isPurchase ? { vendorId: partnerId, expectedDate: date } : { customerId: partnerId, requestedDate: date }), lines: [...normalizedLines, ...chargeLines], currency, exchangeRateToBase: exchangeRate, paymentTerms: terms, dueDate });
+      await onSubmit({ ...(isPurchase ? { vendorId: partnerId, expectedDate: date } : { customerId: partnerId, requestedDate: date, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions }), lines: [...normalizedLines, ...chargeLines], currency, exchangeRateToBase: exchangeRate, paymentTerms: terms, dueDate, projectReference: initialOrder?.project });
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The order could not be created. Your entries are still here."); }
     finally { setSubmitting(false); }
   };
@@ -1143,12 +1411,32 @@ function AdvancedCreateOrderDialog({ type, partners, products, onClose, onSubmit
     { category: "Financial effect", label: "Refundable core / empty deposit", after: `${currency} ${deposit.toFixed(2)}` },
   ];
 
-  return <div className="modal-overlay" role="presentation"><section className="command-dialog create-order-dialog commercial-composer" role="dialog" aria-modal="true" aria-labelledby="create-order-title"><div className="dialog-header"><div><span className="section-kicker">New commercial commitment</span><h2 id="create-order-title">Create multi-line {isPurchase ? "purchase order" : "sales order"}</h2><p>Build the complete draft, then submit or confirm it as a separate command.</p></div><button ref={closeRef} className="icon-button" aria-label="Close dialog" onClick={onClose}>×</button></div><form onSubmit={submit}>
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog create-order-dialog commercial-composer" role="dialog" aria-modal="true" aria-labelledby="create-order-title"><div className="dialog-header"><div><span className="section-kicker">{editing ? initialOrder?.number : "New commercial commitment"}</span><h2 id="create-order-title">{editing ? "Edit sales order draft" : `Create multi-line ${isPurchase ? "purchase order" : "sales order"}`}</h2><p>{editing ? "Add, remove, or change draft lines before confirmation activates demand." : "Build the complete draft, then submit or confirm it as a separate command."}</p></div><button ref={closeRef} className="icon-button" aria-label="Close dialog" onClick={onClose}>×</button></div><form onSubmit={submit}>
     {error && <div className="error-summary" role="alert" tabIndex={-1}><strong>Review the order</strong><p>{error}</p></div>}
-    <div className="command-form form-grid composer-header-fields"><label>{isPurchase ? "Vendor" : "Customer"}<select value={partnerId} onChange={(event) => setPartnerId(event.target.value)}>{eligiblePartners.map((partner) => <option key={partner.id} value={partner.id}>{partner.name}</option>)}</select></label><label>{isPurchase ? "Expected delivery" : "Requested delivery"}<input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><label>Currency<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option>CAD</option><option>USD</option><option>EUR</option></select></label>{currency !== "CAD" && <label>Exchange rate to CAD<input type="number" min="0.0001" step="0.0001" value={exchangeRate} onChange={(event) => setExchangeRate(Number(event.target.value))} /></label>}<label>Payment terms<select value={terms} onChange={(event) => setTerms(event.target.value)}><option>Due on receipt</option><option>Net 15</option><option>Net 30</option><option>Net 45</option></select></label><label>Due date<input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} /></label></div>
-    <section className="composer-lines" aria-labelledby="composer-lines-title"><div className="composer-section-heading"><div><strong id="composer-lines-title">Product lines</strong><small>Pricing, tax, route, and supply lineage are explicit per line.</small></div><button type="button" className="button secondary" onClick={() => setLines((current) => [...current, initialLine()])}>Add product line</button></div>{lines.map((line, index) => { const selected = products.find((product) => product.id === line.productId); return <fieldset key={line.id} className="composer-line"><legend>Line {index + 1}</legend><label className="product-field">Product / configuration<select value={line.productId} onChange={(event) => updateLine(line.id, { productId: event.target.value })}>{products.map((product) => <option key={product.id} value={product.id}>{product.sku} · {product.name}</option>)}</select><small>{selected?.specification}</small></label><label>Quantity<input type="number" min="1" value={line.quantity} onChange={(event) => updateLine(line.id, { quantity: Number(event.target.value) })} /></label><label>Unit {isPurchase ? "cost" : "price"}<input type="number" min="0" step="0.01" value={line.unitAmount} onChange={(event) => updateLine(line.id, { unitAmount: Number(event.target.value) })} /></label><label>Discount %<input type="number" min="0" max="100" step="0.1" value={line.discountRate} onChange={(event) => updateLine(line.id, { discountRate: Number(event.target.value) })} /></label><label>Tax code<select value={line.taxCode} onChange={(event) => updateLine(line.id, { taxCode: event.target.value, taxRate: event.target.value === "GST" ? 5 : 0 })}><option>GST</option><option>Zero</option><option>Exempt</option></select></label><label>Tax %<input type="number" min="0" value={line.taxRate} onChange={(event) => updateLine(line.id, { taxRate: Number(event.target.value) })} /></label><label>Fulfillment route<select value={line.route} onChange={(event) => updateLine(line.id, { route: event.target.value as ComposerLine["route"] })}><option value="stock">Stock</option><option value="special-order">Special order</option><option value="drop-ship">Drop ship</option></select></label><label className="project-field">Customer / project / opening<input value={line.projectReference} onChange={(event) => updateLine(line.id, { projectReference: event.target.value })} placeholder="Optional allocation" /></label>{isPurchase && line.route !== "stock" ? <label className="project-field">Source sales-order line ID<input value={line.sourceSalesOrderLineId} onChange={(event) => updateLine(line.id, { sourceSalesOrderLineId: event.target.value })} placeholder="Required demand-line ID" required /></label> : null}{!isPurchase && line.route !== "stock" ? <label className="project-field">Linked purchase-order line ID<input value={line.linkedPurchaseOrderLineId} onChange={(event) => updateLine(line.id, { linkedPurchaseOrderLineId: event.target.value })} placeholder="Optional until supply PO is created" /></label> : null}{lines.length > 1 && <button type="button" className="remove-composer-line" onClick={() => setLines((current) => current.filter((item) => item.id !== line.id))}>Remove line {index + 1}</button>}</fieldset>; })}</section>
+    <div className="command-form form-grid composer-header-fields"><label>{isPurchase ? "Vendor" : "Customer"}<ReferenceSearchSelect kind="partners" role={partnerRole} value={partnerId} initialOptions={initialPartnerOptions} onSelect={(option) => { setPartnerId(option.id); if (!isPurchase) { setShipToName(option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); } }} placeholder={`Search ${partnerRole} name, code, or email`} /></label><label>{isPurchase ? "Expected delivery" : "Requested delivery"}<input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label><label>Currency<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option>CAD</option><option>USD</option><option>EUR</option></select></label>{currency !== "CAD" && <label>Exchange rate to CAD<input type="number" min="0.0001" step="0.0001" value={exchangeRate} onChange={(event) => setExchangeRate(Number(event.target.value))} /></label>}<label>Payment terms<select value={terms} onChange={(event) => setTerms(event.target.value)}><option>Due on receipt</option><option>Net 15</option><option>Net 30</option><option>Net 45</option></select></label><label>Due date<input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} /></label></div>
+    {!isPurchase ? <fieldset className="composer-lines"><legend>Ship-to address</legend><div className="command-form form-grid composer-header-fields"><label>Recipient<input value={shipToName} onChange={(event) => setShipToName(event.target.value)} required /></label><label>Address line 1<input value={shipToAddressLine1} onChange={(event) => setShipToAddressLine1(event.target.value)} required /></label><label>Address line 2<input value={shipToAddressLine2} onChange={(event) => setShipToAddressLine2(event.target.value)} /></label><label>City<input value={shipToCity} onChange={(event) => setShipToCity(event.target.value)} required /></label><label>Province / region<input value={shipToRegion} onChange={(event) => setShipToRegion(event.target.value)} required /></label><label>Postal code<input value={shipToPostalCode} onChange={(event) => setShipToPostalCode(event.target.value)} required /></label><label>Country<input value={shipToCountry} onChange={(event) => setShipToCountry(event.target.value.toUpperCase())} required /></label><label>Delivery instructions<input value={deliveryInstructions} onChange={(event) => setDeliveryInstructions(event.target.value)} placeholder="Dock, access, or appointment details" /></label></div></fieldset> : null}
+    <section className="composer-lines" aria-labelledby="composer-lines-title">
+      <div className="composer-section-heading"><div><strong id="composer-lines-title">Product lines</strong><small>Catalog and contract pricing use the selected product unit.</small></div><button type="button" className="button secondary" onClick={() => setLines((current) => [...current, initialLine()])}>Add product line</button></div>
+      {lines.map((line, index) => {
+        const selected = productOptions[line.productId];
+        return <fieldset key={line.id} className="composer-line">
+          <legend>Line {index + 1}</legend>
+          <label className="product-field">Product / configuration<ReferenceSearchSelect kind="products" role={partnerRole} partnerId={partnerId} quantity={line.quantity} value={line.productId} initialOptions={Object.values(productOptions)} onSelect={(option) => { setProductOptions((current) => ({ ...current, [option.id]: option })); updateLine(line.id, { productId: option.id, ...(option.unitAmount != null ? { unitAmount: option.unitAmount } : {}), uomId: option.uomId ?? "", uomCode: option.uomCode ?? "", priceSource: option.priceSource ?? "Catalog price" }); }} placeholder="Search SKU, name, manufacturer SKU, or dimensions" /><small>{selected?.detail}</small></label>
+          <label>Quantity ({line.uomCode || "unit"})<input type="number" min="1" value={line.quantity} onChange={(event) => updateLine(line.id, { quantity: Number(event.target.value) })} /><small>{line.uomCode ? `Posts through the ${line.uomCode} conversion` : "Select a configured product unit"}</small></label>
+          <label>Unit {isPurchase ? "cost" : "price"}<input type="number" min="0" step="0.01" value={line.unitAmount} onChange={(event) => updateLine(line.id, { unitAmount: Number(event.target.value), priceSource: "Manual override" })} /><small>{line.priceSource}</small></label>
+          <label>Discount %<input type="number" min="0" max="100" step="0.1" value={line.discountRate} onChange={(event) => updateLine(line.id, { discountRate: Number(event.target.value) })} /></label>
+          <label>Tax code<select value={line.taxCode} onChange={(event) => updateLine(line.id, { taxCode: event.target.value, taxRate: event.target.value === "GST" ? 5 : 0 })}><option>GST</option><option>Zero</option><option>Exempt</option></select></label>
+          <label>Tax %<input type="number" min="0" value={line.taxRate} onChange={(event) => updateLine(line.id, { taxRate: Number(event.target.value) })} /></label>
+          <label>Fulfillment route<select value={line.route} onChange={(event) => updateLine(line.id, { route: event.target.value as ComposerLine["route"] })}><option value="stock">Stock</option><option value="special-order">Special order</option><option value="drop-ship">Drop ship</option></select></label>
+          <label className="project-field">Customer / project / opening<input value={line.projectReference} onChange={(event) => updateLine(line.id, { projectReference: event.target.value })} placeholder="Optional allocation" /></label>
+          {isPurchase && line.route !== "stock" ? <label className="project-field">Source sales-order line ID<input value={line.sourceSalesOrderLineId} onChange={(event) => updateLine(line.id, { sourceSalesOrderLineId: event.target.value })} placeholder="Required demand-line ID" required /></label> : null}
+          {!isPurchase && line.route !== "stock" ? <label className="project-field">Linked purchase-order line ID<input value={line.linkedPurchaseOrderLineId} onChange={(event) => updateLine(line.id, { linkedPurchaseOrderLineId: event.target.value })} placeholder="Optional until supply PO is created" /></label> : null}
+          {lines.length > 1 && <button type="button" className="remove-composer-line" onClick={() => setLines((current) => current.filter((item) => item.id !== line.id))}>Remove line {index + 1}</button>}
+        </fieldset>;
+      })}
+    </section>
     <div className="composer-bottom-grid"><fieldset className="composer-charges"><legend>Charges, fees, and deposits</legend><label>Freight<input type="number" min="0" step="0.01" value={freight} onChange={(event) => setFreight(Number(event.target.value))} /></label><label>Other fees<input type="number" min="0" step="0.01" value={fees} onChange={(event) => setFees(Number(event.target.value))} /></label><label>Refundable core / empty deposit<input type="number" min="0" step="0.01" value={deposit} onChange={(event) => setDeposit(Number(event.target.value))} /></label></fieldset><dl className="composer-totals"><div><dt>Items</dt><dd>{currency} {itemSubtotal.toFixed(2)}</dd></div><div><dt>Discounts</dt><dd>−{currency} {discountTotal.toFixed(2)}</dd></div><div><dt>Freight & fees</dt><dd>{currency} {(freight + fees).toFixed(2)}</dd></div><div><dt>Refundable deposits</dt><dd>{currency} {deposit.toFixed(2)}</dd></div><div><dt>Tax</dt><dd>{currency} {taxTotal.toFixed(2)}</dd></div><div><dt>Paid</dt><dd>{currency} 0.00</dd></div><div className="total"><dt>Balance due</dt><dd>{currency} {total.toFixed(2)}</dd></div></dl></div>
-    <div className="simplified-policy"><span aria-hidden="true">i</span><p>This creates an editable draft only. It does not move stock, reserve inventory, post a payable or receivable, or send the document.</p></div><ImpactPreview lines={impact} /><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Keep editing later</button><button type="submit" className="button primary" disabled={submitting}>{submitting ? "Saving draft…" : `Save ${isPurchase ? "purchase" : "sales"} order draft`}</button></div>
+    <div className="simplified-policy"><span aria-hidden="true">i</span><p>{editing ? "Saving replaces the current draft lines atomically. It does not move stock, reserve inventory, or post an invoice." : "This creates an editable draft only. It does not move stock, reserve inventory, post a payable or receivable, or send the document."}</p></div><ImpactPreview lines={impact} /><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Keep editing later</button><button type="submit" className="button primary" disabled={submitting}>{submitting ? "Saving draft…" : editing ? "Save draft changes" : `Save ${isPurchase ? "purchase" : "sales"} order draft`}</button></div>
   </form></section></div>;
 }
 
@@ -1157,6 +1445,7 @@ type CommandPanelProps = {
   po?: PurchaseOrder;
   so?: SalesOrder;
   products: Product[];
+  locations: LocationOption[];
   countBalances: InventoryLocationBalance[];
   onClose: () => void;
   onSubmit: (payload: Record<string, unknown>) => Promise<void>;
@@ -1165,7 +1454,7 @@ type CommandPanelProps = {
   onRefreshCountApproval: (approval: CountApproval) => Promise<CountApproval>;
 };
 
-function CommandPanel({ command, po, so, products, countBalances, onClose, onSubmit, onRequestCountApproval, onApproveCountApproval, onRefreshCountApproval }: CommandPanelProps) {
+function CommandPanel({ command, po, so, products, locations, countBalances, onClose, onSubmit, onRequestCountApproval, onApproveCountApproval, onRefreshCountApproval }: CommandPanelProps) {
   const initialPoLine = po?.lines.find((line) => command.kind === "reopen" ? line.closed > 0 : command.kind === "vendor-return" ? line.received - line.returned > 0 : line.open > 0) ?? po?.lines[0];
   const initialSoLine = so?.lines?.find((line) => command.kind === "ship" ? line.reserved > 0 : line.open > 0) ?? so?.lines?.[0];
   const [selectedPoLineId, setSelectedPoLineId] = useState(initialPoLine?.id ?? "");
@@ -1174,8 +1463,9 @@ function CommandPanel({ command, po, so, products, countBalances, onClose, onSub
   const selectedSoLine = so?.lines?.find((line) => line.id === selectedSoLineId) ?? initialSoLine;
   const selectedSoProduct = products.find((product) => product.id === selectedSoLine?.productId);
   const effectivePo = po && selectedPoLine ? { ...po, ordered: selectedPoLine.ordered, received: selectedPoLine.received, returned: selectedPoLine.returned, closed: selectedPoLine.closed, open: selectedPoLine.open, lines: [selectedPoLine] } : po;
-  const lineAvailable = Math.min(selectedSoLine?.open ?? 0, selectedSoProduct?.available ?? 0);
-  const lineIncoming = Math.min(Math.max((selectedSoLine?.open ?? 0) - lineAvailable, 0), selectedSoProduct?.incoming ?? 0);
+  const salesFactor = selectedSoLine?.uomFactorToBase || 1;
+  const lineAvailable = Math.min(selectedSoLine?.open ?? 0, (selectedSoProduct?.available ?? 0) / salesFactor);
+  const lineIncoming = Math.min(Math.max((selectedSoLine?.open ?? 0) - lineAvailable, 0), (selectedSoProduct?.incoming ?? 0) / salesFactor);
   const effectiveSo = so && selectedSoLine ? { ...so, ordered: selectedSoLine.ordered, reserved: selectedSoLine.reserved, shipped: selectedSoLine.shipped, open: selectedSoLine.open, availableNow: lineAvailable, incomingBeforeDate: lineIncoming, shortage: Math.max(selectedSoLine.open - lineAvailable - lineIncoming, 0), route: titleCase(selectedSoLine.fulfillmentRoute), lines: [selectedSoLine] } : so;
   const defaults = commandDefaults(command.kind, effectivePo, effectiveSo, products);
   const initialBalance = countBalances.find((item) => item.locationId === command.locationId) ?? countBalances[0];
@@ -1184,6 +1474,10 @@ function CommandPanel({ command, po, so, products, countBalances, onClose, onSub
   const [reason, setReason] = useState("");
   const [disposition, setDisposition] = useState(defaults.disposition);
   const [expectedDate, setExpectedDate] = useState(futureDate(7));
+  const [carrier, setCarrier] = useState("");
+  const [serviceLevel, setServiceLevel] = useState("");
+  const [trackingNumber, setTrackingNumber] = useState("");
+  const [billOfLadingNumber, setBillOfLadingNumber] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [approvalRequired, setApprovalRequired] = useState(false);
@@ -1191,29 +1485,44 @@ function CommandPanel({ command, po, so, products, countBalances, onClose, onSub
   const [approvedCountPayload, setApprovedCountPayload] = useState<Record<string, unknown> | null>(null);
   const [approvalMessage, setApprovalMessage] = useState("");
   const [countLocationId, setCountLocationId] = useState(initialBalance?.locationId ?? "");
+  const usableLocations = locations.filter((location) => location.inventoryStatus === "usable");
+  const quarantineLocations = locations.filter((location) => location.inventoryStatus === "quarantine" || location.inventoryStatus === "damaged");
+  const [postingLocationId, setPostingLocationId] = useState(usableLocations[0]?.id ?? "");
+  const [quarantineLocationId, setQuarantineLocationId] = useState(quarantineLocations[0]?.id ?? "");
+  const [receiptLines, setReceiptLines] = useState(() => (po?.lines ?? []).filter((line) => line.open > 0 && line.fulfillmentRoute !== "drop_ship").map((line) => ({ lineId: line.id, lineVersion: line.version, quantity: line.open, damagedQuantity: 0, uomId: line.orderedUomId })));
+  const isBatchReceipt = command.kind === "receive" && receiptLines.length > 1;
+  const receiptQuantity = isBatchReceipt ? receiptLines.reduce((sum, line) => sum + Math.max(line.quantity, 0), 0) : quantity;
   const title = commandTitle(command.kind);
   const selectedCountBalance = countBalances.find((item) => item.locationId === countLocationId);
-  const impact = commandImpact(command.kind, quantity, secondaryQuantity, effectivePo, effectiveSo, disposition, selectedCountBalance?.recordedQuantity);
+  const impact = commandImpact(command.kind, receiptQuantity, isBatchReceipt ? receiptLines.reduce((sum, line) => sum + Math.max(line.damagedQuantity, 0), 0) : secondaryQuantity, effectivePo, effectiveSo, disposition, selectedCountBalance?.recordedQuantity);
   const max = commandDefaults(command.kind, effectivePo, effectiveSo, products).max;
   const countPayload = () => {
+    if (isBatchReceipt) return { lines: receiptLines.filter((line) => line.quantity > 0), locationId: postingLocationId, quarantineLocationId };
     const lineId = ["receive", "close", "reopen", "vendor-return"].includes(command.kind)
       ? selectedPoLine?.id
       : ["reserve", "ship", "customer-return"].includes(command.kind)
         ? selectedSoLine?.id
         : undefined;
-    return { quantity, quarantineQuantity: secondaryQuantity, reason, disposition, expectedDate, locationId: selectedCountBalance?.locationId, recordedQuantity: selectedCountBalance?.recordedQuantity, balanceVersion: selectedCountBalance?.version, ...(lineId ? { lineId } : {}) };
+    const lineUomId = ["receive", "vendor-return"].includes(command.kind) ? selectedPoLine?.orderedUomId : ["reserve", "ship", "customer-return"].includes(command.kind) ? selectedSoLine?.orderedUomId : undefined;
+    const locationId = command.kind === "count" ? selectedCountBalance?.locationId : ["receive", "vendor-return", "customer-return"].includes(command.kind) ? (command.kind === "customer-return" && disposition !== "available" ? quarantineLocationId : postingLocationId) : undefined;
+    return { quantity, quarantineQuantity: secondaryQuantity, reason, disposition, expectedDate, carrier, serviceLevel, trackingNumber, billOfLadingNumber, locationId, quarantineLocationId, uomId: lineUomId, recordedQuantity: selectedCountBalance?.recordedQuantity, balanceVersion: selectedCountBalance?.version, ...(lineId ? { lineId } : {}) };
   };
   const chooseCountLocation = (locationId: string) => { const balance = countBalances.find((item) => item.locationId === locationId); setCountLocationId(locationId); setQuantity(balance?.recordedQuantity ?? 0); setApprovalRequired(false); setCountApproval(null); setApprovedCountPayload(null); setApprovalMessage(""); };
   const choosePoLine = (lineId: string) => { const line = po?.lines.find((item) => item.id === lineId); setSelectedPoLineId(lineId); if (po && line) setQuantity(commandDefaults(command.kind, { ...po, ordered: line.ordered, received: line.received, returned: line.returned, closed: line.closed, open: line.open, lines: [line] }, effectiveSo, products).quantity); };
   const chooseSoLine = (lineId: string) => { const line = so?.lines?.find((item) => item.id === lineId); const product = products.find((item) => item.id === line?.productId); if (!so || !line) return; const availableNow = Math.min(line.open, product?.available ?? 0); const incomingBeforeDate = Math.min(Math.max(line.open - availableNow, 0), product?.incoming ?? 0); setSelectedSoLineId(lineId); setQuantity(commandDefaults(command.kind, effectivePo, { ...so, ordered: line.ordered, reserved: line.reserved, shipped: line.shipped, open: line.open, availableNow, incomingBeforeDate, shortage: Math.max(line.open - availableNow - incomingBeforeDate, 0), route: titleCase(line.fulfillmentRoute), lines: [line] }, products).quantity); };
+  const updateReceiptLine = (lineId: string, patch: Partial<{ quantity: number; damagedQuantity: number; uomId?: string }>) => setReceiptLines((current) => current.map((line) => line.lineId === lineId ? { ...line, ...patch } : line));
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (command.kind !== "count" && quantity <= 0) return setError("Enter a quantity greater than zero.");
+    if (command.kind !== "count" && receiptQuantity <= 0) return setError("Enter a quantity greater than zero.");
     if (command.kind === "count" && (!selectedCountBalance || !Number.isFinite(selectedCountBalance.version))) return setError("Select a current durable location balance before posting the count.");
     if (command.kind === "count" && quantity < 0) return setError("The counted quantity cannot be negative.");
-    if (command.kind !== "count" && max > 0 && quantity > max) return setError(`Quantity cannot exceed ${max}.`);
+    if (!isBatchReceipt && command.kind !== "count" && max > 0 && quantity > max) return setError(`Quantity cannot exceed ${max}.`);
+    if ((command.kind === "receive" || command.kind === "vendor-return" && disposition !== "allowance") && !postingLocationId) return setError("Select an active usable inventory location.");
+    if ((command.kind === "customer-return" && disposition !== "available") || (command.kind === "receive" && (secondaryQuantity > 0 || isBatchReceipt && receiptLines.some((line) => line.damagedQuantity > 0)))) { if (!quarantineLocationId) return setError("Select an active quarantine or damaged inventory location."); }
     if (command.kind === "receive" && secondaryQuantity > quantity) return setError("Quarantine quantity cannot exceed arrived quantity.");
+    if (isBatchReceipt && receiptLines.some((line) => line.quantity < 0 || line.damagedQuantity < 0 || line.damagedQuantity > line.quantity)) return setError("Each receipt line needs a non-negative quantity and quarantine cannot exceed arrived quantity.");
+    if (command.kind === "ship" && (!carrier.trim() || (!trackingNumber.trim() && !billOfLadingNumber.trim()))) return setError("Enter a carrier and either a tracking number or bill of lading.");
     if (["close", "reopen", "reverse", "vendor-return", "customer-return", "count"].includes(command.kind) && !reason.trim()) return setError("Select or enter a reason before continuing.");
     setSubmitting(true);
     setError("");
@@ -1273,20 +1582,40 @@ function CommandPanel({ command, po, so, products, countBalances, onClose, onSub
 
   return <div className="modal-overlay" role="presentation"><section className="command-dialog" role="dialog" aria-modal="true" aria-labelledby="command-title"><div className="dialog-header"><div><span className="section-kicker">{command.entityNumber}</span><h2 id="command-title">{title}</h2></div><button className="icon-button" aria-label="Close dialog" onClick={onClose}>×</button></div><form onSubmit={submit}>
     {error && <div className="error-summary" role="alert"><strong>Review the highlighted information</strong><p>{error}</p></div>}
-    <fieldset className="command-fields-lock" disabled={command.kind === "count" && Boolean(countApproval)}><CommandFields kind={command.kind} po={effectivePo} so={effectiveSo} purchaseLines={po?.lines ?? []} salesLines={so?.lines ?? []} selectedPoLineId={selectedPoLine?.id ?? ""} selectedSoLineId={selectedSoLine?.id ?? ""} setSelectedPoLineId={choosePoLine} setSelectedSoLineId={chooseSoLine} quantity={quantity} secondaryQuantity={secondaryQuantity} setQuantity={setQuantity} setSecondaryQuantity={setSecondaryQuantity} reason={reason} setReason={setReason} disposition={disposition} setDisposition={setDisposition} expectedDate={expectedDate} setExpectedDate={setExpectedDate} max={max} countBalances={countBalances} countLocationId={countLocationId} setCountLocationId={chooseCountLocation} /></fieldset>
+    <fieldset className="command-fields-lock" disabled={command.kind === "count" && Boolean(countApproval)}>
+      <CommandFields kind={command.kind} po={effectivePo} so={effectiveSo} purchaseLines={po?.lines ?? []} salesLines={so?.lines ?? []} selectedPoLineId={selectedPoLine?.id ?? ""} selectedSoLineId={selectedSoLine?.id ?? ""} setSelectedPoLineId={choosePoLine} setSelectedSoLineId={chooseSoLine} quantity={quantity} secondaryQuantity={secondaryQuantity} setQuantity={setQuantity} setSecondaryQuantity={setSecondaryQuantity} receiptLines={receiptLines} updateReceiptLine={updateReceiptLine} reason={reason} setReason={setReason} disposition={disposition} setDisposition={setDisposition} expectedDate={expectedDate} setExpectedDate={setExpectedDate} carrier={carrier} setCarrier={setCarrier} serviceLevel={serviceLevel} setServiceLevel={setServiceLevel} trackingNumber={trackingNumber} setTrackingNumber={setTrackingNumber} billOfLadingNumber={billOfLadingNumber} setBillOfLadingNumber={setBillOfLadingNumber} max={max} countBalances={countBalances} countLocationId={countLocationId} setCountLocationId={chooseCountLocation} usableLocations={usableLocations} quarantineLocations={quarantineLocations} postingLocationId={postingLocationId} setPostingLocationId={setPostingLocationId} quarantineLocationId={quarantineLocationId} setQuarantineLocationId={setQuarantineLocationId} />
+    </fieldset>
     {command.kind === "count" && approvalRequired ? <div className={`count-approval-status ${countApproval?.status ?? "required"}`} role="status"><strong>{countApproval ? `Approval ${countApproval.status}` : "Manager approval required"}</strong><p>{approvalMessage}</p>{countApproval ? <small>Request ID: {countApproval.id} · Version {countApproval.version}</small> : null}</div> : null}
     <ImpactPreview lines={impact} />
-    <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Go back</button>{command.kind === "count" && approvalRequired ? !countApproval ? <button type="button" className="button primary" disabled={submitting} onClick={() => void requestApproval()}>{submitting ? "Requesting…" : "Request manager approval"}</button> : countApproval.status === "pending" && countApproval.canApprove ? <button type="button" className="button primary" disabled={submitting} onClick={() => void approveRequest()}>{submitting ? "Approving…" : "Approve this variance"}</button> : countApproval.status === "pending" ? <button type="button" className="button primary" disabled={submitting} onClick={() => void checkApproval()}>{submitting ? "Checking…" : "Check approval status"}</button> : countApproval.status === "approved" ? <button type="submit" className="button primary" disabled={submitting}>{submitting ? "Posting approved count…" : "Post approved count"}</button> : <button type="button" className="button primary" disabled={submitting} onClick={onClose}>Review count</button> : <button type="submit" className="button primary" disabled={submitting}>{submitting ? `${title.replace(/^(Post|Reopen|Close|Reverse|Return|Approve)/, "$1ing")}…` : finalCommandLabel(command.kind, quantity)}</button>}</div>
+    <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Go back</button>{command.kind === "count" && approvalRequired ? !countApproval ? <button type="button" className="button primary" disabled={submitting} onClick={() => void requestApproval()}>{submitting ? "Requesting…" : "Request manager approval"}</button> : countApproval.status === "pending" && countApproval.canApprove ? <button type="button" className="button primary" disabled={submitting} onClick={() => void approveRequest()}>{submitting ? "Approving…" : "Approve this variance"}</button> : countApproval.status === "pending" ? <button type="button" className="button primary" disabled={submitting} onClick={() => void checkApproval()}>{submitting ? "Checking…" : "Check approval status"}</button> : countApproval.status === "approved" ? <button type="submit" className="button primary" disabled={submitting}>{submitting ? "Posting approved count…" : "Post approved count"}</button> : <button type="button" className="button primary" disabled={submitting} onClick={onClose}>Review count</button> : <button type="submit" className="button primary" disabled={submitting}>{submitting ? `${title.replace(/^(Post|Reopen|Close|Reverse|Return|Approve)/, "$1ing")}…` : finalCommandLabel(command.kind, receiptQuantity)}</button>}</div>
   </form></section></div>;
 }
 
-function CommandFields({ kind, po, so, purchaseLines, salesLines, selectedPoLineId, selectedSoLineId, setSelectedPoLineId, setSelectedSoLineId, quantity, secondaryQuantity, setQuantity, setSecondaryQuantity, reason, setReason, disposition, setDisposition, expectedDate, setExpectedDate, max, countBalances, countLocationId, setCountLocationId }: { kind: CommandKind; po?: PurchaseOrder; so?: SalesOrder; purchaseLines: PurchaseLine[]; salesLines: SalesLine[]; selectedPoLineId: string; selectedSoLineId: string; setSelectedPoLineId: (value: string) => void; setSelectedSoLineId: (value: string) => void; quantity: number; secondaryQuantity: number; setQuantity: (value: number) => void; setSecondaryQuantity: (value: number) => void; reason: string; setReason: (value: string) => void; disposition: string; setDisposition: (value: string) => void; expectedDate: string; setExpectedDate: (value: string) => void; max: number; countBalances: InventoryLocationBalance[]; countLocationId: string; setCountLocationId: (value: string) => void }) {
+type CommandFieldsProps = {
+  kind: CommandKind; po?: PurchaseOrder; so?: SalesOrder; purchaseLines: PurchaseLine[]; salesLines: SalesLine[];
+  selectedPoLineId: string; selectedSoLineId: string; setSelectedPoLineId: (value: string) => void; setSelectedSoLineId: (value: string) => void;
+  quantity: number; secondaryQuantity: number; setQuantity: (value: number) => void; setSecondaryQuantity: (value: number) => void;
+  receiptLines: Array<{ lineId: string; lineVersion: number; quantity: number; damagedQuantity: number; uomId?: string }>;
+  updateReceiptLine: (lineId: string, patch: Partial<{ quantity: number; damagedQuantity: number; uomId?: string }>) => void;
+  reason: string; setReason: (value: string) => void; disposition: string; setDisposition: (value: string) => void;
+  expectedDate: string; setExpectedDate: (value: string) => void; carrier: string; setCarrier: (value: string) => void;
+  serviceLevel: string; setServiceLevel: (value: string) => void; trackingNumber: string; setTrackingNumber: (value: string) => void;
+  billOfLadingNumber: string; setBillOfLadingNumber: (value: string) => void; max: number;
+  countBalances: InventoryLocationBalance[]; countLocationId: string; setCountLocationId: (value: string) => void;
+  usableLocations: LocationOption[]; quarantineLocations: LocationOption[]; postingLocationId: string; setPostingLocationId: (value: string) => void;
+  quarantineLocationId: string; setQuarantineLocationId: (value: string) => void;
+};
+
+function CommandFields({ kind, po, so, purchaseLines, salesLines, selectedPoLineId, selectedSoLineId, setSelectedPoLineId, setSelectedSoLineId, quantity, secondaryQuantity, setQuantity, setSecondaryQuantity, receiptLines, updateReceiptLine, reason, setReason, disposition, setDisposition, expectedDate, setExpectedDate, carrier, setCarrier, serviceLevel, setServiceLevel, trackingNumber, setTrackingNumber, billOfLadingNumber, setBillOfLadingNumber, max, countBalances, countLocationId, setCountLocationId, usableLocations, quarantineLocations, postingLocationId, setPostingLocationId, quarantineLocationId, setQuarantineLocationId }: CommandFieldsProps) {
   const purchaseLineSelector = purchaseLines.length > 1 ? <label>Purchase order line<select value={selectedPoLineId} onChange={(event) => setSelectedPoLineId(event.target.value)}>{purchaseLines.map((line) => <option key={line.id} value={line.id}>{line.sku} · {line.product} · {line.open} open</option>)}</select></label> : null;
   const salesLineSelector = salesLines.length > 1 ? <label>Sales order line<select value={selectedSoLineId} onChange={(event) => setSelectedSoLineId(event.target.value)}>{salesLines.map((line) => <option key={line.id} value={line.id}>{line.sku} · {line.product} · {line.open} open</option>)}</select></label> : null;
-  if (kind === "receive") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{po?.open ?? 0} open to receive</strong><small>{po?.lines[0]?.specification}</small></div><div className="form-grid"><label>Arrived at dock<input type="number" min="1" max={max || undefined} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Accepted into quarantine<input type="number" min="0" max={quantity} value={secondaryQuantity} onChange={(e) => setSecondaryQuantity(Number(e.target.value))} /></label><label>Rejected at dock<input value="0" readOnly /></label><label>Destination<select><option>Main / Rack A / Bay 03</option><option>Main / Special Orders / Bay S-12</option></select></label></div><p className="formula-note">Available inventory = arrived − quarantine − rejected. The quantity distribution must balance.</p></div>;
-  if (kind === "ship" || kind === "reserve") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer} · {so?.project}</span><strong>{kind === "reserve" ? `${so?.availableNow ?? 0} available now` : `${so?.reserved ?? 0} reserved`}</strong><small>{so?.route}</small></div><label>{kind === "reserve" ? "Quantity to reserve" : "Quantity to ship"}<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>{kind === "reserve" ? "Reserve from location" : "Staging location"}<select><option>{kind === "reserve" ? "Main / Rack A / Bay 01" : "Main / Customer Staging / ST-02"}</option><option>{kind === "reserve" ? "Main / Rack B / Bay 07" : "Main / Pickup Staging / PU-01"}</option></select></label>{kind === "ship" && <label>Carrier or pickup reference<input placeholder="Optional reference" /></label>}</div>;
-  if (kind === "vendor-return") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} eligible to return</strong><small>Source: {po?.number}</small></div><label>Quantity to return<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><fieldset><legend>What should happen after the vendor receives these goods?</legend>{[["replacement", "Replace the returned quantity"], ["refund", "Issue a credit; no replacement"], ["repair", "Repair and return the same unit"], ["allowance", "No physical return; issue a price allowance"]].map(([value, label]) => <label className="radio-row" key={value}><input type="radio" name="disposition" value={value} checked={disposition === value} onChange={(e) => setDisposition(e.target.value)} /><span>{label}</span></label>)}</fieldset><label>Return reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Damaged on arrival</option><option>Wrong specification</option><option>Warranty issue</option><option>Customer cancellation</option></select></label></div>;
-  if (kind === "customer-return") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer} · {so?.number}</span><strong>{max} eligible to return</strong><small>Physical and financial decisions are reviewed separately.</small></div><label>Quantity received back<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Physical disposition<select value={disposition} onChange={(e) => setDisposition(e.target.value)}><option value="quarantine">Receive into quarantine</option><option value="available">Return to available stock</option><option value="damaged">Damaged / discounted stock</option><option value="scrap">Scrap after inspection</option></select></label><label>Customer resolution<select><option>Issue customer credit</option><option>Create replacement order</option><option>Repair</option><option>No credit</option></select></label><label>Return reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Damage</option><option>Incorrect item</option><option>Customer changed mind</option><option>Warranty</option></select></label></div>;
+  const usableLocationField = <label>Usable destination<ReferenceSearchSelect kind="locations" role="usable" value={postingLocationId} initialOptions={usableLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => setPostingLocationId(option.id)} placeholder="Search every usable location" /></label>;
+  const quarantineLocationField = <label>Quarantine destination<ReferenceSearchSelect kind="locations" role="non_usable" value={quarantineLocationId} initialOptions={quarantineLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: titleCase(location.inventoryStatus) }))} onSelect={(option) => setQuarantineLocationId(option.id)} placeholder="Search every quarantine or damaged location" /></label>;
+  if (kind === "receive" && receiptLines.length > 1) return <div className="command-form"><div className="line-context"><span>Multi-line truck receipt</span><strong>{receiptLines.length} PO lines on one receipt document</strong><small>Entered quantities use each line&apos;s purchasing UOM and post to the explicit destinations below.</small></div>{usableLocationField}{receiptLines.some((line) => line.damagedQuantity > 0) ? quarantineLocationField : null}<div className="batch-receipt-lines">{receiptLines.map((receiptLine) => { const line = purchaseLines.find((item) => item.id === receiptLine.lineId); return <div className="batch-receipt-line" key={receiptLine.lineId}><div><strong>{line?.sku} · {line?.product}</strong><small>{line?.open} {line?.orderedUomCode ?? "unit"} open · line version {receiptLine.lineVersion}</small></div><label>Arrived ({line?.orderedUomCode ?? "unit"})<input type="number" min="0" step={line?.uomFactorToBase === 1 ? "1" : "0.001"} value={receiptLine.quantity} onChange={(event) => updateReceiptLine(receiptLine.lineId, { quantity: Number(event.target.value) })} /></label><label>Quarantine ({line?.orderedUomCode ?? "unit"})<input type="number" min="0" step={line?.uomFactorToBase === 1 ? "1" : "0.001"} max={receiptLine.quantity} value={receiptLine.damagedQuantity} onChange={(event) => updateReceiptLine(receiptLine.lineId, { damagedQuantity: Number(event.target.value) })} /></label></div>; })}</div><p className="formula-note">Lines with zero arrived quantity are skipped. All posted lines share one receipt number for bill matching.</p></div>;
+  if (kind === "receive") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{po?.open ?? 0} {po?.lines[0]?.orderedUomCode ?? "units"} open to receive</strong><small>{po?.lines[0]?.specification}</small></div><div className="form-grid"><label>Arrived at dock ({po?.lines[0]?.orderedUomCode ?? "unit"})<input type="number" min="1" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={max || undefined} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Accepted into quarantine<input type="number" min="0" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={quantity} value={secondaryQuantity} onChange={(e) => setSecondaryQuantity(Number(e.target.value))} /></label>{usableLocationField}{secondaryQuantity > 0 ? quarantineLocationField : null}</div><p className="formula-note">The service converts the entered purchasing UOM to base stock and records each status-compatible destination on the immutable movement.</p></div>;
+  if (kind === "ship" || kind === "reserve") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer} · {so?.project}</span><strong>{kind === "reserve" ? `${so?.availableNow ?? 0} available now` : `${so?.reserved ?? 0} reserved`}</strong><small>{so?.route}</small></div><label>{kind === "reserve" ? "Quantity to reserve" : "Quantity to ship"}<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><div className="line-context"><span>{kind === "reserve" ? "Location selection" : "Ship-to address"}</span><strong>{kind === "reserve" ? "Best available usable location is selected at posting" : `${so?.shipToName ?? so?.customer}`}</strong><small>{kind === "reserve" ? "The committed location is recorded on the reservation." : [so?.shipToAddressLine1, so?.shipToCity, so?.shipToRegion, so?.shipToPostalCode, so?.shipToCountry].filter(Boolean).join(", ")}</small></div>{kind === "ship" ? <><label>Carrier<input value={carrier} onChange={(event) => setCarrier(event.target.value)} placeholder="Required carrier" required /></label><label>Service level<input value={serviceLevel} onChange={(event) => setServiceLevel(event.target.value)} placeholder="Ground, LTL, same day…" /></label><label>Tracking number<input value={trackingNumber} onChange={(event) => setTrackingNumber(event.target.value)} placeholder="Tracking or PRO number" /></label><label>Bill of lading<input value={billOfLadingNumber} onChange={(event) => setBillOfLadingNumber(event.target.value)} placeholder="Required when no tracking number" /></label></> : null}</div>;
+  if (kind === "vendor-return") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} {po?.lines[0]?.orderedUomCode ?? "units"} eligible to return</strong><small>Source: {po?.number}</small></div><label>Quantity to return<input type="number" min="1" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label>{disposition !== "allowance" ? usableLocationField : null}<fieldset><legend>What should happen after the vendor receives these goods?</legend>{[["replacement", "Replace the returned quantity"], ["refund", "Issue a credit; no replacement"], ["repair", "Repair and return the same unit"], ["allowance", "No physical return; issue a price allowance"]].map(([value, label]) => <label className="radio-row" key={value}><input type="radio" name="disposition" value={value} checked={disposition === value} onChange={(e) => setDisposition(e.target.value)} /><span>{label}</span></label>)}</fieldset><label>Return reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Damaged on arrival</option><option>Wrong specification</option><option>Warranty issue</option><option>Customer cancellation</option></select></label></div>;
+  if (kind === "customer-return") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer} · {so?.number}</span><strong>{max} {so?.lines?.[0]?.orderedUomCode ?? "units"} eligible to return</strong><small>Physical and financial decisions are reviewed separately.</small></div><label>Quantity received back<input type="number" min="1" step={so?.lines?.[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Physical disposition<select value={disposition} onChange={(e) => setDisposition(e.target.value)}><option value="quarantine">Receive into quarantine</option><option value="available">Return to available stock</option><option value="damaged">Damaged stock</option></select></label>{disposition === "available" ? usableLocationField : quarantineLocationField}<label>Customer resolution<select><option>Issue customer credit</option><option>Create replacement order</option><option>Repair</option><option>No credit</option></select></label><label>Return reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Damage</option><option>Incorrect item</option><option>Customer changed mind</option><option>Warranty</option></select></label></div>;
   if (kind === "count") { const balance = countBalances.find((item) => item.locationId === countLocationId); return <div className="command-form"><div className="line-context"><span>Durable cycle-count balance</span><strong>{balance ? `${balance.warehouseName} / ${balance.locationCode}` : "No active location balance"}</strong><small>{balance ? `Book quantity ${balance.recordedQuantity} · ${balance.reservedQuantity} reserved · version ${balance.version}` : "Create or receive inventory at an active location before counting."}</small></div><label>Inventory location<select value={countLocationId} onChange={(event) => setCountLocationId(event.target.value)} required><option value="" disabled>Select location</option>{countBalances.map((item) => <option key={item.locationId} value={item.locationId}>{item.warehouseName} · {item.locationCode} · {item.locationName} ({item.recordedQuantity} book)</option>)}</select></label><label>Book quantity<input value={balance?.recordedQuantity ?? ""} readOnly /></label><label>Counted quantity<input type="number" min="0" step="0.0001" value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} required /></label><label>Variance reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Found in adjacent bay</option><option>Unrecorded damage</option><option>Counting error confirmed</option></select></label></div>; }
   return <div className="command-form">{kind === "reverse" ? null : purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} eligible</strong><small>{kind === "reopen" ? `${po?.closed} closed without receipt` : kind === "reverse" ? `${po?.received} originally received` : `${po?.open} open to receive`}</small></div><label>{kind === "reopen" ? "Quantity to reopen" : kind === "reverse" ? "Quantity to reverse" : "Quantity to close"}<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label>{kind === "reopen" && <label>New expected date<input type="date" value={expectedDate} onChange={(e) => setExpectedDate(e.target.value)} /></label>}{kind === "reverse" && <fieldset><legend>Is the reversed quantity still expected?</legend><label className="radio-row"><input type="radio" name="disposition" value="reopen" checked={disposition === "reopen"} onChange={(e) => setDisposition(e.target.value)} /><span>Yes, reopen it to receive</span></label><label className="radio-row"><input type="radio" name="disposition" value="close" checked={disposition === "close"} onChange={(e) => setDisposition(e.target.value)} /><span>No, close it without receipt</span></label></fieldset>}<label>Reason<select value={reason} onChange={(e) => setReason(e.target.value)}><option value="">Select reason</option><option>Vendor confirmed partial availability</option><option>Vendor cannot supply</option><option>Customer canceled</option><option>Quantity entered incorrectly</option><option>Other</option></select></label></div>;
 }
@@ -1367,10 +1696,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
   const rawSalesOrders = asRows(raw.salesOrders);
 
   const products: Product[] = rawProducts.map((item, index) => {
-    const demand = rawSalesOrders.reduce((sum, order) => {
-      const matching = asRows(order.lines).filter((line) => text(line.productId) === text(item.id));
-      return sum + matching.reduce((lineSum, line) => lineSum + number(line.orderedQuantity) - number(line.shippedQuantity), 0);
-    }, 0);
+    const demand = number(item.demand);
     const usable = number(item.usable);
     const incoming = number(item.incoming);
     const available = number(item.available);
@@ -1380,38 +1706,56 @@ function normalizeSnapshot(input: unknown): Snapshot {
       name: text(item.name, "Unnamed product"),
       specification: [text(item.dimensions), text(item.finish), text(item.material)].filter(Boolean).join(" · ") || "No configuration recorded",
       policy: titleCase(text(item.trackingPolicy || item.inventoryPolicy, "stock")),
-      location: "Multiple locations",
-      locationCode: "—",
+      location: number(item.stockedLocationCount) > 1 ? `${text(item.primaryLocationName)} + ${number(item.stockedLocationCount) - 1} more` : text(item.primaryLocationName, "No stocked location"),
+      locationCode: text(item.primaryLocationCode, "No stock"),
       onHand: number(item.onHand),
       usable,
       reserved: number(item.reserved),
       available,
       incoming,
       demand,
-      projected: usable + incoming - demand,
+      projected: number(item.projected, usable + incoming - demand),
       reorderPoint: number(item.reorderPoint),
+      standardCost: number(item.standardCostCents) / 100,
+      sellingPrice: number(item.sellingPriceCents) / 100,
+      baseUomId: text(item.baseUomId),
+      baseUomCode: text(item.baseUomCode, "EA"),
+      purchaseUomId: text(item.purchaseUomId),
+      purchaseUomCode: text(item.purchaseUomCode, text(item.baseUomCode, "EA")),
+      salesUomId: text(item.salesUomId),
+      salesUomCode: text(item.salesUomCode, text(item.baseUomCode, "EA")),
+      quantityPrecision: number(item.quantityPrecision),
       customerRef: undefined,
       version: number(item.version, 1),
     };
   });
 
   const purchaseOrders: PurchaseOrder[] = rawPurchaseOrders.map((item, index) => {
-    const lines = asRows(item.lines).map((line, lineIndex): PurchaseLine => ({
+    const lines = asRows(item.lines).map((line, lineIndex): PurchaseLine => {
+      const baseOrdered = number(line.orderedQuantity);
+      const enteredOrdered = number(line.orderedUomQuantity, baseOrdered);
+      const factor = enteredOrdered > 0 ? baseOrdered / enteredOrdered : 1;
+      return {
       id: text(line.id, `${text(item.id)}-line-${lineIndex}`),
       productId: text(line.productId) || undefined,
       sku: text(line.sku),
       product: text(line.productName, "Unnamed product"),
       specification: configurationText(line.configurationSnapshot) || products.find((product) => product.id === text(line.productId))?.specification || "No configuration recorded",
       customerRef: text(line.sourceSalesOrderLineId) || undefined,
-      ordered: number(line.orderedQuantity),
-      received: number(line.netReceivedQuantity),
+      ordered: enteredOrdered,
+      received: number(line.netReceivedQuantity) / factor,
       returned: 0,
-      closed: number(line.closedWithoutReceiptQuantity),
-      open: number(line.openToReceiveQuantity),
-      unitCost: number(line.unitCostCents) / 100,
+      closed: number(line.closedWithoutReceiptQuantity) / factor,
+      open: number(line.openToReceiveQuantity) / factor,
+      unitCost: number(line.orderedUomUnitCostCents, number(line.unitCostCents)) / 100,
+      orderedUomId: text(line.orderedUomId) || undefined,
+      orderedUomCode: text(line.orderedUomCode) || undefined,
+      uomFactorToBase: factor,
       location: text(line.fulfillmentRoute, "stock") === "drop_ship" ? "Drop ship · no internal stock" : "Destination selected at receipt",
       fulfillmentRoute: text(line.fulfillmentRoute, "stock"),
-    }));
+      version: number(line.version, 1),
+      };
+    });
     const expectedDate = text(item.expectedDate, futureDate(7));
     const open = number(item.openToReceiveQuantity);
     const closed = number(item.closedWithoutReceiptQuantity);
@@ -1449,6 +1793,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
     const rawLines = asRows(item.lines);
     const lines: SalesLine[] = rawLines.map((line, lineIndex) => {
       const ordered = number(line.orderedQuantity);
+      const enteredOrdered = number(line.orderedUomQuantity, ordered);
+      const factor = enteredOrdered > 0 ? ordered / enteredOrdered : 1;
       const canceled = number(line.canceledQuantity);
       const shipped = number(line.shippedQuantity);
       return {
@@ -1456,14 +1802,21 @@ function normalizeSnapshot(input: unknown): Snapshot {
         productId: text(line.productId),
         sku: text(line.sku),
         product: text(line.productName, "Unnamed product"),
-        ordered,
-        canceled,
-        reserved: number(line.reservedQuantity),
-        shipped,
-        open: Math.max(ordered - canceled - shipped, 0),
-        unitPrice: number(line.unitPriceCents) / 100,
+        ordered: enteredOrdered,
+        canceled: canceled / factor,
+        reserved: number(line.reservedQuantity) / factor,
+        shipped: shipped / factor,
+        open: Math.max(ordered - canceled - shipped, 0) / factor,
+        unitPrice: number(line.orderedUomUnitPriceCents, number(line.unitPriceCents)) / 100,
+        orderedUomId: text(line.orderedUomId) || undefined,
+        orderedUomCode: text(line.orderedUomCode) || undefined,
+        uomFactorToBase: factor,
         fulfillmentRoute: text(line.fulfillmentRoute, "stock"),
         linkedPurchaseOrderLineId: text(line.linkedPurchaseOrderLineId) || undefined,
+        projectReference: text(line.projectReference) || undefined,
+        discountCents: number(line.discountCents),
+        taxable: number(line.taxable, 1) !== 0,
+        taxRateBps: number(line.taxRateBps),
       };
     });
     const firstLine = rawLines[0];
@@ -1475,6 +1828,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
     return {
       id: text(item.id, `so-${index}`),
       number: text(item.number, `SO-${2000 + index}`),
+      customerId: text(item.customerId),
       customer: text(item.customerName, "Unnamed customer"),
       project: text(item.projectReference, "No project reference"),
       requestedDate: text(item.requestedDate),
@@ -1490,6 +1844,18 @@ function normalizeSnapshot(input: unknown): Snapshot {
       incomingBeforeDate,
       shortage,
       total: number(item.totalCents) / 100,
+      currency: text(item.currency, "CAD"),
+      exchangeRateToBase: number(item.exchangeRateToBase, 1),
+      paymentTerms: text(item.paymentTerms) || undefined,
+      dueDate: text(item.dueDate) || undefined,
+      shipToName: text(item.shipToName) || undefined,
+      shipToAddressLine1: text(item.shipToAddressLine1) || undefined,
+      shipToAddressLine2: text(item.shipToAddressLine2) || undefined,
+      shipToCity: text(item.shipToCity) || undefined,
+      shipToRegion: text(item.shipToRegion) || undefined,
+      shipToPostalCode: text(item.shipToPostalCode) || undefined,
+      shipToCountry: text(item.shipToCountry) || undefined,
+      deliveryInstructions: text(item.deliveryInstructions) || undefined,
       route: titleCase(text(firstLine?.fulfillmentRoute, "stock")),
       linkedPo: text(firstLine?.linkedPurchaseOrderLineId) || undefined,
       exception: shortage > 0 ? `${shortage} unit${shortage === 1 ? "" : "s"} short for requested date` : undefined,
@@ -1543,9 +1909,17 @@ function normalizeSnapshot(input: unknown): Snapshot {
     return {
       id: text(item.id, `partner-${index}`),
       name: text(item.name, "Business partner"),
-      type: kind.includes("vendor") ? "vendor" : "customer",
+      type: kind === "both" ? "both" : kind.includes("vendor") ? "vendor" : "customer",
       email: text(item.email) || undefined,
       phone: text(item.phone) || undefined,
+      addressLine1: text(item.addressLine1) || undefined,
+      addressLine2: text(item.addressLine2) || undefined,
+      city: text(item.city) || undefined,
+      region: text(item.region) || undefined,
+      postalCode: text(item.postalCode) || undefined,
+      country: text(item.country, "CA"),
+      creditLimitCents: number(item.creditLimitCents),
+      creditHold: number(item.creditHold) !== 0,
     };
   });
 
@@ -1560,14 +1934,37 @@ function normalizeSnapshot(input: unknown): Snapshot {
     warehouseName: text(item.warehouseName, text(item.warehouseCode)),
   })).filter((item) => item.productId && item.locationId && item.version > 0);
 
+  const locations: LocationOption[] = asRows(raw.locations).map((item) => ({
+    id: text(item.id),
+    code: text(item.code),
+    name: text(item.name),
+    warehouseName: text(item.warehouseName, "Warehouse"),
+    inventoryStatus: text(item.inventoryStatus),
+  })).filter((item) => item.id && item.code);
+
   return {
     summary: {
       lateReceipts: number(summary.latePurchaseOrders, purchaseOrders.filter((po) => po.daysLate > 0).length),
-      approvals: purchaseOrders.filter((po) => po.lifecycle.toLowerCase().includes("pending")).length,
-      blockedSales: salesOrders.filter((so) => so.shortage > 0).length,
+      approvals: number(summary.pendingApprovals, purchaseOrders.filter((po) => po.lifecycle.toLowerCase().includes("pending")).length),
+      blockedSales: number(summary.blockedSalesOrders, salesOrders.filter((so) => so.shortage > 0).length),
       dueReceipts: number(summary.openPurchaseOrders, purchaseOrders.filter((po) => po.open > 0).length),
       readyToShip: number(summary.readyToShip, salesOrders.filter((so) => so.reserved > 0).length),
       pickups: salesOrders.filter((so) => so.route.toLowerCase().includes("pickup")).length,
+      onHand: number(summary.onHand),
+      usable: number(summary.usable),
+      reserved: number(summary.reserved),
+      available: number(summary.available),
+      incoming: number(summary.incoming),
+      openDemand: number(summary.openDemand),
+      openReceiptUnits: number(summary.openReceiptUnits),
+      readyToShipUnits: number(summary.readyToShipUnits),
+      inventoryRisks: number(summary.inventoryRiskCount),
+      matchExceptions: number(summary.matchExceptions),
+      specialOrderInventory: number(summary.specialOrderInventoryCount),
+      orphanedBalanceRows: number(summary.orphanedBalanceRows),
+      orphanedBalanceUnits: number(summary.orphanedBalanceUnits),
+      orphanedMovementCount: number(summary.orphanedMovementCount),
+      orphanedInventoryValueCents: number(summary.orphanedInventoryValueCents),
     },
     purchaseOrders,
     products,
@@ -1577,9 +1974,11 @@ function normalizeSnapshot(input: unknown): Snapshot {
     bills,
     activities,
     partners,
+    locations,
     pagination: {
       page: number(asRecord(raw.pagination).page, 1),
       pageSize: number(asRecord(raw.pagination).pageSize, 50),
+      filteredTotal: asRecord(raw.pagination).filteredTotal == null ? null : number(asRecord(raw.pagination).filteredTotal),
       totals: Object.fromEntries(Object.entries(asRecord(asRecord(raw.pagination).totals)).map(([key, value]) => [key, number(value)])),
     },
   };

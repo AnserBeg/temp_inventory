@@ -1,5 +1,5 @@
 import type { ActorIdentity } from "./auth";
-import { all, ensureDatabase, getD1, newId } from "./inventory-db";
+import { all, ensureDatabase, first, getD1, newId } from "./inventory-db";
 
 export type ExportType = "inventory" | "movements" | "purchase-orders" | "vendor-bills" | "customer-invoices" | "audit" | "accounting" | "quickbooks";
 export type ExportRange = { from: string; to: string };
@@ -390,9 +390,19 @@ async function quickBooksRows(range: ExportRange) {
   }));
 }
 
+async function assertLocationIntegrityForExport() {
+  const integrity = await first<{ balanceRows: number; movementRows: number; locationIds: string }>(`SELECT
+    (SELECT COUNT(*) FROM inventory_balances ib LEFT JOIN locations l ON l.id=ib.location_id WHERE l.id IS NULL) AS balanceRows,
+    (SELECT COUNT(*) FROM stock_movements sm LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id WHERE (sm.from_location_id IS NOT NULL AND fl.id IS NULL) OR (sm.to_location_id IS NOT NULL AND tl.id IS NULL)) AS movementRows,
+    (SELECT GROUP_CONCAT(location_id,', ') FROM (SELECT ib.location_id AS location_id FROM inventory_balances ib LEFT JOIN locations l ON l.id=ib.location_id WHERE l.id IS NULL UNION SELECT sm.from_location_id FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.from_location_id WHERE sm.from_location_id IS NOT NULL AND l.id IS NULL UNION SELECT sm.to_location_id FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.to_location_id WHERE sm.to_location_id IS NOT NULL AND l.id IS NULL)) AS locationIds`);
+  const affected = Number(integrity?.balanceRows ?? 0) + Number(integrity?.movementRows ?? 0);
+  if (affected > 0) throw new Error(`Export blocked: ${affected} inventory record${affected === 1 ? "" : "s"} reference missing location IDs (${integrity?.locationIds || "unknown"}). Restore those legacy locations in Controls before exporting.`);
+}
+
 export async function buildExport(type: ExportType, actor: ActorIdentity, range?: ExportRange) {
   await ensureDatabase();
   if ((type === "accounting" || type === "quickbooks") && !range) throw new Error("Accounting exports require a bounded from/to date range.");
+  if (["inventory", "movements", "accounting", "quickbooks"].includes(type)) await assertLocationIntegrityForExport();
   const rows = type === "accounting" ? await accountingRows(range!) : type === "quickbooks" ? await quickBooksRows(range!) : await all<Record<string, unknown>>(queries[type]);
   const when = new Date().toISOString();
   const metadata={ type,rowCount:rows.length,role:actor.role,range };

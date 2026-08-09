@@ -25,7 +25,11 @@ Changing one document never silently fabricates another. Reopening a PO restores
 - Returnable rack, core, stillage, crate, and empty custody with issued, returned, forfeited, deposit-charged, and deposit-refunded events.
 - Approval thresholds, period locks, negative-stock blocking, optimistic version checks, idempotency, actor identity, audit events, and transactional outbox records.
 - R2-backed PDF/image attachments, a full accounting control export, and an audited QuickBooks Online journal CSV.
-- Empty-database onboarding for products, vendors/customers, warehouses, locations, returnable types, and user roles.
+- Server-backed worklist search, status filtering, sorting, and pagination across the full product, partner, order, movement, and billing data set.
+- Operational base/purchase/sales units of measure with precision enforcement and global or product-specific conversions applied to orders, receipts, reservations, shipments, and returns.
+- Customer-assigned contract price lists with priorities, validity dates, UOMs, and quantity breaks; catalog cost/price remains the explicit fallback.
+- Empty-database onboarding for products, units, conversions, vendors/customers, warehouses, locations, returnable types, customer pricing, and user roles.
+- Missing-location reconciliation that restores the original historical ID; inventory and accounting exports remain blocked until every location reference resolves.
 
 ## Roles
 
@@ -74,3 +78,5 @@ npm run typecheck
 ## Deliberate boundaries
 
 PaneFlow contains operational AP/AR and inventory-valuation subledgers plus balanced accounting exports. It is not a replacement for a full general ledger, bank reconciliation, payroll, tax filing, or statutory consolidation system. EDI, carrier/customer/vendor portals, demand forecasting, route optimization, manufacturing/MRP, and automated bank feeds are also outside this release. Those integrations can consume the transactional outbox and exports without weakening the operational audit trail.
+
+The product master is an operational catalog rather than a full merchandising/PIM module. Vendor-product cross references and lead times, per-warehouse replenishment policy, barcode/UPC, and dimensional weight remain explicit follow-up work. Customer contract prices and volume tiers are supported; the product selling price and global reorder point remain catalog fallbacks and must not be represented as warehouse-specific planning data.

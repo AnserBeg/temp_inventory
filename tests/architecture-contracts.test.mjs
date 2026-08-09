@@ -7,7 +7,7 @@ const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 test("advanced distributor commands remain wired through the durable dispatcher", async () => {
   const source = await read("lib/server/advanced-domain.ts");
   const commands = [
-    "confirmsalesorder", "cancelsalesorder", "submitpurchaseorder", "approvepurchaseorder",
+    "updatesalesorderdraft", "confirmsalesorder", "cancelsalesorder", "submitpurchaseorder", "approvepurchaseorder",
     "amendpurchaseorder", "transferinventory", "receivetransfer", "changeinventorystatus",
     "scrapinventory", "releasereservation", "reallocatereservation", "reverseshipment",
     "createvendorbill", "approvevendorbill", "createvendorcredit", "createcustomerinvoice",

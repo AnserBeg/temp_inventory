@@ -1,9 +1,11 @@
 import { ensureDatabase, first, getD1, newId } from "./inventory-db";
+import { normalizeProductQuantity, ProductQuantityError } from "./product-quantities";
 
 export type CreateOrderLine = {
   kind?: "item" | "charge";
   productId?: string;
   quantity?: number;
+  uomId?: string;
   unitCostCents?: number;
   unitPriceCents?: number;
   discountCents?: number;
@@ -42,6 +44,14 @@ export type CreateOrderInput = {
   exchangeRateToBase?: number;
   paymentTerms?: string;
   dueDate?: string;
+  shipToName?: string;
+  shipToAddressLine1?: string;
+  shipToAddressLine2?: string;
+  shipToCity?: string;
+  shipToRegion?: string;
+  shipToPostalCode?: string;
+  shipToCountry?: string;
+  deliveryInstructions?: string;
   freightCents?: number;
   feeCents?: number;
   refundableDepositCents?: number;
@@ -61,11 +71,16 @@ type CreateOrderResult = {
   };
 };
 
-type NormalizedItem = {
+export type NormalizedItem = {
   productId: string;
   productName: string;
   quantity: number;
+  enteredQuantity: number;
+  uomId: string;
+  uomCode: string;
+  factorToBase: number;
   unitAmountCents: number;
+  enteredUnitAmountCents: number;
   discountCents: number;
   taxable: boolean;
   taxRateBps: number;
@@ -76,7 +91,7 @@ type NormalizedItem = {
   linkedPurchaseOrderLineId: string | null;
 };
 
-type NormalizedCharge = {
+export type NormalizedCharge = {
   chargeType: string;
   description: string;
   amountCents: number;
@@ -155,7 +170,7 @@ async function hashOrderInput(input: CreateOrderInput) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function normalizeLines(input: CreateOrderInput) {
+export async function normalizeOrderLines(input: CreateOrderInput) {
   const source: CreateOrderLine[] = input.lines?.length ? [...input.lines] : [{
     kind: "item", productId: input.productId, quantity: input.quantity,
     unitCostCents: input.unitCostCents, unitPriceCents: input.unitPriceCents,
@@ -187,18 +202,35 @@ async function normalizeLines(input: CreateOrderInput) {
     if (!(["stock", "special_order", "drop_ship"] as const).includes(route)) {
       throw new RecordValidationError("VALIDATION_ERROR", `lines[${index}].fulfillmentRoute is invalid.`);
     }
-    const unitAmount = input.type === "purchaseOrder"
+    const enteredUnitAmount = input.type === "purchaseOrder"
       ? cents(line.unitCostCents, `lines[${index}].unitCostCents`)
       : cents(line.unitPriceCents, `lines[${index}].unitPriceCents`);
-    const quantity = positiveNumber(line.quantity, `lines[${index}].quantity`);
+    const enteredQuantity = positiveNumber(line.quantity, `lines[${index}].quantity`);
+    let normalizedQuantity: Awaited<ReturnType<typeof normalizeProductQuantity>>;
+    try {
+      normalizedQuantity = await normalizeProductQuantity({
+        productId,
+        quantity: enteredQuantity,
+        uomId: typeof line.uomId === "string" ? line.uomId : undefined,
+        usage: input.type === "purchaseOrder" ? "purchase" : "sales",
+        field: `lines[${index}].quantity`,
+      });
+    } catch (error) {
+      if (error instanceof ProductQuantityError) throw new RecordValidationError(error.code, error.message, error.status);
+      throw error;
+    }
+    const quantity = normalizedQuantity.baseQuantity;
+    const unitAmount = enteredUnitAmount / normalizedQuantity.factorToBase;
     const discountCents = cents(line.discountCents ?? 0, `lines[${index}].discountCents`, true);
-    if (discountCents > Math.round(quantity * unitAmount)) throw new RecordValidationError("VALIDATION_ERROR", `Line ${index + 1} discount exceeds its gross amount.`);
+    if (discountCents > Math.round(enteredQuantity * enteredUnitAmount)) throw new RecordValidationError("VALIDATION_ERROR", `Line ${index + 1} discount exceeds its gross amount.`);
     const sourceSalesOrderLineId=typeof line.sourceSalesOrderLineId==="string"&&line.sourceSalesOrderLineId.trim()?line.sourceSalesOrderLineId.trim():null;
     const linkedPurchaseOrderLineId=typeof line.linkedPurchaseOrderLineId==="string"&&line.linkedPurchaseOrderLineId.trim()?line.linkedPurchaseOrderLineId.trim():null;
     if(input.type==="purchaseOrder"&&route!=="stock"){if(!sourceSalesOrderLineId)throw new RecordValidationError("SUPPLY_LINK_REQUIRED",`Line ${index+1} requires sourceSalesOrderLineId for ${route}.`);const demand=await first("SELECT id FROM sales_order_lines WHERE id=? AND product_id=? AND fulfillment_route=?",sourceSalesOrderLineId,productId,route);if(!demand)throw new RecordValidationError("SUPPLY_LINK_MISMATCH",`Line ${index+1} source sales line does not match product and route.`,409);}
     if(input.type==="salesOrder"&&linkedPurchaseOrderLineId){const supply=await first("SELECT id FROM purchase_order_lines WHERE id=? AND product_id=?",linkedPurchaseOrderLineId,productId);if(!supply)throw new RecordValidationError("SUPPLY_LINK_MISMATCH",`Line ${index+1} linked purchase line does not match the product.`,409);}
     items.push({
-      productId, productName: product.name, quantity, unitAmountCents: unitAmount,
+      productId, productName: product.name, quantity, enteredQuantity, uomId: normalizedQuantity.fromUomId,
+      uomCode: normalizedQuantity.fromUomCode, factorToBase: normalizedQuantity.factorToBase,
+      unitAmountCents: unitAmount, enteredUnitAmountCents: enteredUnitAmount,
       discountCents, taxable: line.taxable !== false,
       taxRateBps: basisPoints(line.taxRateBps, `lines[${index}].taxRateBps`),
       fulfillmentRoute: route,
@@ -209,6 +241,17 @@ async function normalizeLines(input: CreateOrderInput) {
   }
   if (!items.length) throw new RecordValidationError("VALIDATION_ERROR", "At least one item line is required.");
   return { items, charges };
+}
+
+export async function prepareOrderDraft(input: CreateOrderInput) {
+  const { items, charges } = await normalizeOrderLines(input);
+  const itemSubtotalCents = items.reduce((sum, line) => sum + Math.round(line.enteredQuantity * line.enteredUnitAmountCents) - line.discountCents, 0);
+  const chargeSubtotalCents = charges.reduce((sum, charge) => sum + (charge.direction === "subtract" ? -charge.amountCents : charge.amountCents), 0);
+  const taxCents = items.reduce((sum, line) => sum + (line.taxable ? Math.round(((line.enteredQuantity * line.enteredUnitAmountCents - line.discountCents) * line.taxRateBps) / 10000) : 0), 0)
+    + charges.reduce((sum, charge) => sum + (charge.taxable ? (charge.direction === "subtract" ? -1 : 1) * Math.round((charge.amountCents * charge.taxRateBps) / 10000) : 0), 0);
+  const totalCents = itemSubtotalCents + chargeSubtotalCents + taxCents;
+  if (totalCents < 0) throw new RecordValidationError("VALIDATION_ERROR", "Charges and discounts cannot produce a negative order total.");
+  return { items, charges, itemSubtotalCents, chargeSubtotalCents, taxCents, totalCents, quantity: items.reduce((sum, line) => sum + line.quantity, 0) };
 }
 
 export async function createOrderRecord(input: CreateOrderInput): Promise<CreateOrderResult> {
@@ -229,15 +272,8 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
   if (!Number.isFinite(exchangeRateToBase) || exchangeRateToBase <= 0) throw new RecordValidationError("VALIDATION_ERROR", "exchangeRateToBase must be greater than zero.");
   const paymentTerms = typeof input.paymentTerms === "string" && input.paymentTerms.trim() ? input.paymentTerms.trim() : null;
   const dueDate = input.dueDate == null ? null : validDate(input.dueDate, "dueDate");
-  const { items, charges } = await normalizeLines(input);
-  const itemSubtotalCents = items.reduce((sum, line) => sum + Math.round(line.quantity * line.unitAmountCents) - line.discountCents, 0);
-  const chargeSubtotalCents = charges.reduce((sum, charge) => sum + (charge.direction === "subtract" ? -charge.amountCents : charge.amountCents), 0);
-  const taxCents = items.reduce((sum, line) => sum + (line.taxable ? Math.round(((line.quantity * line.unitAmountCents - line.discountCents) * line.taxRateBps) / 10000) : 0), 0)
-    + charges.reduce((sum, charge) => sum + (charge.taxable ? (charge.direction === "subtract" ? -1 : 1) * Math.round((charge.amountCents * charge.taxRateBps) / 10000) : 0), 0);
-  const totalCents = itemSubtotalCents + chargeSubtotalCents + taxCents;
+  const { items, charges, taxCents, totalCents, quantity } = await prepareOrderDraft(input);
   const baseTotalCents = Math.round(totalCents * exchangeRateToBase);
-  if (totalCents < 0) throw new RecordValidationError("VALIDATION_ERROR", "Charges and discounts cannot produce a negative order total.");
-  const quantity = items.reduce((sum, line) => sum + line.quantity, 0);
   const recordId = newId(input.type === "purchaseOrder" ? "po" : "so");
   const now = new Date().toISOString();
   const db = getD1();
@@ -262,17 +298,26 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
         .bind(recordId, number, vendorId, expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, now, idempotencyKey, recordId, claimToken),
     ];
     items.forEach((line) => {const lineId=newId("po-line");statements.push(db.prepare(`INSERT INTO purchase_order_lines
-      (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id)
-      SELECT ?,?,?,?,0,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId, idempotencyKey, recordId, claimToken));if(line.sourceSalesOrderLineId)statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=? WHERE id=? AND product_id=? AND linked_purchase_order_line_id IS NULL AND EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`).bind(lineId,line.sourceSalesOrderLineId,line.productId,idempotencyKey,recordId,claimToken));});
+      (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id)
+      SELECT ?,?,?,?,0,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+      .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId, idempotencyKey, recordId, claimToken));if(line.sourceSalesOrderLineId)statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=? WHERE id=? AND product_id=? AND linked_purchase_order_line_id IS NULL AND EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`).bind(lineId,line.sourceSalesOrderLineId,line.productId,idempotencyKey,recordId,claimToken));});
     statements.push(db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
       SELECT ?,?,1,'draft',?,'Initial draft',?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(newId("revision"), recordId, JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase }), actor, now, idempotencyKey, recordId, claimToken));
   } else {
     const customerId = requiredText(input.customerId, "customerId");
     const requestedDate = validDate(input.requestedDate, "requestedDate");
-    const customer = await first("SELECT id FROM business_partners WHERE id = ? AND partner_type IN ('customer','both') AND active=1", customerId);
+    const customer = await first<{ name: string; addressLine1: string | null; addressLine2: string | null; city: string | null; region: string | null; postalCode: string | null; country: string | null }>("SELECT name,address_line_1 AS addressLine1,address_line_2 AS addressLine2,city,region,postal_code AS postalCode,country FROM business_partners WHERE id = ? AND partner_type IN ('customer','both') AND active=1", customerId);
     if (!customer) throw new RecordValidationError("INVALID_CUSTOMER", "Select a valid customer.", 404);
+    const shipToName = typeof input.shipToName === "string" && input.shipToName.trim() ? input.shipToName.trim() : customer.name;
+    const shipToAddressLine1 = typeof input.shipToAddressLine1 === "string" && input.shipToAddressLine1.trim() ? input.shipToAddressLine1.trim() : customer.addressLine1;
+    const shipToAddressLine2 = typeof input.shipToAddressLine2 === "string" && input.shipToAddressLine2.trim() ? input.shipToAddressLine2.trim() : customer.addressLine2;
+    const shipToCity = typeof input.shipToCity === "string" && input.shipToCity.trim() ? input.shipToCity.trim() : customer.city;
+    const shipToRegion = typeof input.shipToRegion === "string" && input.shipToRegion.trim() ? input.shipToRegion.trim() : customer.region;
+    const shipToPostalCode = typeof input.shipToPostalCode === "string" && input.shipToPostalCode.trim() ? input.shipToPostalCode.trim() : customer.postalCode;
+    const shipToCountry = typeof input.shipToCountry === "string" && input.shipToCountry.trim() ? input.shipToCountry.trim().toUpperCase() : customer.country ?? "CA";
+    const deliveryInstructions = typeof input.deliveryInstructions === "string" && input.deliveryInstructions.trim() ? input.deliveryInstructions.trim() : null;
+    if (!shipToAddressLine1 || !shipToCity || !shipToRegion || !shipToPostalCode || !shipToCountry) throw new RecordValidationError("SHIP_TO_REQUIRED", "A complete ship-to address is required on the sales-order draft.");
     const number = orderNumber("SO");
     result = {
       recordId,
@@ -281,14 +326,14 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     };
     statements = [
       db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at) VALUES (?, 'create_sales_order', ?, ?, ?, ?, ?)").bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now),
-      db.prepare(`INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,owner_name,project_reference,version,created_at)
-        SELECT ?,?,?,'draft','not_invoiced',?,?,?,?,?,?,?,?,?,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-        .bind(recordId, number, customerId, requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, now, idempotencyKey, recordId, claimToken),
+      db.prepare(`INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,owner_name,project_reference,ship_to_name,ship_to_address_line_1,ship_to_address_line_2,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country,delivery_instructions,version,created_at)
+        SELECT ?,?,?,'draft','not_invoiced',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(recordId, number, customerId, requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, now, idempotencyKey, recordId, claimToken),
     ];
     items.forEach((line) => statements.push(db.prepare(`INSERT INTO sales_order_lines
-      (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_rate_bps)
-      SELECT ?,?,?,?,0,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("so-line"), recordId, line.productId, line.quantity, line.unitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.projectReference,line.linkedPurchaseOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxRateBps, idempotencyKey, recordId, claimToken)));
+      (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_rate_bps)
+      SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+      .bind(newId("so-line"), recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.projectReference,line.linkedPurchaseOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxRateBps, idempotencyKey, recordId, claimToken)));
   }
 
   charges.forEach((charge) => statements.push(db.prepare(`INSERT INTO document_charges
