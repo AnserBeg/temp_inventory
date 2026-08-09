@@ -109,3 +109,22 @@ test("tracked physical postings and drop-ship fulfillment preserve their separat
   assert.match(core, /INSERT INTO movement_assignments/);
   assert.match(migration, /idx_purchase_order_lines_source_sales_line/);
 });
+
+test("local development applies the production migration chain before serving", async () => {
+  const [packageSource, wranglerSource, migrationScript, devVars] = await Promise.all([
+    read("package.json"),
+    read("wrangler.local.jsonc"),
+    read("scripts/apply-local-migrations.mjs"),
+    read(".dev.vars.example"),
+  ]);
+  const packageJson = JSON.parse(packageSource);
+  const wrangler = JSON.parse(wranglerSource);
+  assert.equal(packageJson.scripts.predev, "node scripts/apply-local-migrations.mjs");
+  assert.equal(wrangler.d1_databases[0].binding, "DB");
+  assert.equal(wrangler.d1_databases[0].database_name, "site-creator-d1");
+  assert.equal(wrangler.d1_databases[0].migrations_dir, "drizzle");
+  assert.match(migrationScript, /d1[\s\S]*migrations[\s\S]*apply[\s\S]*--local/);
+  assert.match(migrationScript, /WRANGLER_WRITE_LOGS:\s*"false"/);
+  assert.match(devVars, /ALLOW_LOCAL_DEV_AUTH=false/);
+  assert.match(devVars, /BOOTSTRAP_DEMO_DATA=false/);
+});

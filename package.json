@@ -6,6 +6,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "predev": "node scripts/apply-local-migrations.mjs",
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",

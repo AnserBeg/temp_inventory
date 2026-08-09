@@ -56,9 +56,9 @@ npm install
 npm run dev
 ```
 
-The local Sites configuration provides D1 and R2 bindings. Development-only sample records are gated from production; a hosted empty database starts with the authenticated administrator bootstrap and master-data setup flow.
+The `predev` hook applies every pending migration to the project-local D1 database before the server starts. The local Sites configuration then provides the matching D1 and R2 bindings. Development-only sample records are gated from production; a hosted empty database starts with the authenticated administrator bootstrap and master-data setup flow.
 
-Copy `.env.example` for explicit local flags. Set `ALLOW_LOCAL_DEV_AUTH=true` only for a private local process; host names and `Host` headers never enable authentication bypass. Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Production deployments must keep both values `false`; `ENVIRONMENT=development` also enables the sample-data bootstrap and must not be used in production.
+Copy `.dev.vars.example` to `.dev.vars` for explicit local Cloudflare runtime flags. Set `ALLOW_LOCAL_DEV_AUTH=true` only for a private local process; host names and `Host` headers never enable authentication bypass. Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Production deployments must keep both values `false`; `ENVIRONMENT=development` also enables the sample-data bootstrap and must not be used in production.
 
 ## Database migrations
 

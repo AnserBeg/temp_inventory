@@ -111,6 +111,26 @@ test("location lookup reaches bins beyond the snapshot reference cap", async () 
   assert.deepEqual(result.items.map((item) => item.id), ["loc-scale-0259"]);
 });
 
+test("product detail history is complete even when global movement page one is unrelated", async () => {
+  for (let index = 0; index < 55; index += 1) {
+    const suffix = String(index).padStart(4, "0");
+    await run("INSERT INTO stock_movements (id,movement_type,product_id,quantity,to_location_id,inventory_status,source_document_type,source_document_id,posted_at,posted_by,idempotency_key) VALUES (?,?,?,?,?,'usable','scale_test',?,'2026-08-09T12:00:00Z','Scale test',?)", `movement-scale-${suffix}`, "opening_balance", `prod-scale-${suffix}`, 1, "loc-a", `scale-${suffix}`, `movement-scale-${suffix}`);
+  }
+  for (let index = 0; index < 3; index += 1) {
+    await run("INSERT INTO stock_movements (id,movement_type,product_id,quantity,to_location_id,inventory_status,source_document_type,source_document_id,posted_at,posted_by,idempotency_key) VALUES (?,?,?,?,?,'usable','detail_test',?,'2026-08-01T12:00:00Z','Detail test',?)", `movement-detail-${index}`, "opening_balance", "prod-a", 1, "loc-a", `detail-${index}`, `movement-detail-${index}`);
+  }
+  const global = await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 50, scope: "movements", sort: "newest" });
+  assert.equal(global.movements.length, 50);
+  assert.equal(global.movements.some((movement) => movement.productId === "prod-a"), false);
+
+  const firstPage = await inventoryDomain.getProductOperationalDetail("prod-a", 1, 2);
+  const secondPage = await inventoryDomain.getProductOperationalDetail("prod-a", 2, 2);
+  assert.deepEqual(firstPage.pagination, { page: 1, pageSize: 2, total: 3 });
+  assert.equal(firstPage.movements.length, 2);
+  assert.deepEqual(secondPage.pagination, { page: 2, pageSize: 2, total: 3 });
+  assert.equal(secondPage.movements.length, 1);
+});
+
 test("receipts reject unknown locations before creating physical or financial records", async () => {
   await run("INSERT INTO business_partners (id,code,name,partner_type,currency,active,version,created_at) VALUES ('vendor-receipt','VEND-R','Receipt Vendor','vendor','CAD',1,1,'2026-08-01')");
   await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('po-location','PO-LOCATION','vendor-receipt','approved','not_billed','2026-08-10','CAD',1,1000,1000,1,'2026-08-01')");
