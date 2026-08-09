@@ -15,6 +15,27 @@
       "when": 1786228413158,
       "tag": "0001_shallow_ultimo",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786233278262,
+      "tag": "0002_outgoing_tyrannus",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1786234770487,
+      "tag": "0003_polite_kingpin",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1786235231732,
+      "tag": "0004_useful_nomad",
+      "breakpoints": true
     }
   ]
 }

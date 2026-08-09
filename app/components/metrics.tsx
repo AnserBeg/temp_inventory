@@ -48,7 +48,7 @@ export function MetricCard({ label, value, detail, tone = "neutral", href, icon,
 export function InventoryMetricStrip({ metrics, className }: { metrics: MetricItem[]; className?: string }) {
   return (
     <section className={cx("inventory-metric-strip grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-7", className)} aria-label="Inventory metrics">
-      {metrics.map((metric) => <MetricCard key={metric.key} {...metric} />)}
+      {metrics.map(({ key, ...metric }) => <MetricCard key={key} {...metric} />)}
     </section>
   );
 }

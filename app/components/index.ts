@@ -6,3 +6,4 @@ export * from "./entity-table";
 export * from "./command-dialog";
 export * from "./feedback";
 export * from "./warehouse";
+export * from "./operations-suite";

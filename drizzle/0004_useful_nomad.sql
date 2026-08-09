@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `idx_purchase_order_lines_source_sales_line` ON `purchase_order_lines` (`source_sales_order_line_id`);

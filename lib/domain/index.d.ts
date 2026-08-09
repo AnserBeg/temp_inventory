@@ -335,3 +335,125 @@ export function reverseSalesShipment(
   },
 ): CommandResult<SalesOrderLine>;
 
+export type ChargeKind =
+  | "freight"
+  | "fuel_surcharge"
+  | "environmental_fee"
+  | "handling_fee"
+  | "core_charge"
+  | "empty_deposit"
+  | "returnable_deposit"
+  | "customs"
+  | "brokerage"
+  | "tax"
+  | "discount"
+  | "other";
+
+export interface FinancialLineInput {
+  quantity: number;
+  unitAmountCents: number;
+  discountCents?: number;
+  taxable?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ChargeInput {
+  kind: ChargeKind;
+  amountCents: number;
+  direction?: "add" | "subtract";
+  taxable?: boolean;
+  refundable?: boolean;
+  [key: string]: unknown;
+}
+
+export function calculateDocumentTotals(input: {
+  lines?: FinancialLineInput[];
+  charges?: ChargeInput[];
+  taxRateBps?: number;
+}): {
+  itemSubtotalCents: number;
+  chargeTotalCents: number;
+  refundableDepositCents: number;
+  taxableSubtotalCents: number;
+  taxCents: number;
+  subtotalCents: number;
+  totalCents: number;
+  physicalInventoryDelta: 0;
+};
+
+export function evaluateThreeWayMatch(input: {
+  purchaseLines?: Array<{ id: string; quantity: number; unitCostCents: number }>;
+  receiptLines?: Array<{ purchaseOrderLineId: string; quantity: number }>;
+  returnLines?: Array<{ purchaseOrderLineId: string; quantity: number }>;
+  billLines?: Array<{ purchaseOrderLineId: string; quantity: number; unitCostCents: number }>;
+  billCharges?: Array<{ kind: string; amountCents: number }>;
+  tolerances?: { quantity?: number; unitPriceCents?: number; totalCents?: number; allowedChargeKinds?: string[] };
+}): {
+  status: "matched" | "approval_required" | "blocked";
+  payable: boolean;
+  authorizedCents: number;
+  receivedValueCents: number;
+  billedCents: number;
+  varianceCents: number;
+  exceptions: ReadonlyArray<{ code: string; severity: string; message: string }>;
+  physicalInventoryDelta: 0;
+};
+
+export interface ReturnableLedger {
+  kind: "returnable-ledger";
+  balances: Record<string, Record<string, unknown>>;
+  events: ReadonlyArray<Record<string, unknown>>;
+  auditTrail: ReadonlyArray<Record<string, unknown>>;
+  version: number;
+  commandLog: Record<string, unknown>;
+}
+
+export function createReturnableLedger(): ReturnableLedger;
+export function postReturnableEvent(
+  state: ReturnableLedger,
+  command: CommandMeta & {
+    type: "issue_to_partner" | "return_from_partner" | "receive_from_partner" | "return_to_partner" | "forfeit_by_partner" | "forfeit_by_company";
+    partnerId: string;
+    assetType: string;
+    quantity: number;
+    unitDepositCents?: number;
+    actor: string;
+    reason: string;
+  },
+): CommandResult<ReturnableLedger>;
+
+export interface ApprovalRecord {
+  kind: "approval-record";
+  entityId: string;
+  entityType: string;
+  revision: number;
+  totalCents: number;
+  status: "draft" | "pending_approval" | "approved" | "rejected";
+  auditTrail: ReadonlyArray<Record<string, unknown>>;
+  version: number;
+  commandLog: Record<string, unknown>;
+}
+
+export function createApprovalRecord(input: { entityId: string; entityType: string; revision?: number; totalCents?: number }): ApprovalRecord;
+export function submitForApproval(state: ApprovalRecord, command: CommandMeta & { actor: string; reason: string }): CommandResult<ApprovalRecord>;
+export function decideApproval(state: ApprovalRecord, command: CommandMeta & { actor: string; reason: string; decision: "approved" | "rejected" }): CommandResult<ApprovalRecord>;
+export function amendApprovedRecord(state: ApprovalRecord, command: CommandMeta & { actor: string; reason: string; changes: unknown[]; totalCents?: number }): CommandResult<ApprovalRecord>;
+
+export interface ValuationLedger {
+  kind: "valuation-ledger";
+  method: "fifo" | "average" | "standard";
+  standardCostCents: number;
+  layers: ReadonlyArray<Record<string, unknown>>;
+  quantityOnHand: number;
+  inventoryValueCents: number;
+  cogsCents: number;
+  entries: ReadonlyArray<Record<string, unknown>>;
+  auditTrail: ReadonlyArray<Record<string, unknown>>;
+  version: number;
+  commandLog: Record<string, unknown>;
+}
+
+export function createValuationLedger(input?: { method?: "fifo" | "average" | "standard"; standardCostCents?: number }): ValuationLedger;
+export function receiveValuation(state: ValuationLedger, command: CommandMeta & { quantity: number; unitCostCents: number; layerId: string; actor: string; reference: string }): CommandResult<ValuationLedger>;
+export function issueValuation(state: ValuationLedger, command: CommandMeta & { quantity: number; actor: string; reference: string }): CommandResult<ValuationLedger>;
+export function allocateLandedCost(lines: Array<{ id: string; quantity?: number; unitCostCents?: number; weight?: number; volume?: number }>, totalCostCents: number, basis?: "quantity" | "weight" | "volume" | "purchase_value" | "equal"): ReadonlyArray<{ lineId: string; amountCents: number; basis: string; physicalInventoryDelta: 0 }>;

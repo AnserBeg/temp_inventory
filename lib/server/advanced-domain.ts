@@ -1,0 +1,1704 @@
+import type { ActorIdentity } from "./auth";
+import { all, documentNumber, ensureDatabase, first, getD1, newId, roundQuantity } from "./inventory-db";
+import { createOrderRecord, type CreateOrderInput } from "./inventory-records";
+import { getInventorySnapshot } from "./inventory-domain";
+import { assertPeriodOpen } from "./policy";
+
+export type WorkflowCommand = {
+  command: string;
+  entityId?: string;
+  version?: number;
+  idempotencyKey: string;
+  payload?: Record<string, unknown>;
+  actor: ActorIdentity;
+  claimToken?: string;
+  requestHash?: string;
+};
+
+export class WorkflowError extends Error {
+  constructor(public code: string, message: string, public status = 400, public currentVersion?: number) { super(message); }
+}
+
+type WorkflowResult = { message: string; impact: Record<string, unknown>; recordId?: string };
+
+const normalize = (value: string) => value.toLowerCase().replaceAll(/[_\s-]/g, "");
+const today = () => new Date().toISOString().slice(0, 10);
+
+function textValue(payload: Record<string, unknown>, key: string, fallback?: string) {
+  const value = typeof payload[key] === "string" ? payload[key].trim() : "";
+  if (!value && fallback == null) throw new WorkflowError("VALIDATION_ERROR", `${key} is required.`);
+  return value || fallback!;
+}
+
+function numberValue(payload: Record<string, unknown>, key: string, { positive = true, integer = false } = {}) {
+  const value = Number(payload[key]);
+  if (!Number.isFinite(value) || (positive && value <= 0) || (integer && !Number.isSafeInteger(value))) {
+    throw new WorkflowError("VALIDATION_ERROR", `${key} must be ${positive ? "positive" : "numeric"}${integer ? " whole-number" : ""}.`);
+  }
+  return value;
+}
+
+function dateValue(payload: Record<string, unknown>, key: string, fallback?: string) {
+  const value = textValue(payload, key, fallback);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value) {
+    throw new WorkflowError("VALIDATION_ERROR", `${key} must be a valid YYYY-MM-DD date.`);
+  }
+  return value;
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+async function hashCommand(command: WorkflowCommand) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableJson({ command: normalize(command.command), entityId: command.entityId, version: command.version, payload: command.payload })));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function replay(command: WorkflowCommand) {
+  const stored = await first<{ responseJson: string; requestHash: string | null }>("SELECT response_json AS responseJson, request_hash AS requestHash FROM command_log WHERE idempotency_key=?", command.idempotencyKey);
+  if (!stored) return null;
+  if (stored.requestHash && command.requestHash && stored.requestHash !== command.requestHash) throw new WorkflowError("IDEMPOTENCY_CONFLICT", "This idempotency key belongs to a different workflow request.", 409);
+  return JSON.parse(stored.responseJson) as WorkflowResult;
+}
+
+function marker(command: WorkflowCommand) {
+  const key = command.idempotencyKey.replaceAll("'", "''");
+  const claim = (command.claimToken ?? "").replaceAll("'", "''");
+  return `EXISTS (SELECT 1 FROM command_log WHERE idempotency_key='${key}' AND claim_token='${claim}')`;
+}
+
+function auditStatement(command: WorkflowCommand, entityType: string, entityId: string, action: string, summary: string, metadata: unknown, when = new Date().toISOString()) {
+  return getD1().prepare(`INSERT INTO audit_events
+    (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
+    SELECT ?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
+    .bind(newId("audit"), entityType, entityId, action, summary, command.actor.label, command.actor.id, command.actor.email, JSON.stringify(metadata), when);
+}
+
+function outboxStatement(command: WorkflowCommand, eventType: string, aggregateType: string, aggregateId: string, payload: unknown, when = new Date().toISOString()) {
+  return getD1().prepare(`INSERT INTO outbox_events
+    (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
+    SELECT ?,?,?,?,?,'pending',0,?,? WHERE ${marker(command)}`)
+    .bind(newId("outbox"), eventType, aggregateType, aggregateId, JSON.stringify(payload), when, when);
+}
+
+function claimValues(command: WorkflowCommand, result: WorkflowResult, entityId: string) {
+  return [command.idempotencyKey, command.command, entityId, JSON.stringify(result), command.requestHash ?? null, command.claimToken ?? null, new Date().toISOString()] as const;
+}
+
+async function finish(command: WorkflowCommand) {
+  const result = await replay(command);
+  if (!result) throw new WorkflowError("VERSION_CONFLICT", "The record changed before this workflow command could commit.", 409);
+  return result;
+}
+
+async function setting<T>(key: string, fallback: T): Promise<T> {
+  const row = await first<{ valueJson: string }>("SELECT value_json AS valueJson FROM system_settings WHERE key=?", key);
+  if (!row) return fallback;
+  try { return JSON.parse(row.valueJson) as T; } catch { return fallback; }
+}
+
+type NormalizedCharge = {
+  chargeType: string;
+  description: string;
+  amount: number;
+  direction: "add" | "subtract";
+  taxable: boolean;
+  refundable: boolean;
+  taxCode: string | null;
+  taxRate: number;
+  taxAmount: number;
+  subtotalDelta: number;
+  taxDelta: number;
+  totalDelta: number;
+};
+
+const supportedChargeTypes = new Set([
+  "freight",
+  "fuel_surcharge",
+  "environmental_fee",
+  "handling",
+  "customs",
+  "brokerage",
+  "discount",
+  "tax_adjustment",
+  "core_deposit",
+  "empty_deposit",
+  "returnable_deposit",
+  "other",
+]);
+const refundableChargeTypes = new Set(["core_deposit", "empty_deposit", "returnable_deposit"]);
+
+function normalizeChargePayload(payload: Record<string, unknown>): NormalizedCharge {
+  const chargeType = textValue(payload, "chargeType").toLowerCase();
+  if (!supportedChargeTypes.has(chargeType)) {
+    throw new WorkflowError("INVALID_CHARGE_TYPE", `chargeType must be one of: ${[...supportedChargeTypes].join(", ")}.`);
+  }
+  const description = textValue(payload, "description");
+  const amount = numberValue(payload, "amountCents", { integer: true });
+  const direction = payload.direction === "subtract" ? "subtract" : "add";
+  if (chargeType === "discount" && direction !== "subtract") {
+    throw new WorkflowError("INVALID_CHARGE_DIRECTION", "Discount charges must subtract from the document total.");
+  }
+  const refundable = payload.refundable === true;
+  if (refundable !== refundableChargeTypes.has(chargeType)) {
+    throw new WorkflowError(
+      "INVALID_REFUNDABLE_CHARGE",
+      refundableChargeTypes.has(chargeType)
+        ? `${chargeType} must be marked refundable.`
+        : "Only core, empty, and returnable deposits may be marked refundable."
+    );
+  }
+  const taxable = payload.taxable === true;
+  const taxRate = payload.taxRateBps == null ? 0 : numberValue(payload, "taxRateBps", { positive: false, integer: true });
+  if (taxRate < 0 || taxRate > 10_000) throw new WorkflowError("VALIDATION_ERROR", "taxRateBps must be 0-10000.");
+  if (!taxable && taxRate !== 0) throw new WorkflowError("VALIDATION_ERROR", "A non-taxable charge must use a zero tax rate.");
+  const sign = direction === "subtract" ? -1 : 1;
+  const taxAmount = taxable ? Math.round(amount * taxRate / 10_000) : 0;
+  return {
+    chargeType,
+    description,
+    amount,
+    direction,
+    taxable,
+    refundable,
+    taxCode: optionalText(payload, "taxCode"),
+    taxRate,
+    taxAmount,
+    subtotalDelta: sign * amount,
+    taxDelta: sign * taxAmount,
+    totalDelta: sign * (amount + taxAmount),
+  };
+}
+
+function validateDocumentCurrency(value: unknown, expected: string) {
+  if (value == null || value === "") return expected;
+  const currency = String(value).trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) throw new WorkflowError("VALIDATION_ERROR", "currency must be a three-letter ISO code.");
+  if (currency !== expected) {
+    throw new WorkflowError("CURRENCY_MISMATCH", `The document currency must remain ${expected}; use exchangeRateToBase for base-currency conversion.`, 409);
+  }
+  return currency;
+}
+
+async function createDraft(command: WorkflowCommand, type: "purchaseOrder" | "salesOrder") {
+  const payload = command.payload ?? {};
+  const created = await createOrderRecord({
+    ...(payload as Omit<CreateOrderInput, "type" | "idempotencyKey">),
+    type,
+    idempotencyKey: command.idempotencyKey,
+    actor: command.actor.label,
+    actorId: command.actor.id,
+    actorEmail: command.actor.email,
+  } as CreateOrderInput);
+  return created;
+}
+
+async function submitPurchaseOrder(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const reason = textValue(command.payload ?? {}, "reason");
+  const version = command.version ?? 0;
+  const current = await first<{ lifecycleStatus: string; version: number }>("SELECT lifecycle_status AS lifecycleStatus, version FROM purchase_orders WHERE id=?", id);
+  if (!current) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
+  if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before submitting.", 409, current.version);
+  if (!["draft", "rejected"].includes(current.lifecycleStatus)) throw new WorkflowError("INVALID_STATE", "Only draft or rejected purchase orders can be submitted.", 409, current.version);
+  const approvalId = newId("approval");
+  const result: WorkflowResult = { message: "Purchase order submitted for approval; inventory is unchanged.", impact: { physical: "No stock movement.", commercial: "Commitment remains inactive until approval.", financial: "No bill created.", onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=?`).bind(...claimValues(command, result, id), id, version),
+    db.prepare(`UPDATE purchase_orders SET lifecycle_status='pending_approval',version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(id, version),
+    db.prepare(`UPDATE purchase_order_revisions SET lifecycle_status='pending_approval'
+      WHERE purchase_order_id=? AND revision_number=(SELECT revision_number FROM purchase_orders WHERE id=?)
+        AND lifecycle_status IN ('draft','rejected') AND ${marker(command)}`).bind(id, id),
+    db.prepare(`INSERT INTO approvals (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,metadata_json,version)
+      SELECT ?,'purchase_order',?,'purchase_order_approval','pending',?,?,?,'{}',1 WHERE ${marker(command)}`).bind(approvalId, id, command.actor.label, reason, when),
+    auditStatement(command, "purchase_order", id, "submitted_for_approval", result.message, { reason, approvalId }, when),
+    outboxStatement(command, "purchase_order.approval_requested", "purchase_order", id, { approvalId }, when),
+  ]);
+  return finish(command);
+}
+
+async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved" | "rejected") {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const reason = textValue(command.payload ?? {}, "reason");
+  const version = command.version ?? 0;
+  const current = await first<{ version: number; status: string; revision: number }>("SELECT version, lifecycle_status AS status, revision_number AS revision FROM purchase_orders WHERE id=?", id);
+  if (!current) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
+  if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before deciding.", 409, current.version);
+  if (current.status !== "pending_approval") throw new WorkflowError("INVALID_STATE", "Only pending purchase orders can be approved or rejected.", 409);
+  const approval = await first<{ id: string; requestType: string; version: number }>(
+    "SELECT id,request_type AS requestType,version FROM approvals WHERE entity_type='purchase_order' AND entity_id=? AND status='pending' ORDER BY requested_at DESC,id DESC LIMIT 1",
+    id
+  );
+  if (!approval) throw new WorkflowError("APPROVAL_STATE_MISSING", "The pending purchase-order approval record is missing.", 409);
+  const amendmentDecision = approval.requestType === "purchase_order_amendment";
+  let restoration: { revision: number; total: number; baseTotal: number; lines: Array<{ id: string; ordered: number; unitCost: number }> } | null = null;
+  if (amendmentDecision && decision === "rejected") {
+    const revision = await first<{ snapshotJson: string }>(
+      "SELECT snapshot_json AS snapshotJson FROM purchase_order_revisions WHERE purchase_order_id=? AND revision_number=? AND lifecycle_status='pending_approval'",
+      id, current.revision
+    );
+    let parsed: Record<string, unknown> = {};
+    try { parsed = JSON.parse(revision?.snapshotJson ?? "{}") as Record<string, unknown>; } catch { /* handled below */ }
+    const previous = parsed.previous as { order?: Record<string, unknown>; lines?: Array<Record<string, unknown>> } | undefined;
+    const previousRevision = Number(previous?.order?.revisionNumber);
+    const previousTotal = Number(previous?.order?.totalCents);
+    const previousBaseTotal = Number(previous?.order?.baseTotalCents);
+    const previousLines = Array.isArray(previous?.lines) ? previous.lines.map((line) => ({
+      id: String(line.id ?? ""), ordered: Number(line.ordered), unitCost: Number(line.unitCost),
+    })) : [];
+    if (!Number.isSafeInteger(previousRevision) || previousRevision < 1 || !Number.isSafeInteger(previousTotal)
+        || previousTotal < 0 || !Number.isSafeInteger(previousBaseTotal) || previousBaseTotal < 0
+        || !previousLines.length || previousLines.some((line) => !line.id || !Number.isFinite(line.ordered)
+          || line.ordered <= 0 || !Number.isSafeInteger(line.unitCost) || line.unitCost < 0)) {
+      throw new WorkflowError("REVISION_RESTORE_MISSING", "The prior approved purchase-order snapshot cannot be restored safely; approval decision was blocked.", 409);
+    }
+    restoration = { revision: previousRevision, total: previousTotal, baseTotal: previousBaseTotal, lines: previousLines };
+  }
+  const message = amendmentDecision
+    ? decision === "approved"
+      ? "Purchase-order amendment approved; the revised open quantities now contribute to incoming supply."
+      : "Purchase-order amendment rejected; the prior approved commitment was restored without moving inventory."
+    : decision === "approved"
+      ? "Purchase order approved; open quantities now contribute to incoming supply."
+      : "Purchase order rejected; no purchasing commitment or inventory movement was created.";
+  const result: WorkflowResult = { message, impact: { physical: "No stock movement.", commercial: restoration ? "Prior approved incoming commitment restored." : decision === "approved" ? "Incoming forecast activated." : "Commitment remains inactive.", financial: "No vendor bill created.", onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='pending_approval'
+        AND EXISTS (SELECT 1 FROM approvals WHERE id=? AND version=? AND status='pending')`)
+      .bind(...claimValues(command, result, id), id, version, approval.id, approval.version),
+    restoration
+      ? db.prepare(`UPDATE purchase_orders SET lifecycle_status='approved',revision_number=?,total_cents=?,base_total_cents=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`)
+        .bind(restoration.revision, restoration.total, restoration.baseTotal, id, version)
+      : db.prepare(`UPDATE purchase_orders SET lifecycle_status=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(decision, id, version),
+    db.prepare(`UPDATE approvals SET status=?,decided_by=?,decision_reason=?,decided_at=?,version=version+1 WHERE id=? AND version=? AND status='pending' AND ${marker(command)}`)
+      .bind(decision, command.actor.label, reason, when, approval.id, approval.version),
+    db.prepare(`UPDATE purchase_order_revisions SET lifecycle_status=? WHERE purchase_order_id=? AND revision_number=? AND lifecycle_status='pending_approval' AND ${marker(command)}`)
+      .bind(decision, id, current.revision),
+  ];
+  if (restoration) {
+    for (const line of restoration.lines) {
+      statements.push(db.prepare(`UPDATE purchase_order_lines SET ordered_qty=?,unit_cost_cents=? WHERE id=? AND purchase_order_id=? AND ${marker(command)}`)
+        .bind(line.ordered, line.unitCost, line.id, id));
+    }
+  }
+  statements.push(
+    auditStatement(command, "purchase_order", id, restoration ? "amendment_rejected_restored" : decision, message,
+      { reason, approvalId: approval.id, requestType: approval.requestType, proposalRevision: current.revision, restoredRevision: restoration?.revision ?? null }, when),
+    outboxStatement(command, restoration ? "purchase_order.amendment_rejected_restored" : `purchase_order.${decision}`,
+      "purchase_order", id, { reason, approvalId: approval.id, restoredRevision: restoration?.revision ?? null }, when),
+  );
+  await db.batch(statements);
+  return finish(command);
+}
+
+async function amendPurchaseOrder(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const payload = command.payload ?? {};
+  const reason = textValue(payload, "reason");
+  const changes = Array.isArray(payload.lines) ? payload.lines as Array<Record<string, unknown>> : [];
+  if (!changes.length) throw new WorkflowError("VALIDATION_ERROR", "lines must contain at least one amendment.");
+  const version = command.version ?? 0;
+  const order = await first<{ version: number; status: string; revision: number; number: string; vendorId: string; currency: string; exchange: number; total: number; baseTotal: number; expectedDate: string; paymentTerms: string | null; dueDate: string | null; buyerName: string | null; projectReference: string | null }>("SELECT version,lifecycle_status AS status,revision_number AS revision,number,vendor_id AS vendorId,currency,exchange_rate_to_base AS exchange,total_cents AS total,base_total_cents AS baseTotal,expected_date AS expectedDate,payment_terms AS paymentTerms,due_date AS dueDate,buyer_name AS buyerName,project_reference AS projectReference FROM purchase_orders WHERE id=?", id);
+  if (!order) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
+  if (order.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before amending.", 409, order.version);
+  if (order.status !== "approved") throw new WorkflowError("INVALID_STATE", "Only approved purchase orders can be amended.", 409);
+  const changeIds = changes.map((change) => textValue(change, "lineId"));
+  if (new Set(changeIds).size !== changeIds.length) throw new WorkflowError("DUPLICATE_DOCUMENT_LINE", "Each purchase-order line may be amended only once.");
+  const existingLines = await all<{ id: string; productId: string; ordered: number; closed: number; unitCost: number; configuration: string | null; route: string; sourceSalesLineId: string | null; retained: number }>(`SELECT pol.id,pol.product_id AS productId,pol.ordered_qty AS ordered,pol.closed_qty AS closed,pol.unit_cost_cents AS unitCost,pol.configuration_snapshot AS configuration,pol.fulfillment_route AS route,pol.source_sales_order_line_id AS sourceSalesLineId,
+      CASE WHEN pol.fulfillment_route='drop_ship'
+        THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
+        ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END AS retained
+    FROM purchase_order_lines pol WHERE pol.purchase_order_id=? ORDER BY pol.id`, id);
+  if (changeIds.some((lineId) => !existingLines.some((line) => line.id === lineId))) throw new WorkflowError("INVALID_PO_LINE", "Every amendment line must belong to this purchase order.", 409);
+  const amendedLines = existingLines.map((line) => {
+    const change = changes.find((row) => row.lineId === line.id);
+    if (!change) return line;
+    const ordered = roundQuantity(numberValue(change, "orderedQuantity"));
+    const unitCost = change.unitCostCents == null ? line.unitCost : numberValue(change, "unitCostCents", { integer: true });
+    const amendmentFloor = roundQuantity(line.retained + line.closed);
+    if (ordered < amendmentFloor) throw new WorkflowError("BELOW_RETAINED_OR_CLOSED", `Line ${line.id} cannot be amended below ${amendmentFloor}: ${line.retained} retained plus ${line.closed} closed.`, 409);
+    return { ...line, ordered, unitCost };
+  });
+  const charges = await all<{ chargeType: string; description: string; amount: number; direction: string; taxable: number; refundable: number; taxCode: string | null; taxRate: number; taxAmount: number }>("SELECT charge_type AS chargeType,description,amount_cents AS amount,direction,taxable,refundable,tax_code AS taxCode,tax_rate_bps AS taxRate,tax_amount_cents AS taxAmount FROM document_charges WHERE document_type='purchase_order' AND document_id=? ORDER BY created_at,id", id);
+  const itemSubtotal = amendedLines.reduce((sum, line) => sum + Math.round(line.ordered * line.unitCost), 0);
+  const chargeSubtotal = charges.reduce((sum, charge) => sum + (charge.direction === "subtract" ? -charge.amount : charge.amount), 0);
+  const chargeTax = charges.reduce((sum, charge) => sum + (charge.direction === "subtract" ? -Math.abs(charge.taxAmount) : Math.abs(charge.taxAmount)), 0);
+  const total = itemSubtotal + chargeSubtotal + chargeTax;
+  if (total < 0) throw new WorkflowError("INVALID_DOCUMENT_TOTAL", "Amendment cannot make the purchase-order total negative.");
+  const baseTotal = Math.round(total * order.exchange);
+  const revisionHead = await first<{ revision: number }>("SELECT COALESCE(MAX(revision_number),0) AS revision FROM purchase_order_revisions WHERE purchase_order_id=?", id);
+  const nextRevision = Math.max(order.revision, Number(revisionHead?.revision ?? 0)) + 1;
+  const result: WorkflowResult = { message: `Revision ${nextRevision} created and submitted for approval; on-hand inventory is unchanged.`, impact: { physical: "No stock movement.", commercial: "Revised commitment awaits approval.", financial: "Existing bills are unchanged.", onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=?
+        AND NOT EXISTS (SELECT 1 FROM purchase_order_revisions WHERE purchase_order_id=? AND revision_number=?)`)
+      .bind(...claimValues(command, result, id), id, version, id, nextRevision),
+    db.prepare(`UPDATE purchase_orders SET lifecycle_status='pending_approval',revision_number=?,total_cents=?,base_total_cents=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(nextRevision, total, baseTotal, id, version),
+  ];
+  for (const change of changes) {
+    const lineId = textValue(change, "lineId");
+    const amended = amendedLines.find((line) => line.id === lineId)!;
+    statements.push(db.prepare(`UPDATE purchase_order_lines SET ordered_qty=?,unit_cost_cents=? WHERE id=? AND purchase_order_id=? AND ${marker(command)}`).bind(amended.ordered, amended.unitCost, lineId, id));
+  }
+  const previous = {
+    order: { id, number: order.number, vendorId: order.vendorId, lifecycleStatus: "approved", revisionNumber: order.revision,
+      currency: order.currency, exchangeRateToBase: order.exchange, expectedDate: order.expectedDate,
+      paymentTerms: order.paymentTerms, dueDate: order.dueDate, buyerName: order.buyerName,
+      projectReference: order.projectReference, totalCents: order.total, baseTotalCents: order.baseTotal },
+    lines: existingLines,
+    charges,
+  };
+  const snapshot = { order: { id, number: order.number, vendorId: order.vendorId, lifecycleStatus: "pending_approval", revisionNumber: nextRevision, currency: order.currency, exchangeRateToBase: order.exchange, expectedDate: order.expectedDate, paymentTerms: order.paymentTerms, dueDate: order.dueDate, buyerName: order.buyerName, projectReference: order.projectReference, itemSubtotalCents: itemSubtotal, chargeSubtotalCents: chargeSubtotal, chargeTaxCents: chargeTax, totalCents: total, baseTotalCents: baseTotal }, lines: amendedLines, charges, previous };
+  statements.push(
+    db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
+      SELECT ?,?,?,'pending_approval',?,?,?,? WHERE ${marker(command)}`).bind(newId("revision"), id, nextRevision, JSON.stringify(snapshot), reason, command.actor.label, when),
+    db.prepare(`INSERT INTO approvals (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,metadata_json,version)
+      SELECT ?,'purchase_order',?,'purchase_order_amendment','pending',?,?,?, ?,1 WHERE ${marker(command)}`).bind(newId("approval"), id, command.actor.label, reason, when, JSON.stringify({ revision: nextRevision })),
+    auditStatement(command, "purchase_order", id, "amended", result.message, { reason, changes }, when),
+    outboxStatement(command, "purchase_order.amended", "purchase_order", id, { revision: nextRevision }, when)
+  );
+  await db.batch(statements);
+  return finish(command);
+}
+
+async function requestApproval(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const entityType = textValue(payload, "entityType");
+  const entityId = command.entityId ?? textValue(payload, "entityId");
+  const requestType = textValue(payload, "requestType");
+  const reason = textValue(payload, "reason");
+  const allowed:Record<string,{entityType:string;table:string}>={over_receipt:{entityType:"purchase_order_line",table:"purchase_order_lines"},inventory_count_variance:{entityType:"product",table:"products"},scrap:{entityType:"product",table:"products"},price_variance:{entityType:"vendor_bill",table:"vendor_bills"}};
+  const rule=allowed[requestType];
+  if(!rule||entityType!==rule.entityType) throw new WorkflowError("INVALID_APPROVAL_TYPE","requestType/entityType is not an allowed approval workflow.");
+  if(!await first(`SELECT id FROM ${rule.table} WHERE id=?`,entityId)) throw new WorkflowError("NOT_FOUND","Approval target was not found.",404);
+  const metadata=payload.metadata&&typeof payload.metadata==="object"?payload.metadata as Record<string,unknown>:{};
+  if(requestType==="over_receipt"&&(!Number.isFinite(Number(metadata.maxExcessQuantity))||Number(metadata.maxExcessQuantity)<=0)) throw new WorkflowError("VALIDATION_ERROR","over_receipt approval metadata.maxExcessQuantity must be positive.");
+  if(requestType==="scrap"&&(!Number.isSafeInteger(Number(metadata.maxValueCents))||Number(metadata.maxValueCents)<=0)) throw new WorkflowError("VALIDATION_ERROR","scrap approval metadata.maxValueCents must be a positive whole number of cents.");
+  const approvalId = newId("approval");
+  const result: WorkflowResult = { message: "Approval request created; no inventory or financial posting occurred.", impact: { physical: "No stock movement.", financial: "No posting.", onHandDelta: 0 }, recordId: approvalId };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)`).bind(...claimValues(command, result, approvalId)),
+    db.prepare(`INSERT INTO approvals (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,metadata_json,version)
+      SELECT ?,?,?,?,'pending',?,?,?, ?,1 WHERE ${marker(command)}`).bind(approvalId, entityType, entityId, requestType, command.actor.label, reason, when, JSON.stringify(metadata)),
+    auditStatement(command, entityType, entityId, "approval_requested", result.message, { approvalId, requestType, reason }, when),
+    outboxStatement(command, "approval.requested", entityType, entityId, { approvalId, requestType }, when),
+  ]);
+  return finish(command);
+}
+
+async function decideApproval(command: WorkflowCommand, decision: "approved" | "rejected") {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const reason = textValue(command.payload ?? {}, "reason");
+  const version = command.version ?? 0;
+  const approval = await first<{ version: number; status: string; entityType: string; entityId: string }>("SELECT version,status,entity_type AS entityType,entity_id AS entityId FROM approvals WHERE id=?", id);
+  if (!approval) throw new WorkflowError("NOT_FOUND", "Approval was not found.", 404);
+  if (approval.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Approval changed; refresh before deciding.", 409, approval.version);
+  if (approval.status !== "pending") throw new WorkflowError("INVALID_STATE", "Only pending approvals can be decided.", 409);
+  const result: WorkflowResult = { message: `Approval ${decision}; no inventory moved.`, impact: { physical: "No stock movement.", approvalStatus: decision, onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM approvals WHERE id=? AND version=? AND status='pending'`).bind(...claimValues(command, result, id), id, version),
+    db.prepare(`UPDATE approvals SET status=?,decided_by=?,decision_reason=?,decided_at=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(decision, command.actor.label, reason, when, id, version),
+    auditStatement(command, approval.entityType, approval.entityId, `approval_${decision}`, result.message, { approvalId: id, reason }, when),
+    outboxStatement(command, `approval.${decision}`, approval.entityType, approval.entityId, { approvalId: id }, when),
+  ]);
+  return finish(command);
+}
+
+type TrackingSelection = {
+  policy: "quantity" | "lot" | "serial";
+  productId: string;
+  lotId: string | null;
+  unitId: string | null;
+  unitVersion: number | null;
+  sourceStatus: string;
+};
+
+async function requireSourceTracking(
+  productId: string,
+  locationId: string,
+  quantity: number,
+  payload: Record<string, unknown>,
+  fixed?: { lotId?: string | null; unitId?: string | null }
+): Promise<TrackingSelection> {
+  const product = await first<{ policy: string; active: number }>("SELECT tracking_policy AS policy,active FROM products WHERE id=?", productId);
+  if (!product || !product.active) throw new WorkflowError("INVALID_PRODUCT", "An active product is required.", 404);
+  if (!["quantity", "lot", "serial"].includes(product.policy)) throw new WorkflowError("TRACKING_CONFIGURATION_ERROR", "The product tracking policy is invalid.", 500);
+  const location = await first<{ status: string; active: number }>("SELECT inventory_status AS status,active FROM locations WHERE id=?", locationId);
+  if (!location || !location.active) throw new WorkflowError("INVALID_LOCATION", "Traceable inventory requires an active source location.", 409);
+  const suppliedLotId = fixed?.lotId ?? optionalText(payload, "lotId");
+  const suppliedUnitId = fixed?.unitId ?? optionalText(payload, "inventoryUnitId");
+  if (product.policy === "quantity") {
+    if (suppliedLotId || suppliedUnitId) throw new WorkflowError("TRACKING_POLICY_MISMATCH", "Quantity-tracked products cannot post lot or serial identities.", 409);
+    return { policy: "quantity", productId, lotId: null, unitId: null, unitVersion: null, sourceStatus: location.status };
+  }
+  if (product.policy === "lot") {
+    if (!suppliedLotId || suppliedUnitId) throw new WorkflowError("LOT_ASSIGNMENT_REQUIRED", "A valid lotId, and no serial unit, is required for this lot-tracked product.", 409);
+    const lot = await first<{ productId: string; status: string }>("SELECT product_id AS productId,status FROM inventory_lots WHERE id=?", suppliedLotId);
+    if (!lot || lot.productId !== productId || lot.status !== "active") throw new WorkflowError("INVALID_LOT", "The lot is not active for this product.", 409);
+    const balance = await first<{ quantity: number }>(`SELECT COALESCE(SUM(CASE WHEN sm.to_location_id=? THEN ma.quantity WHEN sm.from_location_id=? THEN -ma.quantity ELSE 0 END),0) AS quantity
+      FROM movement_assignments ma JOIN stock_movements sm ON sm.id=ma.movement_id
+      WHERE sm.product_id=? AND ma.lot_id=?`, locationId, locationId, productId, suppliedLotId);
+    if (roundQuantity(Number(balance?.quantity ?? 0)) < quantity) throw new WorkflowError("LOT_QUANTITY_SHORTAGE", "The selected lot does not have enough identified on-hand quantity at the source location.", 409);
+    return { policy: "lot", productId, lotId: suppliedLotId, unitId: null, unitVersion: null, sourceStatus: location.status };
+  }
+  if (quantity !== 1) throw new WorkflowError("SERIAL_QUANTITY_INVALID", "Serial-tracked postings must have a quantity of exactly one.", 409);
+  if (!suppliedUnitId) throw new WorkflowError("SERIAL_ASSIGNMENT_REQUIRED", "inventoryUnitId is required for this serial-tracked product.", 409);
+  const unit = await first<{ productId: string; lotId: string | null; locationId: string; inventoryStatus: string; lifecycleStatus: string; allocated: string | null; version: number }>(`SELECT product_id AS productId,lot_id AS lotId,location_id AS locationId,inventory_status AS inventoryStatus,lifecycle_status AS lifecycleStatus,allocated_sales_order_line_id AS allocated,version FROM inventory_units WHERE id=?`, suppliedUnitId);
+  if (!unit || unit.productId !== productId || unit.locationId !== locationId || unit.inventoryStatus !== location.status || unit.lifecycleStatus !== "on_hand") {
+    throw new WorkflowError("INVALID_SERIAL_STATE", "The serial unit is not on hand for this product, location, and inventory status.", 409);
+  }
+  if (unit.allocated) throw new WorkflowError("SERIAL_ALLOCATED", "The selected serial is allocated to demand and cannot be moved by this workflow.", 409);
+  if (suppliedLotId && unit.lotId !== suppliedLotId) throw new WorkflowError("SERIAL_LOT_MISMATCH", "The selected serial does not belong to the supplied lot.", 409);
+  return { policy: "serial", productId, lotId: unit.lotId, unitId: suppliedUnitId, unitVersion: unit.version, sourceStatus: location.status };
+}
+
+function trackingClaim(trace: TrackingSelection, locationId: string, quantity: number) {
+  if (trace.policy === "quantity") return { sql: "1=1", bindings: [] as unknown[] };
+  if (trace.policy === "lot") return {
+    sql: `(SELECT COALESCE(SUM(CASE WHEN sm.to_location_id=? THEN ma.quantity WHEN sm.from_location_id=? THEN -ma.quantity ELSE 0 END),0) FROM movement_assignments ma JOIN stock_movements sm ON sm.id=ma.movement_id WHERE sm.product_id=? AND ma.lot_id=?)>=?`,
+    bindings: [locationId, locationId, trace.productId, trace.lotId, quantity] as unknown[],
+  };
+  return {
+    sql: "EXISTS (SELECT 1 FROM inventory_units iu WHERE iu.id=? AND iu.product_id=? AND iu.location_id=? AND iu.inventory_status=? AND iu.lifecycle_status='on_hand' AND iu.allocated_sales_order_line_id IS NULL AND iu.version=?)",
+    bindings: [trace.unitId, trace.productId, locationId, trace.sourceStatus, trace.unitVersion] as unknown[],
+  };
+}
+
+function assignmentStatement(command: WorkflowCommand, movementId: string, trace: TrackingSelection, quantity: number) {
+  if (trace.policy === "quantity") return null;
+  return getD1().prepare(`INSERT INTO movement_assignments (id,movement_id,lot_id,inventory_unit_id,quantity) SELECT ?,?,?,?,? WHERE ${marker(command)}`)
+    .bind(newId("assignment"), movementId, trace.lotId, trace.unitId, quantity);
+}
+
+async function moveInventory(command: WorkflowCommand, movementType: "internal_transfer" | "status_change") {
+  const payload = command.payload ?? {};
+  const productId = command.entityId ?? textValue(payload, "productId");
+  const fromLocationId = textValue(payload, "fromLocationId");
+  const requestedTo = textValue(payload, "toLocationId");
+  const quantity = roundQuantity(numberValue(payload, "quantity"));
+  const reason = textValue(payload, "reason");
+  const postingDate = dateValue(payload, "postingDate", today());
+  await assertPeriodOpen("inventory", postingDate);
+  const locations = await all<{ id: string; warehouseId: string; status: string; active: number }>("SELECT id,warehouse_id AS warehouseId,inventory_status AS status,active FROM locations WHERE id IN (?,?)", fromLocationId, requestedTo);
+  if (locations.length !== 2 || locations.some((location) => !location.active)) throw new WorkflowError("INVALID_LOCATION", "Both source and destination locations must be active.", 404);
+  const from = locations.find((row) => row.id === fromLocationId)!;
+  const to = locations.find((row) => row.id === requestedTo)!;
+  const interWarehouse = from.warehouseId !== to.warehouseId;
+  const requestedTransitLocationId = optionalText(payload, "inTransitLocationId");
+  const transitLocation = interWarehouse
+    ? requestedTransitLocationId
+      ? await first<{ id: string }>(`SELECT id FROM locations WHERE id=? AND warehouse_id=? AND location_type='in_transit' AND inventory_status='in_transit' AND active=1`, requestedTransitLocationId, from.warehouseId)
+      : await first<{ id: string }>(`SELECT id FROM locations WHERE warehouse_id=? AND location_type='in_transit' AND inventory_status='in_transit' AND active=1 ORDER BY code,id LIMIT 1`, from.warehouseId)
+    : null;
+  if (interWarehouse && !transitLocation) throw new WorkflowError("TRANSIT_LOCATION_REQUIRED", "Configure an active in-transit location in the source warehouse, or select one explicitly, before dispatching an inter-warehouse transfer.", 409);
+  const destinationId = transitLocation?.id ?? requestedTo;
+  const destinationStatus = interWarehouse ? "in_transit" : to.status;
+  const balance = await first<{ available: number }>("SELECT on_hand_qty-reserved_qty AS available FROM inventory_balances WHERE product_id=? AND location_id=?", productId, fromLocationId);
+  if (!balance || balance.available < quantity) throw new WorkflowError("NEGATIVE_INVENTORY_BLOCKED", "Not enough unreserved stock exists at the source location.", 409);
+  const trace = await requireSourceTracking(productId, fromLocationId, quantity, payload);
+  const traceClaim = trackingClaim(trace, fromLocationId, quantity);
+  const locationClaimSql = `AND EXISTS (SELECT 1 FROM locations source WHERE source.id=? AND source.warehouse_id=? AND source.inventory_status=? AND source.active=1)
+    AND EXISTS (SELECT 1 FROM locations destination WHERE destination.id=? AND destination.warehouse_id=? AND destination.inventory_status=? AND destination.active=1)
+    ${interWarehouse ? "AND EXISTS (SELECT 1 FROM locations transit WHERE transit.id=? AND transit.warehouse_id=? AND transit.location_type='in_transit' AND transit.inventory_status='in_transit' AND transit.active=1)" : ""}`;
+  const locationClaimBindings = [fromLocationId, from.warehouseId, from.status, requestedTo, to.warehouseId, to.status,
+    ...(interWarehouse ? [destinationId, from.warehouseId] : [])];
+  const transferId = newId("transfer"); const transferNumber = documentNumber("TRF");
+  const result: WorkflowResult = { message: interWarehouse ? `${transferNumber} dispatched to in-transit inventory.` : `${transferNumber} posted between warehouse locations.`, impact: { physical: `${quantity} units moved; total company on-hand is unchanged.`, commercial: "Orders are unchanged.", financial: "No invoice or bill created.", onHandDelta: 0, trackingPolicy: trace.policy, transferType: interWarehouse ? "inter_warehouse" : "intra_warehouse", destinationStatus }, recordId: transferId };
+  const db = getD1(); const when = new Date().toISOString(); const sourceMovement = newId("movement"); const destinationMovement = newId("movement");
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM inventory_balances WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${traceClaim.sql} ${locationClaimSql}`).bind(...claimValues(command, result, transferId), productId, fromLocationId, quantity, ...traceClaim.bindings, ...locationClaimBindings),
+    db.prepare(`UPDATE inventory_balances SET on_hand_qty=on_hand_qty-?,version=version+1 WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${marker(command)}`).bind(quantity, productId, fromLocationId, quantity),
+    db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) SELECT ?,?,?,0,1 WHERE ${marker(command)} ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=on_hand_qty+excluded.on_hand_qty,version=version+1`).bind(productId, destinationId, quantity),
+    db.prepare(`INSERT INTO inventory_transfers (id,number,transfer_type,status,from_warehouse_id,to_warehouse_id,in_transit_location_id,posted_at,posted_by,version)
+      SELECT ?,?,?,?, ?,?,?,?, ?,1 WHERE ${marker(command)}`).bind(transferId, transferNumber, interWarehouse ? "inter_warehouse" : "intra_warehouse", interWarehouse ? "in_transit" : "posted", from.warehouseId, to.warehouseId, interWarehouse ? destinationId : null, when, command.actor.label),
+    db.prepare(`INSERT INTO inventory_transfer_lines (id,transfer_id,product_id,from_location_id,to_location_id,quantity,lot_id,inventory_unit_id)
+      SELECT ?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("transfer-line"), transferId, productId, fromLocationId, requestedTo, quantity, trace.lotId, trace.unitId),
+    db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,from_location_id,inventory_status,source_document_type,source_document_id,posted_at,posted_by,idempotency_key,lot_id,inventory_unit_id)
+      SELECT ?,?,?,-?,?,?,'inventory_transfer',?,?,?,?,?,? WHERE ${marker(command)}`).bind(sourceMovement, interWarehouse ? "interwarehouse_dispatch" : movementType, productId, quantity, fromLocationId, trace.sourceStatus, transferId, when, command.actor.label, command.idempotencyKey, trace.lotId, trace.unitId),
+    db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,to_location_id,inventory_status,source_document_type,source_document_id,posted_at,posted_by,idempotency_key,lot_id,inventory_unit_id)
+      SELECT ?,?,?,?,?,?,'inventory_transfer',?,?,?,?,?,? WHERE ${marker(command)}`).bind(destinationMovement, interWarehouse ? "interwarehouse_in_transit" : movementType, productId, quantity, destinationId, destinationStatus, transferId, when, command.actor.label, command.idempotencyKey, trace.lotId, trace.unitId),
+    auditStatement(command, "inventory_transfer", transferId, movementType, result.message, { productId, quantity, fromLocationId, toLocationId: requestedTo, inTransitLocationId: interWarehouse ? destinationId : null, reason }, when),
+    outboxStatement(command, "inventory.transfer_posted", "inventory_transfer", transferId, { productId, quantity, interWarehouse, inTransitLocationId: interWarehouse ? destinationId : null }, when),
+  ];
+  const sourceAssignment = assignmentStatement(command, sourceMovement, trace, quantity);
+  const destinationAssignment = assignmentStatement(command, destinationMovement, trace, quantity);
+  if (sourceAssignment) statements.push(sourceAssignment);
+  if (destinationAssignment) statements.push(destinationAssignment);
+  if (trace.policy === "serial") statements.push(db.prepare(`UPDATE inventory_units SET location_id=?,inventory_status=?,version=version+1 WHERE id=? AND product_id=? AND location_id=? AND inventory_status=? AND lifecycle_status='on_hand' AND allocated_sales_order_line_id IS NULL AND version=? AND ${marker(command)}`).bind(destinationId, destinationStatus, trace.unitId, productId, fromLocationId, trace.sourceStatus, trace.unitVersion));
+  await db.batch(statements);
+  return finish(command);
+}
+
+async function scrapInventory(command: WorkflowCommand) {
+  const payload = command.payload ?? {}; const productId = command.entityId ?? textValue(payload, "productId");
+  const locationId = textValue(payload, "locationId"); const quantity = roundQuantity(numberValue(payload, "quantity"));
+  const reason = textValue(payload, "reason"); const postingDate = dateValue(payload, "postingDate", today());
+  await assertPeriodOpen("inventory", postingDate);
+  const balance = await first<{ available: number }>("SELECT on_hand_qty-reserved_qty AS available FROM inventory_balances WHERE product_id=? AND location_id=?", productId, locationId);
+  if (!balance || balance.available < quantity) throw new WorkflowError("NEGATIVE_INVENTORY_BLOCKED", "Scrap quantity exceeds unreserved on-hand stock.", 409);
+  const trace = await requireSourceTracking(productId, locationId, quantity, payload);
+  const traceClaim = trackingClaim(trace, locationId, quantity);
+  const movementId = newId("movement"); const result: WorkflowResult = { message: `${quantity} units scrapped with an immutable value and movement record.`, impact: { physical: `${quantity} units removed from on-hand.`, commercial: "Orders unchanged.", financial: "Inventory value reduced; no invoice created.", trackingPolicy: trace.policy, onHandDelta: -quantity }, recordId: movementId };
+  const valuation = await valuationForIssue(productId, quantity);
+  const threshold = await setting<number>("inventory.scrapApprovalThresholdCents", 50_000);
+  const approvalId = optionalText(payload, "approvalId");
+  let approval: { id: string; version: number } | null = null;
+  if (valuation.valueCents > threshold) {
+    if (!approvalId) throw new WorkflowError("APPROVAL_REQUIRED", `Scrap value ${valuation.valueCents} cents exceeds the ${threshold}-cent approval threshold.`, 409);
+    const row = await first<{ id: string; version: number; metadataJson: string }>("SELECT id,version,metadata_json AS metadataJson FROM approvals WHERE id=? AND entity_type='product' AND entity_id=? AND request_type='scrap' AND status='approved' AND consumed_at IS NULL", approvalId, productId);
+    if (!row) throw new WorkflowError("APPROVAL_REQUIRED", "An unused manager-approved scrap request for this product is required.", 409);
+    let metadata: Record<string, unknown>; try { metadata = JSON.parse(row.metadataJson) as Record<string, unknown>; } catch { throw new WorkflowError("APPROVAL_SCOPE_MISMATCH", "Scrap approval metadata is invalid.", 409); }
+    if (Number(metadata.maxValueCents) < valuation.valueCents || (metadata.locationId != null && String(metadata.locationId) !== locationId)) throw new WorkflowError("APPROVAL_SCOPE_MISMATCH", "The scrap approval does not cover this value and location.", 409);
+    approval = row;
+  }
+  const layerClaimSql = valuation.layers.map(() => "AND EXISTS (SELECT 1 FROM cost_layers cl WHERE cl.id=? AND cl.remaining_qty>=?)").join(" ");
+  const layerClaimBindings = valuation.layers.flatMap((layer) => [layer.id, layer.quantity]);
+  const approvalClaimSql = approval ? "AND EXISTS (SELECT 1 FROM approvals a WHERE a.id=? AND a.version=? AND a.status='approved' AND a.consumed_at IS NULL)" : "";
+  const approvalClaimBindings = approval ? [approval.id, approval.version] : [];
+  const db = getD1(); const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM inventory_balances WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${traceClaim.sql} ${layerClaimSql} ${approvalClaimSql}`).bind(...claimValues(command, result, movementId), productId, locationId, quantity, ...traceClaim.bindings, ...layerClaimBindings, ...approvalClaimBindings),
+    db.prepare(`UPDATE inventory_balances SET on_hand_qty=on_hand_qty-?,version=version+1 WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${marker(command)}`).bind(quantity, productId, locationId, quantity),
+    db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,from_location_id,inventory_status,source_document_type,source_document_id,posted_at,posted_by,unit_cost_cents,idempotency_key,lot_id,inventory_unit_id)
+      SELECT ?,'scrap',?,-?,?,?,'scrap',?,?,?, ?,?,?,? WHERE ${marker(command)}`).bind(movementId, productId, quantity, locationId, trace.sourceStatus, movementId, when, command.actor.label, valuation.unitCostCents, command.idempotencyKey, trace.lotId, trace.unitId),
+    db.prepare(`INSERT INTO inventory_value_entries (id,product_id,movement_id,entry_type,quantity,unit_cost_cents,value_cents,cost_method,reference_type,reference_id,posted_at,posted_by)
+      SELECT ?,?,?,'scrap',-?,?,?,?,'scrap',?,?,? WHERE ${marker(command)}`).bind(newId("value"), productId, movementId, quantity, valuation.unitCostCents, -valuation.valueCents, valuation.method, movementId, when, command.actor.label),
+    auditStatement(command, "stock_movement", movementId, "inventory_scrapped", result.message, { productId, locationId, quantity, reason }, when),
+    outboxStatement(command, "inventory.scrapped", "stock_movement", movementId, { productId, quantity, valueCents: valuation.valueCents }, when),
+  ];
+  const assignment = assignmentStatement(command, movementId, trace, quantity);
+  if (assignment) statements.push(assignment);
+  if (trace.policy === "serial") statements.push(db.prepare(`UPDATE inventory_units SET inventory_status='scrapped',lifecycle_status='scrapped',allocated_sales_order_line_id=NULL,version=version+1 WHERE id=? AND product_id=? AND location_id=? AND inventory_status=? AND lifecycle_status='on_hand' AND allocated_sales_order_line_id IS NULL AND version=? AND ${marker(command)}`).bind(trace.unitId, productId, locationId, trace.sourceStatus, trace.unitVersion));
+  valuation.layers.forEach((layer) => statements.push(db.prepare(`UPDATE cost_layers SET remaining_qty=remaining_qty-?,status=CASE WHEN remaining_qty-?=0 THEN 'consumed' ELSE status END WHERE id=? AND remaining_qty>=? AND ${marker(command)}`).bind(layer.quantity, layer.quantity, layer.id, layer.quantity)));
+  if (approval) statements.push(db.prepare(`UPDATE approvals SET consumed_at=?,consumed_by=?,consumed_entity_id=?,version=version+1 WHERE id=? AND version=? AND status='approved' AND consumed_at IS NULL AND ${marker(command)}`).bind(when, command.actor.label, movementId, approval.id, approval.version));
+  await db.batch(statements); return finish(command);
+}
+
+async function valuationForIssue(productId: string, quantity: number) {
+  const policy = await first<{ method: string; standardCost: number; averageCost: number }>("SELECT method,standard_cost_cents AS standardCost,average_cost_cents AS averageCost FROM valuation_policies WHERE product_id=?", productId);
+  const method = policy?.method ?? "fifo";
+  const layers = await all<{ id: string; remaining: number; unitCost: number }>("SELECT id,remaining_qty AS remaining,unit_cost_cents + CASE WHEN received_qty>0 THEN ROUND(landed_cost_cents/received_qty) ELSE 0 END AS unitCost FROM cost_layers WHERE product_id=? AND remaining_qty>0 ORDER BY received_at,id", productId);
+  let remaining = quantity; let valueCents = 0; const consumed: Array<{ id: string; quantity: number }> = [];
+  for (const layer of layers) {
+    if (remaining <= 0) break; const used = Math.min(remaining, layer.remaining); remaining = roundQuantity(remaining - used); valueCents += Math.round(used * layer.unitCost); consumed.push({ id: layer.id, quantity: used });
+  }
+  if (remaining > 0) throw new WorkflowError("VALUATION_LAYER_SHORTAGE", "Cost layers do not reconstruct sufficient on-hand quantity.", 409);
+  const unitCostCents = method === "standard" ? policy?.standardCost ?? 0 : method === "average" ? policy?.averageCost ?? 0 : quantity ? Math.round(valueCents / quantity) : 0;
+  return { method, unitCostCents, valueCents: method === "fifo" ? valueCents : Math.round(quantity * unitCostCents), layers: consumed };
+}
+
+async function releaseReservation(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId"); const payload = command.payload ?? {};
+  const quantity = roundQuantity(numberValue(payload, "quantity")); const reason = textValue(payload, "reason");
+  const reservation = await first<{ quantity: number; status: string; productId: string; locationId: string; salesLineId: string }>("SELECT quantity,status,product_id AS productId,location_id AS locationId,sales_order_line_id AS salesLineId FROM reservations WHERE id=?", id);
+  if (!reservation) throw new WorkflowError("NOT_FOUND", "Reservation was not found.", 404);
+  if (reservation.status !== "active" || quantity > reservation.quantity) throw new WorkflowError("INVALID_QUANTITY", "Release exceeds the active reservation.", 409);
+  const result: WorkflowResult = { message: `${quantity} reserved units released back to availability.`, impact: { physical: "On-hand inventory unchanged.", reservedDelta: -quantity, availableDelta: quantity, onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM reservations r WHERE r.id=? AND r.status='active' AND r.quantity>=?
+        AND EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id=r.product_id AND ib.location_id=r.location_id AND ib.reserved_qty>=?)`)
+      .bind(...claimValues(command, result, id), id, quantity, quantity),
+    db.prepare(`UPDATE reservations SET quantity=quantity-?,status=CASE WHEN quantity-?<=0 THEN 'released' ELSE 'active' END WHERE id=? AND status='active' AND quantity>=? AND ${marker(command)}`).bind(quantity, quantity, id, quantity),
+    db.prepare(`UPDATE inventory_balances SET reserved_qty=reserved_qty-?,version=version+1 WHERE product_id=? AND location_id=? AND reserved_qty>=? AND ${marker(command)}`).bind(quantity, reservation.productId, reservation.locationId, quantity),
+    auditStatement(command, "reservation", id, "reservation_released", result.message, { quantity, reason }, when),
+    outboxStatement(command, "reservation.released", "reservation", id, { quantity }, when),
+  ]);
+  return finish(command);
+}
+
+async function reallocateReservation(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId"); const payload = command.payload ?? {};
+  const targetLineId = textValue(payload, "targetSalesOrderLineId"); const targetLocationId = textValue(payload, "targetLocationId");
+  const quantity = roundQuantity(numberValue(payload, "quantity")); const reason = textValue(payload, "reason");
+  const source = await first<{ quantity: number; productId: string; locationId: string; salesLineId: string; status: string }>("SELECT quantity,product_id AS productId,location_id AS locationId,sales_order_line_id AS salesLineId,status FROM reservations WHERE id=?", id);
+  if (!source || source.status !== "active" || source.quantity < quantity) throw new WorkflowError("INVALID_RESERVATION", "Source reservation cannot supply this reallocation.", 409);
+  if (source.salesLineId === targetLineId) throw new WorkflowError("INVALID_RESERVATION", "Select a different sales-order demand line for reallocation.", 409);
+  const target = await first<{ productId: string; route: string; allocated: string | null; remainingDemand: number; orderStatus: string }>(`SELECT sol.product_id AS productId,sol.fulfillment_route AS route,sol.linked_purchase_order_line_id AS allocated,
+      sol.ordered_qty-sol.canceled_qty
+        -COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0)
+        -COALESCE((SELECT SUM(r.quantity) FROM reservations r WHERE r.sales_order_line_id=sol.id AND r.status='active'),0) AS remainingDemand,
+      so.lifecycle_status AS orderStatus
+    FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id WHERE sol.id=?`, targetLineId);
+  if (!target || target.productId !== source.productId) throw new WorkflowError("PRODUCT_MISMATCH", "Target demand must use the same product.", 409);
+  if (target.orderStatus !== "confirmed") throw new WorkflowError("INVALID_STATE", "Target demand must belong to a confirmed sales order.", 409);
+  if (target.route === "drop_ship") throw new WorkflowError("INVALID_FULFILLMENT_ROUTE", "Drop-ship demand cannot reserve internal inventory.", 409);
+  if (target.route === "special_order" && target.allocated) throw new WorkflowError("SPECIAL_ORDER_ALLOCATED", "This special-order demand already has dedicated supply and cannot take another allocation.", 409);
+  if (target.remainingDemand < quantity) throw new WorkflowError("OVER_ALLOCATION", "Reallocation exceeds the target line's remaining unreserved demand.", 409);
+  const targetLocation = await first<{ status: string; active: number }>("SELECT inventory_status AS status,active FROM locations WHERE id=?", targetLocationId);
+  if (!targetLocation || !targetLocation.active || targetLocation.status !== "usable") throw new WorkflowError("INVALID_LOCATION", "Target reservations require an active usable location.", 409);
+  if (targetLocationId !== source.locationId) {
+    const targetBalance = await first<{ available: number }>("SELECT on_hand_qty-reserved_qty AS available FROM inventory_balances WHERE product_id=? AND location_id=?", source.productId, targetLocationId);
+    if (!targetBalance || targetBalance.available < quantity) throw new WorkflowError("INSUFFICIENT_AVAILABILITY", "Target location lacks available stock.", 409);
+  }
+  const targetReservationId = newId("reservation"); const result: WorkflowResult = { message: `${quantity} units reallocated to the selected demand.`, impact: { physical: "On-hand unchanged.", commercial: "Allocation moved between demands.", reservedDelta: 0, availableDelta: 0, onHandDelta: 0 }, recordId: targetReservationId };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM reservations r WHERE r.id=? AND r.status='active' AND r.quantity>=?
+        AND EXISTS (SELECT 1 FROM inventory_balances source_balance WHERE source_balance.product_id=r.product_id AND source_balance.location_id=r.location_id AND source_balance.reserved_qty>=?)
+        AND (?=? OR EXISTS (SELECT 1 FROM inventory_balances target_balance WHERE target_balance.product_id=? AND target_balance.location_id=? AND target_balance.on_hand_qty-target_balance.reserved_qty>=?))
+        AND EXISTS (SELECT 1 FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id WHERE sol.id=? AND so.lifecycle_status='confirmed'
+          AND sol.ordered_qty-sol.canceled_qty
+            -COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0)
+            -COALESCE((SELECT SUM(target_res.quantity) FROM reservations target_res WHERE target_res.sales_order_line_id=sol.id AND target_res.status='active'),0)>=?)`)
+      .bind(...claimValues(command, result, targetReservationId), id, quantity, quantity, source.locationId, targetLocationId, source.productId, targetLocationId, quantity, targetLineId, quantity),
+    db.prepare(`UPDATE reservations SET quantity=quantity-?,status=CASE WHEN quantity-?<=0 THEN 'released' ELSE 'active' END WHERE id=? AND status='active' AND quantity>=? AND ${marker(command)}`).bind(quantity, quantity, id, quantity),
+    db.prepare(`UPDATE inventory_balances SET reserved_qty=reserved_qty-?,version=version+1 WHERE product_id=? AND location_id=? AND reserved_qty>=? AND ${marker(command)}`).bind(quantity, source.productId, source.locationId, quantity),
+    db.prepare(`UPDATE inventory_balances SET reserved_qty=reserved_qty+?,version=version+1 WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${marker(command)}`).bind(quantity, source.productId, targetLocationId, quantity),
+    db.prepare(`INSERT INTO reservations (id,sales_order_line_id,product_id,location_id,quantity,status,created_at) SELECT ?,?,?,?,?,'active',? WHERE ${marker(command)}`).bind(targetReservationId, targetLineId, source.productId, targetLocationId, quantity, when),
+    auditStatement(command, "reservation", id, "reservation_reallocated", result.message, { targetReservationId, targetLineId, quantity, reason }, when),
+    outboxStatement(command, "reservation.reallocated", "reservation", id, { targetReservationId, quantity }, when),
+  ]);
+  return finish(command);
+}
+
+async function reverseShipment(command: WorkflowCommand) {
+  const shipmentId = textValue({ entityId: command.entityId }, "entityId");
+  const payload = command.payload ?? {};
+  const quantity = roundQuantity(numberValue(payload, "quantity"));
+  const reason = textValue(payload, "reason");
+  const lineId = optionalText(payload, "lineId");
+  const postingDate = dateValue(payload, "postingDate", today());
+  await assertPeriodOpen("inventory", postingDate);
+  const source = await first<{
+    movementId: string; productId: string; locationId: string; inventoryStatus: string; salesLineId: string;
+    shipped: number; reversed: number; shipmentVersion: number; salesOrderId: string; orderVersion: number;
+    orderStatus: string; invoiced: number; trackingPolicy: string; lotId: string | null; unitId: string | null; assignedQuantity: number;
+  }>(`SELECT sm.id AS movementId,sm.product_id AS productId,sm.from_location_id AS locationId,sm.inventory_status AS inventoryStatus,
+      sm.sales_order_line_id AS salesLineId,-sm.quantity AS shipped,
+      COALESCE((SELECT SUM(r.quantity) FROM stock_movements r WHERE r.reversal_of_movement_id=sm.id AND r.movement_type='shipment_reversal'),0) AS reversed,
+      s.version AS shipmentVersion,so.id AS salesOrderId,so.version AS orderVersion,so.lifecycle_status AS orderStatus,
+      COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sm.sales_order_line_id AND ci.status<>'void'),0) AS invoiced,
+      p.tracking_policy AS trackingPolicy,
+      COALESCE(sm.lot_id,(SELECT ma.lot_id FROM movement_assignments ma WHERE ma.movement_id=sm.id AND ma.lot_id IS NOT NULL LIMIT 1)) AS lotId,
+      COALESCE(sm.inventory_unit_id,(SELECT ma.inventory_unit_id FROM movement_assignments ma WHERE ma.movement_id=sm.id AND ma.inventory_unit_id IS NOT NULL LIMIT 1)) AS unitId,
+      COALESCE((SELECT SUM(ma.quantity) FROM movement_assignments ma WHERE ma.movement_id=sm.id),0) AS assignedQuantity
+    FROM stock_movements sm
+    JOIN shipments s ON s.id=sm.source_document_id
+    JOIN sales_orders so ON so.id=s.sales_order_id
+    JOIN products p ON p.id=sm.product_id
+    WHERE sm.source_document_type='shipment' AND sm.movement_type='sales_shipment' AND sm.source_document_id=?
+      AND (? IS NULL OR sm.source_line_id=?)
+    ORDER BY sm.posted_at DESC,sm.id LIMIT 1`, shipmentId, lineId, lineId);
+  if (!source) throw new WorkflowError("NOT_FOUND", "Posted shipment movement was not found.", 404);
+  if (command.version !== source.shipmentVersion) throw new WorkflowError("VERSION_CONFLICT", "Shipment changed; refresh before reversal.", 409, source.shipmentVersion);
+  if (source.orderStatus !== "confirmed") throw new WorkflowError("INVALID_STATE", "Only shipments for confirmed sales orders can be reversed.", 409);
+  if (quantity > source.shipped - source.reversed) throw new WorkflowError("INVALID_QUANTITY", "Reversal exceeds the unreversed shipment quantity.", 409);
+  if (source.trackingPolicy === "lot" && (!source.lotId || source.assignedQuantity < quantity)) throw new WorkflowError("LOT_ASSIGNMENT_REQUIRED", "The original tracked shipment does not contain enough immutable lot assignment to reverse.", 409);
+  if (source.trackingPolicy === "serial") {
+    if (quantity !== 1 || !source.unitId || source.assignedQuantity < 1) throw new WorkflowError("SERIAL_ASSIGNMENT_REQUIRED", "The original serial-tracked shipment is missing its unit assignment.", 409);
+    const unit = await first<{ lifecycleStatus: string; version: number }>("SELECT lifecycle_status AS lifecycleStatus,version FROM inventory_units WHERE id=? AND product_id=?", source.unitId, source.productId);
+    if (!unit || unit.lifecycleStatus !== "shipped") throw new WorkflowError("INVALID_SERIAL_STATE", "The shipped serial is not in a reversible shipped lifecycle state.", 409);
+  }
+  const netShipped = await first<{ quantity: number }>(`SELECT COALESCE(SUM(CASE WHEN movement_type='sales_shipment' THEN -quantity WHEN movement_type='shipment_reversal' THEN -quantity ELSE 0 END),0) AS quantity FROM stock_movements WHERE sales_order_line_id=?`, source.salesLineId);
+  if (Number(netShipped?.quantity ?? 0) - quantity < source.invoiced) {
+    throw new WorkflowError("INVOICED_SHIPMENT", "Credit or reverse the related customer invoice before reversing this shipped quantity.", 409);
+  }
+  const historical = await first<{ quantity: number; value: number; restored: number; method: string }>(`SELECT COALESCE(SUM(-quantity),0) AS quantity,COALESCE(SUM(-value_cents),0) AS value,
+      COALESCE((SELECT SUM(reversal_value.value_cents) FROM inventory_value_entries reversal_value JOIN stock_movements reversal_movement ON reversal_movement.id=reversal_value.movement_id WHERE reversal_movement.reversal_of_movement_id=? AND reversal_movement.movement_type='shipment_reversal'),0) AS restored,
+      MAX(cost_method) AS method FROM inventory_value_entries WHERE movement_id=? AND quantity<0`, source.movementId, source.movementId);
+  const historicalQuantity = Number(historical?.quantity ?? 0);
+  if (historicalQuantity <= 0) throw new WorkflowError("VALUATION_HISTORY_MISSING", "The shipment has no immutable value entry to reverse.", 409);
+  const unitCost = Math.round(Number(historical?.value ?? 0) / historicalQuantity);
+  const remainingReversible = source.shipped - source.reversed;
+  const valueCents = quantity === remainingReversible ? Number(historical?.value ?? 0) - Number(historical?.restored ?? 0) : Math.round(quantity * unitCost);
+  const policy = await first<{ method: string; averageCost: number; version: number }>("SELECT method,average_cost_cents AS averageCost,version FROM valuation_policies WHERE product_id=?", source.productId);
+  const totalOnHand = await first<{ quantity: number }>("SELECT COALESCE(SUM(on_hand_qty),0) AS quantity FROM inventory_balances WHERE product_id=?", source.productId);
+  const nextAverage = Math.round(((Number(totalOnHand?.quantity ?? 0) * Number(policy?.averageCost ?? unitCost)) + valueCents) / (Number(totalOnHand?.quantity ?? 0) + quantity));
+  const movementId = newId("movement");
+  const result: WorkflowResult = { message: `${quantity} shipped units reversed into usable stock.`, impact: { physical: `${quantity} units restored to on-hand.`, commercial: `${quantity} units reopened for fulfillment.`, financial: `COGS was reversed by ${valueCents} cents; customer invoices remain separate.`, onHandDelta: quantity }, recordId: movementId };
+  const serialUnit = source.unitId ? await first<{ version: number }>("SELECT version FROM inventory_units WHERE id=?", source.unitId) : null;
+  const reverseTrackingClaim = source.trackingPolicy === "quantity"
+    ? { sql: "1=1", bindings: [] as unknown[] }
+    : source.trackingPolicy === "lot"
+      ? { sql: "EXISTS (SELECT 1 FROM movement_assignments ma WHERE ma.movement_id=? AND ma.lot_id=? AND ma.quantity>=?)", bindings: [source.movementId, source.lotId, quantity] as unknown[] }
+      : { sql: "EXISTS (SELECT 1 FROM movement_assignments ma JOIN inventory_units iu ON iu.id=ma.inventory_unit_id WHERE ma.movement_id=? AND ma.inventory_unit_id=? AND ma.quantity>=1 AND iu.product_id=? AND iu.lifecycle_status='shipped' AND iu.version=?)", bindings: [source.movementId, source.unitId, source.productId, serialUnit?.version ?? 0] as unknown[] };
+  const db = getD1(); const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM shipments s WHERE s.id=? AND s.version=?
+        AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=? AND so.version=? AND so.lifecycle_status='confirmed')
+        AND EXISTS (SELECT 1 FROM stock_movements original WHERE original.id=? AND -original.quantity-COALESCE((SELECT SUM(r.quantity) FROM stock_movements r WHERE r.reversal_of_movement_id=original.id AND r.movement_type='shipment_reversal'),0)>=?)
+        AND COALESCE((SELECT SUM(CASE WHEN movement_type='sales_shipment' THEN -quantity WHEN movement_type='shipment_reversal' THEN -quantity ELSE 0 END) FROM stock_movements WHERE sales_order_line_id=?),0)-?
+          >=COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=? AND ci.status<>'void'),0)
+        AND COALESCE((SELECT version FROM valuation_policies WHERE product_id=?),0)=? AND ${reverseTrackingClaim.sql}`)
+      .bind(...claimValues(command, result, movementId), shipmentId, source.shipmentVersion, source.salesOrderId, source.orderVersion, source.movementId, quantity, source.salesLineId, quantity, source.salesLineId, source.productId, policy?.version ?? 0, ...reverseTrackingClaim.bindings),
+    db.prepare(`UPDATE shipments SET version=version+1,status=CASE WHEN ?=? THEN 'reversed' ELSE 'partially_reversed' END WHERE id=? AND version=? AND ${marker(command)}`).bind(quantity, remainingReversible, shipmentId, source.shipmentVersion),
+    db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(source.salesOrderId, source.orderVersion),
+    db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) SELECT ?,?,?,0,1 WHERE ${marker(command)} ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=on_hand_qty+excluded.on_hand_qty,version=version+1`).bind(source.productId, source.locationId, quantity),
+    db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,to_location_id,inventory_status,source_document_type,source_document_id,sales_order_line_id,reversal_of_movement_id,posted_at,posted_by,unit_cost_cents,idempotency_key)
+      SELECT ?,'shipment_reversal',?,?,?,?, 'shipment_reversal',?,?,?, ?,?,?,? WHERE ${marker(command)}`).bind(movementId, source.productId, quantity, source.locationId, source.inventoryStatus, shipmentId, source.salesLineId, source.movementId, when, command.actor.label, unitCost, command.idempotencyKey),
+    db.prepare(`INSERT INTO cost_layers (id,product_id,receipt_movement_id,received_qty,remaining_qty,unit_cost_cents,landed_cost_cents,received_at,status)
+      SELECT ?,?,?,?,?,?,0,?,'open' WHERE ${marker(command)}`).bind(newId("layer"), source.productId, movementId, quantity, quantity, unitCost, when),
+    db.prepare(`INSERT INTO inventory_value_entries (id,product_id,movement_id,entry_type,quantity,unit_cost_cents,value_cents,cost_method,reference_type,reference_id,posted_at,posted_by)
+      SELECT ?,?,?,'shipment_reversal',?,?,?,?, 'shipment',?,?,? WHERE ${marker(command)}`).bind(newId("value"), source.productId, movementId, quantity, unitCost, valueCents, historical?.method ?? policy?.method ?? "fifo", shipmentId, when, command.actor.label),
+    auditStatement(command, "shipment", shipmentId, "shipment_reversed", result.message, { quantity, reason, movementId, originalMovementId: source.movementId, cogsReversedCents: valueCents }, when),
+    outboxStatement(command, "shipment.reversed", "shipment", shipmentId, { quantity, movementId, cogsReversedCents: valueCents }, when),
+  ];
+  if (policy?.method === "average") {
+    statements.push(db.prepare(`UPDATE valuation_policies SET average_cost_cents=?,version=version+1,updated_at=?,updated_by=? WHERE product_id=? AND version=? AND method='average' AND ${marker(command)}`).bind(nextAverage, when, command.actor.label, source.productId, policy.version));
+  }
+  if (source.trackingPolicy !== "quantity") {
+    statements.push(db.prepare(`INSERT INTO movement_assignments (id,movement_id,lot_id,inventory_unit_id,quantity) SELECT ?,?,?,?,? WHERE ${marker(command)}`).bind(newId("assignment"), movementId, source.lotId, source.unitId, quantity));
+  }
+  if (source.trackingPolicy === "serial") {
+    statements.push(db.prepare(`UPDATE inventory_units SET location_id=?,inventory_status=?,lifecycle_status='on_hand',allocated_sales_order_line_id=NULL,version=version+1 WHERE id=? AND product_id=? AND lifecycle_status='shipped' AND version=? AND ${marker(command)}`).bind(source.locationId, source.inventoryStatus, source.unitId, source.productId, serialUnit?.version ?? 0));
+  }
+  await db.batch(statements);
+  return finish(command);
+}
+
+async function registerIdentity(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const productId = command.entityId ?? textValue(payload, "productId");
+  const locationId = textValue(payload, "locationId");
+  const sourceMovementId = optionalText(payload, "sourceMovementId");
+  const lotNumber = optionalText(payload, "lotNumber") ?? "";
+  const serialNumber = optionalText(payload, "serialNumber") ?? "";
+  const product = await first<{ policy: string; active: number }>("SELECT tracking_policy AS policy,active FROM products WHERE id=?", productId);
+  if (!product || !product.active) throw new WorkflowError("INVALID_PRODUCT", "An active product is required.", 404);
+  if (product.policy === "quantity") throw new WorkflowError("TRACKING_POLICY_MISMATCH", "Quantity-tracked products do not use lot or serial identity registration.", 409);
+  if (product.policy === "lot" && (!lotNumber || serialNumber)) throw new WorkflowError("LOT_ASSIGNMENT_REQUIRED", "A lot-tracked product requires lotNumber and cannot register a serial.", 409);
+  if (product.policy === "serial" && !serialNumber) throw new WorkflowError("SERIAL_ASSIGNMENT_REQUIRED", "A serial-tracked product requires serialNumber.", 409);
+  const quantity = product.policy === "serial" ? 1 : roundQuantity(numberValue(payload, "quantity"));
+  const location = await first<{ status: string; active: number }>("SELECT inventory_status AS status,active FROM locations WHERE id=?", locationId);
+  if (!location || !location.active) throw new WorkflowError("INVALID_LOCATION", "An active location is required.", 409);
+  const requestedStatus = textValue(payload, "inventoryStatus", location.status);
+  if (requestedStatus !== location.status) throw new WorkflowError("INVENTORY_STATUS_MISMATCH", "Identity status must match the physical location status.", 409);
+  const balance = await first<{ onHand: number; identified: number }>(`SELECT ib.on_hand_qty AS onHand,
+      COALESCE((SELECT SUM(CASE WHEN sm.to_location_id=? THEN ma.quantity WHEN sm.from_location_id=? THEN -ma.quantity ELSE 0 END) FROM movement_assignments ma JOIN stock_movements sm ON sm.id=ma.movement_id WHERE sm.product_id=?),0) AS identified
+    FROM inventory_balances ib WHERE ib.product_id=? AND ib.location_id=?`, locationId, locationId, productId, productId, locationId);
+  if (!balance || roundQuantity(balance.identified + quantity) > roundQuantity(balance.onHand)) throw new WorkflowError("UNIDENTIFIED_QUANTITY_SHORTAGE", "This location does not have enough unassigned physical on-hand quantity for the identity.", 409);
+  const source = await first<{ id: string; quantity: number; assigned: number; inventoryStatus: string }>(`SELECT sm.id,sm.quantity,sm.inventory_status AS inventoryStatus,COALESCE(SUM(ma.quantity),0) AS assigned
+    FROM stock_movements sm LEFT JOIN movement_assignments ma ON ma.movement_id=sm.id
+    WHERE sm.product_id=? AND sm.to_location_id=? AND sm.quantity>0 AND (? IS NULL OR sm.id=?)
+    GROUP BY sm.id HAVING sm.quantity-COALESCE(SUM(ma.quantity),0)>=?
+    ORDER BY sm.posted_at,sm.id LIMIT 1`, productId, locationId, sourceMovementId, sourceMovementId, quantity);
+  if (!source || source.inventoryStatus !== location.status) throw new WorkflowError("SOURCE_MOVEMENT_REQUIRED", "Select a positive, unassigned source movement at this product, location, and status.", 409);
+  const existingLot = lotNumber ? await first<{ id: string; status: string }>("SELECT id,status FROM inventory_lots WHERE product_id=? AND lot_number=?", productId, lotNumber) : null;
+  if (existingLot && existingLot.status !== "active") throw new WorkflowError("INVALID_LOT", "The existing lot is not active.", 409);
+  const requestedLotId = optionalText(payload, "lotId");
+  if (requestedLotId && lotNumber) throw new WorkflowError("VALIDATION_ERROR", "Provide lotId or lotNumber, not both.");
+  const referencedLot = requestedLotId ? await first<{ id: string; status: string }>("SELECT id,status FROM inventory_lots WHERE id=? AND product_id=?", requestedLotId, productId) : null;
+  if (requestedLotId && (!referencedLot || referencedLot.status !== "active")) throw new WorkflowError("INVALID_LOT", "lotId is not active for this product.", 409);
+  const lotId = referencedLot?.id ?? existingLot?.id ?? (lotNumber ? newId("lot") : null);
+  if (product.policy === "lot" && !lotId) throw new WorkflowError("LOT_ASSIGNMENT_REQUIRED", "A lot identity is required.", 409);
+  if (serialNumber && await first("SELECT id FROM inventory_units WHERE product_id=? AND serial_number=?", productId, serialNumber)) throw new WorkflowError("DUPLICATE_SERIAL", "This serial number is already registered for the product.", 409);
+  const unitId = serialNumber ? newId("unit") : null;
+  const recordId = unitId ?? lotId!;
+  const result: WorkflowResult = { message: serialNumber ? `Serial ${serialNumber} registered against existing on-hand movement ${source.id}.` : `${quantity} units assigned to lot ${lotNumber || lotId}.`, impact: { physical: "Identity assignment only; on-hand is unchanged.", trackingPolicy: product.policy, assignedQuantity: quantity, onHandDelta: 0 }, recordId };
+  const db = getD1(); const when = new Date().toISOString();
+  const serialClaim = serialNumber ? "AND NOT EXISTS (SELECT 1 FROM inventory_units WHERE product_id=? AND serial_number=?)" : "";
+  const claimBindings = serialNumber ? [productId, serialNumber] : [];
+  const statements: D1PreparedStatement[] = [db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+    SELECT ?,?,?,?,?,?,? FROM stock_movements sm WHERE sm.id=? AND sm.product_id=? AND sm.to_location_id=? AND sm.quantity>0 AND sm.inventory_status=?
+      AND sm.quantity-COALESCE((SELECT SUM(ma.quantity) FROM movement_assignments ma WHERE ma.movement_id=sm.id),0)>=? ${serialClaim}`)
+    .bind(...claimValues(command, result, recordId), source.id, productId, locationId, location.status, quantity, ...claimBindings)];
+  if (lotId && !existingLot && !referencedLot) statements.push(db.prepare(`INSERT INTO inventory_lots (id,product_id,lot_number,vendor_id,manufactured_date,expiry_date,status,created_at) SELECT ?,?,?,?,?,?,'active',? WHERE ${marker(command)}`).bind(lotId, productId, lotNumber, payload.vendorId ?? null, payload.manufacturedDate ?? null, payload.expiryDate ?? null, when));
+  if (unitId) statements.push(db.prepare(`INSERT INTO inventory_units (id,product_id,serial_number,lot_id,location_id,inventory_status,lifecycle_status,allocated_sales_order_line_id,version,created_at) SELECT ?,?,?,?,?,?,'on_hand',NULL,1,? WHERE ${marker(command)}`).bind(unitId, productId, serialNumber, lotId, locationId, location.status, when));
+  statements.push(
+    db.prepare(`INSERT INTO movement_assignments (id,movement_id,lot_id,inventory_unit_id,quantity) SELECT ?,?,?,?,? WHERE ${marker(command)}`).bind(newId("assignment"), source.id, lotId, unitId, quantity),
+    auditStatement(command, "product", productId, "inventory_identity_registered", result.message, { lotId, unitId, locationId, sourceMovementId: source.id, quantity }, when),
+    outboxStatement(command, "inventory.identity_registered", "product", productId, { lotId, unitId, sourceMovementId: source.id, quantity }, when)
+  );
+  await db.batch(statements); return finish(command);
+}
+
+async function updatePolicy(command: WorkflowCommand) {
+  const payload = command.payload ?? {}; const key = textValue(payload, "key"); const reason = textValue(payload, "reason");
+  if (!("value" in payload)) throw new WorkflowError("VALIDATION_ERROR", "value is required.");
+  const allowedKeys = new Set(["receiving.overReceiptPolicy","inventory.countApprovalThreshold","inventory.scrapApprovalThresholdCents","matching.tolerances","tax.defaultRateBps","valuation.defaultMethod","inventory.negativeAllowed"]);
+  if(!allowedKeys.has(key)) throw new WorkflowError("INVALID_SETTING","This setting is not supported by the transaction engine.",400);
+  if(key==="inventory.negativeAllowed"&&payload.value!==false) throw new WorkflowError("UNSUPPORTED_SETTING","Negative inventory cannot be enabled because transaction guards require non-negative on-hand and reserved balances.",409);
+  if(key==="tax.defaultRateBps"&&(!Number.isInteger(payload.value)||Number(payload.value)<0||Number(payload.value)>10000)) throw new WorkflowError("VALIDATION_ERROR","tax.defaultRateBps must be a whole number from 0 to 10000.");
+  if(key==="valuation.defaultMethod"&&!['fifo','average','standard'].includes(String(payload.value))) throw new WorkflowError("VALIDATION_ERROR","valuation.defaultMethod must be fifo, average, or standard.");
+  if(["inventory.scrapApprovalThresholdCents"].includes(key)&&(!Number.isSafeInteger(payload.value)||Number(payload.value)<0)) throw new WorkflowError("VALIDATION_ERROR",`${key} must be a non-negative whole number.`);
+  const current = await first<{ version: number; description: string }>("SELECT version,description FROM system_settings WHERE key=?", key);
+  const version = command.version ?? 0;
+  if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Setting changed; refresh before updating.", 409, current.version);
+  const result: WorkflowResult = { message: `${key} updated for future transactions; existing posted records are unchanged.`, impact: { physical: "No immediate stock movement.", financial: "No posting.", onHandDelta: 0 }, recordId: key };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    current ? db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM system_settings WHERE key=? AND version=?").bind(...claimValues(command, result, key),key,version) : db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command, result, key)),
+    db.prepare(`INSERT INTO system_settings (key,value_json,description,version,updated_by,updated_at) SELECT ?,?,?,1,?,? WHERE ${marker(command)}
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,version=system_settings.version+1,updated_by=excluded.updated_by,updated_at=excluded.updated_at WHERE system_settings.version=?`).bind(key, JSON.stringify(payload.value), current?.description ?? textValue(payload, "description", "Operational setting"), command.actor.label, when,version),
+    auditStatement(command, "system_setting", key, "setting_updated", result.message, { reason, value: payload.value }, when),
+    outboxStatement(command, "setting.updated", "system_setting", key, { reason }, when),
+  ]); return finish(command);
+}
+
+async function setPeriodLock(command: WorkflowCommand, active: boolean) {
+  const payload = command.payload ?? {}; const moduleName = textValue(payload, "module"); const reason = textValue(payload, "reason"); const lockedThrough = dateValue(payload, "lockedThrough");
+  const id = command.entityId ?? newId("period-lock"); const result: WorkflowResult = { message: active ? `${moduleName} locked through ${lockedThrough}.` : `${moduleName} period lock released.`, impact: { physical: "No posting.", onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command, result, id)),
+    db.prepare(`INSERT INTO period_locks (id,module,locked_through,reason,active,version,created_by,created_at) SELECT ?,?,?,?,?,1,?,? WHERE ${marker(command)} ON CONFLICT(id) DO UPDATE SET active=excluded.active,reason=excluded.reason,version=period_locks.version+1`).bind(id, moduleName, lockedThrough, reason, active ? 1 : 0, command.actor.label, when),
+    auditStatement(command, "period_lock", id, active ? "period_locked" : "period_unlocked", result.message, { moduleName, lockedThrough, reason }, when),
+    outboxStatement(command, active ? "period.locked" : "period.unlocked", "period_lock", id, { moduleName, lockedThrough }, when),
+  ]); return finish(command);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+async function addCharge(command: WorkflowCommand) {
+  const payload = command.payload ?? {}; const documentType = textValue(payload, "documentType"); const documentId = command.entityId ?? textValue(payload, "documentId");
+  const chargeType = textValue(payload, "chargeType"); const description = textValue(payload, "description"); const amountCents = numberValue(payload, "amountCents", { integer: true });
+  const taxRateBps = payload.taxRateBps == null ? 0 : numberValue(payload, "taxRateBps", { positive: false, integer: true }); if (taxRateBps < 0 || taxRateBps > 10000) throw new WorkflowError("VALIDATION_ERROR", "taxRateBps must be 0–10000.");
+  const chargeId = newId("charge"); const result: WorkflowResult = { message: `${description} added separately from inventory item lines.`, impact: { physical: "No stock movement.", financial: `${amountCents} cents added to document charges.`, onHandDelta: 0 }, recordId: chargeId };
+  const db = getD1(); const when = new Date().toISOString(); const taxable = payload.taxable === true;
+  await db.batch([
+    db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command, result, chargeId)),
+    db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(chargeId, documentType, documentId, chargeType, description, amountCents, payload.direction === "subtract" ? "subtract" : "add", taxable ? 1 : 0, payload.refundable === true ? 1 : 0, payload.taxCode ?? null, taxRateBps, taxable ? Math.round(amountCents*taxRateBps/10000) : 0, when),
+    auditStatement(command, documentType, documentId, "document_charge_added", result.message, { chargeId, chargeType, amountCents }, when),
+    outboxStatement(command, "document.charge_added", documentType, documentId, { chargeId }, when),
+  ]); return finish(command);
+}
+
+async function issueReturnable(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const partnerId = textValue(payload, "partnerId");
+  const assetTypeId = textValue(payload, "assetTypeId");
+  const quantity = numberValue(payload, "quantity", { integer: true });
+  const direction = textValue(payload, "direction", "customer_holds");
+  const reason = textValue(payload, "reason");
+  const postingDate = dateValue(payload, "postingDate", today());
+  if (!['customer_holds', 'vendor_holds'].includes(direction)) throw new WorkflowError("VALIDATION_ERROR", "direction must be customer_holds or vendor_holds.");
+  const partner = await first<{ type: string }>("SELECT partner_type AS type FROM business_partners WHERE id=? AND active=1", partnerId);
+  if (!partner || (direction === "customer_holds" && !["customer", "both"].includes(partner.type)) || (direction === "vendor_holds" && !["vendor", "both"].includes(partner.type))) {
+    throw new WorkflowError("INVALID_PARTNER", "The active partner type does not match the returnable custody direction.", 409);
+  }
+  const asset = await first<{ unitDeposit: number }>("SELECT unit_deposit_cents AS unitDeposit FROM returnable_asset_types WHERE id=? AND active=1", assetTypeId); if (!asset) throw new WorkflowError("NOT_FOUND", "Returnable asset type was not found.", 404);
+  await assertPeriodOpen("inventory", postingDate);
+  if (asset.unitDeposit > 0) await assertPeriodOpen("accounting", postingDate);
+  const obligationId = newId("returnable"); const deposit = Math.round(quantity*asset.unitDeposit); const result: WorkflowResult = { message: `${quantity} returnable assets issued; ${deposit} cents of refundable deposit tracked.`, impact: { physical: "Sellable inventory unchanged.", returnableQuantityDelta: quantity, depositDeltaCents: deposit, onHandDelta: 0 }, recordId: obligationId };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM business_partners WHERE id=? AND active=1 AND partner_type IN (?, 'both'))
+        AND EXISTS (SELECT 1 FROM returnable_asset_types WHERE id=? AND active=1 AND unit_deposit_cents=?)`)
+      .bind(...claimValues(command, result, obligationId), partnerId, direction === "customer_holds" ? "customer" : "vendor", assetTypeId, asset.unitDeposit),
+    db.prepare(`INSERT INTO returnable_obligations (id,partner_id,asset_type_id,direction,issued_qty,returned_qty,forfeited_qty,deposit_charged_cents,deposit_refunded_cents,status,version,created_at) SELECT ?,?,?,?, ?,0,0,?,0,'open',1,? WHERE ${marker(command)}`).bind(obligationId, partnerId, assetTypeId, direction, quantity, deposit, when),
+    db.prepare(`INSERT INTO returnable_events (id,obligation_id,event_type,quantity,amount_cents,reason,posted_at,posted_by) SELECT ?,?,'issue',?,?,?,?,? WHERE ${marker(command)}`).bind(newId("returnable-event"), obligationId, quantity, deposit, reason, when, command.actor.label),
+    auditStatement(command, "returnable_obligation", obligationId, "returnable_issued", result.message, { partnerId, assetTypeId, quantity, deposit }, when),
+    outboxStatement(command, "returnable.issued", "returnable_obligation", obligationId, { quantity, deposit }, when),
+  ]); return finish(command);
+}
+
+async function updateReturnable(command: WorkflowCommand, eventType: "return" | "forfeit" | "deposit_refund") {
+  const id = textValue({ entityId: command.entityId }, "entityId"); const payload = command.payload ?? {}; const reason = textValue(payload, "reason"); const version = command.version ?? 0;
+  const postingDate = dateValue(payload, "postingDate", today());
+  await assertPeriodOpen(eventType === "deposit_refund" ? "accounting" : "inventory", postingDate);
+  const obligation = await first<{ issued: number; returned: number; forfeited: number; charged: number; refunded: number; unitDeposit: number; version: number; partnerId: string; direction: string }>(`SELECT ro.issued_qty AS issued,ro.returned_qty AS returned,ro.forfeited_qty AS forfeited,ro.deposit_charged_cents AS charged,ro.deposit_refunded_cents AS refunded,rat.unit_deposit_cents AS unitDeposit,ro.version,ro.partner_id AS partnerId,ro.direction FROM returnable_obligations ro JOIN returnable_asset_types rat ON rat.id=ro.asset_type_id WHERE ro.id=?`, id);
+  if (!obligation) throw new WorkflowError("NOT_FOUND", "Returnable obligation was not found.", 404); if (obligation.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Returnable obligation changed.", 409, obligation.version);
+  const quantity = eventType === "deposit_refund" ? 0 : numberValue(payload, "quantity"); const outstanding = obligation.issued-obligation.returned-obligation.forfeited; if (quantity>outstanding) throw new WorkflowError("INVALID_QUANTITY", "Quantity exceeds the outstanding returnable obligation.",409);
+  const refundableCents = Math.max(Math.min(obligation.charged, Math.round(obligation.returned * obligation.unitDeposit)) - obligation.refunded, 0);
+  const amount = eventType === "deposit_refund" ? numberValue(payload,"amountCents",{integer:true}) : eventType === "forfeit" ? Math.round(quantity*obligation.unitDeposit) : 0; if (eventType === "deposit_refund" && amount>refundableCents) throw new WorkflowError("INVALID_AMOUNT","Refund exceeds the deposit attributable to physically returned assets.",409);
+  if (eventType === "deposit_refund" && refundableCents <= 0) throw new WorkflowError("NOTHING_TO_REFUND", "No returned-asset deposit remains refundable.", 409);
+  const result: WorkflowResult = { message: eventType === "return" ? `${quantity} returnables received; any refundable deposit remains pending an explicit refund.` : eventType === "forfeit" ? `${quantity} returnables forfeited and ${amount} cents removed from the refundable deposit balance.` : `${amount} cents of deposit refunded with a linked payment record.`, impact: { physical: "Sellable inventory unchanged.", returnableQuantityDelta: eventType === "deposit_refund" ? 0 : -quantity, depositDeltaCents: eventType === "deposit_refund" ? -amount : eventType === "forfeit" ? -amount : 0, onHandDelta: 0 }, recordId: id };
+  const db=getD1(); const when=new Date().toISOString(); const paymentId=eventType==="deposit_refund"?newId("payment"):null; const paymentNumber=eventType==="deposit_refund"?documentNumber("PAY"):null;
+  const statements:D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM returnable_obligations ro WHERE ro.id=? AND ro.version=?
+        AND ro.issued_qty-ro.returned_qty-ro.forfeited_qty>=?
+        AND (?<>'deposit_refund' OR ?<=MAX(MIN(ro.deposit_charged_cents,ROUND(ro.returned_qty*?))-ro.deposit_refunded_cents,0))`)
+      .bind(...claimValues(command,result,id),id,version,quantity,eventType,amount,obligation.unitDeposit),
+    db.prepare(`UPDATE returnable_obligations SET returned_qty=returned_qty+?,forfeited_qty=forfeited_qty+?,deposit_refunded_cents=deposit_refunded_cents+?,
+      status=CASE
+        WHEN issued_qty-(returned_qty+?)-(forfeited_qty+?)>0 THEN 'open'
+        WHEN MIN(deposit_charged_cents,ROUND((returned_qty+?)*?))-(deposit_refunded_cents+?)>0 THEN 'awaiting_refund'
+        ELSE 'closed' END,
+      version=version+1 WHERE id=? AND version=? AND ${marker(command)}`)
+      .bind(eventType==="return"?quantity:0,eventType==="forfeit"?quantity:0,eventType==="deposit_refund"?amount:0,eventType==="return"?quantity:0,eventType==="forfeit"?quantity:0,eventType==="return"?quantity:0,obligation.unitDeposit,eventType==="deposit_refund"?amount:0,id,version),
+    db.prepare(`INSERT INTO returnable_events (id,obligation_id,event_type,quantity,amount_cents,reason,posted_at,posted_by) SELECT ?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("returnable-event"),id,eventType,quantity,amount,reason,when,command.actor.label),
+    auditStatement(command,"returnable_obligation",id,`returnable_${eventType}`,result.message,{quantity,amount,reason,paymentId},when),outboxStatement(command,`returnable.${eventType}`,"returnable_obligation",id,{quantity,amount,paymentId},when),
+  ];
+  if (paymentId && paymentNumber) statements.push(
+    db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(paymentId,paymentNumber,obligation.direction==="customer_holds"?"outbound":"inbound",obligation.partnerId,"returnable_deposit",id,amount,postingDate,"returnable_deposit_refund",reason,when,command.actor.label,"BASE",amount),
+    auditStatement(command,"payment",paymentId,"returnable_deposit_refund_posted",`${paymentNumber} linked to returnable obligation ${id}.`,{obligationId:id,partnerId:obligation.partnerId,direction:obligation.direction,amount},when),
+  );
+  await db.batch(statements); return finish(command);
+}
+
+async function createVendorBill(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const purchaseOrderId = command.entityId ?? textValue(payload, "purchaseOrderId");
+  const vendorInvoiceNumber = textValue(payload, "vendorInvoiceNumber");
+  const invoiceDate = dateValue(payload, "invoiceDate", today());
+  const dueDate = dateValue(payload, "dueDate", invoiceDate);
+  await assertPeriodOpen("accounting", invoiceDate);
+  const order = await first<{ vendorId: string; currency: string; exchange: number; version: number }>("SELECT vendor_id AS vendorId,currency,exchange_rate_to_base AS exchange,version FROM purchase_orders WHERE id=? AND lifecycle_status='approved'", purchaseOrderId);
+  if (!order) throw new WorkflowError("NOT_FOUND", "Approved purchase order was not found.", 404);
+  if (command.version != null && command.version !== order.version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before billing.", 409, order.version);
+  if (await first("SELECT id FROM vendor_bills WHERE vendor_id=? AND vendor_invoice_number=?", order.vendorId, vendorInvoiceNumber)) {
+    throw new WorkflowError("DUPLICATE_VENDOR_INVOICE", "This vendor invoice number already exists for the vendor.", 409);
+  }
+  const requestedLines = Array.isArray(payload.lines) ? payload.lines as Array<Record<string, unknown>> : [];
+  if (!requestedLines.length) throw new WorkflowError("VALIDATION_ERROR", "At least one vendor bill line is required.");
+  const requestedLineIds = requestedLines.map((line) => textValue(line, "purchaseOrderLineId"));
+  if (new Set(requestedLineIds).size !== requestedLineIds.length) throw new WorkflowError("DUPLICATE_DOCUMENT_LINE", "Each purchase-order line may appear only once on a vendor bill.");
+  const tolerances = await setting<{ quantity: number; unitPriceCents: number; totalCents: number; allowedChargeKinds: string[] }>("matching.tolerances", { quantity: 0, unitPriceCents: 0, totalCents: 0, allowedChargeKinds: [] });
+  const normalized: Array<{ poLineId: string; productId: string; quantity: number; unitCost: number; poCost: number; lineTotal: number; status: string; details: unknown }> = [];
+  const exceptions: Array<Record<string, unknown>> = [];
+  for (const [index, line] of requestedLines.entries()) {
+    const poLineId = requestedLineIds[index];
+    const quantity = roundQuantity(numberValue(line, "quantity"));
+    const unitCost = numberValue(line, "unitCostCents", { integer: true });
+    const poLine = await first<{ productId: string; ordered: number; poCost: number; received: number; billed: number }>(`SELECT pol.product_id AS productId,pol.ordered_qty AS ordered,pol.unit_cost_cents AS poCost,
+        CASE WHEN pol.fulfillment_route='drop_ship'
+          THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
+          ELSE COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0) END AS received,
+        COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0) AS billed
+      FROM purchase_order_lines pol WHERE pol.id=? AND pol.purchase_order_id=?`, poLineId, purchaseOrderId);
+    if (!poLine) throw new WorkflowError("INVALID_PO_LINE", `Bill line ${index + 1} is not linked to this PO.`, 409);
+    const lineExceptions: Array<Record<string, unknown>> = [];
+    const remainingReceived = roundQuantity(poLine.received - poLine.billed);
+    const remainingOrdered = roundQuantity(poLine.ordered - poLine.billed);
+    if (quantity > remainingReceived + tolerances.quantity) lineExceptions.push({ code: "BILLED_ABOVE_RECEIVED", severity: "blocking", variance: roundQuantity(quantity - remainingReceived) });
+    if (quantity > remainingOrdered + tolerances.quantity) lineExceptions.push({ code: "BILLED_ABOVE_ORDERED", severity: "blocking", variance: roundQuantity(quantity - remainingOrdered) });
+    if (Math.abs(unitCost - poLine.poCost) > tolerances.unitPriceCents) lineExceptions.push({ code: "UNIT_PRICE_VARIANCE", severity: "approval", varianceCents: unitCost - poLine.poCost });
+    exceptions.push(...lineExceptions.map((item) => ({ ...item, lineId: poLineId })));
+    normalized.push({ poLineId, productId: poLine.productId, quantity, unitCost, poCost: poLine.poCost, lineTotal: Math.round(quantity * unitCost), status: lineExceptions.length ? "exception" : "matched", details: { exceptions: lineExceptions, ordered: poLine.ordered, netReceived: poLine.received, previouslyBilled: poLine.billed, remainingReceived, poUnitCostCents: poLine.poCost } });
+  }
+  const charges = (Array.isArray(payload.charges) ? payload.charges as Array<Record<string, unknown>> : []).map(normalizeChargePayload);
+  for (const charge of charges) if (!tolerances.allowedChargeKinds.includes(charge.chargeType)) exceptions.push({ code: "UNEXPECTED_CHARGE", severity: "approval", kind: charge.chargeType });
+  const itemSubtotal = normalized.reduce((sum, line) => sum + line.lineTotal, 0);
+  const expectedItemSubtotal = normalized.reduce((sum, line) => sum + Math.round(line.quantity * line.poCost), 0);
+  if (Math.abs(itemSubtotal - expectedItemSubtotal) > tolerances.totalCents) exceptions.push({ code: "TOTAL_PRICE_VARIANCE", severity: "approval", varianceCents: itemSubtotal - expectedItemSubtotal });
+  const taxRate = payload.taxRateBps == null ? 0 : numberValue(payload, "taxRateBps", { positive: false, integer: true });
+  if (taxRate < 0 || taxRate > 10_000) throw new WorkflowError("VALIDATION_ERROR", "taxRateBps must be 0-10000.");
+  const subtotal = itemSubtotal + charges.reduce((sum, charge) => sum + charge.subtotalDelta, 0);
+  const tax = Math.round(itemSubtotal * taxRate / 10_000) + charges.reduce((sum, charge) => sum + charge.taxDelta, 0);
+  const total = subtotal + tax;
+  if (subtotal < 0 || total < 0) throw new WorkflowError("INVALID_DOCUMENT_TOTAL", "Vendor bill charges and discounts cannot make subtotal or total negative.");
+  if (payload.invoiceTotalCents != null && numberValue(payload, "invoiceTotalCents", { positive: false, integer: true }) !== total) throw new WorkflowError("INVOICE_TOTAL_MISMATCH", "Calculated vendor bill total does not match invoiceTotalCents.", 409);
+  const currency = validateDocumentCurrency(payload.currency, order.currency);
+  const exchange = payload.exchangeRateToBase == null ? order.exchange : numberValue(payload, "exchangeRateToBase");
+  const baseTotal = Math.round(total * exchange);
+  const hold = exceptions.length > 0;
+  const billId = newId("vendor-bill");
+  const number = documentNumber("VB");
+  const result: WorkflowResult = { message: hold ? `${number} posted on hold with ${exceptions.length} three-way-match exception${exceptions.length === 1 ? "" : "s"}.` : `${number} posted and matched to PO and cumulative receipts.`, impact: { physical: "No stock movement.", financial: `Payable ${total} ${currency} cents recorded${hold ? " on hold" : ""}.`, matchStatus: hold ? "exception" : "matched", exceptions, onHandDelta: 0 }, recordId: billId };
+  const db = getD1(); const when = new Date().toISOString();
+  const lineClaims = normalized.map(() => `EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.id=? AND pol.purchase_order_id=?
+    AND pol.ordered_qty-COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)+?>=?
+    AND (CASE WHEN pol.fulfillment_route='drop_ship'
+      THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
+      ELSE COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0) END)
+      -COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)+?>=?)`).join(" AND ");
+  const lineClaimBindings = normalized.flatMap((line) => [line.poLineId, purchaseOrderId, tolerances.quantity, line.quantity, tolerances.quantity, line.quantity]);
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='approved'
+        AND NOT EXISTS (SELECT 1 FROM vendor_bills WHERE vendor_id=? AND vendor_invoice_number=?) AND ${lineClaims}`)
+      .bind(...claimValues(command, result, billId), purchaseOrderId, order.version, order.vendorId, vendorInvoiceNumber, ...lineClaimBindings),
+    db.prepare(`INSERT INTO vendor_bills (id,number,vendor_id,purchase_order_id,status,match_status,total_cents,due_date,currency,vendor_invoice_number,invoice_date,posted_at,subtotal_cents,tax_cents,paid_cents,hold_reason,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,version)
+      SELECT ?,?,?,?, ?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,1 WHERE ${marker(command)}`)
+      .bind(billId, number, order.vendorId, purchaseOrderId, hold ? "on_hold" : "approved", hold ? "exception" : "matched", total, dueDate, currency, vendorInvoiceNumber, invoiceDate, when, subtotal, tax, hold ? JSON.stringify(exceptions) : null, exchange, baseTotal, taxRate, optionalText(payload, "taxCode"), optionalText(payload, "paymentTerms")),
+  ];
+  normalized.forEach((line) => statements.push(db.prepare(`INSERT INTO vendor_bill_lines (id,vendor_bill_id,purchase_order_line_id,product_id,quantity,unit_cost_cents,line_total_cents,match_status,match_details_json) SELECT ?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("vendor-bill-line"), billId, line.poLineId, line.productId, line.quantity, line.unitCost, line.lineTotal, line.status, JSON.stringify(line.details))));
+  charges.forEach((charge) => statements.push(db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,'vendor_bill',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("charge"), billId, charge.chargeType, charge.description, charge.amount, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRate, charge.taxAmount, when)));
+  if (hold) statements.push(db.prepare(`INSERT INTO approvals (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,metadata_json,version) SELECT ?,'vendor_bill',?,'vendor_bill_match_exception','pending',?,?,?, ?,1 WHERE ${marker(command)}`).bind(newId("approval"), billId, command.actor.label, "Three-way match exception", when, JSON.stringify({ exceptions })));
+  statements.push(
+    db.prepare(`UPDATE purchase_orders SET billing_status=CASE WHEN NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id=purchase_orders.id AND COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)<pol.ordered_qty) THEN 'billed' ELSE 'partially_billed' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(purchaseOrderId, order.version),
+    auditStatement(command, "vendor_bill", billId, "vendor_bill_posted", result.message, { purchaseOrderId, exceptions, total, currency, exchange, lineCount: normalized.length, chargeCount: charges.length }, when),
+    outboxStatement(command, "vendor_bill.posted", "vendor_bill", billId, { status: hold ? "on_hold" : "approved", total, baseTotal }, when)
+  );
+  await db.batch(statements);
+  return finish(command);
+}
+
+/* eslint-disable @typescript-eslint/no-unused-vars -- legacy V1 helpers are retained for data-migration compatibility; V2 owns dispatch */
+async function approveVendorBill(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const reason = textValue(command.payload ?? {}, "reason");
+  const version = command.version ?? 0;
+  const bill = await first<{ version: number; status: string }>("SELECT version,status FROM vendor_bills WHERE id=?", id);
+  if (!bill) throw new WorkflowError("NOT_FOUND", "Vendor bill not found.", 404);
+  if (bill.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Vendor bill changed.", 409, bill.version);
+  if (bill.status !== "on_hold") throw new WorkflowError("INVALID_STATE", "Only held bills require approval.", 409);
+  const result: WorkflowResult = { message: "Vendor bill hold approved; payable released without moving inventory.", impact: { physical: "No stock movement.", financial: "Payable released.", onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM vendor_bills WHERE id=? AND version=? AND status='on_hold'`).bind(...claimValues(command, result, id), id, version),
+    db.prepare(`UPDATE vendor_bills SET status='approved',approved_at=?,approved_by=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(when, command.actor.label, id, version),
+    db.prepare(`UPDATE approvals SET status='approved',decided_by=?,decision_reason=?,decided_at=?,consumed_at=?,consumed_by=?,consumed_entity_id=?,version=version+1 WHERE entity_type='vendor_bill' AND entity_id=? AND request_type='vendor_bill_match_exception' AND status='pending' AND ${marker(command)}`).bind(command.actor.label, reason, when, when, command.actor.label, id, id),
+    auditStatement(command, "vendor_bill", id, "vendor_bill_approved", result.message, { reason }, when),
+    outboxStatement(command, "vendor_bill.approved", "vendor_bill", id, { reason }, when),
+  ]);
+  return finish(command);
+}
+
+async function createFinancialCredit(command:WorkflowCommand,type:"vendor"|"customer") {const payload=command.payload??{};const amount=numberValue(payload,"amountCents",{integer:true});const reason=textValue(payload,"reason");const currency=typeof payload.currency==="string"?payload.currency.toUpperCase():"CAD";const exchange=payload.exchangeRateToBase==null?1:numberValue(payload,"exchangeRateToBase");const base=Math.round(amount*exchange);const id=newId(`${type}-credit`);const number=documentNumber(type==="vendor"?"VC":"CM");const partnerId=textValue(payload,type==="vendor"?"vendorId":"customerId");const result:WorkflowResult={message:`${number} posted for ${amount} ${currency} cents; inventory is unchanged.`,impact:{physical:"No stock movement.",financial:`Credit ${amount} ${currency} cents posted.`,onHandDelta:0},recordId:id};const db=getD1();const when=new Date().toISOString();const table=type==="vendor"?"vendor_credits":"customer_credits";const partnerCol=type==="vendor"?"vendor_id":"customer_id";const billCol=type==="vendor"?"vendor_bill_id":"customer_invoice_id";await assertPeriodOpen("accounting",today());await db.batch([db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command,result,id)),db.prepare(`INSERT INTO ${table} (id,number,${partnerCol},${billCol},${type==="vendor"?"purchase_order_id":"sales_order_id"},amount_cents,reason,status,posted_at,posted_by,version,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,'posted',?,?,1,?,?,? WHERE ${marker(command)}`).bind(id,number,partnerId,payload.documentId??null,payload.orderId??null,amount,reason,when,command.actor.label,currency,exchange,base),auditStatement(command,`${type}_credit`,id,`${type}_credit_posted`,result.message,{amount,currency,exchange,reason},when),outboxStatement(command,`${type}_credit.posted`,`${type}_credit`,id,{amount,base},when)]);return finish(command);}
+
+async function createCustomerInvoice(command:WorkflowCommand){const salesOrderId=command.entityId??textValue(command.payload??{},"salesOrderId");const payload=command.payload??{};const invoiceDate=dateValue(payload,"invoiceDate",today());const dueDate=dateValue(payload,"dueDate",invoiceDate);await assertPeriodOpen("accounting",invoiceDate);const order=await first<{customerId:string;currency:string;status:string}>("SELECT customer_id AS customerId,currency,lifecycle_status AS status FROM sales_orders WHERE id=?",salesOrderId);if(!order||order.status!=="confirmed")throw new WorkflowError("INVALID_STATE","A confirmed sales order is required.",409);const requested=Array.isArray(payload.lines)?payload.lines as Array<Record<string,unknown>>:null;const soLines=await all<{id:string;productId:string;unitPrice:number;taxRate:number;discount:number;shipped:number;invoiced:number}>(`SELECT sol.id,sol.product_id AS productId,sol.unit_price_cents AS unitPrice,sol.tax_rate_bps AS taxRate,sol.discount_cents AS discount,COALESCE(SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity ELSE 0 END),0) AS shipped,COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil WHERE cil.sales_order_line_id=sol.id),0) AS invoiced FROM sales_order_lines sol LEFT JOIN stock_movements sm ON sm.sales_order_line_id=sol.id WHERE sol.sales_order_id=? GROUP BY sol.id`,salesOrderId);const lines=[] as Array<{id:string;productId:string;quantity:number;unitPrice:number;total:number;tax:number}>;for(const line of soLines){const available=line.shipped-line.invoiced;const requestedLine=requested?.find(row=>row.salesOrderLineId===line.id);const quantity=requestedLine?numberValue(requestedLine,"quantity"):available;if(quantity<=0)continue;if(quantity>available)throw new WorkflowError("INVOICE_EXCEEDS_SHIPPED",`Invoice quantity exceeds shipped-not-invoiced quantity on line ${line.id}.`,409);const total=Math.max(Math.round(quantity*line.unitPrice)-line.discount,0);lines.push({id:line.id,productId:line.productId,quantity,unitPrice:line.unitPrice,total,tax:Math.round(total*line.taxRate/10000)});}if(!lines.length)throw new WorkflowError("NOTHING_TO_INVOICE","No shipped-not-yet-invoiced quantity remains.",409);const subtotal=lines.reduce((s,l)=>s+l.total,0);const tax=lines.reduce((s,l)=>s+l.tax,0);const total=subtotal+tax;const exchange=payload.exchangeRateToBase==null?1:numberValue(payload,"exchangeRateToBase");const base=Math.round(total*exchange);const id=newId("customer-invoice");const number=documentNumber("INV");const result:WorkflowResult={message:`${number} posted for ${lines.reduce((s,l)=>s+l.quantity,0)} shipped units; no stock movement occurred.`,impact:{physical:"No stock movement.",financial:`Receivable ${total} ${order.currency} cents posted.`,onHandDelta:0},recordId:id};const db=getD1();const when=new Date().toISOString();const statements:D1PreparedStatement[]=[db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command,result,id)),db.prepare(`INSERT INTO customer_invoices (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) SELECT ?,?,?,?,'posted',?,?,?,?,?,0,?,?,?,?,?,?,?, ?,1 WHERE ${marker(command)}`).bind(id,number,order.customerId,salesOrderId,invoiceDate,dueDate,subtotal,tax,total,order.currency,exchange,base,payload.taxRateBps??0,payload.taxCode??null,payload.paymentTerms??null,when,command.actor.label)];lines.forEach(line=>statements.push(db.prepare(`INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,quantity,unit_price_cents,line_total_cents) SELECT ?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("invoice-line"),id,line.id,line.productId,line.quantity,line.unitPrice,line.total)));statements.push(auditStatement(command,"customer_invoice",id,"customer_invoice_posted",result.message,{salesOrderId,total,base},when),outboxStatement(command,"customer_invoice.posted","customer_invoice",id,{total,base},when));await db.batch(statements);return finish(command);}
+
+async function recordPayment(command:WorkflowCommand){const payload=command.payload??{};const documentType=textValue(payload,"documentType");const documentId=command.entityId??textValue(payload,"documentId");const amount=numberValue(payload,"amountCents",{integer:true});const paymentDate=dateValue(payload,"paymentDate",today());await assertPeriodOpen("accounting",paymentDate);const isCustomer=documentType==="customer_invoice";const row=isCustomer?await first<{partnerId:string;total:number;paid:number;version:number;currency:string}>("SELECT customer_id AS partnerId,total_cents AS total,paid_cents AS paid,version,currency FROM customer_invoices WHERE id=?",documentId):await first<{partnerId:string;total:number;paid:number;version:number;currency:string}>("SELECT vendor_id AS partnerId,total_cents AS total,paid_cents AS paid,version,currency FROM vendor_bills WHERE id=?",documentId);if(!row)throw new WorkflowError("NOT_FOUND","Payable or receivable document not found.",404);if(amount>row.total-row.paid)throw new WorkflowError("OVERPAYMENT","Payment exceeds the outstanding balance.",409);const exchange=payload.exchangeRateToBase==null?1:numberValue(payload,"exchangeRateToBase");const base=Math.round(amount*exchange);const id=newId("payment");const number=documentNumber("PAY");const result:WorkflowResult={message:`${number} posted for ${amount} ${row.currency} cents.`,impact:{physical:"No stock movement.",financial:"Document balance reduced.",onHandDelta:0},recordId:id};const db=getD1();const when=new Date().toISOString();const table=isCustomer?"customer_invoices":"vendor_bills";await db.batch([db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command,result,id)),db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(id,number,isCustomer?"inbound":"outbound",row.partnerId,documentType,documentId,amount,paymentDate,textValue(payload,"method"),payload.reference??null,when,command.actor.label,row.currency,exchange,base),db.prepare(`UPDATE ${table} SET paid_cents=paid_cents+?,status=CASE WHEN paid_cents+?>=total_cents THEN 'paid' ELSE 'partially_paid' END,version=version+1 WHERE id=? AND paid_cents+?<=total_cents AND ${marker(command)}`).bind(amount,amount,documentId,amount),auditStatement(command,"payment",id,"payment_posted",result.message,{documentType,documentId,amount,base},when),outboxStatement(command,"payment.posted","payment",id,{documentType,documentId,amount,base},when)]);return finish(command);}
+
+async function setValuationPolicy(command:WorkflowCommand){const productId=command.entityId??textValue(command.payload??{},"productId");const payload=command.payload??{};const method=textValue(payload,"method");if(!["fifo","average","standard"].includes(method))throw new WorkflowError("VALIDATION_ERROR","method must be fifo, average, or standard.");const standard=payload.standardCostCents==null?0:numberValue(payload,"standardCostCents",{positive:false,integer:true});const version=command.version??0;const current=await first<{version:number}>("SELECT version FROM valuation_policies WHERE product_id=?",productId);if(current&&current.version!==version)throw new WorkflowError("VERSION_CONFLICT","Valuation policy changed.",409,current.version);const result:WorkflowResult={message:`${method} valuation selected for future postings; prior value entries remain immutable.`,impact:{physical:"No stock movement.",financial:"Future valuation method changed.",onHandDelta:0},recordId:productId};const db=getD1();const when=new Date().toISOString();await db.batch([db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command,result,productId)),db.prepare(`INSERT INTO valuation_policies (product_id,method,standard_cost_cents,average_cost_cents,version,updated_at,updated_by) SELECT ?,?,?,?,1,?,? WHERE ${marker(command)} ON CONFLICT(product_id) DO UPDATE SET method=excluded.method,standard_cost_cents=excluded.standard_cost_cents,version=valuation_policies.version+1,updated_at=excluded.updated_at,updated_by=excluded.updated_by`).bind(productId,method,standard,standard,when,command.actor.label),auditStatement(command,"product",productId,"valuation_policy_updated",result.message,{method,standard},when),outboxStatement(command,"valuation.policy_updated","product",productId,{method},when)]);return finish(command);}
+
+/* eslint-enable @typescript-eslint/no-unused-vars */
+async function allocateLandedCost(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const amount = numberValue(payload, "amountCents", { integer: true });
+  const basis = textValue(payload, "allocationBasis", "purchase_value");
+  if (!["quantity", "purchase_value"].includes(basis)) throw new WorkflowError("VALIDATION_ERROR", "allocationBasis must be quantity or purchase_value.");
+  const sourceDocumentType = textValue(payload, "sourceDocumentType");
+  const sourceDocumentId = textValue(payload, "sourceDocumentId");
+  if (sourceDocumentType !== "vendor_bill") throw new WorkflowError("UNSUPPORTED_LANDED_COST_SOURCE", "Landed-cost allocations currently require an approved vendor bill source.", 409);
+  const source = await first<{ status: string; baseTotal: number; invoiceDate: string; purchaseOrderId: string | null; exchange: number; eligibleCharges: number }>(`SELECT vb.status,vb.base_total_cents AS baseTotal,vb.invoice_date AS invoiceDate,vb.purchase_order_id AS purchaseOrderId,vb.exchange_rate_to_base AS exchange,
+      COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='vendor_bill' AND dc.document_id=vb.id AND dc.refundable=0 AND dc.charge_type IN ('freight','fuel_surcharge','handling','customs','brokerage')),0) AS eligibleCharges
+    FROM vendor_bills vb WHERE vb.id=?`, sourceDocumentId);
+  if (!source) throw new WorkflowError("NOT_FOUND", "Landed-cost source vendor bill was not found.", 404);
+  if (!["approved", "partially_paid", "paid"].includes(source.status)) throw new WorkflowError("INVALID_STATE", "The landed-cost source vendor bill must be approved and off hold.", 409);
+  if (!source.purchaseOrderId) throw new WorkflowError("LANDED_COST_SOURCE_UNRELATED", "The source vendor bill must be linked to a purchase order.", 409);
+  const eligibleBaseCents = Math.round(source.eligibleCharges * source.exchange);
+  if (eligibleBaseCents <= 0 || amount > eligibleBaseCents) throw new WorkflowError("LANDED_COST_EXCEEDS_ELIGIBLE_CHARGES", `Allocation cannot exceed ${eligibleBaseCents} base-currency cents of eligible freight, fuel, handling, customs, and brokerage charges.`, 409);
+  const postingDate = dateValue(payload, "postingDate", source.invoiceDate || today());
+  await assertPeriodOpen("accounting", postingDate);
+  await assertPeriodOpen("inventory", postingDate);
+  const layerIds = Array.isArray(payload.costLayerIds) ? payload.costLayerIds.map(String) : [];
+  if (!layerIds.length) throw new WorkflowError("VALIDATION_ERROR", "costLayerIds is required.");
+  const uniqueLayerIds = lineIdsUnique(layerIds);
+  if (uniqueLayerIds.length !== layerIds.length) throw new WorkflowError("DUPLICATE_COST_LAYER", "Each cost layer may appear only once in an allocation.");
+  const placeholders = layerIds.map(() => "?").join(",");
+  const fetched = await all<{ id: string; productId: string; received: number; remaining: number; unitCost: number; purchaseOrderId: string | null }>(`SELECT cl.id,cl.product_id AS productId,cl.received_qty AS received,cl.remaining_qty AS remaining,cl.unit_cost_cents AS unitCost,pol.purchase_order_id AS purchaseOrderId
+    FROM cost_layers cl JOIN stock_movements sm ON sm.id=cl.receipt_movement_id LEFT JOIN purchase_order_lines pol ON pol.id=sm.purchase_order_line_id
+    WHERE cl.id IN (${placeholders})`, ...layerIds);
+  if (fetched.length !== layerIds.length) throw new WorkflowError("NOT_FOUND", "One or more cost layers were not found.", 404);
+  const byId = new Map(fetched.map((layer) => [layer.id, layer]));
+  const layers = layerIds.map((id) => byId.get(id)!);
+  if (layers.some((layer) => layer.purchaseOrderId !== source.purchaseOrderId)) throw new WorkflowError("LANDED_COST_LAYER_UNRELATED", "Every selected cost layer must originate from the purchase order linked to the landed-cost vendor bill.", 409);
+  if (layers.some((layer) => layer.remaining !== layer.received || layer.remaining <= 0)) throw new WorkflowError("CONSUMED_COST_LAYER", "Landed cost can only be allocated before any selected receipt layer is consumed.", 409);
+  const weights = layers.map((layer) => basis === "quantity" ? layer.received : layer.received * layer.unitCost);
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  if (totalWeight <= 0) throw new WorkflowError("INVALID_ALLOCATION", "Allocation weights must be positive.");
+  const rawShares = layers.map((layer, index) => ({ layer, index, exact: amount * weights[index] / totalWeight }));
+  const shares = rawShares.map(({ layer, exact }) => ({ layerId: layer.id, productId: layer.productId, received: layer.received, cents: Math.floor(exact), fraction: exact - Math.floor(exact) }));
+  let remainder = amount - shares.reduce((sum, share) => sum + share.cents, 0);
+  for (const share of [...shares].sort((a, b) => b.fraction - a.fraction || a.layerId.localeCompare(b.layerId))) {
+    if (remainder-- <= 0) break;
+    share.cents += 1;
+  }
+  const postedShares = shares.map((share) => ({ layerId: share.layerId, productId: share.productId, received: share.received, cents: share.cents }));
+  const id = newId("landed-cost"); const number = documentNumber("LC");
+  const result: WorkflowResult = { message: `${number} allocated ${amount} base-currency cents across ${layers.length} unconsumed cost layers without changing quantity.`, impact: { physical: "No stock movement.", financial: `Inventory value increased by ${amount} base-currency cents.`, inventoryValueDeltaCents: amount, onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM landed_cost_allocations WHERE source_document_type=? AND source_document_id=?)
+        AND EXISTS (SELECT 1 FROM vendor_bills vb WHERE vb.id=? AND vb.status IN ('approved','partially_paid','paid') AND vb.purchase_order_id=?
+          AND ROUND(COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='vendor_bill' AND dc.document_id=vb.id AND dc.refundable=0 AND dc.charge_type IN ('freight','fuel_surcharge','handling','customs','brokerage')),0)*vb.exchange_rate_to_base)>=?)
+        AND (SELECT COUNT(*) FROM cost_layers cl JOIN stock_movements sm ON sm.id=cl.receipt_movement_id JOIN purchase_order_lines pol ON pol.id=sm.purchase_order_line_id WHERE cl.id IN (${placeholders}) AND cl.remaining_qty=cl.received_qty AND cl.remaining_qty>0 AND pol.purchase_order_id=?)=?`)
+      .bind(...claimValues(command, result, id), sourceDocumentType, sourceDocumentId, sourceDocumentId, source.purchaseOrderId, amount, ...layerIds, source.purchaseOrderId, layerIds.length),
+    db.prepare(`INSERT INTO landed_cost_allocations (id,number,source_document_type,source_document_id,amount_cents,allocation_basis,posted_at,posted_by) SELECT ?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(id, number, sourceDocumentType, sourceDocumentId, amount, basis, when, command.actor.label),
+  ];
+  shares.forEach((share) => {
+    statements.push(
+      db.prepare(`INSERT INTO landed_cost_allocation_lines (id,allocation_id,cost_layer_id,allocated_cents) SELECT ?,?,?,? WHERE ${marker(command)}`).bind(newId("landed-line"), id, share.layerId, share.cents),
+      db.prepare(`UPDATE cost_layers SET landed_cost_cents=landed_cost_cents+? WHERE id=? AND remaining_qty=received_qty AND remaining_qty>0 AND ${marker(command)}`).bind(share.cents, share.layerId),
+      db.prepare(`INSERT INTO inventory_value_entries (id,product_id,movement_id,entry_type,quantity,unit_cost_cents,value_cents,cost_method,reference_type,reference_id,posted_at,posted_by)
+        SELECT ?,?,NULL,'landed_cost',0,?,?,COALESCE((SELECT method FROM valuation_policies WHERE product_id=?),'fifo'),'landed_cost',?,?,? WHERE ${marker(command)}`)
+        .bind(newId("value"), share.productId, share.received > 0 ? Math.round(share.cents / share.received) : 0, share.cents, share.productId, id, when, command.actor.label)
+    );
+  });
+  statements.push(
+    auditStatement(command, "landed_cost", id, "landed_cost_allocated", result.message, { sourceDocumentType, sourceDocumentId, shares: postedShares, amount, basis }, when),
+    outboxStatement(command, "valuation.landed_cost_allocated", "landed_cost", id, { sourceDocumentType, sourceDocumentId, amount, shares: postedShares }, when)
+  );
+  await db.batch(statements);
+  return finish(command);
+}
+
+function lineIdsUnique(values:string[]){return [...new Set(values)];}
+
+async function receiveTransfer(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const payload = command.payload ?? {};
+  const requestedLineId = optionalText(payload, "lineId");
+  const line = await first<{ lineId: string; productId: string; fromLocation: string; toLocation: string; destinationStatus: string; quantity: number; received: number; transitLocation: string; version: number; status: string; lotId: string | null; unitId: string | null }>(`SELECT itl.id AS lineId,itl.product_id AS productId,itl.from_location_id AS fromLocation,itl.to_location_id AS toLocation,destination.inventory_status AS destinationStatus,
+      itl.quantity,itl.received_qty AS received,it.in_transit_location_id AS transitLocation,it.version,it.status,itl.lot_id AS lotId,itl.inventory_unit_id AS unitId
+    FROM inventory_transfers it JOIN inventory_transfer_lines itl ON itl.transfer_id=it.id JOIN locations destination ON destination.id=itl.to_location_id
+    WHERE it.id=? AND (? IS NULL OR itl.id=?) ORDER BY itl.id LIMIT 1`, id, requestedLineId, requestedLineId);
+  if (!line) throw new WorkflowError("NOT_FOUND", "Inter-warehouse transfer or transfer line was not found.", 404);
+  if (line.status !== "in_transit" && line.status !== "partially_received") throw new WorkflowError("INVALID_STATE", "Only in-transit transfers can be received.", 409);
+  if (line.version !== (command.version ?? 0)) throw new WorkflowError("VERSION_CONFLICT", "Transfer changed.", 409, line.version);
+  const quantity = payload.quantity == null ? roundQuantity(line.quantity - line.received) : roundQuantity(numberValue(payload, "quantity"));
+  if (quantity <= 0 || quantity > line.quantity - line.received) throw new WorkflowError("INVALID_QUANTITY", "Receipt exceeds the remaining in-transit quantity.", 409);
+  const postingDate = dateValue(payload, "postingDate", today());
+  await assertPeriodOpen("inventory", postingDate);
+  const transit = await first<{ available: number }>("SELECT on_hand_qty-reserved_qty AS available FROM inventory_balances WHERE product_id=? AND location_id=?", line.productId, line.transitLocation);
+  if (!transit || transit.available < quantity) throw new WorkflowError("TRANSIT_SHORTAGE", "In-transit balance is insufficient.", 409);
+  const trace = await requireSourceTracking(line.productId, line.transitLocation, quantity, payload, { lotId: line.lotId, unitId: line.unitId });
+  const traceClaim = trackingClaim(trace, line.transitLocation, quantity);
+  const result: WorkflowResult = { message: `${quantity} in-transit units received at the destination warehouse.`, impact: { physical: "Inventory moved from transit to destination; company on-hand unchanged.", trackingPolicy: trace.policy, onHandDelta: 0, inTransitDelta: -quantity }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString(); const sm1 = newId("movement"); const sm2 = newId("movement");
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM inventory_transfers it WHERE it.id=? AND it.version=? AND it.status IN ('in_transit','partially_received')
+        AND EXISTS (SELECT 1 FROM inventory_transfer_lines itl WHERE itl.id=? AND itl.transfer_id=it.id AND itl.received_qty+?<=itl.quantity)
+        AND EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id=? AND ib.location_id=? AND ib.on_hand_qty-ib.reserved_qty>=?) AND ${traceClaim.sql}`)
+      .bind(...claimValues(command, result, id), id, line.version, line.lineId, quantity, line.productId, line.transitLocation, quantity, ...traceClaim.bindings),
+    db.prepare(`UPDATE inventory_balances SET on_hand_qty=on_hand_qty-?,version=version+1 WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${marker(command)}`).bind(quantity, line.productId, line.transitLocation, quantity),
+    db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) SELECT ?,?,?,0,1 WHERE ${marker(command)} ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=on_hand_qty+excluded.on_hand_qty,version=version+1`).bind(line.productId, line.toLocation, quantity),
+    db.prepare(`UPDATE inventory_transfer_lines SET received_qty=received_qty+? WHERE id=? AND received_qty+?<=quantity AND ${marker(command)}`).bind(quantity, line.lineId, quantity),
+    db.prepare(`UPDATE inventory_transfers SET status=CASE WHEN NOT EXISTS (SELECT 1 FROM inventory_transfer_lines itl WHERE itl.transfer_id=inventory_transfers.id AND itl.received_qty<itl.quantity) THEN 'received' ELSE 'partially_received' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(id, line.version),
+    db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,from_location_id,inventory_status,source_document_type,source_document_id,source_line_id,posted_at,posted_by,idempotency_key,lot_id,inventory_unit_id) SELECT ?,'interwarehouse_receive',?,-?,?,'in_transit','inventory_transfer',?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(sm1, line.productId, quantity, line.transitLocation, id, line.lineId, when, command.actor.label, command.idempotencyKey, line.lotId, line.unitId),
+    db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,to_location_id,inventory_status,source_document_type,source_document_id,source_line_id,posted_at,posted_by,idempotency_key,lot_id,inventory_unit_id) SELECT ?,'interwarehouse_receive',?,?,?,?,'inventory_transfer',?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(sm2, line.productId, quantity, line.toLocation, line.destinationStatus, id, line.lineId, when, command.actor.label, command.idempotencyKey, line.lotId, line.unitId),
+    auditStatement(command, "inventory_transfer", id, "interwarehouse_received", result.message, { quantity, lineId: line.lineId, productId: line.productId, destinationStatus: line.destinationStatus }, when),
+    outboxStatement(command, "inventory.transfer_received", "inventory_transfer", id, { quantity, lineId: line.lineId }, when),
+  ];
+  const sourceAssignment = assignmentStatement(command, sm1, trace, quantity);
+  const destinationAssignment = assignmentStatement(command, sm2, trace, quantity);
+  if (sourceAssignment) statements.push(sourceAssignment);
+  if (destinationAssignment) statements.push(destinationAssignment);
+  if (trace.policy === "serial") statements.push(db.prepare(`UPDATE inventory_units SET location_id=?,inventory_status=?,version=version+1 WHERE id=? AND product_id=? AND location_id=? AND inventory_status='in_transit' AND lifecycle_status='on_hand' AND allocated_sales_order_line_id IS NULL AND version=? AND ${marker(command)}`).bind(line.toLocation, line.destinationStatus, trace.unitId, line.productId, line.transitLocation, trace.unitVersion));
+  await db.batch(statements);
+  return finish(command);
+}
+
+async function updateUserRole(command:WorkflowCommand){const userId=textValue({entityId:command.entityId},"entityId");const payload=command.payload??{};const role=textValue(payload,"role");if(!["viewer","operator","accounting","manager","administrator"].includes(role))throw new WorkflowError("VALIDATION_ERROR","role must be viewer, operator, accounting, manager, or administrator.");const active=payload.active!==false;const reason=textValue(payload,"reason");const version=command.version??0;const user=await first<{version:number;email:string}>("SELECT version,email FROM app_users WHERE user_id=?",userId);if(!user)throw new WorkflowError("NOT_FOUND","User was not found.",404);if(user.version!==version)throw new WorkflowError("VERSION_CONFLICT","User mapping changed.",409,user.version);if(userId===command.actor.id&&(!active||role!=="administrator")){const admins=await first<{count:number}>("SELECT COUNT(*) AS count FROM app_users WHERE role='administrator' AND active=1");if(Number(admins?.count??0)<=1)throw new WorkflowError("LAST_ADMIN","The last active administrator cannot remove their own administration access.",409);}const result:WorkflowResult={message:`${user.email} updated to ${role}${active?"":" (disabled)"}.`,impact:{physical:"No inventory effect.",securityRole:role,active,onHandDelta:0},recordId:userId};const db=getD1();const when=new Date().toISOString();await db.batch([db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM app_users WHERE user_id=? AND version=?`).bind(...claimValues(command,result,userId),userId,version),db.prepare(`UPDATE app_users SET role=?,active=?,version=version+1,updated_at=? WHERE user_id=? AND version=? AND ${marker(command)}`).bind(role,active?1:0,when,userId,version),auditStatement(command,"app_user",userId,"user_role_updated",result.message,{role,active,reason},when),outboxStatement(command,"security.user_role_updated","app_user",userId,{role,active},when)]);return finish(command);}
+
+function optionalText(payload:Record<string,unknown>,key:string){return typeof payload[key]==="string"&&payload[key].trim()?payload[key].trim():null;}
+function activeFor(command:WorkflowCommand){return !normalize(command.command).startsWith("deactivate")&&command.payload?.active!==false;}
+
+async function deactivateMaster(command:WorkflowCommand,table:"products"|"business_partners"|"warehouses"|"locations"|"returnable_asset_types",entityType:string){const id=textValue({entityId:command.entityId},"entityId"),version=command.version??0,reason=textValue(command.payload??{},"reason");const current=await first<{version:number}>(`SELECT version FROM ${table} WHERE id=?`,id);if(!current)throw new WorkflowError("NOT_FOUND",`${entityType} not found.`,404);if(current.version!==version)throw new WorkflowError("VERSION_CONFLICT",`${entityType} changed.`,409,current.version);const result:WorkflowResult={message:`${entityType} deactivated; historical records remain available.`,impact:{physical:"No inventory posting.",onHandDelta:0},recordId:id};const db=getD1(),when=new Date().toISOString();await db.batch([db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM ${table} WHERE id=? AND version=? AND active=1`).bind(...claimValues(command,result,id),id,version),db.prepare(`UPDATE ${table} SET active=0,version=version+1 WHERE id=? AND version=? AND active=1 AND ${marker(command)}`).bind(id,version),auditStatement(command,entityType,id,"deactivated",result.message,{reason},when),outboxStatement(command,"master.deactivated",entityType,id,{reason},when)]);return finish(command);}
+
+async function saveBusinessPartner(command:WorkflowCommand){const payload=command.payload??{};const creating=normalize(command.command).startsWith("create");const id=creating?newId("partner"):textValue({entityId:command.entityId},"entityId");const code=textValue(payload,"code").toUpperCase();const name=textValue(payload,"name");const partnerType=textValue(payload,"partnerType");if(!["vendor","customer","both"].includes(partnerType))throw new WorkflowError("VALIDATION_ERROR","partnerType must be vendor, customer, or both.");const currency=textValue(payload,"currency","CAD").toUpperCase();if(!/^[A-Z]{3}$/.test(currency))throw new WorkflowError("VALIDATION_ERROR","currency must be a three-letter ISO code.");const version=command.version??0;const current=creating?null:await first<{version:number}>("SELECT version FROM business_partners WHERE id=?",id);if(!creating&&!current)throw new WorkflowError("NOT_FOUND","Business partner not found.",404);if(current&&current.version!==version)throw new WorkflowError("VERSION_CONFLICT","Business partner changed.",409,current.version);const active=activeFor(command);const result:WorkflowResult={message:`${name} ${creating?"created":"updated"}${active?"":" and deactivated"}.`,impact:{physical:"No inventory posting.",onHandDelta:0},recordId:id};const db=getD1();const when=new Date().toISOString();const statements:D1PreparedStatement[]=[creating?db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command,result,id)):db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM business_partners WHERE id=? AND version=?").bind(...claimValues(command,result,id),id,version)];if(creating)statements.push(db.prepare(`INSERT INTO business_partners (id,code,name,partner_type,email,phone,payment_terms,currency,active,version,created_at) SELECT ?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(id,code,name,partnerType,optionalText(payload,"email"),optionalText(payload,"phone"),optionalText(payload,"paymentTerms"),currency,active?1:0,when));else statements.push(db.prepare(`UPDATE business_partners SET code=?,name=?,partner_type=?,email=?,phone=?,payment_terms=?,currency=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(code,name,partnerType,optionalText(payload,"email"),optionalText(payload,"phone"),optionalText(payload,"paymentTerms"),currency,active?1:0,id,version));statements.push(auditStatement(command,"business_partner",id,creating?"created":"updated",result.message,{code,partnerType,currency,active},when),outboxStatement(command,creating?"master.business_partner_created":"master.business_partner_updated","business_partner",id,{code,active},when));await db.batch(statements);return finish(command);}
+
+async function saveProduct(command:WorkflowCommand){const payload=command.payload??{};const creating=normalize(command.command).startsWith("create");const id=creating?newId("product"):textValue({entityId:command.entityId},"entityId");const sku=textValue(payload,"sku").toUpperCase();const name=textValue(payload,"name");const tracking=textValue(payload,"trackingPolicy","quantity");const policy=textValue(payload,"inventoryPolicy","stocked");if(!["quantity","lot","serial"].includes(tracking)||!["stocked","special_order","drop_ship"].includes(policy))throw new WorkflowError("VALIDATION_ERROR","Invalid trackingPolicy or inventoryPolicy.");const standard=numberValue(payload,"standardCostCents",{positive:false,integer:true});const price=numberValue(payload,"sellingPriceCents",{positive:false,integer:true});if(standard<0||price<0)throw new WorkflowError("VALIDATION_ERROR","Costs and prices cannot be negative.");const reorder=payload.reorderPoint==null?0:numberValue(payload,"reorderPoint",{positive:false});if(reorder<0)throw new WorkflowError("VALIDATION_ERROR","reorderPoint cannot be negative.");const version=command.version??0;const current=creating?null:await first<{version:number}>("SELECT version FROM products WHERE id=?",id);if(!creating&&!current)throw new WorkflowError("NOT_FOUND","Product not found.",404);if(current&&current.version!==version)throw new WorkflowError("VERSION_CONFLICT","Product changed.",409,current.version);const active=activeFor(command);const result:WorkflowResult={message:`${sku} ${creating?"created":"updated"}${active?"":" and deactivated"}.`,impact:{physical:"No inventory posting.",onHandDelta:0},recordId:id};const db=getD1();const when=new Date().toISOString();const claim=creating?db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command,result,id)):db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM products WHERE id=? AND version=?").bind(...claimValues(command,result,id),id,version);const values=[sku,optionalText(payload,"manufacturerSku"),name,textValue(payload,"category"),textValue(payload,"material"),textValue(payload,"dimensions"),textValue(payload,"finish"),tracking,policy,standard,price,reorder,textValue(payload,"baseUomId","uom-each"),textValue(payload,"purchaseUomId","uom-each"),textValue(payload,"salesUomId","uom-each"),active?1:0] as const;const write=creating?db.prepare(`INSERT INTO products (id,sku,manufacturer_sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(id,...values,when):db.prepare(`UPDATE products SET sku=?,manufacturer_sku=?,name=?,category=?,material=?,dimensions=?,finish=?,tracking_policy=?,inventory_policy=?,standard_cost_cents=?,selling_price_cents=?,reorder_point=?,base_uom_id=?,purchase_uom_id=?,sales_uom_id=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(...values,id,version);await db.batch([claim,write,auditStatement(command,"product",id,creating?"created":"updated",result.message,{sku,tracking,policy,active},when),outboxStatement(command,creating?"master.product_created":"master.product_updated","product",id,{sku,active},when)]);return finish(command);}
+
+async function saveWarehouse(command:WorkflowCommand){const payload=command.payload??{};const creating=normalize(command.command).startsWith("create");const id=creating?newId("warehouse"):textValue({entityId:command.entityId},"entityId");const code=textValue(payload,"code").toUpperCase(),name=textValue(payload,"name"),timezone=textValue(payload,"timezone","UTC");const active=activeFor(command),version=command.version??0;const current=creating?null:await first<{version:number}>("SELECT version FROM warehouses WHERE id=?",id);if(!creating&&!current)throw new WorkflowError("NOT_FOUND","Warehouse not found.",404);if(current&&current.version!==version)throw new WorkflowError("VERSION_CONFLICT","Warehouse changed.",409,current.version);const result:WorkflowResult={message:`Warehouse ${code} ${creating?"created":"updated"}.`,impact:{physical:"No inventory posting.",onHandDelta:0},recordId:id};const db=getD1(),when=new Date().toISOString();const claim=creating?db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command,result,id)):db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM warehouses WHERE id=? AND version=?").bind(...claimValues(command,result,id),id,version);const write=creating?db.prepare(`INSERT INTO warehouses (id,code,name,timezone,active,version) SELECT ?,?,?,?,?,1 WHERE ${marker(command)}`).bind(id,code,name,timezone,active?1:0):db.prepare(`UPDATE warehouses SET code=?,name=?,timezone=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(code,name,timezone,active?1:0,id,version);await db.batch([claim,write,auditStatement(command,"warehouse",id,creating?"created":"updated",result.message,{code,active},when),outboxStatement(command,"master.warehouse_saved","warehouse",id,{code,active},when)]);return finish(command);}
+
+async function saveLocation(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const creating = normalize(command.command).startsWith("create");
+  const id = creating ? newId("location") : textValue({ entityId: command.entityId }, "entityId");
+  const code = textValue(payload, "code").toUpperCase();
+  const name = textValue(payload, "name");
+  const locationType = textValue(payload, "locationType");
+  const status = textValue(payload, "inventoryStatus", "usable");
+  const warehouseId = textValue(payload, "warehouseId");
+  if (!["storage", "receiving", "shipping", "quarantine", "in_transit", "scrap"].includes(locationType)
+      || !["usable", "quarantine", "damaged", "in_transit"].includes(status)) {
+    throw new WorkflowError("VALIDATION_ERROR", "Invalid locationType or inventoryStatus.");
+  }
+  if ((locationType === "in_transit") !== (status === "in_transit")) {
+    throw new WorkflowError("VALIDATION_ERROR", "An in-transit location must use both the in_transit location type and inventory status.");
+  }
+  if (!await first("SELECT id FROM warehouses WHERE id=? AND active=1", warehouseId)) throw new WorkflowError("NOT_FOUND", "Active warehouse not found.", 404);
+  const active = activeFor(command);
+  const version = command.version ?? 0;
+  const current = creating ? null : await first<{ version: number; locationType: string; status: string; warehouseId: string; active: number }>(
+    "SELECT version,location_type AS locationType,inventory_status AS status,warehouse_id AS warehouseId,active FROM locations WHERE id=?", id
+  );
+  if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Location not found.", 404);
+  if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Location changed.", 409, current.version);
+  const stockSensitiveChange = current != null && (current.locationType !== locationType || current.status !== status
+    || current.warehouseId !== warehouseId || (current.active === 1 && !active));
+  if (stockSensitiveChange) {
+    const balance = await first<{ onHand: number; reserved: number }>(
+      "SELECT COALESCE(SUM(on_hand_qty),0) AS onHand,COALESCE(SUM(reserved_qty),0) AS reserved FROM inventory_balances WHERE location_id=?", id
+    );
+    const units = await first<{ count: number }>("SELECT COUNT(*) AS count FROM inventory_units WHERE location_id=? AND lifecycle_status='on_hand'", id);
+    if (Number(balance?.onHand ?? 0) !== 0 || Number(balance?.reserved ?? 0) !== 0 || Number(units?.count ?? 0) !== 0) {
+      throw new WorkflowError("LOCATION_HAS_STOCK", "Move all on-hand and reserved inventory out of this location before changing its warehouse, type, inventory status, or active state.", 409);
+    }
+  }
+  const result: WorkflowResult = { message: `Location ${code} ${creating ? "created" : "updated"}.`, impact: { physical: "No inventory posting.", onHandDelta: 0 }, recordId: id };
+  const db = getD1();
+  const when = new Date().toISOString();
+  const emptyLocationClaim = stockSensitiveChange
+    ? "AND NOT EXISTS (SELECT 1 FROM inventory_balances WHERE location_id=? AND (on_hand_qty<>0 OR reserved_qty<>0)) AND NOT EXISTS (SELECT 1 FROM inventory_units WHERE location_id=? AND lifecycle_status='on_hand')"
+    : "";
+  const claim = creating
+    ? db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command, result, id))
+    : db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+        SELECT ?,?,?,?,?,?,? FROM locations WHERE id=? AND version=? ${emptyLocationClaim}`)
+      .bind(...claimValues(command, result, id), id, version, ...(stockSensitiveChange ? [id, id] : []));
+  const parent = optionalText(payload, "parentLocationId");
+  const write = creating
+    ? db.prepare(`INSERT INTO locations (id,code,name,location_type,inventory_status,warehouse_id,parent_location_id,active,version) SELECT ?,?,?,?,?,?,?,?,1 WHERE ${marker(command)}`)
+      .bind(id, code, name, locationType, status, warehouseId, parent, active ? 1 : 0)
+    : db.prepare(`UPDATE locations SET code=?,name=?,location_type=?,inventory_status=?,warehouse_id=?,parent_location_id=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`)
+      .bind(code, name, locationType, status, warehouseId, parent, active ? 1 : 0, id, version);
+  const before = current ? { locationType: current.locationType, status: current.status, warehouseId: current.warehouseId, active: Boolean(current.active) } : null;
+  const after = { locationType, status, warehouseId, active };
+  await db.batch([
+    claim,
+    write,
+    auditStatement(command, "location", id, creating ? "created" : "updated", result.message, { code, before, after }, when),
+    outboxStatement(command, "master.location_saved", "location", id, { code, before, after }, when),
+  ]);
+  return finish(command);
+}
+
+async function deactivateLocation(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const version = command.version ?? 0;
+  const reason = textValue(command.payload ?? {}, "reason");
+  const current = await first<{ version: number; code: string; active: number }>("SELECT version,code,active FROM locations WHERE id=?", id);
+  if (!current) throw new WorkflowError("NOT_FOUND", "Location not found.", 404);
+  if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Location changed.", 409, current.version);
+  if (!current.active) throw new WorkflowError("INVALID_STATE", "Location is already inactive.", 409, current.version);
+  const balance = await first<{ onHand: number; reserved: number }>(
+    "SELECT COALESCE(SUM(on_hand_qty),0) AS onHand,COALESCE(SUM(reserved_qty),0) AS reserved FROM inventory_balances WHERE location_id=?", id
+  );
+  const units = await first<{ count: number }>("SELECT COUNT(*) AS count FROM inventory_units WHERE location_id=? AND lifecycle_status='on_hand'", id);
+  if (Number(balance?.onHand ?? 0) !== 0 || Number(balance?.reserved ?? 0) !== 0 || Number(units?.count ?? 0) !== 0) {
+    throw new WorkflowError("LOCATION_HAS_STOCK", "Move all on-hand and reserved inventory out of this location before deactivating it.", 409);
+  }
+  const result: WorkflowResult = { message: `Location ${current.code} deactivated; historical records remain available.`, impact: { physical: "No inventory posting.", onHandDelta: 0 }, recordId: id };
+  const db = getD1();
+  const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM locations WHERE id=? AND version=? AND active=1
+        AND NOT EXISTS (SELECT 1 FROM inventory_balances WHERE location_id=? AND (on_hand_qty<>0 OR reserved_qty<>0))
+        AND NOT EXISTS (SELECT 1 FROM inventory_units WHERE location_id=? AND lifecycle_status='on_hand')`)
+      .bind(...claimValues(command, result, id), id, version, id, id),
+    db.prepare(`UPDATE locations SET active=0,version=version+1 WHERE id=? AND version=? AND active=1 AND ${marker(command)}`).bind(id, version),
+    auditStatement(command, "location", id, "deactivated", result.message, { reason, code: current.code, before: { active: true }, after: { active: false } }, when),
+    outboxStatement(command, "master.deactivated", "location", id, { reason, code: current.code }, when),
+  ]);
+  return finish(command);
+}
+
+async function saveReturnableAssetType(command:WorkflowCommand){const payload=command.payload??{};const creating=normalize(command.command).startsWith("create");const id=creating?newId("asset-type"):textValue({entityId:command.entityId},"entityId");const code=textValue(payload,"code").toUpperCase(),name=textValue(payload,"name"),assetClass=textValue(payload,"assetClass");const deposit=numberValue(payload,"unitDepositCents",{positive:false,integer:true});if(deposit<0)throw new WorkflowError("VALIDATION_ERROR","unitDepositCents cannot be negative.");const active=activeFor(command),version=command.version??0;const current=creating?null:await first<{version:number}>("SELECT version FROM returnable_asset_types WHERE id=?",id);if(!creating&&!current)throw new WorkflowError("NOT_FOUND","Returnable asset type not found.",404);if(current&&current.version!==version)throw new WorkflowError("VERSION_CONFLICT","Returnable asset type changed.",409,current.version);const result:WorkflowResult={message:`Returnable asset ${code} ${creating?"created":"updated"}.`,impact:{physical:"No inventory posting.",onHandDelta:0},recordId:id};const db=getD1(),when=new Date().toISOString();const claim=creating?db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command,result,id)):db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM returnable_asset_types WHERE id=? AND version=?").bind(...claimValues(command,result,id),id,version);const write=creating?db.prepare(`INSERT INTO returnable_asset_types (id,code,name,asset_class,unit_deposit_cents,active,version) SELECT ?,?,?,?,?,?,1 WHERE ${marker(command)}`).bind(id,code,name,assetClass,deposit,active?1:0):db.prepare(`UPDATE returnable_asset_types SET code=?,name=?,asset_class=?,unit_deposit_cents=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(code,name,assetClass,deposit,active?1:0,id,version);await db.batch([claim,write,auditStatement(command,"returnable_asset_type",id,creating?"created":"updated",result.message,{code,deposit,active},when),outboxStatement(command,"master.returnable_asset_type_saved","returnable_asset_type",id,{code,active},when)]);return finish(command);}
+
+async function setSalesOrderLifecycle(command: WorkflowCommand, target: "confirmed" | "canceled") {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const version = command.version ?? 0;
+  const order = await first<{ version: number; status: string }>("SELECT version,lifecycle_status AS status FROM sales_orders WHERE id=?", id);
+  if (!order) throw new WorkflowError("NOT_FOUND", "Sales order not found.", 404);
+  if (order.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Sales order changed.", 409, order.version);
+  if (target === "confirmed" && order.status !== "draft") throw new WorkflowError("INVALID_STATE", "Only a draft sales order can be confirmed.", 409);
+  if (target === "canceled" && !["draft", "confirmed"].includes(order.status)) throw new WorkflowError("INVALID_STATE", "Only a draft or confirmed sales order can be canceled.", 409);
+  const reason = textValue(command.payload ?? {}, "reason");
+  const reservations = target === "canceled" ? await all<{ id: string; productId: string; locationId: string; quantity: number }>("SELECT r.id,r.product_id AS productId,r.location_id AS locationId,r.quantity FROM reservations r JOIN sales_order_lines sol ON sol.id=r.sales_order_line_id WHERE sol.sales_order_id=? AND r.status='active'", id) : [];
+  const reservationClaims = reservations.map(() => "AND EXISTS (SELECT 1 FROM reservations r JOIN inventory_balances ib ON ib.product_id=r.product_id AND ib.location_id=r.location_id WHERE r.id=? AND r.status='active' AND r.quantity=? AND ib.reserved_qty>=r.quantity)").join(" ");
+  const reservationClaimBindings = reservations.flatMap((reservation) => [reservation.id, reservation.quantity]);
+  const result: WorkflowResult = { message: target === "confirmed" ? "Sales order confirmed; open stock lines now contribute demand." : "Sales order canceled; remaining demand and reservations were released.", impact: { physical: "No stock movement.", commercial: target, onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM sales_orders WHERE id=? AND version=? ${reservationClaims}`).bind(...claimValues(command, result, id), id, version, ...reservationClaimBindings),
+    db.prepare(`UPDATE sales_orders SET lifecycle_status=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(target, id, version),
+  ];
+  if (target === "canceled") {
+    for (const reservation of reservations) statements.push(
+      db.prepare(`UPDATE inventory_balances SET reserved_qty=reserved_qty-?,version=version+1 WHERE product_id=? AND location_id=? AND reserved_qty>=? AND ${marker(command)}`).bind(reservation.quantity, reservation.productId, reservation.locationId, reservation.quantity),
+      db.prepare(`UPDATE reservations SET status='released' WHERE id=? AND status='active' AND quantity=? AND ${marker(command)}`).bind(reservation.id, reservation.quantity)
+    );
+    statements.push(db.prepare(`UPDATE sales_order_lines SET canceled_qty=MAX(0,ordered_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sales_order_lines.id),0)) WHERE sales_order_id=? AND ${marker(command)}`).bind(id));
+  }
+  statements.push(auditStatement(command, "sales_order", id, `sales_order_${target}`, result.message, { reason }, when), outboxStatement(command, `sales_order.${target}`, "sales_order", id, { reason }, when));
+  await db.batch(statements);
+  return finish(command);
+}
+
+async function postDropShipDelivery(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const salesLineId = command.entityId ?? textValue(payload, "salesOrderLineId");
+  const quantity = roundQuantity(numberValue(payload, "quantity"));
+  const deliveryDate = dateValue(payload, "deliveryDate", today());
+  const externalReference = textValue(payload, "externalReference");
+  const source = await first<{
+    productId: string; salesOrderId: string; salesVersion: number; salesStatus: string; salesOrdered: number; salesCanceled: number;
+    purchaseLineId: string; purchaseOrderId: string; purchaseVersion: number; purchaseStatus: string; purchaseOrdered: number;
+    deliveredSales: number; deliveredPurchase: number;
+  }>(`SELECT sol.product_id AS productId,sol.sales_order_id AS salesOrderId,so.version AS salesVersion,so.lifecycle_status AS salesStatus,
+      sol.ordered_qty AS salesOrdered,sol.canceled_qty AS salesCanceled,pol.id AS purchaseLineId,pol.purchase_order_id AS purchaseOrderId,
+      po.version AS purchaseVersion,po.lifecycle_status AS purchaseStatus,pol.ordered_qty AS purchaseOrdered,
+      COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0) AS deliveredSales,
+      COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0) AS deliveredPurchase
+    FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id
+    JOIN purchase_order_lines pol ON pol.id=sol.linked_purchase_order_line_id
+    JOIN purchase_orders po ON po.id=pol.purchase_order_id
+    WHERE sol.id=? AND sol.fulfillment_route='drop_ship' AND pol.fulfillment_route='drop_ship'
+      AND pol.source_sales_order_line_id=sol.id AND pol.product_id=sol.product_id`, salesLineId);
+  if (!source) throw new WorkflowError("DROP_SHIP_LINK_REQUIRED", "A symmetric drop-ship PO/SO line link is required.", 409);
+  if (source.salesStatus !== "confirmed" || source.purchaseStatus !== "approved") throw new WorkflowError("INVALID_STATE", "Drop-ship delivery requires a confirmed sales order and approved purchase order.", 409);
+  if (command.version != null && command.version !== source.salesVersion) throw new WorkflowError("VERSION_CONFLICT", "Sales order changed; refresh before posting delivery.", 409, source.salesVersion);
+  const salesRemaining = roundQuantity(source.salesOrdered - source.salesCanceled - source.deliveredSales);
+  const purchaseRemaining = roundQuantity(source.purchaseOrdered - source.deliveredPurchase);
+  if (quantity > Math.min(salesRemaining, purchaseRemaining)) throw new WorkflowError("OVER_DELIVERY", "Drop-ship delivery exceeds linked open sales or purchase quantity.", 409);
+  const id = newId("drop-delivery");
+  const number = documentNumber("DSD");
+  const result: WorkflowResult = { message: `${number} posted for ${quantity} externally delivered units.`, impact: { physical: "No internal stock or valuation movement.", commercial: `${quantity} drop-ship units are now customer-invoice and vendor-bill eligible.`, financial: "No invoice, bill, or payment was created.", onHandDelta: 0, deliveredDelta: quantity }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM sales_orders so JOIN sales_order_lines sol ON sol.sales_order_id=so.id
+      JOIN purchase_order_lines pol ON pol.id=sol.linked_purchase_order_line_id JOIN purchase_orders po ON po.id=pol.purchase_order_id
+      WHERE sol.id=? AND sol.fulfillment_route='drop_ship' AND pol.fulfillment_route='drop_ship' AND pol.source_sales_order_line_id=sol.id
+        AND so.lifecycle_status='confirmed' AND so.version=? AND po.lifecycle_status='approved' AND po.version=?
+        AND sol.ordered_qty-sol.canceled_qty-COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)>=?
+        AND pol.ordered_qty-COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)>=?`)
+      .bind(...claimValues(command, result, id), salesLineId, source.salesVersion, source.purchaseVersion, quantity, quantity),
+    db.prepare(`INSERT INTO drop_ship_deliveries (id,number,purchase_order_id,purchase_order_line_id,sales_order_id,sales_order_line_id,product_id,quantity,reversed_qty,status,delivery_date,external_reference,posted_at,posted_by,version)
+      SELECT ?,?,?,?,?,?,?,?,0,'posted',?,?,?,?,1 WHERE ${marker(command)}`).bind(id, number, source.purchaseOrderId, source.purchaseLineId, source.salesOrderId, salesLineId, source.productId, quantity, deliveryDate, externalReference, when, command.actor.label),
+    db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(source.salesOrderId, source.salesVersion),
+    db.prepare(`UPDATE purchase_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(source.purchaseOrderId, source.purchaseVersion),
+    auditStatement(command, "drop_ship_delivery", id, "drop_ship_delivery_posted", result.message, { number, quantity, deliveryDate, externalReference, salesOrderId: source.salesOrderId, salesOrderLineId: salesLineId, purchaseOrderId: source.purchaseOrderId, purchaseOrderLineId: source.purchaseLineId }, when),
+    outboxStatement(command, "drop_ship.delivery_posted", "drop_ship_delivery", id, { quantity, salesOrderId: source.salesOrderId, purchaseOrderId: source.purchaseOrderId }, when),
+  ]);
+  return finish(command);
+}
+
+async function reverseDropShipDelivery(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const payload = command.payload ?? {};
+  const quantity = roundQuantity(numberValue(payload, "quantity"));
+  const reason = textValue(payload, "reason");
+  const delivery = await first<{ version: number; quantity: number; reversed: number; salesOrderId: string; salesLineId: string; salesVersion: number; purchaseOrderId: string; purchaseLineId: string; purchaseVersion: number; netDelivered: number; invoiced: number }>(`SELECT d.version,d.quantity,d.reversed_qty AS reversed,d.sales_order_id AS salesOrderId,d.sales_order_line_id AS salesLineId,so.version AS salesVersion,
+      d.purchase_order_id AS purchaseOrderId,d.purchase_order_line_id AS purchaseLineId,po.version AS purchaseVersion,
+      COALESCE((SELECT SUM(other.quantity-other.reversed_qty) FROM drop_ship_deliveries other WHERE other.sales_order_line_id=d.sales_order_line_id),0) AS netDelivered,
+      COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=d.sales_order_line_id AND ci.status<>'void'),0) AS invoiced
+    FROM drop_ship_deliveries d JOIN sales_orders so ON so.id=d.sales_order_id JOIN purchase_orders po ON po.id=d.purchase_order_id WHERE d.id=?`, id);
+  if (!delivery) throw new WorkflowError("NOT_FOUND", "Drop-ship delivery was not found.", 404);
+  if (delivery.version !== (command.version ?? 0)) throw new WorkflowError("VERSION_CONFLICT", "Drop-ship delivery changed; refresh before reversing.", 409, delivery.version);
+  if (quantity > delivery.quantity - delivery.reversed) throw new WorkflowError("INVALID_QUANTITY", "Reversal exceeds the delivery's remaining quantity.", 409);
+  if (delivery.netDelivered - quantity < delivery.invoiced) throw new WorkflowError("INVOICED_DELIVERY", "Credit or void the related customer invoice quantity before reversing this delivery.", 409);
+  const result: WorkflowResult = { message: `${quantity} drop-ship delivery units reversed.`, impact: { physical: "No internal stock or valuation movement.", commercial: `${quantity} externally delivered units are no longer billable or invoiceable.`, financial: "Posted invoices and bills remain separate.", onHandDelta: 0, deliveredDelta: -quantity }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM drop_ship_deliveries d WHERE d.id=? AND d.version=? AND d.quantity-d.reversed_qty>=?
+        AND COALESCE((SELECT SUM(other.quantity-other.reversed_qty) FROM drop_ship_deliveries other WHERE other.sales_order_line_id=d.sales_order_line_id),0)-?
+          >=COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=d.sales_order_line_id AND ci.status<>'void'),0)
+        AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=d.sales_order_id AND so.version=?)
+        AND EXISTS (SELECT 1 FROM purchase_orders po WHERE po.id=d.purchase_order_id AND po.version=?)`)
+      .bind(...claimValues(command, result, id), id, delivery.version, quantity, quantity, delivery.salesVersion, delivery.purchaseVersion),
+    db.prepare(`UPDATE drop_ship_deliveries SET reversed_qty=reversed_qty+?,status=CASE WHEN reversed_qty+?=quantity THEN 'reversed' ELSE 'partially_reversed' END,version=version+1 WHERE id=? AND version=? AND quantity-reversed_qty>=? AND ${marker(command)}`).bind(quantity, quantity, id, delivery.version, quantity),
+    db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(delivery.salesOrderId, delivery.salesVersion),
+    db.prepare(`UPDATE purchase_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(delivery.purchaseOrderId, delivery.purchaseVersion),
+    auditStatement(command, "drop_ship_delivery", id, "drop_ship_delivery_reversed", result.message, { quantity, reason, salesOrderLineId: delivery.salesLineId, purchaseOrderLineId: delivery.purchaseLineId }, when),
+    outboxStatement(command, "drop_ship.delivery_reversed", "drop_ship_delivery", id, { quantity, reason }, when),
+  ]);
+  return finish(command);
+}
+
+async function addChargeV2(command:WorkflowCommand){
+  const payload = command.payload ?? {};
+  const documentType = textValue(payload, "documentType");
+  const documentId = command.entityId ?? textValue(payload, "documentId");
+  const config: Record<string, { table: string; status: string; financial: boolean }> = {
+    purchase_order: { table: "purchase_orders", status: "lifecycle_status", financial: false },
+    sales_order: { table: "sales_orders", status: "lifecycle_status", financial: false },
+    vendor_bill: { table: "vendor_bills", status: "status", financial: true },
+    customer_invoice: { table: "customer_invoices", status: "status", financial: true },
+  };
+  const kind = config[documentType];
+  if (!kind) throw new WorkflowError("VALIDATION_ERROR", "Unsupported documentType for charges.");
+  const creditTable = documentType === "vendor_bill" ? "vendor_credits" : "customer_credits";
+  const creditColumn = documentType === "vendor_bill" ? "vendor_bill_id" : "customer_invoice_id";
+  const document = await first<{ version: number; status: string; exchange: number; total: number; paid: number; credited: number }>(`SELECT version,${kind.status} AS status,exchange_rate_to_base AS exchange,total_cents AS total,
+      ${kind.financial ? "paid_cents" : "0"} AS paid,
+      ${kind.financial ? `COALESCE((SELECT SUM(amount_cents) FROM ${creditTable} WHERE ${creditColumn}=? AND status='posted'),0)` : "0"} AS credited
+    FROM ${kind.table} WHERE id=?`, ...(kind.financial ? [documentId, documentId] : [documentId]));
+  if (!document) throw new WorkflowError("NOT_FOUND", "Charge document not found.", 404);
+  if (command.version != null && command.version !== document.version) throw new WorkflowError("VERSION_CONFLICT", "Document changed.", 409, document.version);
+  if ((documentType === "purchase_order" && !["draft", "rejected"].includes(document.status)) ||
+      (documentType === "sales_order" && document.status !== "draft") ||
+      (kind.financial && ["void", "paid", "credited"].includes(document.status))) {
+    throw new WorkflowError("INVALID_STATE", "Charges cannot be changed in this document state.", 409);
+  }
+  if (kind.financial) await assertPeriodOpen("accounting", dateValue(payload, "postingDate", today()));
+  const charge = normalizeChargePayload(payload);
+  if (document.total + charge.totalDelta < document.paid + document.credited) throw new WorkflowError("SETTLED_BALANCE_CONFLICT", "This charge would reduce the document below payments and posted credits.", 409);
+  const id = newId("charge");
+  const result: WorkflowResult = { message: `${charge.description} added and document totals recalculated.`, impact: { physical: "No stock movement.", financial: `Document total changed by ${charge.totalDelta} cents.`, onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  const totalUpdate = kind.financial
+    ? `subtotal_cents=subtotal_cents+?,tax_cents=tax_cents+?,total_cents=total_cents+?,base_total_cents=ROUND((total_cents+?)*exchange_rate_to_base),version=version+1`
+    : `total_cents=total_cents+?,base_total_cents=ROUND((total_cents+?)*exchange_rate_to_base),version=version+1`;
+  const binds = kind.financial
+    ? [charge.subtotalDelta, charge.taxDelta, charge.totalDelta, charge.totalDelta]
+    : [charge.totalDelta, charge.totalDelta];
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM ${kind.table} WHERE id=? AND version=? AND total_cents+?>=${document.paid + document.credited}`)
+      .bind(...claimValues(command, result, id), documentId, document.version, charge.totalDelta),
+    db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
+      .bind(id, documentType, documentId, charge.chargeType, charge.description, charge.amount, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRate, charge.taxAmount, when),
+    db.prepare(`UPDATE ${kind.table} SET ${totalUpdate} WHERE id=? AND version=? AND total_cents+?>=${document.paid + document.credited} AND ${marker(command)}`)
+      .bind(...binds, documentId, document.version, charge.totalDelta),
+    auditStatement(command, documentType, documentId, "document_charge_added", result.message, { chargeId: id, chargeType: charge.chargeType, amount: charge.amount, direction: charge.direction, taxAmount: charge.taxAmount, refundable: charge.refundable }, when),
+    outboxStatement(command, "document.charge_added", documentType, documentId, { chargeId: id, delta: charge.totalDelta }, when),
+  ]);
+  return finish(command);
+}
+
+async function recordPaymentV2(command:WorkflowCommand){
+  const payload = command.payload ?? {};
+  const documentType = textValue(payload, "documentType");
+  if (!["vendor_bill", "customer_invoice"].includes(documentType)) throw new WorkflowError("VALIDATION_ERROR", "documentType must be vendor_bill or customer_invoice.");
+  const documentId = command.entityId ?? textValue(payload, "documentId");
+  const amount = numberValue(payload, "amountCents", { integer: true });
+  const paymentDate = dateValue(payload, "paymentDate", today());
+  await assertPeriodOpen("accounting", paymentDate);
+  const customer = documentType === "customer_invoice";
+  const table = customer ? "customer_invoices" : "vendor_bills";
+  const creditsTable = customer ? "customer_credits" : "vendor_credits";
+  const creditsColumn = customer ? "customer_invoice_id" : "vendor_bill_id";
+  const row = await first<{ partnerId: string; total: number; paid: number; version: number; currency: string; exchange: number; status: string; credits: number }>(`SELECT ${customer ? "customer_id" : "vendor_id"} AS partnerId,total_cents AS total,paid_cents AS paid,version,currency,exchange_rate_to_base AS exchange,status,
+      COALESCE((SELECT SUM(amount_cents) FROM ${creditsTable} WHERE ${creditsColumn}=? AND status='posted'),0) AS credits FROM ${table} WHERE id=?`, documentId, documentId);
+  if (!row || row.status === "void") throw new WorkflowError("NOT_FOUND", "Payable or receivable document not found.", 404);
+  if (!customer && row.status === "on_hold") throw new WorkflowError("DOCUMENT_ON_HOLD", "Approve the vendor bill match exception before recording payment.", 409);
+  if (["paid", "credited"].includes(row.status)) throw new WorkflowError("NOTHING_OUTSTANDING", "The financial document is already settled.", 409);
+  if (command.version != null && command.version !== row.version) throw new WorkflowError("VERSION_CONFLICT", "Financial document changed.", 409, row.version);
+  const outstanding = row.total - row.paid - row.credits;
+  if (outstanding <= 0) throw new WorkflowError("NOTHING_OUTSTANDING", "The financial document has no outstanding balance.", 409);
+  if (amount > outstanding) throw new WorkflowError("OVERPAYMENT", "Payment exceeds the outstanding balance after posted credits.", 409);
+  const exchange = payload.exchangeRateToBase == null ? row.exchange : numberValue(payload, "exchangeRateToBase");
+  const base = Math.round(amount * exchange);
+  const id = newId("payment"); const number = documentNumber("PAY");
+  const result: WorkflowResult = { message: `${number} posted for ${amount} ${row.currency} cents.`, impact: { physical: "No stock movement.", financial: `Document balance reduced to ${outstanding - amount} ${row.currency} cents.`, onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM ${table} document WHERE document.id=? AND document.version=?
+        AND document.status NOT IN ('void','paid','credited'${customer ? "" : ",'on_hold'"})
+        AND document.paid_cents+?+COALESCE((SELECT SUM(amount_cents) FROM ${creditsTable} WHERE ${creditsColumn}=document.id AND status='posted'),0)<=document.total_cents`)
+      .bind(...claimValues(command, result, id), documentId, row.version, amount),
+    db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
+      .bind(id, number, customer ? "inbound" : "outbound", row.partnerId, documentType, documentId, amount, paymentDate, textValue(payload, "method"), optionalText(payload, "reference"), when, command.actor.label, row.currency, exchange, base),
+    db.prepare(`UPDATE ${table} SET paid_cents=paid_cents+?,status=CASE WHEN paid_cents+?+COALESCE((SELECT SUM(amount_cents) FROM ${creditsTable} WHERE ${creditsColumn}=${table}.id AND status='posted'),0)>=total_cents THEN 'paid' ELSE 'partially_paid' END,version=version+1
+      WHERE id=? AND version=? AND paid_cents+?+COALESCE((SELECT SUM(amount_cents) FROM ${creditsTable} WHERE ${creditsColumn}=${table}.id AND status='posted'),0)<=total_cents AND ${marker(command)}`)
+      .bind(amount, amount, documentId, row.version, amount),
+    auditStatement(command, "payment", id, "payment_posted", result.message, { documentType, documentId, partnerId: row.partnerId, currency: row.currency, amount, base, paymentDate }, when),
+    outboxStatement(command, "payment.posted", "payment", id, { documentType, documentId, amount, base }, when),
+  ]);
+  return finish(command);
+}
+
+async function createFinancialCreditV2(command:WorkflowCommand,type:"vendor"|"customer"){
+  const payload=command.payload??{},documentId=command.entityId??textValue(payload,"documentId"),amount=numberValue(payload,"amountCents",{integer:true}),reason=textValue(payload,"reason"),postingDate=dateValue(payload,"postingDate",today());await assertPeriodOpen("accounting",postingDate);
+  const document=type==="vendor"?await first<{partnerId:string;orderId:string|null;currency:string;exchange:number;total:number;paid:number;version:number;status:string;credited:number}>(`SELECT vb.vendor_id AS partnerId,vb.purchase_order_id AS orderId,vb.currency,vb.exchange_rate_to_base AS exchange,vb.total_cents AS total,vb.paid_cents AS paid,vb.version,vb.status,COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted'),0) AS credited FROM vendor_bills vb WHERE vb.id=?`,documentId):await first<{partnerId:string;orderId:string|null;currency:string;exchange:number;total:number;paid:number;version:number;status:string;credited:number}>(`SELECT ci.customer_id AS partnerId,ci.sales_order_id AS orderId,ci.currency,ci.exchange_rate_to_base AS exchange,ci.total_cents AS total,ci.paid_cents AS paid,ci.version,ci.status,COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS credited FROM customer_invoices ci WHERE ci.id=?`,documentId);
+  if(!document||document.status==="void")throw new WorkflowError("NOT_FOUND","Active financial document not found.",404);if(type==="vendor"&&document.status==="on_hold")throw new WorkflowError("DOCUMENT_ON_HOLD","Approve the vendor bill match exception before posting a credit.",409);if(["paid","credited"].includes(document.status))throw new WorkflowError("NOTHING_OUTSTANDING","The financial document is already settled.",409);if(command.version!=null&&command.version!==document.version)throw new WorkflowError("VERSION_CONFLICT","Financial document changed.",409,document.version);const remaining=Math.max(document.total-document.paid-document.credited,0);if(remaining<=0)throw new WorkflowError("NOTHING_OUTSTANDING","The financial document has no outstanding balance.",409);if(amount>remaining)throw new WorkflowError("CREDIT_EXCEEDS_BALANCE","Credit exceeds the document's remaining uncredited balance.",409);
+  validateDocumentCurrency(payload.currency,document.currency);const exchange=payload.exchangeRateToBase==null?document.exchange:numberValue(payload,"exchangeRateToBase"),base=Math.round(amount*exchange),id=newId(`${type}-credit`),number=documentNumber(type==="vendor"?"VC":"CM"),result:WorkflowResult={message:`${number} posted for ${amount} ${document.currency} cents.`,impact:{physical:"No stock movement.",financial:`Outstanding document balance reduced to ${remaining-amount} ${document.currency} cents.`,onHandDelta:0},recordId:id},db=getD1(),when=new Date().toISOString(),table=type==="vendor"?"vendor_credits":"customer_credits",documentTable=type==="vendor"?"vendor_bills":"customer_invoices",partnerCol=type==="vendor"?"vendor_id":"customer_id",documentCol=type==="vendor"?"vendor_bill_id":"customer_invoice_id",orderCol=type==="vendor"?"purchase_order_id":"sales_order_id";
+  await db.batch([db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+    SELECT ?,?,?,?,?,?,? FROM ${documentTable} document WHERE document.id=? AND document.version=?
+      AND document.status NOT IN ('void','paid','credited'${type==="vendor"?",'on_hold'":""})
+      AND document.paid_cents+?+COALESCE((SELECT SUM(amount_cents) FROM ${table} WHERE ${documentCol}=document.id AND status='posted'),0)<=document.total_cents`)
+    .bind(...claimValues(command,result,id),documentId,document.version,amount),db.prepare(`INSERT INTO ${table} (id,number,${partnerCol},${documentCol},${orderCol},amount_cents,reason,status,posted_at,posted_by,version,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,'posted',?,?,1,?,?,? WHERE ${marker(command)}`).bind(id,number,document.partnerId,documentId,document.orderId,amount,reason,when,command.actor.label,document.currency,exchange,base),db.prepare(`UPDATE ${documentTable} SET status=CASE WHEN paid_cents+COALESCE((SELECT SUM(amount_cents) FROM ${table} WHERE ${documentCol}=${documentTable}.id AND status='posted'),0)>=total_cents THEN 'credited' WHEN paid_cents>0 THEN 'partially_paid' ELSE status END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(documentId,document.version),auditStatement(command,`${type}_credit`,id,`${type}_credit_posted`,result.message,{documentId,partnerId:document.partnerId,currency:document.currency,amount,base,reason,postingDate},when),outboxStatement(command,`${type}_credit.posted`,`${type}_credit`,id,{documentId,amount,base},when)]);return finish(command);
+}
+
+async function voidCustomerInvoice(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const payload = command.payload ?? {};
+  const reason = textValue(payload, "reason");
+  const invoice = await first<{ version: number; status: string; paid: number; credited: number; salesOrderId: string; salesVersion: number; invoiceDate: string }>(`SELECT ci.version,ci.status,ci.paid_cents AS paid,ci.sales_order_id AS salesOrderId,so.version AS salesVersion,ci.invoice_date AS invoiceDate,
+      COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS credited
+    FROM customer_invoices ci JOIN sales_orders so ON so.id=ci.sales_order_id WHERE ci.id=?`, id);
+  if (!invoice) throw new WorkflowError("NOT_FOUND", "Customer invoice was not found.", 404);
+  if (invoice.version !== (command.version ?? 0)) throw new WorkflowError("VERSION_CONFLICT", "Customer invoice changed; refresh before voiding.", 409, invoice.version);
+  if (invoice.status === "void") throw new WorkflowError("INVALID_STATE", "Customer invoice is already void.", 409);
+  if (invoice.paid !== 0 || invoice.credited !== 0) throw new WorkflowError("INVOICE_CORRECTION_REQUIRED", "Only an entirely unpaid and uncredited invoice can be voided; reverse payments or use a credit memo first.", 409);
+  await assertPeriodOpen("accounting", invoice.invoiceDate);
+  const result: WorkflowResult = { message: "Customer invoice voided; its quantities no longer block shipment or drop-ship delivery reversal.", impact: { physical: "No stock movement.", financial: "The unpaid receivable was voided.", onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM customer_invoices ci WHERE ci.id=? AND ci.version=? AND ci.status<>'void' AND ci.paid_cents=0
+        AND NOT EXISTS (SELECT 1 FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted')
+        AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=ci.sales_order_id AND so.version=?)`)
+      .bind(...claimValues(command, result, id), id, invoice.version, invoice.salesVersion),
+    db.prepare(`UPDATE customer_invoices SET status='void',version=version+1 WHERE id=? AND version=? AND paid_cents=0 AND ${marker(command)}`).bind(id, invoice.version),
+    db.prepare(`UPDATE sales_orders SET billing_status=CASE
+      WHEN NOT EXISTS (SELECT 1 FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE ci.sales_order_id=sales_orders.id AND ci.status<>'void') THEN 'not_invoiced'
+      ELSE 'partially_invoiced' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(invoice.salesOrderId, invoice.salesVersion),
+    auditStatement(command, "customer_invoice", id, "customer_invoice_voided", result.message, { reason, salesOrderId: invoice.salesOrderId }, when),
+    outboxStatement(command, "customer_invoice.voided", "customer_invoice", id, { reason, salesOrderId: invoice.salesOrderId }, when),
+  ]);
+  return finish(command);
+}
+
+async function createCustomerInvoiceV2(command:WorkflowCommand){
+  const payload = command.payload ?? {};
+  const salesOrderId = command.entityId ?? textValue(payload, "salesOrderId");
+  const invoiceDate = dateValue(payload, "invoiceDate", today());
+  const dueDate = dateValue(payload, "dueDate", invoiceDate);
+  await assertPeriodOpen("accounting", invoiceDate);
+  const order = await first<{ customerId: string; currency: string; exchange: number; status: string; version: number }>("SELECT customer_id AS customerId,currency,exchange_rate_to_base AS exchange,lifecycle_status AS status,version FROM sales_orders WHERE id=?", salesOrderId);
+  if (!order || !["confirmed", "canceled"].includes(order.status)) throw new WorkflowError("INVALID_STATE", "A confirmed order, or a canceled order with shipped quantity, is required.", 409);
+  if (command.version != null && command.version !== order.version) throw new WorkflowError("VERSION_CONFLICT", "Sales order changed; refresh before invoicing.", 409, order.version);
+  validateDocumentCurrency(payload.currency, order.currency);
+  const requested = Array.isArray(payload.lines) ? payload.lines as Array<Record<string, unknown>> : null;
+  if (requested) {
+    const requestedIds = requested.map((row) => textValue(row, "salesOrderLineId"));
+    if (new Set(requestedIds).size !== requestedIds.length) throw new WorkflowError("DUPLICATE_DOCUMENT_LINE", "Each sales-order line may appear only once on an invoice.");
+  }
+  const sourceLines = await all<{ id: string; productId: string; ordered: number; unitPrice: number; taxable: number; taxRate: number; discount: number; shipped: number; invoiced: number; invoicedDiscount: number }>(`SELECT sol.id,sol.product_id AS productId,sol.ordered_qty AS ordered,sol.unit_price_cents AS unitPrice,sol.taxable,sol.tax_rate_bps AS taxRate,sol.discount_cents AS discount,
+      CASE WHEN sol.fulfillment_route='drop_ship'
+        THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)
+        ELSE COALESCE(SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END),0) END AS shipped,
+      COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sol.id AND ci.status<>'void'),0) AS invoiced,
+      COALESCE((SELECT SUM(ROUND(cil.quantity*cil.unit_price_cents)-cil.line_total_cents) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sol.id AND ci.status<>'void'),0) AS invoicedDiscount
+    FROM sales_order_lines sol LEFT JOIN stock_movements sm ON sm.sales_order_line_id=sol.id WHERE sol.sales_order_id=? GROUP BY sol.id`, salesOrderId);
+  const lines: Array<{ id: string; productId: string; quantity: number; unitPrice: number; discount: number; total: number; tax: number }> = [];
+  for (const source of sourceLines) {
+    const selected = requested?.find((row) => row.salesOrderLineId === source.id);
+    if (requested && !selected) continue;
+    const available = roundQuantity(source.shipped - source.invoiced);
+    const quantity = selected ? roundQuantity(numberValue(selected, "quantity")) : available;
+    if (quantity <= 0) continue;
+    if (quantity > available) throw new WorkflowError("INVOICE_EXCEEDS_SHIPPED", `Invoice quantity exceeds shipped-not-invoiced quantity on line ${source.id}.`, 409);
+    const cumulativeDiscount = source.ordered > 0 ? Math.round(source.discount * Math.min(source.invoiced + quantity, source.ordered) / source.ordered) : 0;
+    const gross = Math.round(quantity * source.unitPrice);
+    const discount = Math.max(Math.min(cumulativeDiscount - source.invoicedDiscount, gross), 0);
+    const total = gross - discount;
+    lines.push({ id: source.id, productId: source.productId, quantity, unitPrice: source.unitPrice, discount, total, tax: source.taxable ? Math.round(total * source.taxRate / 10_000) : 0 });
+  }
+  if (!lines.length) throw new WorkflowError("NOTHING_TO_INVOICE", "No selected shipped-not-yet-invoiced quantity remains.", 409);
+  const previous = await first<{ count: number }>("SELECT COUNT(*) AS count FROM customer_invoices WHERE sales_order_id=? AND status<>'void'", salesOrderId);
+  const orderCharges = Number(previous?.count ?? 0) === 0 ? await all<{ chargeType: string; description: string; amount: number; direction: string; taxable: number; refundable: number; taxCode: string | null; taxRate: number; taxAmount: number }>("SELECT charge_type AS chargeType,description,amount_cents AS amount,direction,taxable,refundable,tax_code AS taxCode,tax_rate_bps AS taxRate,tax_amount_cents AS taxAmount FROM document_charges WHERE document_type='sales_order' AND document_id=?", salesOrderId) : [];
+  const itemSubtotal = lines.reduce((sum, row) => sum + row.total, 0);
+  const chargeSubtotal = orderCharges.reduce((sum, row) => sum + (row.direction === "subtract" ? -row.amount : row.amount), 0);
+  const subtotal = itemSubtotal + chargeSubtotal;
+  const tax = lines.reduce((sum, row) => sum + row.tax, 0) + orderCharges.reduce((sum, row) => sum + (row.direction === "subtract" ? -Math.abs(row.taxAmount) : Math.abs(row.taxAmount)), 0);
+  const total = subtotal + tax;
+  if (subtotal < 0 || total < 0) throw new WorkflowError("INVALID_DOCUMENT_TOTAL", "Order charges and discounts cannot make the invoice subtotal or total negative.");
+  const exchange = payload.exchangeRateToBase == null ? order.exchange : numberValue(payload, "exchangeRateToBase");
+  const base = Math.round(total * exchange);
+  const id = newId("customer-invoice"); const number = documentNumber("INV");
+  const result: WorkflowResult = { message: `${number} posted for ${lines.reduce((sum, row) => sum + row.quantity, 0)} shipped units.`, impact: { physical: "No stock movement.", financial: `Receivable ${total} ${order.currency} cents posted.`, onHandDelta: 0 }, recordId: id };
+  const db = getD1(); const when = new Date().toISOString();
+  const lineClaims = lines.map(() => `EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.id=? AND sol.sales_order_id=?
+    AND (CASE WHEN sol.fulfillment_route='drop_ship'
+      THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)
+      ELSE COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0) END)
+      -COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sol.id AND ci.status<>'void'),0)>=?)`).join(" AND ");
+  const lineClaimBindings = lines.flatMap((line) => [line.id, salesOrderId, line.quantity]);
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM sales_orders WHERE id=? AND version=? AND lifecycle_status IN ('confirmed','canceled') AND ${lineClaims}`).bind(...claimValues(command, result, id), salesOrderId, order.version, ...lineClaimBindings),
+    db.prepare(`INSERT INTO customer_invoices (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) SELECT ?,?,?,?,'posted',?,?,?,?,?,0,?,?,?,?,?,?,?, ?,1 WHERE ${marker(command)}`).bind(id, number, order.customerId, salesOrderId, invoiceDate, dueDate, subtotal, tax, total, order.currency, exchange, base, payload.taxRateBps ?? 0, optionalText(payload, "taxCode"), optionalText(payload, "paymentTerms"), when, command.actor.label),
+  ];
+  lines.forEach((row) => statements.push(db.prepare(`INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,quantity,unit_price_cents,line_total_cents) SELECT ?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("invoice-line"), id, row.id, row.productId, row.quantity, row.unitPrice, row.total)));
+  orderCharges.forEach((row) => statements.push(db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,'customer_invoice',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("charge"), id, row.chargeType, row.description, row.amount, row.direction, row.taxable, row.refundable, row.taxCode, row.taxRate, Math.abs(row.taxAmount), when)));
+  statements.push(
+    db.prepare(`UPDATE sales_orders SET billing_status=CASE WHEN NOT EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.sales_order_id=sales_orders.id AND
+      (CASE WHEN sol.fulfillment_route='drop_ship' THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)
+        ELSE COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0) END)
+      >COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sol.id AND ci.status<>'void'),0)) THEN 'invoiced' ELSE 'partially_invoiced' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(salesOrderId, order.version),
+    auditStatement(command, "customer_invoice", id, "customer_invoice_posted", result.message, { salesOrderId, total, base, charges: orderCharges.length, lines: lines.map(({ id: salesOrderLineId, quantity, discount }) => ({ salesOrderLineId, quantity, discount })) }, when),
+    outboxStatement(command, "customer_invoice.posted", "customer_invoice", id, { total, base }, when)
+  );
+  await db.batch(statements);
+  return finish(command);
+}
+
+export async function getAdvancedSnapshot(actor?:ActorIdentity){await ensureDatabase();const [settings,approvals,periodLocks,revisions,warehouses,locations,lots,units,transfers,dropShipDeliveries,reservations,shipments,vendorBills,vendorCredits,customerInvoices,customerCredits,payments,charges,assetTypes,obligations,returnableEvents,valuationPolicies,costLayers,valueEntries,landedCosts,outbox,attachments,users,uoms,uomConversions,partners,products]=await Promise.all([
+  all<Record<string,unknown>>("SELECT key,value_json AS valueJson,description,version,updated_by AS updatedBy,updated_at AS updatedAt FROM system_settings ORDER BY key"),
+  all<Record<string,unknown>>("SELECT id,entity_type AS entityType,entity_id AS entityId,request_type AS requestType,status,requested_by AS requestedBy,requested_reason AS requestedReason,requested_at AS requestedAt,decided_by AS decidedBy,decision_reason AS decisionReason,decided_at AS decidedAt,metadata_json AS metadataJson,version FROM approvals ORDER BY requested_at DESC"),
+  all<Record<string,unknown>>("SELECT id,module,locked_through AS lockedThrough,reason,active,version,created_by AS createdBy,created_at AS createdAt FROM period_locks ORDER BY locked_through DESC"),
+  all<Record<string,unknown>>("SELECT id,purchase_order_id AS purchaseOrderId,revision_number AS revisionNumber,lifecycle_status AS lifecycleStatus,snapshot_json AS snapshotJson,reason,created_by AS createdBy,created_at AS createdAt FROM purchase_order_revisions ORDER BY created_at DESC"),
+  all<Record<string,unknown>>("SELECT id,code,name,timezone,active,version FROM warehouses ORDER BY code"),
+  all<Record<string,unknown>>("SELECT l.id,l.code,l.name,l.location_type AS locationType,l.inventory_status AS inventoryStatus,l.warehouse_id AS warehouseId,w.name AS warehouseName,l.parent_location_id AS parentLocationId,l.active,l.version FROM locations l LEFT JOIN warehouses w ON w.id=l.warehouse_id ORDER BY w.code,l.code"),
+  all<Record<string,unknown>>("SELECT il.id,il.product_id AS productId,p.sku,p.name AS productName,il.lot_number AS lotNumber,il.vendor_id AS vendorId,il.manufactured_date AS manufacturedDate,il.expiry_date AS expiryDate,il.status,il.created_at AS createdAt FROM inventory_lots il JOIN products p ON p.id=il.product_id ORDER BY il.created_at DESC"),
+  all<Record<string,unknown>>("SELECT iu.id,iu.product_id AS productId,p.sku,p.name AS productName,iu.serial_number AS serialNumber,iu.lot_id AS lotId,iu.location_id AS locationId,l.code AS locationCode,iu.inventory_status AS inventoryStatus,iu.lifecycle_status AS lifecycleStatus,iu.allocated_sales_order_line_id AS allocatedSalesOrderLineId,iu.version FROM inventory_units iu JOIN products p ON p.id=iu.product_id JOIN locations l ON l.id=iu.location_id ORDER BY iu.created_at DESC"),
+  all<Record<string,unknown>>("SELECT it.id,it.number,it.transfer_type AS transferType,it.status,it.from_warehouse_id AS fromWarehouseId,it.to_warehouse_id AS toWarehouseId,it.in_transit_location_id AS inTransitLocationId,it.posted_at AS postedAt,it.posted_by AS postedBy,it.version,itl.id AS lineId,itl.product_id AS productId,itl.from_location_id AS fromLocationId,itl.to_location_id AS toLocationId,itl.quantity,itl.received_qty AS receivedQuantity FROM inventory_transfers it JOIN inventory_transfer_lines itl ON itl.transfer_id=it.id ORDER BY it.posted_at DESC"),
+  all<Record<string,unknown>>("SELECT d.id,d.number,d.purchase_order_id AS purchaseOrderId,po.number AS purchaseOrderNumber,d.purchase_order_line_id AS purchaseOrderLineId,d.sales_order_id AS salesOrderId,so.number AS salesOrderNumber,d.sales_order_line_id AS salesOrderLineId,d.product_id AS productId,p.sku,p.name AS productName,d.quantity,d.reversed_qty AS reversedQuantity,d.quantity-d.reversed_qty AS netDeliveredQuantity,d.status,d.delivery_date AS deliveryDate,d.external_reference AS externalReference,d.posted_at AS postedAt,d.posted_by AS postedBy,d.version FROM drop_ship_deliveries d JOIN purchase_orders po ON po.id=d.purchase_order_id JOIN sales_orders so ON so.id=d.sales_order_id JOIN products p ON p.id=d.product_id ORDER BY d.posted_at DESC"),
+  all<Record<string,unknown>>("SELECT r.id,r.sales_order_line_id AS salesOrderLineId,sol.sales_order_id AS salesOrderId,so.number AS salesOrderNumber,r.product_id AS productId,p.sku,p.name AS productName,r.location_id AS locationId,l.code AS locationCode,r.quantity,r.status,r.created_at AS createdAt,so.version AS orderVersion FROM reservations r JOIN sales_order_lines sol ON sol.id=r.sales_order_line_id JOIN sales_orders so ON so.id=sol.sales_order_id JOIN products p ON p.id=r.product_id JOIN locations l ON l.id=r.location_id ORDER BY r.created_at DESC"),
+  all<Record<string,unknown>>("SELECT s.id,s.number,s.sales_order_id AS salesOrderId,so.number AS salesOrderNumber,s.status,s.posted_at AS postedAt,s.version,sl.id AS lineId,sl.sales_order_line_id AS salesOrderLineId,sl.product_id AS productId,p.sku,p.name AS productName,sl.location_id AS locationId,l.code AS locationCode,sl.quantity FROM shipments s JOIN shipment_lines sl ON sl.shipment_id=s.id JOIN sales_orders so ON so.id=s.sales_order_id JOIN products p ON p.id=sl.product_id JOIN locations l ON l.id=sl.location_id ORDER BY s.posted_at DESC"),
+  all<Record<string,unknown>>("SELECT vb.*,bp.name AS vendorName,po.number AS purchaseOrderNumber,(SELECT COUNT(*) FROM vendor_bill_lines WHERE vendor_bill_id=vb.id) AS lineCount FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id ORDER BY COALESCE(vb.posted_at,vb.due_date) DESC"),
+  all<Record<string,unknown>>("SELECT vc.*,bp.name AS vendorName FROM vendor_credits vc JOIN business_partners bp ON bp.id=vc.vendor_id ORDER BY vc.posted_at DESC"),
+  all<Record<string,unknown>>("SELECT ci.*,bp.name AS customerName,so.number AS salesOrderNumber,(SELECT COUNT(*) FROM customer_invoice_lines WHERE customer_invoice_id=ci.id) AS lineCount,COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS credited_cents FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id LEFT JOIN sales_orders so ON so.id=ci.sales_order_id ORDER BY ci.posted_at DESC"),
+  all<Record<string,unknown>>("SELECT cc.*,bp.name AS customerName FROM customer_credits cc JOIN business_partners bp ON bp.id=cc.customer_id ORDER BY cc.posted_at DESC"),
+  all<Record<string,unknown>>("SELECT * FROM payments ORDER BY posted_at DESC"),all<Record<string,unknown>>("SELECT * FROM document_charges ORDER BY created_at DESC"),all<Record<string,unknown>>("SELECT id,code,name,asset_class AS assetClass,unit_deposit_cents AS unitDepositCents,active FROM returnable_asset_types ORDER BY name"),
+  all<Record<string,unknown>>("SELECT ro.*,bp.name AS partnerName,rat.code AS assetCode,rat.name AS assetName,ro.issued_qty-ro.returned_qty-ro.forfeited_qty AS outstandingQuantity,MAX(ro.deposit_charged_cents-ro.deposit_refunded_cents-COALESCE((SELECT SUM(re.amount_cents) FROM returnable_events re WHERE re.obligation_id=ro.id AND re.event_type='forfeit'),0),0) AS depositBalanceCents,MAX(MIN(ro.deposit_charged_cents,ROUND(ro.returned_qty*rat.unit_deposit_cents))-ro.deposit_refunded_cents,0) AS refundableDepositCents FROM returnable_obligations ro JOIN business_partners bp ON bp.id=ro.partner_id JOIN returnable_asset_types rat ON rat.id=ro.asset_type_id ORDER BY ro.created_at DESC"),
+  all<Record<string,unknown>>("SELECT * FROM returnable_events ORDER BY posted_at DESC"),all<Record<string,unknown>>("SELECT vp.*,p.sku,p.name AS productName FROM valuation_policies vp JOIN products p ON p.id=vp.product_id ORDER BY p.name"),all<Record<string,unknown>>("SELECT cl.*,p.sku,p.name AS productName FROM cost_layers cl JOIN products p ON p.id=cl.product_id ORDER BY cl.received_at DESC"),all<Record<string,unknown>>("SELECT ive.*,p.sku,p.name AS productName FROM inventory_value_entries ive JOIN products p ON p.id=ive.product_id ORDER BY ive.posted_at DESC LIMIT 200"),all<Record<string,unknown>>("SELECT lca.*,COALESCE(SUM(lcal.allocated_cents),0) AS allocatedCents FROM landed_cost_allocations lca LEFT JOIN landed_cost_allocation_lines lcal ON lcal.allocation_id=lca.id GROUP BY lca.id ORDER BY lca.posted_at DESC"),all<Record<string,unknown>>("SELECT id,event_type AS eventType,aggregate_type AS aggregateType,aggregate_id AS aggregateId,status,attempts,available_at AS availableAt,last_error AS lastError,created_at AS createdAt,processed_at AS processedAt FROM outbox_events ORDER BY created_at DESC LIMIT 100"),all<Record<string,unknown>>("SELECT id,document_type AS documentType,document_id AS documentId,file_name AS fileName,content_type AS contentType,size_bytes AS sizeBytes,category,owner_id AS ownerId,owner_email AS ownerEmail,uploaded_at AS uploadedAt,version FROM attachments WHERE deleted_at IS NULL ORDER BY uploaded_at DESC"),all<Record<string,unknown>>("SELECT user_id AS userId,email,full_name AS fullName,role,active,version FROM app_users ORDER BY full_name"),all<Record<string,unknown>>("SELECT id,code,name,dimension,precision,active FROM units_of_measure ORDER BY code"),all<Record<string,unknown>>("SELECT id,product_id AS productId,from_uom_id AS fromUomId,to_uom_id AS toUomId,numerator,denominator,rounding_mode AS roundingMode FROM uom_conversions ORDER BY id"),all<Record<string,unknown>>("SELECT id,code,name,partner_type AS partnerType,email,phone,payment_terms AS paymentTerms,currency,active,version FROM business_partners ORDER BY code"),all<Record<string,unknown>>("SELECT id,sku,manufacturer_sku AS manufacturerSku,name,category,material,dimensions,finish,tracking_policy AS trackingPolicy,inventory_policy AS inventoryPolicy,standard_cost_cents AS standardCostCents,selling_price_cents AS sellingPriceCents,reorder_point AS reorderPoint,base_uom_id AS baseUomId,purchase_uom_id AS purchaseUomId,sales_uom_id AS salesUomId,active,version FROM products ORDER BY sku")
+]);
+  const safeParse=(value:unknown)=>{try{return JSON.parse(String(value??"{}"));}catch{return{};}};
+  const parse=(rows:Array<Record<string,unknown>>)=>rows.map(row=>({...row,...("valueJson" in row?{value:safeParse(row.valueJson)}:{}),...("metadataJson" in row?{metadata:safeParse(row.metadataJson)}:{})}));
+  const isAdmin=actor?.role==="administrator";
+  const canOperate=!!actor&&["operator","manager","administrator"].includes(actor.role);
+  const canFinance=!!actor&&["accounting","manager","administrator"].includes(actor.role);
+  const canApprove=!!actor&&["manager","administrator"].includes(actor.role);
+  const masterActions={createProduct:canApprove,updateProduct:canApprove,deactivateProduct:canApprove,createBusinessPartner:canApprove,updateBusinessPartner:canApprove,deactivateBusinessPartner:canApprove,createWarehouse:canApprove,updateWarehouse:canApprove,deactivateWarehouse:canApprove,createLocation:canApprove,updateLocation:canApprove,deactivateLocation:canApprove,createReturnableAssetType:canApprove,updateReturnableAssetType:canApprove,deactivateReturnableAssetType:canApprove};
+  const actions={...masterActions,createPurchaseOrderDraft:canOperate,createSalesOrderDraft:canOperate,confirmSalesOrder:canOperate,cancelSalesOrder:canOperate,submitPurchaseOrder:canOperate,approvePurchaseOrder:canApprove,rejectPurchaseOrder:canApprove,amendPurchaseOrder:canOperate,requestOverReceiptApproval:canOperate,approveApproval:canApprove,rejectApproval:canApprove,transferInventory:canOperate,receiveTransfer:canOperate,changeInventoryStatus:canOperate,scrapInventory:canOperate,releaseReservation:canOperate,reallocateReservation:canOperate,reverseShipment:canOperate,registerInventoryIdentity:canOperate,postDropShipDelivery:canOperate,reverseDropShipDelivery:canOperate,createVendorBill:canFinance,approveVendorBill:canApprove,createVendorCredit:canFinance,createCustomerInvoice:canFinance,createCustomerCredit:canFinance,voidCustomerInvoice:canFinance,recordPayment:canFinance,addDocumentCharge:canFinance,issueReturnable:canOperate,returnReturnable:canOperate,forfeitReturnable:canOperate,refundReturnableDeposit:canFinance,updatePolicy:isAdmin,lockPeriod:isAdmin,unlockPeriod:isAdmin,setValuationPolicy:isAdmin,allocateLandedCost:canFinance,updateUserRole:isAdmin};
+  const permissions={canRead:!!actor,canExport:!!actor,canOperate,canPostFinancial:canFinance,canApprove,canAdminister:isAdmin,actions};
+  const safeOutbox=isAdmin?outbox.map((entry)=>Object.fromEntries(Object.entries(entry).filter(([key])=>key!=="lastError"))):[];
+  return {settings:isAdmin?parse(settings):[],approvals:parse(approvals),periodLocks:isAdmin?periodLocks:[],purchaseRevisions:revisions,warehouses,locations,businessPartners:partners,masterProducts:products,products,lots,units,transfers,dropShipDeliveries,reservations,shipments,vendorBills,vendorCredits,customerInvoices,customerCredits,payments,charges,returnableAssetTypes:assetTypes,returnableObligations:obligations,returnableEvents,valuationPolicies,costLayers,valueEntries,landedCosts,outbox:safeOutbox,attachments,users:isAdmin?users:[],uoms,uomConversions,currentUser:actor?{id:actor.id,email:actor.email,name:actor.name,role:actor.role}:null,permissions,summary:{pendingApprovals:approvals.filter(row=>row.status==="pending").length,heldVendorBills:vendorBills.filter(row=>row.status==="on_hold").length,outstandingReceivablesCents:customerInvoices.reduce((s,row)=>s+Math.max(Number(row.total_cents??0)-Number(row.paid_cents??0)-Number(row.credited_cents??0),0),0),openReturnables:obligations.filter(row=>row.status==="open").length,inTransitTransfers:transfers.filter(row=>row.status==="in_transit"||row.status==="partially_received").length,openDropShipDeliveries:dropShipDeliveries.filter(row=>Number(row.netDeliveredQuantity??0)>0).length,inventoryValueCents:valueEntries.reduce((s,row)=>s+Number(row.value_cents??0),0),pendingOutbox:isAdmin?outbox.filter(row=>row.status==="pending"||row.status==="failed").length:0}};
+}
+
+export async function getWorkflowSnapshot(actor?:ActorIdentity){const [core,advanced]=await Promise.all([getInventorySnapshot(),getAdvancedSnapshot(actor)]);return{snapshot:core,advanced};}
+
+export async function executeWorkflow(command: WorkflowCommand): Promise<WorkflowResult> {
+  await ensureDatabase();
+  if (!command.command?.trim()) throw new WorkflowError("VALIDATION_ERROR", "command is required.");
+  if (!command.idempotencyKey?.trim()) throw new WorkflowError("VALIDATION_ERROR", "idempotencyKey is required.");
+  command.claimToken = crypto.randomUUID(); command.requestHash = await hashCommand(command);
+  const prior = await replay(command); if (prior) return prior;
+  switch (normalize(command.command)) {
+    case "createpurchaseorderdraft": return createDraft(command, "purchaseOrder");
+    case "createsalesorderdraft": return createDraft(command, "salesOrder");
+    case "confirmsalesorder": return setSalesOrderLifecycle(command, "confirmed");
+    case "cancelsalesorder": return setSalesOrderLifecycle(command, "canceled");
+    case "submitpurchaseorder": return submitPurchaseOrder(command);
+    case "approvepurchaseorder": return decidePurchaseOrder(command, "approved");
+    case "rejectpurchaseorder": return decidePurchaseOrder(command, "rejected");
+    case "amendpurchaseorder": return amendPurchaseOrder(command);
+    case "requestoverreceiptapproval": case "requestapproval": return requestApproval(command);
+    case "approveapproval": return decideApproval(command, "approved");
+    case "rejectapproval": return decideApproval(command, "rejected");
+    case "transferinventory": return moveInventory(command, "internal_transfer");
+    case "changeinventorystatus": return moveInventory(command, "status_change");
+    case "receivetransfer": return receiveTransfer(command);
+    case "scrapinventory": return scrapInventory(command);
+    case "releasereservation": return releaseReservation(command);
+    case "reallocatereservation": return reallocateReservation(command);
+    case "reverseshipment": return reverseShipment(command);
+    case "registerinventoryidentity": return registerIdentity(command);
+    case "postdropshipdelivery": return postDropShipDelivery(command);
+    case "reversedropshipdelivery": return reverseDropShipDelivery(command);
+    case "createvendorbill": return createVendorBill(command);
+    case "approvevendorbill": return approveVendorBill(command);
+    case "createvendorcredit": return createFinancialCreditV2(command, "vendor");
+    case "createcustomerinvoice": return createCustomerInvoiceV2(command);
+    case "createcustomercredit": return createFinancialCreditV2(command, "customer");
+    case "voidcustomerinvoice": return voidCustomerInvoice(command);
+    case "recordpayment": return recordPaymentV2(command);
+    case "adddocumentcharge": return addChargeV2(command);
+    case "issuereturnable": return issueReturnable(command);
+    case "returnreturnable": return updateReturnable(command, "return");
+    case "forfeitreturnable": return updateReturnable(command, "forfeit");
+    case "refundreturnabledeposit": return updateReturnable(command, "deposit_refund");
+    case "updatepolicy": return updatePolicy(command);
+    case "lockperiod": return setPeriodLock(command, true);
+    case "unlockperiod": return setPeriodLock(command, false);
+    case "setvaluationpolicy": return setValuationPolicy(command);
+    case "allocatelandedcost": return allocateLandedCost(command);
+    case "updateuserrole": return updateUserRole(command);
+    case "createbusinesspartner": case "updatebusinesspartner": return saveBusinessPartner(command);
+    case "deactivatebusinesspartner": return deactivateMaster(command,"business_partners","business_partner");
+    case "createproduct": case "updateproduct": return saveProduct(command);
+    case "deactivateproduct": return deactivateMaster(command,"products","product");
+    case "createwarehouse": case "updatewarehouse": return saveWarehouse(command);
+    case "deactivatewarehouse": return deactivateMaster(command,"warehouses","warehouse");
+    case "createlocation": case "updatelocation": return saveLocation(command);
+    case "deactivatelocation": return deactivateLocation(command);
+    case "createreturnableassettype": case "updatereturnableassettype": return saveReturnableAssetType(command);
+    case "deactivatereturnableassettype": return deactivateMaster(command,"returnable_asset_types","returnable_asset_type");
+    default: throw new WorkflowError("UNKNOWN_COMMAND", `Unsupported workflow command: ${command.command}.`);
+  }
+}

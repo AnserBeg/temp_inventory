@@ -20,7 +20,10 @@ test("ships PaneFlow product metadata and removes starter preview infrastructure
 });
 
 test("exposes the required operational language and impact previews", async () => {
-  const source = await readFile(new URL("../app/inventory-app.tsx", import.meta.url), "utf8");
+  const source = (await Promise.all([
+    readFile(new URL("../app/inventory-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/operations-suite.tsx", import.meta.url), "utf8"),
+  ])).join("\n");
 
   for (const required of [
     "Reopen quantity to receive",
@@ -33,7 +36,7 @@ test("exposes the required operational language and impact previews", async () =
     "Create purchase order",
     "Create sales order",
     "approved purchase order",
-    "confirmed sales order",
+    "Sales order with invoiceable delivery",
     "Physical inventory",
     "Commercial commitment",
     "Financial effect",

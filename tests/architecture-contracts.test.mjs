@@ -1,0 +1,110 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
+
+test("advanced distributor commands remain wired through the durable dispatcher", async () => {
+  const source = await read("lib/server/advanced-domain.ts");
+  const commands = [
+    "confirmsalesorder", "cancelsalesorder", "submitpurchaseorder", "approvepurchaseorder",
+    "amendpurchaseorder", "transferinventory", "receivetransfer", "changeinventorystatus",
+    "scrapinventory", "releasereservation", "reallocatereservation", "reverseshipment",
+    "createvendorbill", "approvevendorbill", "createvendorcredit", "createcustomerinvoice",
+    "createcustomercredit", "recordpayment", "issuereturnable", "returnreturnable",
+    "forfeitreturnable", "refundreturnabledeposit", "setvaluationpolicy", "allocatelandedcost",
+    "updateuserrole", "createbusinesspartner", "createproduct", "createwarehouse",
+    "createlocation", "createreturnableassettype",
+    "postdropshipdelivery", "reversedropshipdelivery", "registerinventoryidentity", "voidcustomerinvoice",
+  ];
+  for (const command of commands) assert.match(source, new RegExp(`case\\s+"${command}"`), command);
+  assert.match(source, /outbox_events/);
+  assert.match(source, /audit_events/);
+  assert.match(source, /requestHash/);
+});
+
+test("application routes enforce identity and capability checks", async () => {
+  const [snapshot, workflow, records, attachments, exports] = await Promise.all([
+    read("app/api/snapshot/route.ts"), read("app/api/workflows/route.ts"),
+    read("app/api/records/route.ts"), read("app/api/attachments/route.ts"),
+    read("app/api/export/route.ts"),
+  ]);
+  for (const route of [snapshot, workflow, records, attachments, exports]) {
+    assert.match(route, /resolveActor/);
+    assert.match(route, /requireCapability/);
+  }
+  assert.match(workflow, /updateuserrole/);
+  assert.match(workflow, /masterData/);
+  const financialCommands = workflow.match(/const financial = \[([^\]]+)\]/)?.[1] ?? "";
+  assert.match(financialCommands, /refundreturnabledeposit/);
+});
+
+test("runtime storage preserves inventory, upload, and onboarding invariants", async () => {
+  const [database, auth, attachments] = await Promise.all([
+    read("lib/server/inventory-db.ts"), read("lib/server/auth.ts"), read("lib/server/attachments.ts"),
+  ]);
+  assert.match(database, /inventory_balances_nonnegative_insert/);
+  assert.match(database, /NEW\.reserved_qty\s*>\s*NEW\.on_hand_qty/);
+  assert.match(database, /CREATE TABLE IF NOT EXISTS cost_layers/);
+  assert.match(database, /CREATE TABLE IF NOT EXISTS outbox_events/);
+  assert.match(auth, /first_administrator_bootstrapped/);
+  assert.match(auth, /'viewer'/);
+  assert.match(attachments, /MAX_BYTES\s*=\s*10\s*\*\s*1024\s*\*\s*1024/);
+  assert.match(attachments, /CONTENT_MISMATCH/);
+  assert.match(attachments, /attachment\.delete_requested/);
+});
+
+test("multi-line order contract retains currency, tax, routes, fees, and refundable deposits", async () => {
+  const source = await read("lib/server/inventory-records.ts");
+  for (const field of [
+    "exchangeRateToBase", "paymentTerms", "taxRateBps", "fulfillmentRoute",
+    "freightCents", "feeCents", "refundableDepositCents", "discountCents",
+  ]) assert.match(source, new RegExp(field), field);
+  assert.match(source, /INSERT INTO purchase_orders/);
+  assert.match(source, /'draft'/);
+  assert.match(source, /outbox_events/);
+});
+
+test("operations UI uses live adapters, exact payload builders, permissions, and attachments", async () => {
+  const source = await read("app/components/operations-suite.tsx");
+  assert.match(source, /normalizeLiveWorkflowState/);
+  assert.match(source, /buildWorkflowPayload/);
+  assert.match(source, /permissions\.actions|capabilities\.actions/);
+  assert.match(source, /type="file"/);
+  assert.match(source, /\/api\/attachments/);
+  assert.doesNotMatch(source, /Â|â|Ã/);
+});
+
+test("schema covers the operational subledgers and audit trail", async () => {
+  const source = await read("db/schema.ts");
+  for (const table of [
+    "document_charges", "vendor_bill_lines", "customer_invoices", "customer_credits",
+    "returnable_obligations", "returnable_events", "valuation_policies", "cost_layers",
+    "inventory_value_entries", "landed_cost_allocations", "period_locks", "outbox_events",
+    "attachments", "warehouses", "inventory_transfers", "uom_conversions",
+    "drop_ship_deliveries", "movement_assignments", "inventory_units", "inventory_lots",
+  ]) assert.match(source, new RegExp(`"${table}"`), table);
+});
+
+test("tracked physical postings and drop-ship fulfillment preserve their separate ledgers", async () => {
+  const [advanced, core, database] = await Promise.all([
+    read("lib/server/advanced-domain.ts"), read("lib/server/inventory-domain.ts"), read("lib/server/inventory-db.ts"),
+  ]);
+  assert.match(advanced, /LOT_QUANTITY_SHORTAGE/);
+  assert.match(advanced, /SERIAL_QUANTITY_INVALID/);
+  assert.match(advanced, /UPDATE inventory_units SET location_id=/);
+  assert.match(advanced, /drop_ship\.delivery_posted/);
+  assert.match(advanced, /drop_ship\.delivery_reversed/);
+  assert.match(advanced, /customer_invoice\.voided/);
+  assert.match(advanced, /LANDED_COST_LAYER_UNRELATED/);
+  assert.match(advanced, /purchase_order_revisions SET lifecycle_status/);
+  assert.match(advanced, /base_total_cents=\?/);
+  assert.match(advanced, /CASE WHEN sol\.fulfillment_route='drop_ship'/);
+  assert.match(core, /incomingTracking/);
+  assert.match(core, /outgoingTracking/);
+  assert.match(core, /returnTracking/);
+  assert.match(core, /receipt_reversed/);
+  assert.match(core, /returned_to_vendor/);
+  assert.match(core, /INSERT INTO movement_assignments/);
+  assert.match(database, /idx_purchase_order_lines_source_sales_line/);
+});
