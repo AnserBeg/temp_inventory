@@ -22,6 +22,12 @@ function bucket() {
   return files;
 }
 
+/** Idempotent storage cleanup used both by the request path and the durable outbox retry. */
+export async function deleteAttachmentObject(objectKey: string) {
+  if (!objectKey.trim()) throw new AttachmentError("OBJECT_KEY_REQUIRED", "Attachment cleanup requires an object key.");
+  await bucket().delete(objectKey);
+}
+
 async function validateDocument(documentType: string, documentId: string) {
   const table = documentTables[documentType];
   if (!table) throw new AttachmentError("INVALID_DOCUMENT_TYPE", "This document type does not support attachments.");
@@ -104,5 +110,5 @@ export async function deleteAttachment(actor: ActorIdentity, id: string) {
     db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
       SELECT ?,'attachment.delete_requested',?,?,?,'pending',0,?,? WHERE EXISTS (SELECT 1 FROM attachments WHERE id=? AND deleted_at=?)`).bind(newId("outbox"), metadata.documentType, metadata.documentId, JSON.stringify({ attachmentId: id,objectKey:metadata.objectKey }), when, when,id,when),
   ]);
-  try{await bucket().delete(metadata.objectKey);}catch{/* durable delete_requested outbox retains retry details */}
+  try{await deleteAttachmentObject(metadata.objectKey);}catch{/* durable delete_requested outbox retains retry details */}
 }

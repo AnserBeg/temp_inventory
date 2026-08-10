@@ -6,9 +6,11 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "predev": "node scripts/apply-local-migrations.mjs",
     "dev": "vinext dev",
     "build": "vinext build",
-    "start": "vinext start",
+    "prestart": "node scripts/apply-local-migrations.mjs && vinext build",
+    "start": "wrangler dev --config dist/server/wrangler.json --persist-to .wrangler/state --port 3000",
     "test": "npm run build && npm run test:production",
     "test:production": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/*.test.mjs",
     "test:domain": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/production-integration.test.mjs tests/workflow-envelope.test.mjs",

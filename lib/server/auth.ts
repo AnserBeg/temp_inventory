@@ -60,7 +60,15 @@ export async function resolveActor(request: Request): Promise<ActorIdentity> {
     }
     const now = new Date().toISOString();
     const db = getD1();
+    const configuredDefault = await first<{ valueJson: string }>("SELECT value_json AS valueJson FROM system_settings WHERE key='security.defaultRole'");
+    let defaultRole: AppRole = "viewer";
+    try {
+      const parsed = JSON.parse(configuredDefault?.valueJson ?? '"viewer"');
+      if (["viewer", "operator", "accounting"].includes(parsed)) defaultRole = parsed as AppRole;
+    } catch { /* malformed legacy settings safely fall back to viewer */ }
     const bootstrapAuditId = `audit-auth-bootstrap-${crypto.randomUUID()}`;
+    const registrationAuditId = `audit-auth-registration-${crypto.randomUUID()}`;
+    const registrationOutboxId = `outbox-auth-registration-${crypto.randomUUID()}`;
     await db.batch([
       db.prepare(`INSERT OR IGNORE INTO app_users (user_id,email,full_name,role,active,created_at,updated_at)
         SELECT ?,?,?,'administrator',1,?,? WHERE NOT EXISTS (SELECT 1 FROM app_users)`)
@@ -74,7 +82,15 @@ export async function resolveActor(request: Request): Promise<ActorIdentity> {
         WHERE EXISTS (SELECT 1 FROM app_users WHERE user_id=? AND role='administrator')`)
         .bind(`outbox-auth-bootstrap-${crypto.randomUUID()}`,id,JSON.stringify({userId:id,email}),now,now,id),
       db.prepare(`INSERT OR IGNORE INTO app_users (user_id,email,full_name,role,active,created_at,updated_at)
-        VALUES (?,?,?,'viewer',1,?,?)`).bind(id,email,name,now,now),
+        VALUES (?,?,?,?,1,?,?)`).bind(id,email,name,defaultRole,now,now),
+      db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
+        SELECT ?,'app_user',?,'authenticated_user_registered',?,?,?,?,?,?
+        WHERE EXISTS (SELECT 1 FROM app_users WHERE user_id=? AND created_at=? AND role<>'administrator')`)
+        .bind(registrationAuditId,id,`Authenticated identity registered with ${defaultRole} access.`,`${name} <${email}>`,id,email,JSON.stringify({defaultRole}),now,id,now),
+      db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
+        SELECT ?,'security.authenticated_user_registered','app_user',?,?,'pending',0,?,?
+        WHERE EXISTS (SELECT 1 FROM app_users WHERE user_id=? AND created_at=? AND role<>'administrator')`)
+        .bind(registrationOutboxId,id,JSON.stringify({userId:id,email,role:defaultRole}),now,now,id,now),
     ]);
     const created = await first<{ role: AppRole }>("SELECT role FROM app_users WHERE user_id=?",id);
     role=created?.role??"viewer";

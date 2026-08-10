@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { inventoryCountApprovalPayload, workflowCommandEnvelope, workflowSnapshotParts } from "../lib/domain/workflow-envelope.js";
+import { inventoryCountApprovalPayload, workflowCommandEnvelope, workflowCommandForAction, workflowSnapshotParts } from "../lib/domain/workflow-envelope.js";
 
 const core = {
   purchaseOrders: [{ id: "po-1", number: "PO-1", lines: [{ id: "line-1" }] }],
@@ -47,6 +47,12 @@ test("builds the exact scope-locked inventory count approval contract", () => {
   });
 });
 
+test("routes each match-exception decision to the intended durable command", () => {
+  assert.equal(workflowCommandForAction("resolveMatchException", "approve-variance"), "approveVendorBill");
+  assert.equal(workflowCommandForAction("resolveMatchException", "request-credit"), "createVendorCredit");
+  assert.equal(workflowCommandForAction("recordVendorPayment"), "recordPayment");
+});
+
 test("financial workflow envelopes use the selected source document and its current version", () => {
   const options = {
     purchaseOrders: [{ id: "po-1", version: 7 }],
@@ -67,4 +73,34 @@ test("financial workflow envelopes use the selected source document and its curr
     command: "postDropShipDelivery", entityId: "so-line-drop", version: 4, payload: { salesOrderLineId: "so-line-drop", quantity: 2 }, idempotencyKey: "drop-1",
   });
   assert.throws(() => workflowCommandEnvelope({ command: "createVendorBill", kind: "createVendorBill", payload: { purchaseOrderId: "stale-po" }, options, idempotencyKey: "stale" }), /Refresh the source document/);
+});
+
+test("server-searched sources can carry their current version outside snapshot page one", () => {
+  const envelope = workflowCommandEnvelope({
+    command: "createVendorBill",
+    kind: "createVendorBill",
+    payload: { purchaseOrderId: "po-beyond-page-one", sourceVersion: 17 },
+    options: { purchaseOrders: [] },
+    idempotencyKey: "remote-source",
+  });
+  assert.equal(envelope.entityId, "po-beyond-page-one");
+  assert.equal(envelope.version, 17);
+});
+
+test("shipment reversal targets the displayed shipment line instead of an arbitrary line", () => {
+  const payload = { shipmentId: "shipment-1", lineId: "shipment-line-2", quantity: 3, postingDate: "2026-08-10", reason: "Wrong quantity" };
+  assert.deepEqual(workflowCommandEnvelope({
+    command: "reverseShipment",
+    kind: "reverseShipment",
+    record: { id: "shipment-1:shipment-line-2", version: 6 },
+    payload,
+    options: {},
+    idempotencyKey: "reverse-shipment-line-2",
+  }), {
+    command: "reverseShipment",
+    entityId: "shipment-1",
+    version: 6,
+    payload,
+    idempotencyKey: "reverse-shipment-line-2",
+  });
 });

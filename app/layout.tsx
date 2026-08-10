@@ -35,7 +35,7 @@ export async function generateMetadata(): Promise<Metadata> {
       title: "PaneFlow Operations",
       description: "Know what is ordered, what is physically here, and what is financially owed.",
       type: "website",
-      images: [{ url: new URL("/og.png", base).toString(), width: 1735, height: 908, alt: "PaneFlow — Window operations, clearly connected." }],
+      images: [{ url: new URL("/og-operations-v2.png", base).toString(), width: 1662, height: 946, alt: "PaneFlow window distribution operations from receiving through shipment." }],
     },
     twitter: {
       card: "summary_large_image",

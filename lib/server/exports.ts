@@ -1,5 +1,5 @@
 import type { ActorIdentity } from "./auth";
-import { all, ensureDatabase, getD1, newId } from "./inventory-db";
+import { all, ensureDatabase, first, getD1, newId } from "./inventory-db";
 
 export type ExportType = "inventory" | "movements" | "purchase-orders" | "vendor-bills" | "customer-invoices" | "audit" | "accounting" | "quickbooks";
 export type ExportRange = { from: string; to: string };
@@ -7,7 +7,7 @@ export type ExportRange = { from: string; to: string };
 const queries: Record<Exclude<ExportType, "accounting" | "quickbooks">, string> = {
   inventory: `SELECT p.sku,p.name,l.code AS location,l.inventory_status AS status,ib.on_hand_qty AS on_hand,ib.reserved_qty AS reserved,ib.on_hand_qty-ib.reserved_qty AS available,p.base_uom_id AS uom FROM inventory_balances ib JOIN products p ON p.id=ib.product_id JOIN locations l ON l.id=ib.location_id ORDER BY p.sku,l.code`,
   movements: `SELECT sm.posted_at,sm.movement_type,p.sku,sm.quantity,fl.code AS from_location,tl.code AS to_location,sm.inventory_status,sm.source_document_type,sm.source_document_id,sm.posted_by,sm.lot_id,sm.inventory_unit_id FROM stock_movements sm JOIN products p ON p.id=sm.product_id LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id ORDER BY sm.posted_at`,
-  "purchase-orders": `SELECT po.number,bp.name AS vendor,po.lifecycle_status,po.billing_status,po.expected_date,po.currency,po.total_cents,po.revision_number,po.version,pol.id AS line_id,p.sku,pol.ordered_qty,pol.closed_qty,pol.unit_cost_cents,pol.fulfillment_route FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id JOIN purchase_order_lines pol ON pol.purchase_order_id=po.id JOIN products p ON p.id=pol.product_id ORDER BY po.number,pol.id`,
+  "purchase-orders": `SELECT po.number,bp.name AS vendor,po.lifecycle_status,po.billing_status,po.expected_date,po.currency,po.total_cents,po.revision_number,po.version,pol.id AS line_id,p.sku,pol.ordered_qty,pol.closed_qty,pol.unit_cost_cents,pol.discount_cents,pol.taxable,pol.tax_rate_bps,pol.fulfillment_route FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id JOIN purchase_order_lines pol ON pol.purchase_order_id=po.id JOIN products p ON p.id=pol.product_id ORDER BY po.number,pol.id`,
   "vendor-bills": `SELECT vb.number,vb.vendor_invoice_number,bp.name AS vendor,po.number AS purchase_order,vb.status,vb.match_status,vb.invoice_date,vb.due_date,vb.currency,vb.exchange_rate_to_base,vb.subtotal_cents,vb.tax_cents,vb.total_cents,vb.base_total_cents,vb.paid_cents,vb.hold_reason FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id ORDER BY vb.invoice_date`,
   "customer-invoices": `SELECT ci.number,bp.name AS customer,so.number AS sales_order,ci.status,ci.invoice_date,ci.due_date,ci.currency,ci.exchange_rate_to_base,ci.subtotal_cents,ci.tax_cents,ci.total_cents,ci.base_total_cents,ci.paid_cents FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id LEFT JOIN sales_orders so ON so.id=ci.sales_order_id ORDER BY ci.invoice_date`,
   audit: `SELECT created_at,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json FROM audit_events ORDER BY created_at`,
@@ -106,7 +106,7 @@ type ReturnableEventRow = {
   direction: string;
 };
 
-const returnableCurrencyMemo = "Base-currency cents; returnable obligations do not store a transaction currency.";
+const returnableCurrencyMemo = "Company-base CAD cents; returnable deposits are denominated in CAD.";
 
 function returnableLine(input: {
   postingDate: string;
@@ -158,7 +158,7 @@ function returnableLine(input: {
     account: input.account,
     debit_cents: 0,
     credit_cents: 0,
-    currency: "BASE",
+    currency: "CAD",
     transaction_amount_cents: 0,
     exchange_rate_to_base: 1,
   };
@@ -217,7 +217,10 @@ async function accountingRows(range: ExportRange) {
   for(const payment of payments){
     const d:DocumentRow={id:String(payment.id),number:String(payment.number),postingDate:String(payment.postingDate),subtotal:Number(payment.amount),tax:0,total:Number(payment.amount),baseTotal:Number(payment.base),currency:String(payment.currency),exchange:Number(payment.exchange),partnerName:String(payment.partnerName??"")};
     validateDocument(d);
-    if(payment.documentType==="returnable_deposit"){
+    if(payment.documentType==="returnable_deposit_collection"){
+      if(payment.direction==="inbound") rows.push(line(d,"returnable_deposit_collection","Cash",d.baseTotal,0,d.total),line(d,"returnable_deposit_collection","Refundable returnable deposits payable",0,d.baseTotal,d.total));
+      else rows.push(line(d,"returnable_deposit_collection","Refundable returnable deposits receivable",d.baseTotal,0,d.total),line(d,"returnable_deposit_collection","Cash",0,d.baseTotal,d.total));
+    } else if(payment.documentType==="returnable_deposit_refund" || payment.documentType==="returnable_deposit"){
       if(payment.direction==="inbound") rows.push(line(d,"returnable_deposit_refund","Cash",d.baseTotal,0,d.total),line(d,"returnable_deposit_refund","Refundable returnable deposits receivable",0,d.baseTotal,d.total));
       else rows.push(line(d,"returnable_deposit_refund","Refundable returnable deposits payable",d.baseTotal,0,d.total),line(d,"returnable_deposit_refund","Cash",0,d.baseTotal,d.total));
     } else if(payment.direction==="inbound") rows.push(line(d,"payment","Cash",d.baseTotal,0,d.total),line(d,"payment","Accounts receivable",0,d.baseTotal,d.total));
@@ -226,7 +229,7 @@ async function accountingRows(range: ExportRange) {
   const values=await all<Record<string,unknown>>("SELECT ive.id,ive.posted_at AS postingDate,ive.entry_type AS entryType,ive.reference_type AS referenceType,ive.reference_id AS referenceId,ive.value_cents AS value,ive.quantity,ive.cost_method AS costMethod,p.sku FROM inventory_value_entries ive JOIN products p ON p.id=ive.product_id WHERE substr(ive.posted_at,1,10) BETWEEN ? AND ? ORDER BY ive.posted_at,ive.id",range.from,range.to);
   for(const value of values){
     const amount=Math.abs(Number(value.value));if(!amount)continue;
-    const d:DocumentRow={id:String(value.id),number:String(value.id),postingDate:String(value.postingDate),subtotal:amount,tax:0,total:amount,baseTotal:amount,currency:"BASE",exchange:1};
+    const d:DocumentRow={id:String(value.id),number:String(value.id),postingDate:String(value.postingDate),subtotal:amount,tax:0,total:amount,baseTotal:amount,currency:"CAD",exchange:1};
     const entryType=String(value.entryType);
     const accounts = entryType === "receipt" ? ["Inventory", "Inventory clearing"]
       : entryType === "receipt_reversal" ? ["Inventory clearing", "Inventory"]
@@ -241,7 +244,7 @@ async function accountingRows(range: ExportRange) {
     rows.push(line(d,"inventory_value_entry",accounts[0],amount,0,amount),line(d,"inventory_value_entry",accounts[1],0,amount,amount));
   }
   const landed=await all<Record<string,unknown>>("SELECT id,number,posted_at AS postingDate,amount_cents AS amount FROM landed_cost_allocations WHERE substr(posted_at,1,10) BETWEEN ? AND ? ORDER BY posted_at,number",range.from,range.to);
-  for(const entry of landed){const d:DocumentRow={id:String(entry.id),number:String(entry.number),postingDate:String(entry.postingDate),subtotal:Number(entry.amount),tax:0,total:Number(entry.amount),baseTotal:Number(entry.amount),currency:"BASE",exchange:1};rows.push(line(d,"landed_cost","Inventory",d.baseTotal,0,d.total),line(d,"landed_cost","Landed cost accrual",0,d.baseTotal,d.total));}
+  for(const entry of landed){const d:DocumentRow={id:String(entry.id),number:String(entry.number),postingDate:String(entry.postingDate),subtotal:Number(entry.amount),tax:0,total:Number(entry.amount),baseTotal:Number(entry.amount),currency:"CAD",exchange:1};rows.push(line(d,"landed_cost","Inventory",d.baseTotal,0,d.total),line(d,"landed_cost","Landed cost accrual",0,d.baseTotal,d.total));}
   const obligations = await all<ReturnableObligationRow>(`SELECT
     ro.id,
     COALESCE((SELECT MAX(re.posted_at) FROM returnable_events re WHERE re.obligation_id=ro.id),ro.created_at) AS postingDate,
@@ -350,7 +353,7 @@ async function accountingRows(range: ExportRange) {
       account: "Returnable custody and deposit event memorandum",
     }));
     if (event.eventType === "forfeit" && Number(event.amount) > 0) {
-      const financialEvent: DocumentRow = { id:event.id,number:event.id,postingDate:event.postingDate,subtotal:Number(event.amount),tax:0,total:Number(event.amount),baseTotal:Number(event.amount),currency:"BASE",exchange:1,partnerName:event.partnerName };
+      const financialEvent: DocumentRow = { id:event.id,number:event.id,postingDate:event.postingDate,subtotal:Number(event.amount),tax:0,total:Number(event.amount),baseTotal:Number(event.amount),currency:"CAD",exchange:1,partnerName:event.partnerName };
       if (customerHolds) rows.push(
         line(financialEvent,"returnable_forfeit","Refundable returnable deposits payable",Number(event.amount),0,Number(event.amount)),
         line(financialEvent,"returnable_forfeit","Forfeited returnable deposit revenue",0,Number(event.amount),Number(event.amount)),
@@ -390,9 +393,19 @@ async function quickBooksRows(range: ExportRange) {
   }));
 }
 
+async function assertLocationIntegrityForExport() {
+  const integrity = await first<{ balanceRows: number; movementRows: number; locationIds: string }>(`SELECT
+    (SELECT COUNT(*) FROM inventory_balances ib LEFT JOIN locations l ON l.id=ib.location_id WHERE l.id IS NULL) AS balanceRows,
+    (SELECT COUNT(*) FROM stock_movements sm LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id WHERE (sm.from_location_id IS NOT NULL AND fl.id IS NULL) OR (sm.to_location_id IS NOT NULL AND tl.id IS NULL)) AS movementRows,
+    (SELECT GROUP_CONCAT(location_id,', ') FROM (SELECT ib.location_id AS location_id FROM inventory_balances ib LEFT JOIN locations l ON l.id=ib.location_id WHERE l.id IS NULL UNION SELECT sm.from_location_id FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.from_location_id WHERE sm.from_location_id IS NOT NULL AND l.id IS NULL UNION SELECT sm.to_location_id FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.to_location_id WHERE sm.to_location_id IS NOT NULL AND l.id IS NULL)) AS locationIds`);
+  const affected = Number(integrity?.balanceRows ?? 0) + Number(integrity?.movementRows ?? 0);
+  if (affected > 0) throw new Error(`Export blocked: ${affected} inventory record${affected === 1 ? "" : "s"} reference missing location IDs (${integrity?.locationIds || "unknown"}). Restore those legacy locations in Controls before exporting.`);
+}
+
 export async function buildExport(type: ExportType, actor: ActorIdentity, range?: ExportRange) {
   await ensureDatabase();
   if ((type === "accounting" || type === "quickbooks") && !range) throw new Error("Accounting exports require a bounded from/to date range.");
+  if (["inventory", "movements", "accounting", "quickbooks"].includes(type)) await assertLocationIntegrityForExport();
   const rows = type === "accounting" ? await accountingRows(range!) : type === "quickbooks" ? await quickBooksRows(range!) : await all<Record<string, unknown>>(queries[type]);
   const when = new Date().toISOString();
   const metadata={ type,rowCount:rows.length,role:actor.role,range };

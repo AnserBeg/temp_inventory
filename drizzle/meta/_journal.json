@@ -50,6 +50,55 @@
       "when": 1786243913240,
       "tag": "0006_runtime-integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1786250165982,
+      "tag": "0007_slow_thor_girl",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1786250580519,
+      "tag": "0008_brave_shiver_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1786252305121,
+      "tag": "0009_curious_kate_bishop",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1786261073722,
+      "tag": "0010_lucky_prima",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1786296185244,
+      "tag": "0011_little_sersi",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1786352137255,
+      "tag": "0012_material_edwin_jarvis",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1786356000000,
+      "tag": "0013_production_policy_defaults",
+      "breakpoints": true
     }
   ]
 }

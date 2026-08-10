@@ -7,7 +7,7 @@ const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 test("advanced distributor commands remain wired through the durable dispatcher", async () => {
   const source = await read("lib/server/advanced-domain.ts");
   const commands = [
-    "confirmsalesorder", "cancelsalesorder", "submitpurchaseorder", "approvepurchaseorder",
+    "updatesalesorderdraft", "confirmsalesorder", "cancelsalesorder", "submitpurchaseorder", "approvepurchaseorder", "cancelpurchaseorder",
     "amendpurchaseorder", "transferinventory", "receivetransfer", "changeinventorystatus",
     "scrapinventory", "releasereservation", "reallocatereservation", "reverseshipment",
     "createvendorbill", "approvevendorbill", "createvendorcredit", "createcustomerinvoice",
@@ -38,6 +38,8 @@ test("application routes enforce identity and capability checks", async () => {
   const advanced = await read("lib/server/advanced-domain.ts");
   assert.match(advanced, /updateUserRole:\s*"administer"/);
   assert.match(advanced, /refundReturnableDeposit:\s*"financialWrite"/);
+  assert.match(workflow, /scope:\s*url\.searchParams\.get\("scope"\)/);
+  assert.match(advanced, /workflowCoreScope/);
 });
 
 test("runtime storage preserves inventory, upload, and onboarding invariants", async () => {
@@ -49,7 +51,8 @@ test("runtime storage preserves inventory, upload, and onboarding invariants", a
   assert.doesNotMatch(database, /CREATE TABLE IF NOT EXISTS/);
   assert.match(database, /SELECT source_sales_order_line_id FROM purchase_order_lines LIMIT 0/);
   assert.match(auth, /first_administrator_bootstrapped/);
-  assert.match(auth, /'viewer'/);
+  assert.match(auth, /security\.defaultRole/);
+  assert.match(auth, /["']viewer["']/);
   assert.match(attachments, /MAX_BYTES\s*=\s*10\s*\*\s*1024\s*\*\s*1024/);
   assert.match(attachments, /CONTENT_MISMATCH/);
   assert.match(attachments, /attachment\.delete_requested/);
@@ -73,7 +76,17 @@ test("operations UI uses live adapters, exact payload builders, permissions, and
   assert.match(source, /permissions\.actions|capabilities\.actions/);
   assert.match(source, /type="file"/);
   assert.match(source, /\/api\/attachments/);
+  assert.match(source, /LookupField kind=\{lookupKind\} label="Document"/);
+  assert.match(source, /LocalPager label="Audit timeline pages"/);
+  assert.match(source, /LocalPager label="Operational record pages"/);
   assert.doesNotMatch(source, /Â|â|Ã/);
+});
+
+test("reports keep complete long results navigable", async () => {
+  const source = await read("app/inventory-app.tsx");
+  assert.match(source, /reports:\s*"products"/);
+  assert.match(source, /aria-label=\{view === "reports" \? "Projected availability pages" : "Record pages"\}/);
+  assert.match(source, /LocalTablePager label="Report result pages"/);
 });
 
 test("schema covers the operational subledgers and audit trail", async () => {
@@ -108,4 +121,25 @@ test("tracked physical postings and drop-ship fulfillment preserve their separat
   assert.match(core, /returned_to_vendor/);
   assert.match(core, /INSERT INTO movement_assignments/);
   assert.match(migration, /idx_purchase_order_lines_source_sales_line/);
+});
+
+test("local development applies the production migration chain before serving", async () => {
+  const [packageSource, wranglerSource, migrationScript, devVars] = await Promise.all([
+    read("package.json"),
+    read("wrangler.local.jsonc"),
+    read("scripts/apply-local-migrations.mjs"),
+    read(".dev.vars.example"),
+  ]);
+  const packageJson = JSON.parse(packageSource);
+  const wrangler = JSON.parse(wranglerSource);
+  assert.equal(packageJson.scripts.predev, "node scripts/apply-local-migrations.mjs");
+  assert.match(packageJson.scripts.start, /--persist-to\s+\.wrangler\/state/);
+  assert.equal(wrangler.d1_databases[0].binding, "DB");
+  assert.equal(wrangler.d1_databases[0].database_name, "site-creator-d1");
+  assert.equal(wrangler.d1_databases[0].migrations_dir, "drizzle");
+  assert.match(migrationScript, /d1[\s\S]*migrations[\s\S]*apply[\s\S]*--local/);
+  assert.match(migrationScript, /--persist-to[\s\S]*\.wrangler\/state/);
+  assert.match(migrationScript, /WRANGLER_WRITE_LOGS:\s*"false"/);
+  assert.match(devVars, /ALLOW_LOCAL_DEV_AUTH=false/);
+  assert.match(devVars, /BOOTSTRAP_DEMO_DATA=false/);
 });

@@ -4,6 +4,7 @@ import test from "node:test";
 
 const domain = readFileSync(new URL("../lib/server/inventory-domain.ts", import.meta.url), "utf8");
 const schema = readFileSync(new URL("../db/schema.ts", import.meta.url), "utf8");
+const migration = readFileSync(new URL("../drizzle/0007_slow_thor_girl.sql", import.meta.url), "utf8");
 
 test("all outbound legacy postings couple stock, layers, and immutable value entries", () => {
   for (const entryType of ["receipt_reversal", "vendor_return", "shipment"]) {
@@ -57,4 +58,33 @@ test("physical postings emit both audit and transactional outbox records", () =>
     "inventory.count_posted",
   ]) assert.match(domain, new RegExp(event.replaceAll(".", "\\.")));
   assert.match(domain, /actor_id, actor_email/);
+});
+
+test("receipt and customer-return postings require active status-compatible locations", () => {
+  const receiptStart = domain.indexOf("async function postReceipt");
+  const returnStart = domain.indexOf("async function postCustomerReturn");
+  const receipt = domain.slice(receiptStart, domain.indexOf("async function closeRemainder", receiptStart));
+  const customerReturn = domain.slice(returnStart, domain.indexOf("async function postInventoryAdjustment", returnStart));
+  for (const block of [receipt, customerReturn]) {
+    assert.match(block, /requireActiveLocation/);
+    assert.match(block, /EXISTS \(SELECT 1 FROM locations WHERE id=\? AND active=1/);
+  }
+  assert.match(schema, /inventoryBalances[\s\S]*productId: text\("product_id"\)\.notNull\(\)\.references\(\(\) => products\.id\)/);
+  assert.match(schema, /inventoryBalances[\s\S]*locationId: text\("location_id"\)\.notNull\(\)\.references\(\(\) => locations\.id\)/);
+  assert.match(migration, /__inventory_balance_fk_guard/);
+  assert.match(migration, /PRAGMA foreign_key_check/);
+});
+
+test("snapshot reconciliation exposes orphaned balances, movements, and value", () => {
+  for (const field of ["orphanedBalanceRows", "orphanedBalanceUnits", "orphanedMovementCount", "orphanedInventoryValueCents"]) {
+    assert.match(domain, new RegExp(field));
+  }
+});
+
+test("receiving supports one-document batches and line-level optimistic locking", () => {
+  assert.match(domain, /async function postReceiptBatch/);
+  assert.match(domain, /inventory\.batch_receipt_posted/);
+  assert.match(domain, /purchase_order_lines SET version=version\+1/);
+  assert.match(domain, /case "postreceiptbatch": return postReceiptBatch\(input\)/);
+  assert.match(schema, /purchaseOrderLines[\s\S]*version: integer\("version"\)\.notNull\(\)\.default\(1\)/);
 });

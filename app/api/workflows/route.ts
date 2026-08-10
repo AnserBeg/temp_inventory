@@ -1,5 +1,6 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
 import { executeWorkflow, getWorkflowSnapshot, workflowCapability, WorkflowError, type WorkflowCommand } from "@/lib/server/advanced-domain";
+import { processOutboxBatch } from "@/lib/server/outbox";
 
 export const dynamic = "force-dynamic";
 
@@ -11,6 +12,7 @@ export async function GET(request: Request) {
     return Response.json(await getWorkflowSnapshot(actor, {
       page: Number(url.searchParams.get("page") ?? 1),
       pageSize: Number(url.searchParams.get("pageSize") ?? 50),
+      scope: url.searchParams.get("scope") ?? "",
     }), { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof AuthorizationError) return authorizationResponse(error);
@@ -28,6 +30,9 @@ export async function POST(request: Request) {
     requireCapability(actor, capability);
 
     const result = await executeWorkflow({ ...input, actor });
+    // Delivery is best-effort after the database transaction. The outbox row is already
+    // durable, so a downstream outage never turns a successful business posting into a 500.
+    try { await processOutboxBatch({ limit: 10 }); } catch { /* scheduled/manual retry retains the event */ }
     return Response.json(result, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof AuthorizationError) return authorizationResponse(error);

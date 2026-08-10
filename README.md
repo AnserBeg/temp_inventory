@@ -25,7 +25,11 @@ Changing one document never silently fabricates another. Reopening a PO restores
 - Returnable rack, core, stillage, crate, and empty custody with issued, returned, forfeited, deposit-charged, and deposit-refunded events.
 - Approval thresholds, period locks, negative-stock blocking, optimistic version checks, idempotency, actor identity, audit events, and transactional outbox records.
 - R2-backed PDF/image attachments, a full accounting control export, and an audited QuickBooks Online journal CSV.
-- Empty-database onboarding for products, vendors/customers, warehouses, locations, returnable types, and user roles.
+- Server-backed worklist search, status filtering, sorting, and pagination across the full product, partner, order, movement, and billing data set.
+- Operational base/purchase/sales units of measure with precision enforcement and global or product-specific conversions applied to orders, receipts, reservations, shipments, and returns.
+- Customer-assigned contract price lists with priorities, validity dates, UOMs, and quantity breaks; catalog cost/price remains the explicit fallback.
+- Empty-database onboarding for products, units, conversions, vendors/customers, warehouses, locations, returnable types, customer pricing, and user roles.
+- Missing-location reconciliation that restores the original historical ID; inventory and accounting exports remain blocked until every location reference resolves.
 
 ## Roles
 
@@ -52,9 +56,26 @@ npm install
 npm run dev
 ```
 
-The local Sites configuration provides D1 and R2 bindings. Development-only sample records are gated from production; a hosted empty database starts with the authenticated administrator bootstrap and master-data setup flow.
+The `predev` hook applies every pending migration to the project-local D1 database before the server starts. The local Sites configuration then provides the matching D1 and R2 bindings. Development-only sample records are gated from production; a hosted empty database starts with the authenticated administrator bootstrap and master-data setup flow.
 
-Copy `.env.example` for explicit local flags. Set `ALLOW_LOCAL_DEV_AUTH=true` only for a private local process; host names and `Host` headers never enable authentication bypass. Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Production deployments must keep both values `false`; `ENVIRONMENT=development` also enables the sample-data bootstrap and must not be used in production.
+Copy `.dev.vars.example` to `.dev.vars` for explicit local Cloudflare runtime flags. Set `ALLOW_LOCAL_DEV_AUTH=true` only for a private local process; host names and `Host` headers never enable authentication bypass. Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Production deployments must keep both values `false`. No environment name implicitly seeds operational records.
+
+`npm start` applies pending local migrations, creates a fresh production build, and serves that build through Wrangler so Cloudflare bindings such as D1, R2, and scheduled outbox delivery behave like the deployed application. `vinext start` alone is intentionally not used because Node cannot load the Cloudflare runtime modules directly.
+
+## Transactional outbox delivery
+
+Every externally useful business event is committed to `outbox_events` in the same durable database operation as the workflow change. To deliver those events, configure both `OUTBOX_WEBHOOK_URL` and `OUTBOX_WEBHOOK_SECRET`; leaving both blank keeps ordinary integration events queued and still allows local R2 attachment cleanup events to run. Configure neither or both—setting only one is treated as an error.
+
+The Worker attempts queued delivery every five minutes and administrators can also retry it from **Controls → Integrations**. Delivery is at least once. Failed calls use exponential backoff from 15 seconds up to one hour and retain their last error in the integration worklist. Consumers must deduplicate on the `id` field or `x-paneflow-event-id` header.
+
+Webhook requests are JSON `POST`s with these headers:
+
+- `x-paneflow-event-id`: immutable event identifier.
+- `x-paneflow-event-type`: business event type.
+- `x-paneflow-timestamp`: Unix time in seconds.
+- `x-paneflow-signature`: `sha256=<hex HMAC-SHA256>` over `<timestamp>.<raw request body>` using `OUTBOX_WEBHOOK_SECRET`.
+
+Consumers should verify the signature against the raw body with a constant-time comparison and reject stale timestamps before acknowledging with any 2xx response. Hosted deployments should use an HTTPS webhook URL.
 
 ## Database migrations
 
@@ -74,3 +95,5 @@ npm run typecheck
 ## Deliberate boundaries
 
 PaneFlow contains operational AP/AR and inventory-valuation subledgers plus balanced accounting exports. It is not a replacement for a full general ledger, bank reconciliation, payroll, tax filing, or statutory consolidation system. EDI, carrier/customer/vendor portals, demand forecasting, route optimization, manufacturing/MRP, and automated bank feeds are also outside this release. Those integrations can consume the transactional outbox and exports without weakening the operational audit trail.
+
+The product master is an operational catalog rather than a full merchandising/PIM module. Vendor-product cross references and lead times, per-warehouse replenishment policy, barcode/UPC, and dimensional weight remain explicit follow-up work. Customer contract prices and volume tiers are supported; the product selling price and global reorder point remain catalog fallbacks and must not be represented as warehouse-specific planning data.

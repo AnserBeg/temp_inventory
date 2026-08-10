@@ -10,13 +10,24 @@ export const businessPartners = sqliteTable(
     partnerType: text("partner_type").notNull(),
     email: text("email"),
     phone: text("phone"),
+    addressLine1: text("address_line_1"),
+    addressLine2: text("address_line_2"),
+    city: text("city"),
+    region: text("region"),
+    postalCode: text("postal_code"),
+    country: text("country").notNull().default("CA"),
     paymentTerms: text("payment_terms"),
     currency: text("currency").notNull().default("CAD"),
+    creditLimitCents: integer("credit_limit_cents").notNull().default(0),
+    creditHold: integer("credit_hold", { mode: "boolean" }).notNull().default(false),
     active: integer("active", { mode: "boolean" }).notNull().default(true),
     version: integer("version").notNull().default(1),
     createdAt: text("created_at").notNull(),
   },
-  (table) => [uniqueIndex("idx_business_partners_code").on(table.code)]
+  (table) => [
+    uniqueIndex("idx_business_partners_code").on(table.code),
+    index("idx_business_partners_active_name").on(table.active, table.name),
+  ]
 );
 
 export const products = sqliteTable(
@@ -42,7 +53,10 @@ export const products = sqliteTable(
     version: integer("version").notNull().default(1),
     createdAt: text("created_at").notNull(),
   },
-  (table) => [uniqueIndex("idx_products_sku").on(table.sku)]
+  (table) => [
+    uniqueIndex("idx_products_sku").on(table.sku),
+    index("idx_products_active_name").on(table.active, table.name),
+  ]
 );
 
 export const locations = sqliteTable(
@@ -58,7 +72,10 @@ export const locations = sqliteTable(
     active: integer("active", { mode: "boolean" }).notNull().default(true),
     version: integer("version").notNull().default(1),
   },
-  (table) => [uniqueIndex("idx_locations_code").on(table.code)]
+  (table) => [
+    uniqueIndex("idx_locations_code").on(table.code),
+    index("idx_locations_warehouse_status_active").on(table.warehouseId, table.inventoryStatus, table.active),
+  ]
 );
 
 export const purchaseOrders = sqliteTable(
@@ -85,6 +102,7 @@ export const purchaseOrders = sqliteTable(
   (table) => [
     uniqueIndex("idx_purchase_orders_number").on(table.number),
     index("idx_purchase_orders_vendor_status").on(table.vendorId, table.lifecycleStatus),
+    index("idx_purchase_orders_status_expected").on(table.lifecycleStatus, table.expectedDate),
   ]
 );
 
@@ -97,9 +115,16 @@ export const purchaseOrderLines = sqliteTable(
     orderedQty: real("ordered_qty").notNull(),
     closedQty: real("closed_qty").notNull().default(0),
     unitCostCents: integer("unit_cost_cents").notNull(),
+    orderedUomId: text("ordered_uom_id"),
+    orderedUomQty: real("ordered_uom_qty"),
+    orderedUomUnitCostCents: integer("ordered_uom_unit_cost_cents"),
     configurationSnapshot: text("configuration_snapshot"),
     fulfillmentRoute: text("fulfillment_route").notNull().default("stock"),
     sourceSalesOrderLineId: text("source_sales_order_line_id"),
+    discountCents: integer("discount_cents").notNull().default(0),
+    taxable: integer("taxable", { mode: "boolean" }).notNull().default(false),
+    taxRateBps: integer("tax_rate_bps").notNull().default(0),
+    version: integer("version").notNull().default(1),
   },
   (table) => [
     index("idx_purchase_order_lines_order").on(table.purchaseOrderId),
@@ -154,12 +179,21 @@ export const salesOrders = sqliteTable(
     totalCents: integer("total_cents").notNull(),
     ownerName: text("owner_name"),
     projectReference: text("project_reference"),
+    shipToName: text("ship_to_name"),
+    shipToAddressLine1: text("ship_to_address_line_1"),
+    shipToAddressLine2: text("ship_to_address_line_2"),
+    shipToCity: text("ship_to_city"),
+    shipToRegion: text("ship_to_region"),
+    shipToPostalCode: text("ship_to_postal_code"),
+    shipToCountry: text("ship_to_country"),
+    deliveryInstructions: text("delivery_instructions"),
     version: integer("version").notNull().default(1),
     createdAt: text("created_at").notNull(),
   },
   (table) => [
     uniqueIndex("idx_sales_orders_number").on(table.number),
     index("idx_sales_orders_customer_status").on(table.customerId, table.lifecycleStatus),
+    index("idx_sales_orders_status_requested").on(table.lifecycleStatus, table.requestedDate),
   ]
 );
 
@@ -172,6 +206,9 @@ export const salesOrderLines = sqliteTable(
     orderedQty: real("ordered_qty").notNull(),
     canceledQty: real("canceled_qty").notNull().default(0),
     unitPriceCents: integer("unit_price_cents").notNull(),
+    orderedUomId: text("ordered_uom_id"),
+    orderedUomQty: real("ordered_uom_qty"),
+    orderedUomUnitPriceCents: integer("ordered_uom_unit_price_cents"),
     configurationSnapshot: text("configuration_snapshot"),
     fulfillmentRoute: text("fulfillment_route").notNull().default("stock"),
     projectReference: text("project_reference"),
@@ -235,6 +272,17 @@ export const shipments = sqliteTable(
     number: text("number").notNull(),
     salesOrderId: text("sales_order_id").notNull(),
     status: text("status").notNull().default("posted"),
+    carrier: text("carrier"),
+    serviceLevel: text("service_level"),
+    trackingNumber: text("tracking_number"),
+    billOfLadingNumber: text("bill_of_lading_number"),
+    shipToName: text("ship_to_name"),
+    shipToAddressLine1: text("ship_to_address_line_1"),
+    shipToAddressLine2: text("ship_to_address_line_2"),
+    shipToCity: text("ship_to_city"),
+    shipToRegion: text("ship_to_region"),
+    shipToPostalCode: text("ship_to_postal_code"),
+    shipToCountry: text("ship_to_country"),
     postedAt: text("posted_at").notNull(),
     version: integer("version").notNull().default(1),
   },
@@ -308,6 +356,7 @@ export const stockMovements = sqliteTable(
   },
   (table) => [
     index("idx_stock_movements_product_posted").on(table.productId, table.postedAt),
+    index("idx_stock_movements_posted").on(table.postedAt),
     index("idx_stock_movements_po_line").on(table.purchaseOrderLineId),
     index("idx_stock_movements_so_line").on(table.salesOrderLineId),
     index("idx_stock_movements_source").on(table.sourceDocumentType, table.sourceDocumentId),
@@ -318,8 +367,8 @@ export const stockMovements = sqliteTable(
 export const inventoryBalances = sqliteTable(
   "inventory_balances",
   {
-    productId: text("product_id").notNull(),
-    locationId: text("location_id").notNull(),
+    productId: text("product_id").notNull().references(() => products.id),
+    locationId: text("location_id").notNull().references(() => locations.id),
     onHandQty: real("on_hand_qty").notNull().default(0),
     reservedQty: real("reserved_qty").notNull().default(0),
     version: integer("version").notNull().default(1),
@@ -370,7 +419,10 @@ export const vendorBills = sqliteTable("vendor_bills", {
   taxCode: text("tax_code"),
   paymentTerms: text("payment_terms"),
   version: integer("version").notNull().default(1),
-}, (table) => [uniqueIndex("idx_vendor_bills_vendor_invoice").on(table.vendorId, table.vendorInvoiceNumber)]);
+}, (table) => [
+  uniqueIndex("idx_vendor_bills_vendor_invoice").on(table.vendorId, table.vendorInvoiceNumber),
+  index("idx_vendor_bills_status_due").on(table.status, table.dueDate),
+]);
 
 export const commandLog = sqliteTable("command_log", {
   idempotencyKey: text("idempotency_key").primaryKey(),
@@ -396,7 +448,10 @@ export const auditEvents = sqliteTable(
     metadataJson: text("metadata_json"),
     createdAt: text("created_at").notNull(),
   },
-  (table) => [index("idx_audit_events_entity_created").on(table.entityType, table.entityId, table.createdAt)]
+  (table) => [
+    index("idx_audit_events_entity_created").on(table.entityType, table.entityId, table.createdAt),
+    index("idx_audit_events_action_created").on(table.action, table.createdAt),
+  ]
 );
 
 export const appUsers = sqliteTable("app_users", {
@@ -599,7 +654,10 @@ export const customerInvoices = sqliteTable(
     postedBy: text("posted_by").notNull(),
     version: integer("version").notNull().default(1),
   },
-  (table) => [uniqueIndex("idx_customer_invoices_number").on(table.number)]
+  (table) => [
+    uniqueIndex("idx_customer_invoices_number").on(table.number),
+    index("idx_customer_invoices_status_due").on(table.status, table.dueDate),
+  ]
 );
 
 export const customerInvoiceLines = sqliteTable(
@@ -838,6 +896,70 @@ export const uomConversions = sqliteTable(
   ]
 );
 
+export const priceLists = sqliteTable(
+  "price_lists",
+  {
+    id: text("id").primaryKey(),
+    code: text("code").notNull(),
+    name: text("name").notNull(),
+    currency: text("currency").notNull().default("CAD"),
+    priority: integer("priority").notNull().default(0),
+    validFrom: text("valid_from"),
+    validTo: text("valid_to"),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_price_lists_code").on(table.code),
+    index("idx_price_lists_active_priority").on(table.active, table.priority),
+  ]
+);
+
+export const priceListAssignments = sqliteTable(
+  "price_list_assignments",
+  {
+    id: text("id").primaryKey(),
+    priceListId: text("price_list_id").notNull().references(() => priceLists.id),
+    partnerId: text("partner_id").notNull().references(() => businessPartners.id),
+    priority: integer("priority").notNull().default(0),
+    validFrom: text("valid_from"),
+    validTo: text("valid_to"),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_price_list_assignments_list_partner").on(table.priceListId, table.partnerId),
+    index("idx_price_list_assignments_partner_active").on(table.partnerId, table.active, table.priority),
+  ]
+);
+
+export const priceListEntries = sqliteTable(
+  "price_list_entries",
+  {
+    id: text("id").primaryKey(),
+    priceListId: text("price_list_id").notNull().references(() => priceLists.id),
+    productId: text("product_id").notNull().references(() => products.id),
+    uomId: text("uom_id").notNull().references(() => unitsOfMeasure.id),
+    minimumQuantity: real("minimum_quantity").notNull().default(1),
+    unitPriceCents: integer("unit_price_cents").notNull(),
+    validFrom: text("valid_from"),
+    validTo: text("valid_to"),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_price_list_entries_scope").on(table.priceListId, table.productId, table.uomId, table.minimumQuantity),
+    index("idx_price_list_entries_lookup").on(table.productId, table.uomId, table.active, table.minimumQuantity),
+    check("price_list_entry_quantity_check", sql`${table.minimumQuantity} > 0`),
+    check("price_list_entry_price_check", sql`${table.unitPriceCents} >= 0`),
+  ]
+);
+
 export const inventoryTransfers = sqliteTable("inventory_transfers", {
   id: text("id").primaryKey(),
   number: text("number").notNull().unique(),
@@ -862,3 +984,43 @@ export const inventoryTransferLines = sqliteTable("inventory_transfer_lines", {
   lotId: text("lot_id").references(() => inventoryLots.id),
   inventoryUnitId: text("inventory_unit_id").references(() => inventoryUnits.id),
 });
+
+/**
+ * Monotonic per-prefix counters so operational documents get short sequential numbers
+ * (SO-000142) instead of random suffixes that nobody can read over the phone.
+ */
+export const documentSequences = sqliteTable("document_sequences", {
+  prefix: text("prefix").primaryKey(),
+  nextValue: integer("next_value").notNull().default(0),
+  updatedAt: text("updated_at").notNull(),
+});
+
+/**
+ * Ship-to address book. Distributors deliver the same customer's orders to many job
+ * sites, so addresses belong to the partner rather than being retyped per order.
+ */
+export const partnerAddresses = sqliteTable(
+  "partner_addresses",
+  {
+    id: text("id").primaryKey(),
+    partnerId: text("partner_id").notNull().references(() => businessPartners.id),
+    label: text("label").notNull(),
+    contactName: text("contact_name"),
+    addressLine1: text("address_line_1").notNull(),
+    addressLine2: text("address_line_2"),
+    city: text("city").notNull(),
+    region: text("region").notNull(),
+    postalCode: text("postal_code").notNull(),
+    country: text("country").notNull().default("CA"),
+    deliveryInstructions: text("delivery_instructions"),
+    isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_partner_addresses_label").on(table.partnerId, table.label),
+    index("idx_partner_addresses_partner_active").on(table.partnerId, table.active, table.isDefault),
+  ]
+);
