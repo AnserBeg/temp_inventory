@@ -9,10 +9,12 @@
     "predev": "node scripts/apply-local-migrations.mjs",
     "dev": "vinext dev",
     "build": "vinext build",
-    "start": "vinext start",
+    "prestart": "node scripts/apply-local-migrations.mjs && vinext build",
+    "start": "node scripts/start-local.mjs",
     "test": "npm run build && npm run test:production",
     "test:production": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/*.test.mjs",
     "test:domain": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/production-integration.test.mjs tests/workflow-envelope.test.mjs",
+    "test:qbo": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/qbo-integration.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit"

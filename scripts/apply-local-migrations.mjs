@@ -16,6 +16,8 @@ const result = spawnSync(
     "--local",
     "--config",
     "wrangler.local.jsonc",
+    "--persist-to",
+    ".wrangler/state",
   ],
   {
     cwd: fileURLToPath(new URL("..", import.meta.url)),

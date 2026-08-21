@@ -44,7 +44,9 @@ test("inter-warehouse transfers use an active configured transit location", () =
   assert.match(move, /inTransitLocationId: interWarehouse \? destinationId : null/);
   assert.doesNotMatch(move, /loc-interwarehouse-transit/);
   assert.match(operationsSource, /<option value="in_transit">In transit<\/option>/);
-  assert.match(operationsSource, /detail === "in_transit" \? "in_transit" : "usable"/);
+  // Status is now an independent field, so the invariant is that the two types the transfer
+  // query matches on are coerced to agree with their location type rather than left to drift.
+  assert.match(operationsSource, /inventoryStatus: detail === "in_transit" \? "in_transit" : detail === "quarantine" \? "quarantine" : inventoryStatus/);
 });
 
 test("locations with stock cannot be reclassified or deactivated", () => {

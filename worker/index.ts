@@ -1,10 +1,21 @@
-/** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { processOutboxBatch } from "@/lib/server/outbox";
+import { processQboSyncBatch } from "@/lib/server/qbo-sync";
+import { processQboWebhookBatch } from "@/lib/server/qbo-webhook";
 
 interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
+  FILES: R2Bucket;
+  OUTBOX_WEBHOOK_URL?: string;
+  OUTBOX_WEBHOOK_SECRET?: string;
+  QBO_CLIENT_ID?: string;
+  QBO_CLIENT_SECRET?: string;
+  QBO_TOKEN_ENCRYPTION_KEY?: string;
+  QBO_REDIRECT_URI?: string;
+  QBO_WEBHOOK_VERIFIER_TOKEN?: string;
+  QBO_MINOR_VERSION?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -41,6 +52,18 @@ const worker = {
     }
 
     return handler.fetch(request, env, ctx);
+  },
+  async scheduled(): Promise<void> {
+    const results = await Promise.allSettled([
+      processOutboxBatch({ limit: 100 }),
+      processQboWebhookBatch(100),
+      processQboSyncBatch({ limit: 100 }),
+    ]);
+    const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) {
+      console.error("Scheduled integration processing failed.", ...failures);
+      throw new AggregateError(failures, `${failures.length} scheduled integration processor(s) failed.`);
+    }
   },
 };
 

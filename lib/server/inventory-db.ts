@@ -57,12 +57,8 @@ export function commandD1(command: CommandClaim): D1Database {
 }
 
 function demoBootstrapEnabled() {
-  const runtime = env as unknown as { BOOTSTRAP_DEMO_DATA?: string; ENVIRONMENT?: string };
-  const explicit = runtime.BOOTSTRAP_DEMO_DATA?.toLowerCase();
-  if (explicit === "true") return true;
-  if (explicit === "false") return false;
-  const nodeEnvironment = typeof process !== "undefined" ? process.env.NODE_ENV : undefined;
-  return nodeEnvironment === "development" || runtime.ENVIRONMENT === "development";
+  const runtime = env as unknown as { BOOTSTRAP_DEMO_DATA?: string };
+  return runtime.BOOTSTRAP_DEMO_DATA?.trim().toLowerCase() === "true";
 }
 
 export function statement(sql: string, ...values: SqlValue[]) {
@@ -234,6 +230,11 @@ async function seedDatabase(db: D1Database) {
 }
 
 async function seedAdvancedDatabase(db: D1Database) {
+  // Sample data is only for an empty database. Its rows reference the sample products and
+  // partners, so injecting them into a database that already holds real master data fails
+  // on a foreign key and takes every request down with it.
+  const existing = await db.prepare("SELECT id FROM products LIMIT 1").first();
+  if (existing) return;
   const now = new Date().toISOString();
   const statements = [
     db.prepare("INSERT OR IGNORE INTO warehouses (id, code, name, timezone, active) VALUES ('warehouse-main','YYC','Calgary Distribution Centre','America/Edmonton',1)"),
@@ -246,9 +247,10 @@ async function seedAdvancedDatabase(db: D1Database) {
     db.prepare("INSERT OR IGNORE INTO locations (id, code, name, location_type, inventory_status, warehouse_id, parent_location_id) VALUES ('loc-interwarehouse-transit','TRANSIT-YYC-YEG','Calgary to Edmonton transit','in_transit','in_transit','warehouse-main',NULL)"),
     db.prepare("UPDATE locations SET warehouse_id='warehouse-main' WHERE warehouse_id IS NULL OR warehouse_id='warehouse-main'"),
     db.prepare("INSERT OR IGNORE INTO app_users (user_id, email, full_name, role, active, created_at, updated_at) VALUES ('local-dev', 'local@paneflow.dev', 'Local developer', 'administrator', 1, ?, ?)").bind(now, now),
-    db.prepare("INSERT OR IGNORE INTO system_settings (key, value_json, description, version, updated_by, updated_at) VALUES ('receiving.overReceiptPolicy', ?, 'Percentage tolerance and approval threshold for receipts above ordered quantity.', 1, 'System', ?)").bind(JSON.stringify({ tolerancePct: 5, approvalRequiredAbovePct: 0 }), now),
+    db.prepare("INSERT OR IGNORE INTO system_settings (key, value_json, description, version, updated_by, updated_at) VALUES ('receiving.overReceiptPolicy', ?, 'Percentage and absolute-quantity tolerance for receipts above ordered quantity.', 1, 'System', ?)").bind(JSON.stringify({ tolerancePct: 5, toleranceQuantity: 0 }), now),
     db.prepare("INSERT OR IGNORE INTO system_settings (key, value_json, description, version, updated_by, updated_at) VALUES ('inventory.negativeAllowed', 'false', 'Negative on-hand inventory is blocked by default.', 1, 'System', ?)").bind(now),
     db.prepare("INSERT OR IGNORE INTO system_settings (key, value_json, description, version, updated_by, updated_at) VALUES ('inventory.countApprovalThreshold', ?, 'Absolute inventory count variance thresholds requiring manager approval.', 1, 'System', ?)").bind(JSON.stringify({ absoluteQuantity: 5, absoluteValueCents: 100000 }), now),
+    db.prepare("INSERT OR IGNORE INTO system_settings (key, value_json, description, version, updated_by, updated_at) VALUES ('inventory.scrapApprovalThresholdCents', '50000', 'Inventory value above which scrap requires manager approval.', 1, 'System', ?)").bind(now),
     db.prepare("INSERT OR IGNORE INTO system_settings (key, value_json, description, version, updated_by, updated_at) VALUES ('matching.tolerances', ?, 'Quantity, unit-price, total, and allowed-charge tolerances for three-way matching.', 1, 'System', ?)").bind(JSON.stringify({ quantity: 0, unitPriceCents: 2500, totalCents: 5000, allowedChargeKinds: ['freight', 'fuel_surcharge', 'environmental_fee'] }), now),
     db.prepare("INSERT OR IGNORE INTO system_settings (key, value_json, description, version, updated_by, updated_at) VALUES ('tax.defaultRateBps', '500', 'Default GST rate in basis points.', 1, 'System', ?)").bind(now),
     db.prepare("INSERT OR IGNORE INTO system_settings (key, value_json, description, version, updated_by, updated_at) VALUES ('security.defaultRole', ?, 'Least-privilege role assigned to authenticated users without an explicit mapping.', 1, 'System', ?)").bind(JSON.stringify('viewer'), now),
@@ -308,9 +310,26 @@ export function newId(prefix: string) {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
-export function documentNumber(prefix: string) {
-  const date = new Date().toISOString().slice(2, 10).replaceAll("-", "");
-  return `${prefix}-${date}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+/**
+ * Reserves the next number for a document prefix.
+ *
+ * Numbers are sequential and never reused: accounting, customer AP departments, and the
+ * QuickBooks handoff all expect readable ascending document numbers, and a random suffix
+ * cannot be dictated over the phone. The counter is bumped by a single atomic upsert, so
+ * concurrent commands can never claim the same value. A command that fails after reserving
+ * leaves a gap, which is the correct trade: a gap is auditable, a duplicate is not.
+ */
+export async function nextDocumentNumber(prefix: string) {
+  const row = await first<{ nextValue: number }>(
+    `INSERT INTO document_sequences (prefix, next_value, updated_at) VALUES (?, 1, ?)
+     ON CONFLICT(prefix) DO UPDATE SET next_value = next_value + 1, updated_at = excluded.updated_at
+     RETURNING next_value AS nextValue`,
+    prefix,
+    new Date().toISOString(),
+  );
+  const value = Number(row?.nextValue ?? 0);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`Could not reserve a ${prefix} document number.`);
+  return `${prefix}-${String(value).padStart(6, "0")}`;
 }
 
 export function roundQuantity(value: number) {

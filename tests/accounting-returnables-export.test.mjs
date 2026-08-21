@@ -44,7 +44,7 @@ test("returnable rows preserve references and do not masquerade as balanced GL e
   ]) assert.match(source, new RegExp(`${field}:`));
   assert.match(source, /reference: `returnable_event:\$\{event\.id\}`/);
   assert.match(source, /const obligationReference = `returnable_obligation:\$\{/);
-  assert.match(source, /returnable obligations do not store a transaction currency/);
+  assert.match(source, /returnable deposits are denominated in CAD/);
   assert.match(source, /debit_cents: 0,\s+credit_cents: 0/);
 });
 
@@ -60,6 +60,7 @@ test("QuickBooks export uses balanced journal import columns and stable PaneFlow
   for (const account of ["Inventory clearing", "Landed cost clearing", "Vendor return clearing", "Cost of goods sold", "Inventory scrap expense", "Inventory adjustment expense", "Opening balance equity", "Refundable returnable deposits payable", "Refundable returnable deposits receivable", "Distribution fees revenue", "Forfeited returnable deposit revenue"]) {
     assert.match(source, new RegExp(account));
   }
-  assert.match(source, /payment\.documentType==="returnable_deposit"/);
+  assert.match(source, /payment\.documentType==="returnable_deposit_collection"/);
+  assert.match(source, /payment\.documentType==="returnable_deposit_refund"/);
   assert.match(source, /document_charges dc WHERE dc\.document_type='customer_invoice'/);
 });

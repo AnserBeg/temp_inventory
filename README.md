@@ -43,9 +43,23 @@ The first authenticated user on an empty private deployment is recorded as the a
 
 Every write derives its actor from Sites authentication headers; client-supplied actor fields are ignored.
 
-## QuickBooks handoff
+## QuickBooks Online integration
 
-PaneFlow is the operational source of truth; QuickBooks remains the accounting ledger. The Reports workspace provides an accounting control export and a balanced QuickBooks journal CSV with journal number/date, account, description, debit, credit, partner name, and immutable PaneFlow source references. The export is itself written to the audit log and outbox. Before the first import, create or map the named accounts in QuickBooks; any account-name customization should be handled as deployment configuration rather than by rewriting historical operations.
+PaneFlow is the operational and inventory source of truth; QuickBooks Online remains the general ledger and banking system. The native integration sends customers, vendors, non-inventory products, approved purchase orders, customer invoices, approved vendor bills, credits, and payments. Draft or pending purchase orders and match-held bills remain in PaneFlow until approval. Inventory receipts, COGS, returns, scrap, counts, landed cost, and returnable-deposit forfeitures are sent as balanced journal entries so QBO does not maintain a second, competing stock valuation. Lots, serials, bins, reservations, physical movements, and R2 attachments stay in PaneFlow.
+
+The connection uses Intuit OAuth 2.0. Access and refresh tokens are AES-GCM encrypted before they are stored in D1; the encryption key remains a Worker secret. Delivery is durable and at least once, with local idempotency, stable QBO-ID links, `SyncToken` conflict detection, exponential retry, signed webhook ingestion, and reconciliation. PaneFlow never guesses a chart-of-accounts or Canadian tax mapping: missing mappings appear as administrator-visible conflicts.
+
+To configure an Intuit app:
+
+1. Create an app in the Intuit Developer dashboard and enable the `com.intuit.quickbooks.accounting` scope. A QBO Plus or Advanced company is required when purchase orders are part of the workflow.
+2. Register `https://YOUR_HOST/api/integrations/qbo/callback` as an OAuth redirect URI and `https://YOUR_HOST/api/integrations/qbo/webhook` as the webhook endpoint. Enable the current CloudEvents v1.0 webhook payload; the endpoint also accepts Intuit's legacy payload during migration. Use the equivalent localhost callback for sandbox development.
+3. Set `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `QBO_REDIRECT_URI`, and `QBO_WEBHOOK_VERIFIER_TOKEN` as Worker secrets. Set `QBO_TOKEN_ENCRYPTION_KEY` to an independent, randomly generated value of at least 32 characters. `QBO_MINOR_VERSION` defaults to `75`.
+4. Open **Reports & admin → Integrations**, connect a sandbox company, load its reference lists, and map every applicable PaneFlow accounting role plus all local tax codes, payment terms, and payment methods. Map **Vendor payment credit card** if bills can be paid from a credit-card account.
+5. Run the initial sync from the chosen cutover date, resolve any worklist conflicts, reconcile, and only then repeat the connection process for production.
+
+The same screen supports manual sync, retry, disconnect/revocation, delivery inspection, and round-robin reconciliation. The Worker also projects and delivers QBO work every five minutes. QBO webhook edits are treated as conflicts because the integration is intentionally one-way for PaneFlow-owned records; an administrator can retry the conflict to refresh its current `SyncToken` and overwrite it from PaneFlow.
+
+The Reports workspace still provides an accounting control export and balanced QuickBooks journal CSV as an audited fallback and reconciliation artifact.
 
 ## Local development
 
@@ -58,7 +72,24 @@ npm run dev
 
 The `predev` hook applies every pending migration to the project-local D1 database before the server starts. The local Sites configuration then provides the matching D1 and R2 bindings. Development-only sample records are gated from production; a hosted empty database starts with the authenticated administrator bootstrap and master-data setup flow.
 
-Copy `.dev.vars.example` to `.dev.vars` for explicit local Cloudflare runtime flags. Set `ALLOW_LOCAL_DEV_AUTH=true` only for a private local process; host names and `Host` headers never enable authentication bypass. Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Production deployments must keep both values `false`; `ENVIRONMENT=development` also enables the sample-data bootstrap and must not be used in production.
+Copy `.dev.vars.example` to `.dev.vars` for explicit local Cloudflare runtime flags. Set `ALLOW_LOCAL_DEV_AUTH=true` only for a private local process; host names and `Host` headers never enable authentication bypass. Set `BOOTSTRAP_DEMO_DATA=true` only for an isolated development database. Production deployments must keep both values `false`. No environment name implicitly seeds operational records.
+
+`npm start` applies pending local migrations, creates a fresh production build, and serves that build through a project-local Wrangler process so Cloudflare bindings such as D1, R2, and scheduled outbox delivery behave like the deployed application. Wrangler state and diagnostics stay under `.wrangler/`, including in restricted development environments. `vinext start` alone is intentionally not used because Node cannot load the Cloudflare runtime modules directly.
+
+## Transactional outbox delivery
+
+Every externally useful business event is committed to `outbox_events` in the same durable database operation as the workflow change. To deliver those events, configure both `OUTBOX_WEBHOOK_URL` and `OUTBOX_WEBHOOK_SECRET`; leaving both blank keeps ordinary integration events queued and still allows local R2 attachment cleanup events to run. Configure neither or both—setting only one is treated as an error.
+
+The Worker attempts queued delivery every five minutes and administrators can also retry it from **Reports & admin → Integrations**. Delivery is at least once. Failed calls use exponential backoff from 15 seconds up to one hour and retain their last error in the integration worklist. Consumers must deduplicate on the `id` field or `x-paneflow-event-id` header.
+
+Webhook requests are JSON `POST`s with these headers:
+
+- `x-paneflow-event-id`: immutable event identifier.
+- `x-paneflow-event-type`: business event type.
+- `x-paneflow-timestamp`: Unix time in seconds.
+- `x-paneflow-signature`: `sha256=<hex HMAC-SHA256>` over `<timestamp>.<raw request body>` using `OUTBOX_WEBHOOK_SECRET`.
+
+Consumers should verify the signature against the raw body with a constant-time comparison and reject stale timestamps before acknowledging with any 2xx response. Hosted deployments should use an HTTPS webhook URL.
 
 ## Database migrations
 

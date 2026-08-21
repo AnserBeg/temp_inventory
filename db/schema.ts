@@ -121,6 +121,10 @@ export const purchaseOrderLines = sqliteTable(
     configurationSnapshot: text("configuration_snapshot"),
     fulfillmentRoute: text("fulfillment_route").notNull().default("stock"),
     sourceSalesOrderLineId: text("source_sales_order_line_id"),
+    discountCents: integer("discount_cents").notNull().default(0),
+    taxable: integer("taxable", { mode: "boolean" }).notNull().default(false),
+    taxCode: text("tax_code").notNull().default("EXEMPT"),
+    taxRateBps: integer("tax_rate_bps").notNull().default(0),
     version: integer("version").notNull().default(1),
   },
   (table) => [
@@ -137,6 +141,11 @@ export const receipts = sqliteTable(
     purchaseOrderId: text("purchase_order_id").notNull(),
     status: text("status").notNull().default("posted"),
     postedAt: text("posted_at").notNull(),
+    /**
+     * The carrier or vendor paperwork that arrived with the goods. Receiving is reconciled
+     * against that document, and without somewhere to record it the number lived on paper only.
+     */
+    packingSlipNumber: text("packing_slip_number"),
     version: integer("version").notNull().default(1),
   },
   (table) => [
@@ -212,6 +221,7 @@ export const salesOrderLines = sqliteTable(
     linkedPurchaseOrderLineId: text("linked_purchase_order_line_id"),
     discountCents: integer("discount_cents").notNull().default(0),
     taxable: integer("taxable", { mode: "boolean" }).notNull().default(true),
+    taxCode: text("tax_code").notNull().default("EXEMPT"),
     taxRateBps: integer("tax_rate_bps").notNull().default(0),
   },
   (table) => [index("idx_sales_order_lines_order").on(table.salesOrderId)]
@@ -835,6 +845,220 @@ export const outboxEvents = sqliteTable(
   ]
 );
 
+/**
+ * One authorized QuickBooks company connection. Tokens are encrypted by the application
+ * before they reach D1; the encryption key is a Worker secret and is never stored here.
+ */
+export const qboConnections = sqliteTable(
+  "qbo_connections",
+  {
+    id: text("id").primaryKey(),
+    realmId: text("realm_id").notNull(),
+    environment: text("environment").notNull().default("sandbox"),
+    status: text("status").notNull().default("connected"),
+    companyName: text("company_name").notNull().default("QuickBooks company"),
+    country: text("country").notNull().default("CA"),
+    homeCurrency: text("home_currency").notNull().default("CAD"),
+    scopes: text("scopes").notNull().default("com.intuit.quickbooks.accounting"),
+    encryptedAccessToken: text("encrypted_access_token").notNull(),
+    encryptedRefreshToken: text("encrypted_refresh_token").notNull(),
+    accessTokenExpiresAt: text("access_token_expires_at").notNull(),
+    refreshTokenExpiresAt: text("refresh_token_expires_at"),
+    syncFrom: text("sync_from").notNull(),
+    initialSyncStatus: text("initial_sync_status").notNull().default("not_started"),
+    tokenLockOwner: text("token_lock_owner"),
+    tokenLockUntil: text("token_lock_until"),
+    connectedBy: text("connected_by").notNull(),
+    connectedAt: text("connected_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    disconnectedAt: text("disconnected_at"),
+    lastError: text("last_error"),
+    version: integer("version").notNull().default(1),
+  },
+  (table) => [
+    uniqueIndex("idx_qbo_connections_realm").on(table.realmId),
+    index("idx_qbo_connections_status").on(table.status),
+    check("qbo_connection_environment_check", sql`${table.environment} IN ('sandbox','production')`),
+    check("qbo_connection_status_check", sql`${table.status} IN ('connected','disconnected','error','reauthorization_required')`),
+    check("qbo_initial_sync_status_check", sql`${table.initialSyncStatus} IN ('not_started','queued','running','completed','failed')`),
+  ]
+);
+
+/** Short-lived, one-use OAuth state records bind callbacks to an authenticated administrator. */
+export const qboOauthStates = sqliteTable(
+  "qbo_oauth_states",
+  {
+    stateHash: text("state_hash").primaryKey(),
+    actorId: text("actor_id").notNull(),
+    actorEmail: text("actor_email").notNull(),
+    environment: text("environment").notNull(),
+    returnTo: text("return_to").notNull().default("/"),
+    syncFrom: text("sync_from").notNull(),
+    createdAt: text("created_at").notNull(),
+    expiresAt: text("expires_at").notNull(),
+    consumedAt: text("consumed_at"),
+  },
+  (table) => [
+    index("idx_qbo_oauth_states_expires").on(table.expiresAt),
+    check("qbo_oauth_state_environment_check", sql`${table.environment} IN ('sandbox','production')`),
+  ]
+);
+
+/** Logical PaneFlow accounting roles are mapped to immutable QBO Account IDs, never names. */
+export const qboAccountMappings = sqliteTable(
+  "qbo_account_mappings",
+  {
+    connectionId: text("connection_id").notNull().references(() => qboConnections.id),
+    logicalKey: text("logical_key").notNull(),
+    qboAccountId: text("qbo_account_id").notNull(),
+    qboAccountName: text("qbo_account_name").notNull(),
+    qboAccountType: text("qbo_account_type").notNull(),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    updatedBy: text("updated_by").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.connectionId, table.logicalKey] }),
+    index("idx_qbo_account_mappings_account").on(table.connectionId, table.qboAccountId),
+  ]
+);
+
+/** Tax codes, terms, payment methods, and other QBO-owned reference lists. */
+export const qboReferenceMappings = sqliteTable(
+  "qbo_reference_mappings",
+  {
+    connectionId: text("connection_id").notNull().references(() => qboConnections.id),
+    mappingType: text("mapping_type").notNull(),
+    localValue: text("local_value").notNull(),
+    qboEntityId: text("qbo_entity_id").notNull(),
+    qboEntityName: text("qbo_entity_name").notNull(),
+    metadataJson: text("metadata_json").notNull().default("{}"),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    updatedBy: text("updated_by").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.connectionId, table.mappingType, table.localValue] }),
+    index("idx_qbo_reference_mappings_entity").on(table.connectionId, table.mappingType, table.qboEntityId),
+  ]
+);
+
+/** Stable cross-system identity and optimistic-concurrency metadata. */
+export const qboEntityLinks = sqliteTable(
+  "qbo_entity_links",
+  {
+    id: text("id").primaryKey(),
+    connectionId: text("connection_id").notNull().references(() => qboConnections.id),
+    localEntityType: text("local_entity_type").notNull(),
+    localEntityId: text("local_entity_id").notNull(),
+    qboEntityType: text("qbo_entity_type").notNull(),
+    qboEntityId: text("qbo_entity_id").notNull(),
+    qboSyncToken: text("qbo_sync_token").notNull().default("0"),
+    localVersion: integer("local_version"),
+    sourceHash: text("source_hash"),
+    qboLastUpdatedAt: text("qbo_last_updated_at"),
+    status: text("status").notNull().default("synced"),
+    lastSyncedAt: text("last_synced_at").notNull(),
+    lastError: text("last_error"),
+  },
+  (table) => [
+    uniqueIndex("idx_qbo_entity_links_local").on(table.connectionId, table.localEntityType, table.localEntityId, table.qboEntityType),
+    uniqueIndex("idx_qbo_entity_links_remote").on(table.connectionId, table.qboEntityType, table.qboEntityId),
+    index("idx_qbo_entity_links_status").on(table.connectionId, table.status),
+    check("qbo_entity_link_status_check", sql`${table.status} IN ('synced','conflict','inactive','deleted','error')`),
+  ]
+);
+
+/** Per-destination delivery state. It is separate from the generic outbox so one integration
+ * cannot mark another destination's delivery complete. */
+export const qboSyncDeliveries = sqliteTable(
+  "qbo_sync_deliveries",
+  {
+    id: text("id").primaryKey(),
+    connectionId: text("connection_id").notNull().references(() => qboConnections.id),
+    outboxEventId: text("outbox_event_id").references(() => outboxEvents.id),
+    dedupeKey: text("dedupe_key").notNull(),
+    localEntityType: text("local_entity_type").notNull(),
+    localEntityId: text("local_entity_id").notNull(),
+    operation: text("operation").notNull().default("upsert"),
+    sourceVersion: integer("source_version"),
+    payloadJson: text("payload_json").notNull().default("{}"),
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    availableAt: text("available_at").notNull(),
+    lockedAt: text("locked_at"),
+    lastErrorCode: text("last_error_code"),
+    lastError: text("last_error"),
+    qboEntityType: text("qbo_entity_type"),
+    qboEntityId: text("qbo_entity_id"),
+    requestHash: text("request_hash"),
+    createdAt: text("created_at").notNull(),
+    processedAt: text("processed_at"),
+  },
+  (table) => [
+    uniqueIndex("idx_qbo_sync_deliveries_dedupe").on(table.connectionId, table.dedupeKey),
+    index("idx_qbo_sync_deliveries_claim").on(table.connectionId, table.status, table.availableAt),
+    index("idx_qbo_sync_deliveries_entity").on(table.connectionId, table.localEntityType, table.localEntityId),
+    check("qbo_sync_delivery_operation_check", sql`${table.operation} IN ('upsert','void','deactivate','reconcile')`),
+    check("qbo_sync_delivery_status_check", sql`${table.status} IN ('pending','processing','succeeded','failed','conflict','canceled')`),
+  ]
+);
+
+/** Verified QBO webhook notifications are durable before any API readback is attempted. */
+export const qboWebhookEvents = sqliteTable(
+  "qbo_webhook_events",
+  {
+    id: text("id").primaryKey(),
+    connectionId: text("connection_id").references(() => qboConnections.id),
+    realmId: text("realm_id").notNull(),
+    payloadSha256: text("payload_sha256").notNull(),
+    payloadJson: text("payload_json").notNull(),
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+    processedAt: text("processed_at"),
+    lastError: text("last_error"),
+  },
+  (table) => [
+    uniqueIndex("idx_qbo_webhook_events_payload").on(table.realmId, table.payloadSha256),
+    index("idx_qbo_webhook_events_status").on(table.status, table.createdAt),
+    check("qbo_webhook_status_check", sql`${table.status} IN ('pending','processing','processed','failed','ignored')`),
+  ]
+);
+
+export const qboSyncCursors = sqliteTable(
+  "qbo_sync_cursors",
+  {
+    connectionId: text("connection_id").notNull().references(() => qboConnections.id),
+    entityType: text("entity_type").notNull(),
+    lastChangedAt: text("last_changed_at").notNull(),
+    lastCheckedAt: text("last_checked_at").notNull(),
+    lastError: text("last_error"),
+  },
+  (table) => [primaryKey({ columns: [table.connectionId, table.entityType] })]
+);
+
+export const qboReconciliationRuns = sqliteTable(
+  "qbo_reconciliation_runs",
+  {
+    id: text("id").primaryKey(),
+    connectionId: text("connection_id").notNull().references(() => qboConnections.id),
+    status: text("status").notNull().default("running"),
+    checkedCount: integer("checked_count").notNull().default(0),
+    matchedCount: integer("matched_count").notNull().default(0),
+    conflictCount: integer("conflict_count").notNull().default(0),
+    errorCount: integer("error_count").notNull().default(0),
+    summaryJson: text("summary_json").notNull().default("{}"),
+    startedAt: text("started_at").notNull(),
+    completedAt: text("completed_at"),
+    lastError: text("last_error"),
+  },
+  (table) => [
+    index("idx_qbo_reconciliation_runs_started").on(table.connectionId, table.startedAt),
+    check("qbo_reconciliation_status_check", sql`${table.status} IN ('running','completed','failed')`),
+  ]
+);
+
 export const attachments = sqliteTable(
   "attachments",
   {
@@ -981,3 +1205,43 @@ export const inventoryTransferLines = sqliteTable("inventory_transfer_lines", {
   lotId: text("lot_id").references(() => inventoryLots.id),
   inventoryUnitId: text("inventory_unit_id").references(() => inventoryUnits.id),
 });
+
+/**
+ * Monotonic per-prefix counters so operational documents get short sequential numbers
+ * (SO-000142) instead of random suffixes that nobody can read over the phone.
+ */
+export const documentSequences = sqliteTable("document_sequences", {
+  prefix: text("prefix").primaryKey(),
+  nextValue: integer("next_value").notNull().default(0),
+  updatedAt: text("updated_at").notNull(),
+});
+
+/**
+ * Ship-to address book. Distributors deliver the same customer's orders to many job
+ * sites, so addresses belong to the partner rather than being retyped per order.
+ */
+export const partnerAddresses = sqliteTable(
+  "partner_addresses",
+  {
+    id: text("id").primaryKey(),
+    partnerId: text("partner_id").notNull().references(() => businessPartners.id),
+    label: text("label").notNull(),
+    contactName: text("contact_name"),
+    addressLine1: text("address_line_1").notNull(),
+    addressLine2: text("address_line_2"),
+    city: text("city").notNull(),
+    region: text("region").notNull(),
+    postalCode: text("postal_code").notNull(),
+    country: text("country").notNull().default("CA"),
+    deliveryInstructions: text("delivery_instructions"),
+    isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_partner_addresses_label").on(table.partnerId, table.label),
+    index("idx_partner_addresses_partner_active").on(table.partnerId, table.active, table.isDefault),
+  ]
+);

@@ -1,4 +1,4 @@
-import { ensureDatabase, first, getD1, newId } from "./inventory-db";
+import { ensureDatabase, first, getD1, newId, nextDocumentNumber } from "./inventory-db";
 import { normalizeProductQuantity, ProductQuantityError } from "./product-quantities";
 
 export type CreateOrderLine = {
@@ -55,10 +55,16 @@ export type CreateOrderInput = {
   freightCents?: number;
   feeCents?: number;
   refundableDepositCents?: number;
+  /** Internal context used while replacing an existing purchase-order draft. */
+  editingPurchaseOrderId?: string;
+  /** Supplied by the workflow envelope so both layers persist the same idempotency fingerprint. */
+  requestHash?: string;
 };
 
 type CreateOrderResult = {
   recordId: string;
+  /** Returned so the caller can put the caller straight onto the document it just created. */
+  number: string;
   message: string;
   impact: {
     physical: string;
@@ -83,6 +89,7 @@ export type NormalizedItem = {
   enteredUnitAmountCents: number;
   discountCents: number;
   taxable: boolean;
+  taxCode: string;
   taxRateBps: number;
   fulfillmentRoute: "stock" | "special_order" | "drop_ship";
   projectReference: string | null;
@@ -101,6 +108,9 @@ export type NormalizedCharge = {
   taxRateBps: number;
   taxCode: string | null;
 };
+
+const supportedChargeTypes = new Set(["freight", "fee", "handling_fee", "fuel_surcharge", "environmental_fee", "handling", "customs", "brokerage", "discount", "tax_adjustment", "core_deposit", "empty_deposit", "returnable_deposit", "other"]);
+const refundableChargeTypes = new Set(["core_deposit", "empty_deposit", "returnable_deposit"]);
 
 export class RecordValidationError extends Error {
   constructor(public code: string, message: string, public status = 400) { super(message); }
@@ -134,6 +144,12 @@ function basisPoints(value: unknown, field: string) {
   return normalized;
 }
 
+function normalizedTaxCode(value: unknown, taxable: boolean, taxRateBps: number) {
+  const supplied = typeof value === "string" ? value.trim().toUpperCase() : "";
+  if (supplied) return supplied === "ZERO" ? "ZERO" : supplied === "EXEMPT" ? "EXEMPT" : supplied;
+  return taxable && taxRateBps > 0 ? "GST" : taxable ? "ZERO" : "EXEMPT";
+}
+
 function validDate(value: unknown, field: string) {
   const normalized = requiredText(value, field);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) throw new RecordValidationError("VALIDATION_ERROR", `${field} must use YYYY-MM-DD format.`);
@@ -144,10 +160,7 @@ function validDate(value: unknown, field: string) {
   return normalized;
 }
 
-function orderNumber(prefix: "PO" | "SO") {
-  const date = new Date().toISOString().slice(2, 10).replaceAll("-", "");
-  return `${prefix}-${date}-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
-}
+
 
 async function replay(idempotencyKey: string, requestHash?: string) {
   const prior = await first<{ responseJson: string; requestHash: string | null }>("SELECT response_json AS responseJson, request_hash AS requestHash FROM command_log WHERE idempotency_key = ?", idempotencyKey);
@@ -165,7 +178,7 @@ function stableJson(value: unknown): string {
 }
 
 async function hashOrderInput(input: CreateOrderInput) {
-  const normalized = { ...input, actor: undefined, actorId: undefined, actorEmail: undefined };
+  const normalized = { ...input, actor: undefined, actorId: undefined, actorEmail: undefined, editingPurchaseOrderId: undefined, requestHash: undefined };
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableJson(normalized)));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -183,13 +196,20 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
   const charges: NormalizedCharge[] = [];
   for (const [index, line] of source.entries()) {
     if (line.kind === "charge") {
+      const chargeType = requiredText(line.chargeType, `lines[${index}].chargeType`).toLowerCase();
+      if (!supportedChargeTypes.has(chargeType)) throw new RecordValidationError("INVALID_CHARGE_TYPE", `lines[${index}].chargeType is not supported.`);
+      const direction = line.direction === "subtract" ? "subtract" : "add";
+      if (chargeType === "discount" && direction !== "subtract") throw new RecordValidationError("INVALID_CHARGE_DIRECTION", "Discount charges must subtract from the order total.");
+      if (refundableChargeTypes.has(chargeType) && direction !== "add") throw new RecordValidationError("INVALID_CHARGE_DIRECTION", "Refundable deposit charges must add to the order total.");
+      const refundable = line.refundable === true;
+      if (refundable !== refundableChargeTypes.has(chargeType)) throw new RecordValidationError("INVALID_REFUNDABLE_CHARGE", refundableChargeTypes.has(chargeType) ? `${chargeType} must be marked refundable.` : "Only core, empty, and returnable deposits may be marked refundable.");
       charges.push({
-        chargeType: requiredText(line.chargeType, `lines[${index}].chargeType`),
+        chargeType,
         description: requiredText(line.description, `lines[${index}].description`),
-        amountCents: cents(line.amountCents, `lines[${index}].amountCents`, true),
-        direction: line.direction === "subtract" ? "subtract" : "add",
+        amountCents: cents(line.amountCents, `lines[${index}].amountCents`),
+        direction,
         taxable: line.taxable === true,
-        refundable: line.refundable === true,
+        refundable,
         taxRateBps: basisPoints(line.taxRateBps, `lines[${index}].taxRateBps`),
         taxCode: typeof line.taxCode === "string" && line.taxCode.trim() ? line.taxCode.trim() : null,
       });
@@ -203,8 +223,8 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
       throw new RecordValidationError("VALIDATION_ERROR", `lines[${index}].fulfillmentRoute is invalid.`);
     }
     const enteredUnitAmount = input.type === "purchaseOrder"
-      ? cents(line.unitCostCents, `lines[${index}].unitCostCents`)
-      : cents(line.unitPriceCents, `lines[${index}].unitPriceCents`);
+      ? cents(line.unitCostCents, `lines[${index}].unitCostCents`, true)
+      : cents(line.unitPriceCents, `lines[${index}].unitPriceCents`, true);
     const enteredQuantity = positiveNumber(line.quantity, `lines[${index}].quantity`);
     let normalizedQuantity: Awaited<ReturnType<typeof normalizeProductQuantity>>;
     try {
@@ -225,14 +245,33 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
     if (discountCents > Math.round(enteredQuantity * enteredUnitAmount)) throw new RecordValidationError("VALIDATION_ERROR", `Line ${index + 1} discount exceeds its gross amount.`);
     const sourceSalesOrderLineId=typeof line.sourceSalesOrderLineId==="string"&&line.sourceSalesOrderLineId.trim()?line.sourceSalesOrderLineId.trim():null;
     const linkedPurchaseOrderLineId=typeof line.linkedPurchaseOrderLineId==="string"&&line.linkedPurchaseOrderLineId.trim()?line.linkedPurchaseOrderLineId.trim():null;
-    if(input.type==="purchaseOrder"&&route!=="stock"){if(!sourceSalesOrderLineId)throw new RecordValidationError("SUPPLY_LINK_REQUIRED",`Line ${index+1} requires sourceSalesOrderLineId for ${route}.`);const demand=await first("SELECT id FROM sales_order_lines WHERE id=? AND product_id=? AND fulfillment_route=?",sourceSalesOrderLineId,productId,route);if(!demand)throw new RecordValidationError("SUPPLY_LINK_MISMATCH",`Line ${index+1} source sales line does not match product and route.`,409);}
-    if(input.type==="salesOrder"&&linkedPurchaseOrderLineId){const supply=await first("SELECT id FROM purchase_order_lines WHERE id=? AND product_id=?",linkedPurchaseOrderLineId,productId);if(!supply)throw new RecordValidationError("SUPPLY_LINK_MISMATCH",`Line ${index+1} linked purchase line does not match the product.`,409);}
+    if (input.type === "purchaseOrder") {
+      if (linkedPurchaseOrderLineId) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot use linkedPurchaseOrderLineId on a purchase order.`);
+      if (route === "stock" && sourceSalesOrderLineId) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot link stock replenishment to customer demand.`);
+      if (route !== "stock") {
+        if (!sourceSalesOrderLineId) throw new RecordValidationError("SUPPLY_LINK_REQUIRED", `Line ${index + 1} requires sourceSalesOrderLineId for ${route}.`);
+        const demand = await first("SELECT id FROM sales_order_lines WHERE id=? AND product_id=? AND fulfillment_route=?", sourceSalesOrderLineId, productId, route);
+        if (!demand) throw new RecordValidationError("SUPPLY_LINK_MISMATCH", `Line ${index + 1} source sales line does not match product and route.`, 409);
+        const editingId = input.editingPurchaseOrderId?.trim() ?? "";
+        const available = await first(`SELECT sol.id FROM sales_order_lines sol
+          LEFT JOIN purchase_order_lines linked ON linked.id=sol.linked_purchase_order_line_id
+          WHERE sol.id=? AND (sol.linked_purchase_order_line_id IS NULL OR linked.purchase_order_id=?)
+            AND NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.source_sales_order_line_id=sol.id AND pol.purchase_order_id<>?)`, sourceSalesOrderLineId, editingId, editingId);
+        if (!available) throw new RecordValidationError("SUPPLY_LINK_IN_USE", `Line ${index + 1} customer demand is already linked to another purchase order.`, 409);
+      }
+    }
+    if (input.type === "salesOrder") {
+      if (sourceSalesOrderLineId) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot use sourceSalesOrderLineId on a sales order.`);
+      if (linkedPurchaseOrderLineId) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot link supply from the sales-order side. Save the demand first, then create the dedicated purchase order from that sales line.`, 409);
+    }
+    const taxable = line.taxable !== false;
+    const taxRateBps = basisPoints(line.taxRateBps, `lines[${index}].taxRateBps`);
     items.push({
       productId, productName: product.name, quantity, enteredQuantity, uomId: normalizedQuantity.fromUomId,
       uomCode: normalizedQuantity.fromUomCode, factorToBase: normalizedQuantity.factorToBase,
       unitAmountCents: unitAmount, enteredUnitAmountCents: enteredUnitAmount,
-      discountCents, taxable: line.taxable !== false,
-      taxRateBps: basisPoints(line.taxRateBps, `lines[${index}].taxRateBps`),
+      discountCents, taxable, taxCode: normalizedTaxCode(line.taxCode, taxable, taxRateBps),
+      taxRateBps,
       fulfillmentRoute: route,
       projectReference: typeof line.projectReference === "string" && line.projectReference.trim() ? line.projectReference.trim() : input.projectReference?.trim() || null,
       configurationSnapshot: typeof line.configurationSnapshot === "string" && line.configurationSnapshot.trim() ? line.configurationSnapshot : null,
@@ -240,6 +279,10 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
     });
   }
   if (!items.length) throw new RecordValidationError("VALIDATION_ERROR", "At least one item line is required.");
+  if (input.type === "purchaseOrder") {
+    const sourceIds = items.flatMap((line) => line.sourceSalesOrderLineId ? [line.sourceSalesOrderLineId] : []);
+    if (new Set(sourceIds).size !== sourceIds.length) throw new RecordValidationError("DUPLICATE_SUPPLY_LINK", "Each source sales-order line can be linked only once in a purchase order.", 409);
+  }
   return { items, charges };
 }
 
@@ -257,7 +300,7 @@ export async function prepareOrderDraft(input: CreateOrderInput) {
 export async function createOrderRecord(input: CreateOrderInput): Promise<CreateOrderResult> {
   await ensureDatabase();
   const idempotencyKey = requiredText(input.idempotencyKey, "idempotencyKey");
-  const requestHash = await hashOrderInput(input);
+  const requestHash = input.requestHash ?? await hashOrderInput(input);
   const claimToken = crypto.randomUUID();
   const prior = await replay(idempotencyKey, requestHash);
   if (prior) return prior;
@@ -267,9 +310,12 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
   const actorId = requiredText(input.actorId, "server actor id");
   const actorEmail = requiredText(input.actorEmail, "server actor email");
   const projectReference = typeof input.projectReference === "string" && input.projectReference.trim() ? input.projectReference.trim() : null;
-  const currency = typeof input.currency === "string" && /^[A-Z]{3}$/.test(input.currency.trim().toUpperCase()) ? input.currency.trim().toUpperCase() : "CAD";
+  const currency = typeof input.currency === "string" && input.currency.trim() ? input.currency.trim().toUpperCase() : "CAD";
+  if (!/^[A-Z]{3}$/.test(currency)) throw new RecordValidationError("VALIDATION_ERROR", "currency must be a three-letter ISO code.");
+  if (currency !== "CAD" && input.exchangeRateToBase == null) throw new RecordValidationError("EXCHANGE_RATE_REQUIRED", `Enter the ${currency}-to-CAD exchange rate.`);
   const exchangeRateToBase = input.exchangeRateToBase == null ? 1 : Number(input.exchangeRateToBase);
   if (!Number.isFinite(exchangeRateToBase) || exchangeRateToBase <= 0) throw new RecordValidationError("VALIDATION_ERROR", "exchangeRateToBase must be greater than zero.");
+  if (currency === "CAD" && exchangeRateToBase !== 1) throw new RecordValidationError("EXCHANGE_RATE_MISMATCH", "CAD documents must use an exchange rate of 1.");
   const paymentTerms = typeof input.paymentTerms === "string" && input.paymentTerms.trim() ? input.paymentTerms.trim() : null;
   const dueDate = input.dueDate == null ? null : validDate(input.dueDate, "dueDate");
   const { items, charges, taxCents, totalCents, quantity } = await prepareOrderDraft(input);
@@ -285,22 +331,29 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     const expectedDate = validDate(input.expectedDate, "expectedDate");
     const vendor = await first("SELECT id FROM business_partners WHERE id = ? AND partner_type IN ('vendor','both') AND active=1", vendorId);
     if (!vendor) throw new RecordValidationError("INVALID_VENDOR", "Select a valid vendor.", 404);
-    const number = orderNumber("PO");
+    const number = await nextDocumentNumber("PO");
     result = {
       recordId,
+      number,
       message: `${number} saved as a draft with ${items.length} item line${items.length === 1 ? "" : "s"}; approval is required before its ${quantity}-unit purchasing commitment becomes incoming supply.`,
       impact: { physical: "On-hand inventory and the immutable movement ledger are unchanged.", commercial: "Draft lines do not increase incoming forecast until approval.", financial: "Charges and tax are planned only; no vendor bill or payment was created.", onHandDelta: 0, incomingDelta: 0, reservedDelta: 0, availableDelta: 0 },
     };
+    const sourceLines = items.filter((line) => line.sourceSalesOrderLineId);
+    const sourceClaims = sourceLines.map(() => ` AND EXISTS (SELECT 1 FROM sales_order_lines sol
+      WHERE sol.id=? AND sol.product_id=? AND sol.fulfillment_route=? AND sol.linked_purchase_order_line_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.source_sales_order_line_id=sol.id))`).join("");
+    const sourceClaimValues = sourceLines.flatMap((line) => [line.sourceSalesOrderLineId!, line.productId, line.fulfillmentRoute]);
     statements = [
-      db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at) VALUES (?, 'create_purchase_order', ?, ?, ?, ?, ?)").bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now),
+      db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
+        SELECT ?, 'create_purchase_order', ?, ?, ?, ?, ? WHERE 1=1${sourceClaims}`).bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now, ...sourceClaimValues),
       db.prepare(`INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,buyer_name,project_reference,revision_number,version,created_at)
         SELECT ?,?,?,'draft','not_billed',?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
         .bind(recordId, number, vendorId, expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, now, idempotencyKey, recordId, claimToken),
     ];
     items.forEach((line) => {const lineId=newId("po-line");statements.push(db.prepare(`INSERT INTO purchase_order_lines
-      (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id)
-      SELECT ?,?,?,?,0,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId, idempotencyKey, recordId, claimToken));if(line.sourceSalesOrderLineId)statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=? WHERE id=? AND product_id=? AND linked_purchase_order_line_id IS NULL AND EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`).bind(lineId,line.sourceSalesOrderLineId,line.productId,idempotencyKey,recordId,claimToken));});
+      (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
+      SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+      .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId,line.discountCents,line.taxable ? 1 : 0,line.taxCode,line.taxRateBps, idempotencyKey, recordId, claimToken));if(line.sourceSalesOrderLineId)statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=? WHERE id=? AND product_id=? AND linked_purchase_order_line_id IS NULL AND EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`).bind(lineId,line.sourceSalesOrderLineId,line.productId,idempotencyKey,recordId,claimToken));});
     statements.push(db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
       SELECT ?,?,1,'draft',?,'Initial draft',?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(newId("revision"), recordId, JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase }), actor, now, idempotencyKey, recordId, claimToken));
@@ -318,10 +371,11 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     const shipToCountry = typeof input.shipToCountry === "string" && input.shipToCountry.trim() ? input.shipToCountry.trim().toUpperCase() : customer.country ?? "CA";
     const deliveryInstructions = typeof input.deliveryInstructions === "string" && input.deliveryInstructions.trim() ? input.deliveryInstructions.trim() : null;
     if (!shipToAddressLine1 || !shipToCity || !shipToRegion || !shipToPostalCode || !shipToCountry) throw new RecordValidationError("SHIP_TO_REQUIRED", "A complete ship-to address is required on the sales-order draft.");
-    const number = orderNumber("SO");
+    const number = await nextDocumentNumber("SO");
     result = {
       recordId,
-      message: `${number} saved as a draft with ${items.length} item line${items.length === 1 ? "" : "s"}; confirmation is required before its ${quantity} units become customer demand.`,
+      number,
+      message: `${number} saved as a draft with ${items.length} item line${items.length === 1 ? "" : "s"}; confirmation is required before its ${quantity} unit${quantity === 1 ? "" : "s"} become${quantity === 1 ? "s" : ""} customer demand.`,
       impact: { physical: "On-hand inventory and the immutable movement ledger are unchanged.", commercial: "Draft lines do not create active demand or reserve stock.", financial: "Charges and tax are planned only; no customer invoice or revenue posting was created.", onHandDelta: 0, incomingDelta: 0, reservedDelta: 0, availableDelta: 0 },
     };
     statements = [
@@ -331,9 +385,9 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
         .bind(recordId, number, customerId, requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, now, idempotencyKey, recordId, claimToken),
     ];
     items.forEach((line) => statements.push(db.prepare(`INSERT INTO sales_order_lines
-      (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_rate_bps)
-      SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("so-line"), recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.projectReference,line.linkedPurchaseOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxRateBps, idempotencyKey, recordId, claimToken)));
+      (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
+      SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+      .bind(newId("so-line"), recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.projectReference,line.linkedPurchaseOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps, idempotencyKey, recordId, claimToken)));
   }
 
   charges.forEach((charge) => statements.push(db.prepare(`INSERT INTO document_charges

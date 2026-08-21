@@ -1,0 +1,1 @@
+ALTER TABLE `receipts` ADD `packing_slip_number` text;
