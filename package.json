@@ -15,6 +15,7 @@
     "test:production": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/*.test.mjs",
     "test:domain": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/production-integration.test.mjs tests/workflow-envelope.test.mjs",
     "test:qbo": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/qbo-integration.test.mjs",
+    "benchmark:snapshot": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs scripts/benchmark-snapshot.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit"

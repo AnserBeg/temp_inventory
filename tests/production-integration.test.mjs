@@ -146,6 +146,51 @@ test("purchase-order worklists expose completed and closed-short filters", async
   assert.equal(closed.pagination.filteredTotal, 2);
 });
 
+test("worklist column sorts apply to the full server-side result set", async () => {
+  const ascending = await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 50, scope: "purchase-orders", search: "PO-FILTER-", sort: "number:asc" });
+  const descending = await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 50, scope: "purchase-orders", search: "PO-FILTER-", sort: "number:desc" });
+  assert.deepEqual(ascending.purchaseOrders.map((order) => order.number), ["PO-FILTER-FULLY", "PO-FILTER-OPEN", "PO-FILTER-SHORT"]);
+  assert.deepEqual(descending.purchaseOrders.map((order) => order.number), ["PO-FILTER-SHORT", "PO-FILTER-OPEN", "PO-FILTER-FULLY"]);
+
+  // Every clickable header family gets prepared by SQLite here, even when this compact
+  // migration fixture has no rows for a particular operational register yet.
+  const sortMatrix = {
+    "purchase-orders": ["exception", "number", "vendor", "status", "expected", "ordered", "received", "closed", "open", "billing", "total"],
+    "sales-orders": ["exception", "number", "customer", "requested", "availability", "fulfillment", "billing", "total"],
+    "customer-invoices": ["number", "customer", "ordered", "shipped", "invoiced", "availableToInvoice", "billing"],
+    stock: ["product", "location", "onHand", "usable", "reserved", "available", "incoming", "demand", "projected", "exception"],
+    products: ["product", "configuration", "policy", "units", "standardCost", "sellingPrice", "margin", "reorderPoint"],
+    movements: ["posted", "movement", "document", "order", "product", "quantity", "from", "to", "actor"],
+    counts: ["product", "location", "recorded", "reserved", "available"],
+    partners: ["partner", "type", "contact", "address", "terms", "credit"],
+    "vendor-bills": ["number", "vendorInvoice", "vendor", "purchaseOrder", "invoiced", "due", "authorized", "billed", "variance", "tax", "total", "outstanding", "match", "settlement"],
+  };
+  for (const [scope, columns] of Object.entries(sortMatrix)) {
+    for (const column of columns) {
+      const sort = `${column}:asc`;
+      await assert.doesNotReject(inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 10, scope, sort }), `${scope} accepts ${sort}`);
+    }
+  }
+});
+
+test("billable PO lines default from net receipts, prior bills, and the latest revised price", async () => {
+  await run("UPDATE purchase_order_lines SET unit_cost_cents=175,version=version+1 WHERE id='pol-filter-short'");
+  await run("INSERT INTO stock_movements (id,movement_type,product_id,quantity,inventory_status,source_document_type,source_document_id,purchase_order_line_id,posted_at,posted_by,idempotency_key) VALUES ('movement-filter-return','vendor_return','prod-completion-filter',-2,'usable','vendor_return','return-filter-short','pol-filter-short','2026-08-17T12:00:00Z','Tester','filter-return')");
+  await run("INSERT INTO vendor_bills (id,number,vendor_invoice_number,vendor_id,purchase_order_id,status,match_status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,version,posted_at) VALUES ('bill-filter-short','VB-FILTER-SHORT','FILTER-001','vendor-completion-filter','po-filter-short','approved','matched','2026-08-18','2026-09-17',100,0,100,0,'CAD',1,100,1,'2026-08-18T12:00:00Z')");
+  await run("INSERT INTO vendor_bill_lines (id,vendor_bill_id,purchase_order_line_id,product_id,quantity,unit_cost_cents,line_total_cents,match_status,match_details_json) VALUES ('bill-line-filter-short','bill-filter-short','pol-filter-short','prod-completion-filter',1,100,100,'matched','{}')");
+
+  const result = await inventoryDomain.searchInventoryReferences("purchaseOrderLines", "", 50, "billable", "po-filter-short");
+  assert.equal(result.items.length, 1);
+  assert.deepEqual({
+    ordered: result.items[0].orderedQuantity,
+    closed: result.items[0].closedQuantity,
+    netReceived: result.items[0].netReceivedQuantity,
+    previouslyBilled: result.items[0].billedQuantity,
+    billable: result.items[0].billableQuantity,
+    revisedUnitCost: result.items[0].unitCostCents,
+  }, { ordered: 10, closed: 4, netReceived: 4, previouslyBilled: 1, billable: 3, revisedUnitCost: 175 });
+});
+
 test("document numbers are sequential, unique, and never reused", async () => {
   const numbers = [];
   for (let index = 0; index < 250; index += 1) numbers.push(await inventoryDb.nextDocumentNumber("SHP"));

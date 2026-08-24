@@ -129,6 +129,7 @@ export const purchaseOrderLines = sqliteTable(
   },
   (table) => [
     index("idx_purchase_order_lines_order").on(table.purchaseOrderId),
+    index("idx_purchase_order_lines_product").on(table.productId),
     uniqueIndex("idx_purchase_order_lines_source_sales_line").on(table.sourceSalesOrderLineId),
   ]
 );
@@ -224,7 +225,10 @@ export const salesOrderLines = sqliteTable(
     taxCode: text("tax_code").notNull().default("EXEMPT"),
     taxRateBps: integer("tax_rate_bps").notNull().default(0),
   },
-  (table) => [index("idx_sales_order_lines_order").on(table.salesOrderId)]
+  (table) => [
+    index("idx_sales_order_lines_order").on(table.salesOrderId),
+    index("idx_sales_order_lines_product").on(table.productId),
+  ]
 );
 
 export const dropShipDeliveries = sqliteTable(
@@ -269,6 +273,7 @@ export const reservations = sqliteTable(
   (table) => [
     index("idx_reservations_line_status").on(table.salesOrderLineId, table.status),
     index("idx_reservations_product_location_status").on(table.productId, table.locationId, table.status),
+    index("idx_reservations_status_created").on(table.status, table.createdAt),
   ]
 );
 
@@ -382,6 +387,7 @@ export const inventoryBalances = sqliteTable(
   },
   (table) => [
     primaryKey({ columns: [table.productId, table.locationId] }),
+    index("idx_inventory_balances_location").on(table.locationId),
     check("inventory_balances_on_hand_check", sql`${table.onHandQty} >= 0`),
     check("inventory_balances_reserved_check", sql`${table.reservedQty} >= 0 AND ${table.reservedQty} <= ${table.onHandQty}`),
   ]
@@ -429,6 +435,8 @@ export const vendorBills = sqliteTable("vendor_bills", {
 }, (table) => [
   uniqueIndex("idx_vendor_bills_vendor_invoice").on(table.vendorId, table.vendorInvoiceNumber),
   index("idx_vendor_bills_status_due").on(table.status, table.dueDate),
+  index("idx_vendor_bills_match_due").on(table.matchStatus, table.dueDate),
+  index("idx_vendor_bills_purchase_order").on(table.purchaseOrderId),
 ]);
 
 export const commandLog = sqliteTable("command_log", {
@@ -518,6 +526,7 @@ export const approvals = sqliteTable(
   },
   (table) => [
     index("idx_approvals_entity_status").on(table.entityType, table.entityId, table.status),
+    index("idx_approvals_status").on(table.status),
     check("approvals_status_check", sql`${table.status} IN ('pending','approved','rejected','canceled')`),
   ]
 );
@@ -617,25 +626,32 @@ export const vendorBillLines = sqliteTable(
     matchStatus: text("match_status").notNull(),
     matchDetailsJson: text("match_details_json").notNull().default("{}"),
   },
-  (table) => [index("idx_vendor_bill_lines_bill").on(table.vendorBillId)]
+  (table) => [
+    index("idx_vendor_bill_lines_bill").on(table.vendorBillId),
+    index("idx_vendor_bill_lines_purchase_line").on(table.purchaseOrderLineId),
+  ]
 );
 
-export const vendorCredits = sqliteTable("vendor_credits", {
-  id: text("id").primaryKey(),
-  number: text("number").notNull().unique(),
-  vendorId: text("vendor_id").notNull(),
-  vendorBillId: text("vendor_bill_id").references(() => vendorBills.id),
-  purchaseOrderId: text("purchase_order_id").references(() => purchaseOrders.id),
-  amountCents: integer("amount_cents").notNull(),
-  reason: text("reason").notNull(),
-  status: text("status").notNull().default("posted"),
-  postedAt: text("posted_at").notNull(),
-  postedBy: text("posted_by").notNull(),
-  version: integer("version").notNull().default(1),
-  currency: text("currency").notNull().default("CAD"),
-  exchangeRateToBase: real("exchange_rate_to_base").notNull().default(1),
-  baseAmountCents: integer("base_amount_cents").notNull().default(0),
-});
+export const vendorCredits = sqliteTable(
+  "vendor_credits",
+  {
+    id: text("id").primaryKey(),
+    number: text("number").notNull().unique(),
+    vendorId: text("vendor_id").notNull(),
+    vendorBillId: text("vendor_bill_id").references(() => vendorBills.id),
+    purchaseOrderId: text("purchase_order_id").references(() => purchaseOrders.id),
+    amountCents: integer("amount_cents").notNull(),
+    reason: text("reason").notNull(),
+    status: text("status").notNull().default("posted"),
+    postedAt: text("posted_at").notNull(),
+    postedBy: text("posted_by").notNull(),
+    version: integer("version").notNull().default(1),
+    currency: text("currency").notNull().default("CAD"),
+    exchangeRateToBase: real("exchange_rate_to_base").notNull().default(1),
+    baseAmountCents: integer("base_amount_cents").notNull().default(0),
+  },
+  (table) => [index("idx_vendor_credits_bill_status_posted").on(table.vendorBillId, table.status, table.postedAt)]
+);
 
 export const customerInvoices = sqliteTable(
   "customer_invoices",
@@ -664,6 +680,7 @@ export const customerInvoices = sqliteTable(
   (table) => [
     uniqueIndex("idx_customer_invoices_number").on(table.number),
     index("idx_customer_invoices_status_due").on(table.status, table.dueDate),
+    index("idx_customer_invoices_sales_order").on(table.salesOrderId),
   ]
 );
 
@@ -678,25 +695,32 @@ export const customerInvoiceLines = sqliteTable(
     unitPriceCents: integer("unit_price_cents").notNull(),
     lineTotalCents: integer("line_total_cents").notNull(),
   },
-  (table) => [index("idx_customer_invoice_lines_invoice").on(table.customerInvoiceId)]
+  (table) => [
+    index("idx_customer_invoice_lines_invoice").on(table.customerInvoiceId),
+    index("idx_customer_invoice_lines_sales_line").on(table.salesOrderLineId),
+  ]
 );
 
-export const customerCredits = sqliteTable("customer_credits", {
-  id: text("id").primaryKey(),
-  number: text("number").notNull().unique(),
-  customerId: text("customer_id").notNull(),
-  customerInvoiceId: text("customer_invoice_id").references(() => customerInvoices.id),
-  salesOrderId: text("sales_order_id").references(() => salesOrders.id),
-  amountCents: integer("amount_cents").notNull(),
-  reason: text("reason").notNull(),
-  status: text("status").notNull().default("posted"),
-  postedAt: text("posted_at").notNull(),
-  postedBy: text("posted_by").notNull(),
-  version: integer("version").notNull().default(1),
-  currency: text("currency").notNull().default("CAD"),
-  exchangeRateToBase: real("exchange_rate_to_base").notNull().default(1),
-  baseAmountCents: integer("base_amount_cents").notNull().default(0),
-});
+export const customerCredits = sqliteTable(
+  "customer_credits",
+  {
+    id: text("id").primaryKey(),
+    number: text("number").notNull().unique(),
+    customerId: text("customer_id").notNull(),
+    customerInvoiceId: text("customer_invoice_id").references(() => customerInvoices.id),
+    salesOrderId: text("sales_order_id").references(() => salesOrders.id),
+    amountCents: integer("amount_cents").notNull(),
+    reason: text("reason").notNull(),
+    status: text("status").notNull().default("posted"),
+    postedAt: text("posted_at").notNull(),
+    postedBy: text("posted_by").notNull(),
+    version: integer("version").notNull().default(1),
+    currency: text("currency").notNull().default("CAD"),
+    exchangeRateToBase: real("exchange_rate_to_base").notNull().default(1),
+    baseAmountCents: integer("base_amount_cents").notNull().default(0),
+  },
+  (table) => [index("idx_customer_credits_invoice_status_posted").on(table.customerInvoiceId, table.status, table.postedAt)]
+);
 
 export const payments = sqliteTable(
   "payments",
@@ -717,7 +741,10 @@ export const payments = sqliteTable(
     exchangeRateToBase: real("exchange_rate_to_base").notNull().default(1),
     baseAmountCents: integer("base_amount_cents").notNull().default(0),
   },
-  (table) => [uniqueIndex("idx_payments_number").on(table.number)]
+  (table) => [
+    uniqueIndex("idx_payments_number").on(table.number),
+    index("idx_payments_document_date").on(table.documentType, table.documentId, table.direction, table.paymentDate),
+  ]
 );
 
 export const returnableAssetTypes = sqliteTable("returnable_asset_types", {
@@ -783,7 +810,10 @@ export const costLayers = sqliteTable(
     receivedAt: text("received_at").notNull(),
     status: text("status").notNull().default("open"),
   },
-  (table) => [index("idx_cost_layers_product_received").on(table.productId, table.receivedAt)]
+  (table) => [
+    index("idx_cost_layers_product_received").on(table.productId, table.receivedAt),
+    index("idx_cost_layers_receipt_movement").on(table.receiptMovementId),
+  ]
 );
 
 export const inventoryValueEntries = sqliteTable(
@@ -802,7 +832,10 @@ export const inventoryValueEntries = sqliteTable(
     postedAt: text("posted_at").notNull(),
     postedBy: text("posted_by").notNull(),
   },
-  (table) => [index("idx_value_entries_product_posted").on(table.productId, table.postedAt)]
+  (table) => [
+    index("idx_value_entries_product_posted").on(table.productId, table.postedAt),
+    index("idx_value_entries_movement").on(table.movementId),
+  ]
 );
 
 export const landedCostAllocations = sqliteTable("landed_cost_allocations", {

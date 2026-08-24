@@ -120,6 +120,27 @@
       "when": 1787338436034,
       "tag": "0016_normal_shaman",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1787552725863,
+      "tag": "0017_daily_maelstrom",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1787553999130,
+      "tag": "0018_slimy_dracula",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1787554384169,
+      "tag": "0019_lumpy_kinsey_walden",
+      "breakpoints": true
     }
   ]
 }

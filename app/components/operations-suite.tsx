@@ -148,56 +148,22 @@ function emptyWorkflowOptions(): WorkflowState["options"] {
   return { products: [], warehouses: [], locations: [], uoms: [], priceLists: [], salesOrderLines: [], purchaseOrderLines: [], purchaseOrders: [], salesOrders: [], partners: [], costLayers: [], assetTypes: [], vendorBills: [], customerInvoices: [] };
 }
 
-function mergeWorkflowPage(base: Record<string, unknown> | undefined, page: unknown, deduplicate = false) {
-  if (!page || typeof page !== "object") return base ?? {};
-  const result = base ?? {};
-  for (const [key, value] of Object.entries(page as Record<string, unknown>)) {
-    if (!Array.isArray(value)) {
-      if (!(key in result)) result[key] = value;
-      continue;
-    }
-    const existing = Array.isArray(result[key]) ? result[key] as unknown[] : [];
-    if (!deduplicate) { result[key] = existing.concat(value); continue; }
-    const seen = new Set(existing.map((item) => item && typeof item === "object" && "id" in item ? String((item as { id?: unknown }).id) : JSON.stringify(item)));
-    result[key] = existing.concat(value.filter((item) => {
-      const identity = item && typeof item === "object" && "id" in item ? String((item as { id?: unknown }).id) : JSON.stringify(item);
-      if (seen.has(identity)) return false;
-      seen.add(identity);
-      return true;
-    }));
-  }
-  return result;
-}
-
-async function loadCompleteWorkflowState(workspace: OperationsWorkspaceKind) {
+async function loadWorkflowState(workspace: OperationsWorkspaceKind) {
   const pageSize = 100;
-  let advanced: Record<string, unknown> | undefined;
-  let core: Record<string, unknown> | undefined;
-  for (let page = 1; ; page += 1) {
-    const response = await fetch(`/api/workflows?page=${page}&pageSize=${pageSize}&scope=${encodeURIComponent(workspace)}`, { cache: "no-store" });
-    const body = await response.json() as Record<string, unknown>;
-    if (!response.ok) {
-      const error = body.error;
-      const message = typeof error === "string" ? error : error && typeof error === "object" && "message" in error ? String((error as { message?: unknown }).message) : "Workflow service unavailable";
-      throw new Error(message);
-    }
-    const parts = workflowSnapshotParts(body);
-    const pageAdvanced = parts.advanced && typeof parts.advanced === "object" ? parts.advanced as Record<string, unknown> : {};
-    const pageCore = parts.core && typeof parts.core === "object" ? parts.core as Record<string, unknown> : {};
-    advanced = mergeWorkflowPage(advanced, pageAdvanced);
-    // The core location reference list intentionally repeats on every page.
-    core = mergeWorkflowPage(core, pageCore, true);
-    const corePageKeys: Record<OperationsWorkspaceKind, string[]> = {
-      purchasing: [], sales: [], inventory: ["products"],
-      "vendor-billing": [], "customer-billing": [], controls: [],
-    };
-    const pagedCollections = [
-      ...Object.values(pageAdvanced),
-      ...corePageKeys[workspace].map((key) => pageCore[key]),
-    ].filter(Array.isArray) as unknown[][];
-    if (!pagedCollections.some((collection) => collection.length === pageSize)) break;
+  // Workflow tabs are action queues, while the surrounding register is the paginated system of
+  // record. Loading every historical workflow page before showing the first one turned 10,000
+  // bills into 100 serial requests and retained the full history in the browser. The server sorts
+  // these queues by operational relevance, so one bounded page gives the user the next work
+  // immediately; older records remain available in the register and remote reference pickers.
+  const response = await fetch(`/api/workflows?page=1&pageSize=${pageSize}&scope=${encodeURIComponent(workspace)}`, { cache: "no-store" });
+  const body = await response.json() as Record<string, unknown>;
+  if (!response.ok) {
+    const error = body.error;
+    const message = typeof error === "string" ? error : error && typeof error === "object" && "message" in error ? String((error as { message?: unknown }).message) : "Workflow service unavailable";
+    throw new Error(message);
   }
-  return normalizeLiveWorkflowState(advanced, core);
+  const parts = workflowSnapshotParts(body);
+  return normalizeLiveWorkflowState(parts.advanced, parts.core);
 }
 
 function emptyWorkflowState(): WorkflowState {
@@ -257,7 +223,7 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
     const generation = ++loadGeneration.current;
     setServiceState("loading");
     try {
-      const nextState = await loadCompleteWorkflowState(workspace);
+      const nextState = await loadWorkflowState(workspace);
       if (generation !== loadGeneration.current) return;
       setState(nextState);
       setLoadedWorkspace(workspace);
@@ -830,10 +796,28 @@ function LocalPager({ label, page, pages, setPage }: { label: string; page: numb
 
 function RecordTable({ records, columns, actions }: { records: WorkflowRecord[]; columns: Array<keyof WorkflowRecord>; actions?: (record: WorkflowRecord) => ReactNode }) {
   const [page, setPage] = useState(1);
+  const [sort, setSort] = useState<{ column: keyof WorkflowRecord; direction: "asc" | "desc" } | null>(null);
+  const sortedRecords = useMemo(() => {
+    if (!sort) return records;
+    const direction = sort.direction === "asc" ? 1 : -1;
+    return [...records].sort((left, right) => {
+      const leftValue = left[sort.column];
+      const rightValue = right[sort.column];
+      if (typeof leftValue === "number" && typeof rightValue === "number") return (leftValue - rightValue) * direction;
+      return String(leftValue ?? "").localeCompare(String(rightValue ?? ""), undefined, { numeric: true, sensitivity: "base" }) * direction;
+    });
+  }, [records, sort]);
   const pages = Math.max(1, Math.ceil(records.length / WORKFLOW_PAGE_SIZE));
   const currentPage = Math.min(page, pages);
-  const visible = records.slice((currentPage - 1) * WORKFLOW_PAGE_SIZE, currentPage * WORKFLOW_PAGE_SIZE);
-  return <><div className="workflow-table-wrap"><table className="workflow-table"><caption className="sr-only">Operational records</caption><thead><tr>{columns.map((column) => <th key={column}>{columnLabel(column)}</th>)}{actions ? <th><span className="sr-only">Actions</span></th> : null}</tr></thead><tbody>{visible.map((record) => <tr key={record.id}>{columns.map((column) => <td key={column}>{renderRecordValue(column, record[column], record.currency)}</td>)}{actions ? <td><div className="workflow-row-actions">{actions(record)}</div></td> : null}</tr>)}{!records.length ? <tr><td colSpan={columns.length + (actions ? 1 : 0)}><div className="workflow-empty">No records in this view.</div></td></tr> : null}</tbody></table></div><LocalPager label="Operational record pages" page={currentPage} pages={pages} setPage={setPage} /></>;
+  const visible = sortedRecords.slice((currentPage - 1) * WORKFLOW_PAGE_SIZE, currentPage * WORKFLOW_PAGE_SIZE);
+  const changeSort = (column: keyof WorkflowRecord) => {
+    setPage(1);
+    setSort((current) => ({ column, direction: current?.column === column && current.direction === "asc" ? "desc" : "asc" }));
+  };
+  return <><div className="workflow-table-wrap"><table className="workflow-table"><caption className="sr-only">Operational records</caption><thead><tr>{columns.map((column) => {
+    const activeDirection = sort?.column === column ? sort.direction : null;
+    return <th key={column} aria-sort={activeDirection === "asc" ? "ascending" : activeDirection === "desc" ? "descending" : "none"}><button type="button" className="sortable-heading" onClick={() => changeSort(column)}><span>{columnLabel(column)}</span><span className={`sort-indicator ${activeDirection ? "active" : ""}`} aria-hidden="true">{activeDirection === "asc" ? "↑" : activeDirection === "desc" ? "↓" : "↕"}</span></button></th>;
+  })}{actions ? <th><span className="sr-only">Actions</span></th> : null}</tr></thead><tbody>{visible.map((record) => <tr key={record.id}>{columns.map((column) => <td key={column}>{renderRecordValue(column, record[column], record.currency)}</td>)}{actions ? <td><div className="workflow-row-actions">{actions(record)}</div></td> : null}</tr>)}{!records.length ? <tr><td colSpan={columns.length + (actions ? 1 : 0)}><div className="workflow-empty">No records in this view.</div></td></tr> : null}</tbody></table></div><LocalPager label="Operational record pages" page={currentPage} pages={pages} setPage={setPage} /></>;
 }
 
 function RecordCards<T extends WorkflowRecord>({ records, renderActions }: { records: T[]; renderActions: (record: T) => ReactNode }) {
@@ -848,12 +832,30 @@ function RecordCards<T extends WorkflowRecord>({ records, renderActions }: { rec
     <dl>{record.requester ? <div><dt>Requested by</dt><dd>{record.requester}</dd></div> : null}{record.issuedOn ? <div><dt>Raised</dt><dd>{formatWorkflowDate(record.issuedOn)}</dd></div> : null}{record.dueOn ? <div><dt>Expected</dt><dd>{formatWorkflowDate(record.dueOn)}</dd></div> : null}{/* Omitted rather than dashed when a record type does not carry them: a vendor bill has
     no quantity or revision, so every card printed two empty rows between the dates and
     the amount, which is the field the reader came for. */}{record.quantity === undefined ? null : <div><dt>Quantity</dt><dd>{record.quantity}</dd></div>}{record.amount === undefined ? null : <div><dt>Amount</dt><dd>{formatWorkflowMoney(record.amount, record.currency)}</dd></div>}{record.revision === undefined ? null : <div><dt>Revision</dt><dd>{record.revision}</dd></div>}</dl>
-    {record.lines?.length ? <table className="record-lines"><caption className="sr-only">Lines on {record.number}</caption><thead><tr><th>Item</th><th>Qty</th><th>Unit</th><th>Amount</th></tr></thead><tbody>{record.lines.map((line) => <tr key={line.id}><td><strong>{line.sku}</strong><span>{line.product}</span></td><td>{line.quantity}</td><td>{formatWorkflowMoney(line.unitAmount, record.currency)}</td><td>{formatWorkflowMoney(line.amount, record.currency)}</td></tr>)}</tbody></table> : null}
+    {record.lines?.length ? <RecordLinesTable lines={record.lines} currency={record.currency} recordNumber={record.number} /> : null}
     <footer>{renderActions(record)}</footer></article>)}</div><LocalPager label="Workflow record pages" page={currentPage} pages={pages} setPage={setPage} /></>;
 }
 
 function ActionCard({ title, detail, impact, action, onClick, disabled, tone = "neutral" }: { title: string; detail?: string; impact: string; action: string; onClick: () => void; disabled?: boolean; tone?: Tone }) {
   return <article className={`workflow-action-card ${tone}`}><h3>{title}</h3>{detail ? <p>{detail}</p> : null}<strong>{impact}</strong><ActionButton kind={tone === "danger" ? "secondary" : "primary"} onClick={onClick} disabled={disabled}>{action}</ActionButton></article>;
+}
+
+function RecordLinesTable({ lines, currency, recordNumber }: { lines: NonNullable<WorkflowRecord["lines"]>; currency?: string; recordNumber: string }) {
+  const [sort, setSort] = useState<{ column: "item" | "quantity" | "unit" | "amount"; direction: "asc" | "desc" } | null>(null);
+  const rows = useMemo(() => {
+    if (!sort) return lines;
+    const direction = sort.direction === "asc" ? 1 : -1;
+    return [...lines].sort((left, right) => {
+      const leftValue = sort.column === "item" ? `${left.sku} ${left.product}` : sort.column === "quantity" ? left.quantity : sort.column === "unit" ? left.unitAmount : left.amount;
+      const rightValue = sort.column === "item" ? `${right.sku} ${right.product}` : sort.column === "quantity" ? right.quantity : sort.column === "unit" ? right.unitAmount : right.amount;
+      return (typeof leftValue === "number" && typeof rightValue === "number" ? leftValue - rightValue : String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true, sensitivity: "base" })) * direction;
+    });
+  }, [lines, sort]);
+  const heading = (label: string, column: "item" | "quantity" | "unit" | "amount") => {
+    const active = sort?.column === column ? sort.direction : null;
+    return <th aria-sort={active === "asc" ? "ascending" : active === "desc" ? "descending" : "none"}><button type="button" className="sortable-heading" onClick={() => setSort({ column, direction: active === "asc" ? "desc" : "asc" })}><span>{label}</span><span className={`sort-indicator ${active ? "active" : ""}`} aria-hidden="true">{active === "asc" ? "↑" : active === "desc" ? "↓" : "↕"}</span></button></th>;
+  };
+  return <table className="record-lines"><caption className="sr-only">Lines on {recordNumber}</caption><thead><tr>{heading("Item", "item")}{heading("Qty", "quantity")}{heading("Unit", "unit")}{heading("Amount", "amount")}</tr></thead><tbody>{rows.map((line) => <tr key={line.id}><td><strong>{line.sku}</strong><span>{line.product}</span></td><td>{line.quantity}</td><td>{formatWorkflowMoney(line.unitAmount, currency)}</td><td>{formatWorkflowMoney(line.amount, currency)}</td></tr>)}</tbody></table>;
 }
 
 function StatusPill({ children }: { children: ReactNode }) {
@@ -969,6 +971,7 @@ function WorkflowDialog({ action, state, onClose, onSubmit }: { action: ActionDe
   const [resolution, setResolution] = useState(["recordVendorPayment", "recordCustomerPayment"].includes(action.kind) ? "bank_transfer" : action.kind === "registerInventoryIdentity" ? "usable" : action.kind === "issueReturnableAsset" ? "" : action.kind === "resolveMatchException" ? state.permissions.approveVendorBill === true ? "approve-variance" : "request-credit" : action.kind === "setValuationPolicy" ? String(action.record?.data?.method ?? "fifo") : action.kind === "updateUserRole" ? String(action.record?.data?.role ?? "viewer") : action.kind === "lockPeriod" ? "accounting" : action.kind === "addDocumentCharge" ? "fee" : "");
   const [policyValue, setPolicyValue] = useState(action.kind === "updateUserRole" ? Number(action.record?.data?.active ?? 1) ? "active" : "disabled" : (action.record as PolicyRecord | undefined)?.value ?? "");
   const [extraLines, setExtraLines] = useState<ExtraBillLine[]>([]);
+  const [confirmedBillFingerprint, setConfirmedBillFingerprint] = useState("");
   const recordData = action.record?.data ?? {};
   const documentDate = String(recordData.invoice_date ?? recordData.invoiceDate ?? "");
   const initialPostingDate = documentDate > today ? documentDate : today;
@@ -984,25 +987,29 @@ function WorkflowDialog({ action, state, onClose, onSubmit }: { action: ActionDe
   // The bill's item subtotal spans every line on it, so the review total and the charge tax
   // have to be computed from the whole set rather than the first line alone.
   const extraItemsTotal = extraLines.reduce((sum, line) => sum + line.quantity * line.unitCost, 0);
+  const billLineFingerprint = JSON.stringify({ reference, quantity, amount, extraLines });
   const impact = useMemo(() => workflowImpact(action.kind, { quantity, amount, source, destination, resolution, policyValue, currency: financial.currency, financial, extraItemsTotal }, action.record), [action, amount, destination, extraItemsTotal, financial, policyValue, quantity, resolution, source]);
   const validationError = workflowValidationError(action, state, { quantity, amount, reason, reference, referenceData: referenceOption?.data, referenceVersion: referenceOption?.version, externalReference, source, destination, resolution, policyValue, financial, extraLines });
-  const invalid = Boolean(validationError);
+  const billLinesConfirmed = confirmedBillFingerprint === billLineFingerprint;
+  const billReviewIncomplete = action.kind === "createVendorBill" && !billLinesConfirmed;
+  const invalid = Boolean(validationError) || billReviewIncomplete;
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError("");
-    if (validationError) { setError(validationError); return; }
+    if (validationError || billReviewIncomplete) { setError(validationError || "Confirm the lines included on this bill before posting."); return; }
     setBusy(true);
     try {
       await onSubmit(buildWorkflowPayload(action, state, { quantity, amount, reason, reference, referenceData: referenceOption?.data, referenceVersion: referenceOption?.version, externalReference, source, destination, resolution, policyValue, financial, extraLines }));
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The workflow could not be completed. Your entries are still here."); setBusy(false); }
   };
 
-  return <div className="workflow-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="workflow-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId}><header><div><span className="workflow-kicker">Business command</span><h2 id={titleId}>{action.title}</h2><p id={descriptionId}>{action.description}</p></div><button ref={closeRef} onClick={onClose} disabled={busy} aria-label={`Close ${action.title}`}>×</button></header><form onSubmit={submit}>{error ? <div className="workflow-error" role="alert" tabIndex={-1}><strong>Couldn’t complete this action</strong><p>{error}</p></div> : null}<WorkflowFields action={action} state={state} quantity={quantity} setQuantity={setQuantity} amount={amount} setAmount={setAmount} reason={reason} setReason={setReason} reference={reference} setReference={setReference} onReferenceSelect={setReferenceOption} externalReference={externalReference} setExternalReference={setExternalReference} source={source} setSource={setSource} destination={destination} setDestination={setDestination} resolution={resolution} setResolution={setResolution} policyValue={policyValue} setPolicyValue={setPolicyValue} financial={financial} setFinancial={setFinancial} extraLines={extraLines} setExtraLines={setExtraLines} referenceData={referenceOption?.data} /><ImpactReview lines={impact} /><footer><button type="button" className="workflow-action secondary" onClick={onClose} disabled={busy}>Keep reviewing</button><button type="submit" className="workflow-action primary" disabled={busy || invalid} aria-busy={busy}>{busy ? "Posting…" : action.finalLabel}</button></footer></form></section></div>;
+  return <div className="workflow-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="workflow-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId}><header><div><span className="workflow-kicker">Business command</span><h2 id={titleId}>{action.title}</h2><p id={descriptionId}>{action.description}</p></div><button ref={closeRef} onClick={onClose} disabled={busy} aria-label={`Close ${action.title}`}>×</button></header><form onSubmit={submit}>{error ? <div className="workflow-error" role="alert" tabIndex={-1}><strong>Couldn’t complete this action</strong><p>{error}</p></div> : null}<WorkflowFields action={action} state={state} quantity={quantity} setQuantity={setQuantity} amount={amount} setAmount={setAmount} reason={reason} setReason={setReason} reference={reference} setReference={setReference} onReferenceSelect={setReferenceOption} externalReference={externalReference} setExternalReference={setExternalReference} source={source} setSource={setSource} destination={destination} setDestination={setDestination} resolution={resolution} setResolution={setResolution} policyValue={policyValue} setPolicyValue={setPolicyValue} financial={financial} setFinancial={setFinancial} extraLines={extraLines} setExtraLines={setExtraLines} referenceData={referenceOption?.data} billLinesConfirmed={billLinesConfirmed} setBillLinesConfirmed={(confirmed) => setConfirmedBillFingerprint(confirmed ? billLineFingerprint : "")} /><ImpactReview lines={impact} /><footer><button type="button" className="workflow-action secondary" onClick={onClose} disabled={busy}>Keep reviewing</button><button type="submit" className="workflow-action primary" disabled={busy || invalid} aria-busy={busy} title={billReviewIncomplete ? "Confirm the included bill lines above" : undefined}>{busy ? "Posting…" : action.finalLabel}</button></footer></form></section></div>;
 }
 
 type FieldProps = {
   action: ActionDefinition; state: WorkflowState; quantity: number; setQuantity: (value: number) => void; amount: number; setAmount: (value: number) => void; reason: string; setReason: (value: string) => void; reference: string; setReference: (value: string) => void; onReferenceSelect: (option: SelectOption) => void; externalReference: string; setExternalReference: (value: string) => void; source: string; setSource: (value: string) => void; destination: string; setDestination: (value: string) => void; resolution: string; setResolution: (value: string) => void; policyValue: string; setPolicyValue: (value: string) => void; financial: FinancialInput; setFinancial: (value: FinancialInput) => void;
   extraLines: ExtraBillLine[]; setExtraLines: Dispatch<SetStateAction<ExtraBillLine[]>>; referenceData?: Record<string, unknown>;
+  billLinesConfirmed: boolean; setBillLinesConfirmed: (value: boolean) => void;
 };
 
 function WorkflowFields(props: FieldProps) {
@@ -1063,14 +1070,49 @@ function RemoteReferenceField({ kind, role, label, placeholder, value, initialOp
  * line has to belong to, so it stays the primary field and the rest are added beneath it.
  */
 function VendorBillFields(props: FieldProps) {
+  const [defaultingLines, setDefaultingLines] = useState(false);
+  const [defaultingError, setDefaultingError] = useState("");
+  const defaultRequest = useRef(0);
   const primaryPurchaseOrderId = String(props.referenceData?.purchaseOrderId ?? "");
   const items = props.quantity * props.amount + props.extraLines.reduce((sum, line) => sum + line.quantity * line.unitCost, 0);
   const update = (key: string, patch: Partial<ExtraBillLine>) => props.setExtraLines((current) => current.map((line) => line.key === key ? { ...line, ...patch } : line));
   const addLine = () => props.setExtraLines((current) => [...current, { key: crypto.randomUUID(), lineId: "", label: "", purchaseOrderId: "", quantity: 1, unitCost: 0 }]);
   const removeLine = (key: string) => props.setExtraLines((current) => current.filter((line) => line.key !== key));
+  const defaultBillableLines = async (primary: PickerOption) => {
+    const request = ++defaultRequest.current;
+    const purchaseOrderId = String(primary.data?.purchaseOrderId ?? "");
+    props.setQuantity(Number(primary.data?.billableQuantity ?? 0));
+    setDefaultingLines(true);
+    setDefaultingError("");
+    try {
+      const loaded: Record<string, unknown>[] = [];
+      for (let offset = 0; ; offset += 50) {
+        const params = new URLSearchParams({ lookup: "purchaseOrderLines", role: "billable", partnerId: purchaseOrderId, limit: "50", offset: String(offset) });
+        const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store" });
+        const result = await response.json() as { items?: Record<string, unknown>[]; error?: { message?: string } };
+        if (!response.ok) throw new Error(result.error?.message ?? "The PO lines could not be loaded.");
+        const page = result.items ?? [];
+        loaded.push(...page);
+        if (page.length < 50) break;
+      }
+      if (request !== defaultRequest.current) return;
+      props.setExtraLines(loaded.filter((line) => String(line.id) !== primary.id).map((line) => ({
+        key: crypto.randomUUID(),
+        lineId: String(line.id),
+        label: `${String(line.orderNumber)} · ${String(line.sku)}`,
+        purchaseOrderId,
+        quantity: Number(line.billableQuantity ?? 0),
+        unitCost: Number(line.unitCostCents ?? 0) / 100,
+      })));
+    } catch (error) {
+      if (request !== defaultRequest.current) return;
+      props.setExtraLines([]);
+      setDefaultingError(error instanceof Error ? error.message : "The remaining PO lines could not be loaded.");
+    } finally { if (request === defaultRequest.current) setDefaultingLines(false); }
+  };
 
   return <div className="workflow-form-grid">
-    <LookupField kind="purchaseOrderLines" label="Purchase order line" value={props.reference} setValue={props.setReference} onSelect={(option) => {
+    <LookupField kind="purchaseOrderLines" role="billable" label="Purchase order (select any received line)" value={props.reference} setValue={props.setReference} onSelect={(option) => {
       props.onReferenceSelect(option as SelectOption);
       props.setAmount(Number(option.data?.unitCostCents ?? 0) / 100);
       const terms = String(option.data?.paymentTerms ?? "Net 30");
@@ -1079,15 +1121,18 @@ function VendorBillFields(props: FieldProps) {
       // the old one, and the server would reject the bill wholesale rather than per line.
       const nextPurchaseOrderId = String(option.data?.purchaseOrderId ?? "");
       if (primaryPurchaseOrderId && nextPurchaseOrderId !== primaryPurchaseOrderId) props.setExtraLines([]);
+      void defaultBillableLines(option);
     }} />
     <label><span>Vendor invoice number</span><input value={props.externalReference} onChange={(event) => props.setExternalReference(event.target.value)} required /></label>
     <label><span>Billed quantity</span><input type="number" min="0.0001" step="0.0001" value={props.quantity} onChange={(event) => props.setQuantity(Number(event.target.value))} required /></label>
     <label><span>Unit cost</span><input type="number" min="0.01" step="0.01" value={props.amount} onChange={(event) => props.setAmount(Number(event.target.value))} required /></label>
 
-    <fieldset className="bill-lines full"><legend>Additional lines on this invoice</legend>
+    <fieldset className="bill-lines full"><legend>PO lines included by default</legend>
+      {defaultingLines ? <p className="read-only-label" role="status">Loading every received, unbilled line from this purchase order…</p> : null}
+      {defaultingError ? <p className="bill-line-warning" role="alert"><strong>Only the selected line could be loaded.</strong>{defaultingError}</p> : null}
       {props.extraLines.length
         ? <div className="bill-line-rows">{props.extraLines.map((line, index) => <div className="bill-line-row" key={line.key}>
-            <LookupField kind="purchaseOrderLines" label={`Line ${index + 2}`} value={line.lineId} setValue={(value) => update(line.key, { lineId: value })} onSelect={(option) => update(line.key, {
+            <LookupField kind="purchaseOrderLines" role="billable" partnerId={primaryPurchaseOrderId} label={`Line ${index + 2}`} value={line.lineId} setValue={(value) => update(line.key, { lineId: value })} onSelect={(option) => update(line.key, {
               lineId: option.id,
               label: String(option.label ?? ""),
               purchaseOrderId: String(option.data?.purchaseOrderId ?? ""),
@@ -1097,9 +1142,19 @@ function VendorBillFields(props: FieldProps) {
             <label><span>Unit cost</span><input type="number" min="0.01" step="0.01" value={line.unitCost} onChange={(event) => update(line.key, { unitCost: Number(event.target.value) })} required /></label>
             <button type="button" className="workflow-action secondary" onClick={() => removeLine(line.key)} aria-label={`Remove line ${index + 2}`}>Remove</button>
           </div>)}</div>
-        : <p className="read-only-label">One line so far. Add the rest of the lines this vendor invoice charges for so the bill matches the document the vendor sent.</p>}
-      <button type="button" className="workflow-action secondary" onClick={addLine}>Add invoice line</button>
+        : !defaultingLines && props.reference ? <p className="read-only-label">There are no other received, unbilled lines on this purchase order.</p> : null}
+      <button type="button" className="workflow-action secondary" onClick={addLine}>Add another PO line to this bill</button>
     </fieldset>
+
+    <section className="bill-inclusion-review full" aria-labelledby="bill-inclusion-title">
+      <header><div><span className="workflow-kicker">Posting scope</span><h3 id="bill-inclusion-title">Included on this bill: {props.reference ? 1 + props.extraLines.filter((line) => line.lineId).length : 0} line{props.reference && props.extraLines.filter((line) => line.lineId).length === 0 ? "" : "s"}</h3></div><strong>{formatWorkflowMoney(items, props.financial.currency)}</strong></header>
+      <p>All currently billable PO lines are included automatically. Quantities use net receipts after returns and prior bills; closed-short quantities are excluded; unit costs use the latest approved PO revision. Remove or edit lines to match the vendor invoice.</p>
+      {props.reference ? <ol>
+        <li><span>{String(props.referenceData?.orderNumber ?? "Purchase order")} · {String(props.referenceData?.sku ?? "Line 1")}</span><small>{props.quantity} × {formatWorkflowMoney(props.amount, props.financial.currency)}</small><strong>{formatWorkflowMoney(props.quantity * props.amount, props.financial.currency)}</strong></li>
+        {props.extraLines.filter((line) => line.lineId).map((line) => <li key={line.key}><span>{line.label || "Selected PO line"}</span><small>{line.quantity} × {formatWorkflowMoney(line.unitCost, props.financial.currency)}</small><strong>{formatWorkflowMoney(line.quantity * line.unitCost, props.financial.currency)}</strong></li>)}
+      </ol> : <p className="read-only-label">Select the first PO line to build the bill’s posting scope.</p>}
+      <label className="bill-inclusion-confirm"><input type="checkbox" checked={props.billLinesConfirmed} onChange={(event) => props.setBillLinesConfirmed(event.target.checked)} disabled={!props.reference || defaultingLines} /><span>I compared this list with the vendor invoice and confirm these are all lines included on this bill.</span></label>
+    </section>
 
     <FinancialDetails value={props.financial} onChange={props.setFinancial} items={items} showCharges currencyLocked postingDateLabel="Vendor invoice date" />
   </div>;

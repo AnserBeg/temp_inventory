@@ -1396,7 +1396,13 @@ async function createVendorBill(command: WorkflowCommand) {
   charges.forEach((charge) => statements.push(db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,'vendor_bill',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("charge"), billId, charge.chargeType, charge.description, charge.amount, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRate, charge.taxAmount, when)));
   if (hold) statements.push(db.prepare(`INSERT INTO approvals (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,metadata_json,version) SELECT ?,'vendor_bill',?,'vendor_bill_match_exception','pending',?,?,?, ?,1 WHERE ${marker(command)}`).bind(newId("approval"), billId, command.actor.label, "Three-way match exception", when, JSON.stringify({ exceptions })));
   statements.push(
-    db.prepare(`UPDATE purchase_orders SET billing_status=CASE WHEN NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id=purchase_orders.id AND COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)<pol.ordered_qty) THEN 'billed' ELSE 'partially_billed' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(purchaseOrderId, order.version),
+    db.prepare(`UPDATE purchase_orders SET billing_status=CASE WHEN NOT EXISTS (
+      SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id=purchase_orders.id
+        AND COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)
+          < CASE WHEN pol.fulfillment_route='drop_ship'
+              THEN MAX(COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0),0)
+              ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END
+      ) THEN 'fully_billed' ELSE 'partially_billed' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(purchaseOrderId, order.version),
     auditStatement(command, "vendor_bill", billId, "vendor_bill_posted", result.message, { purchaseOrderId, exceptions, total, currency, exchange, lineCount: normalized.length, chargeCount: charges.length }, when),
     outboxStatement(command, "vendor_bill.posted", "vendor_bill", billId, { status: hold ? "on_hold" : "approved", total, baseTotal }, when)
   );
