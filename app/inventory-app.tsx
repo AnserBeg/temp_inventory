@@ -1282,7 +1282,7 @@ export function InventoryApp() {
       <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`} aria-label="Primary navigation">
         <div className="brand">
           <span className="brand-mark" aria-hidden="true"><span /></span>
-          <div><strong>PaneFlow</strong><small>Operations</small></div>
+          <div><strong>PaneFlow</strong><small>Max Green</small></div>
         </div>
         <nav className="nav-groups">
           {navGroups.map((group, index) => (

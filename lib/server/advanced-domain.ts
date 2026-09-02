@@ -1958,7 +1958,10 @@ async function saveMarginRule(command: WorkflowCommand) {
   if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Margin rule changed; refresh before saving.", 409, current.version);
   if (await first("SELECT id FROM margin_rules WHERE code=? AND id<>?", code, id)) throw new WorkflowError("DUPLICATE_MARGIN_RULE", `Margin rule ${code} already exists.`, 409);
   const high = 9_007_199_254_740_000;
-  const overlap = await first(`SELECT id FROM margin_rules WHERE active=1 AND id<>?
+  // The seeded catch-all is an intentional fallback. It may overlap explicit global bands;
+  // priority and the narrower lower bound decide which rule wins. User-authored rules within
+  // the same scope still cannot overlap one another.
+  const overlap = id === "margin-default-32" ? null : await first(`SELECT id FROM margin_rules WHERE active=1 AND id<>? AND id<>'margin-default-32'
     AND COALESCE(product_id,'')=COALESCE(?,'') AND COALESCE(category,'')=COALESCE(?,'')
     AND minimum_cost_cents<? AND ?<COALESCE(maximum_cost_cents,?)
     AND (valid_to IS NULL OR ? IS NULL OR valid_to>=?) AND (? IS NULL OR valid_from IS NULL OR valid_from<=?)

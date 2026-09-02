@@ -204,8 +204,11 @@ export async function prepareCanceledPurchaseCostStatements(input: { claim: Comm
   for (const product of affected) {
     const prior = await first<{ purchaseOrderId: string }>(`SELECT po.id AS purchaseOrderId
       FROM purchase_orders po JOIN purchase_order_lines pol ON pol.purchase_order_id=po.id
+      LEFT JOIN product_cost_history pch ON pch.product_id=pol.product_id AND pch.source_purchase_order_id=po.id
       WHERE pol.product_id=? AND po.lifecycle_status='approved' AND po.id<>?
-      ORDER BY po.created_at DESC,po.id DESC LIMIT 1`, product.id, input.purchaseOrderId);
+      GROUP BY po.id,po.created_at
+      ORDER BY COALESCE(MAX(pch.effective_at),po.created_at) DESC,MAX(COALESCE(pch.purchase_order_revision,po.revision_number)) DESC,po.id DESC
+      LIMIT 1`, product.id, input.purchaseOrderId);
     if (prior) {
       const restored = await prepareExistingApprovedPurchaseCostStatements({ ...input, purchaseOrderId: prior.purchaseOrderId, eventType: "purchase_order_cost_restored" });
       statements.push(...restored);

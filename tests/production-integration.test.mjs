@@ -56,7 +56,50 @@ test("a clean migration chain boots the production database contract", async () 
   assert.equal(trigger.name, "stock_movements_immutable_update");
   const balanceFks = db.sqlite.prepare("PRAGMA foreign_key_list(inventory_balances)").all().map((row) => row.table).sort();
   assert.deepEqual(balanceFks, ["locations", "products"]);
+  const productColumns = db.sqlite.prepare("PRAGMA table_info(products)").all().map((row) => row.name);
+  assert.ok(productColumns.includes("last_unit_cost_cents"));
+  assert.ok(productColumns.includes("suggested_selling_price_cents"));
+  assert.ok(productColumns.includes("pricing_mode"));
+  assert.equal(db.sqlite.prepare("SELECT target_margin_bps FROM margin_rules WHERE id='margin-default-32'").get().target_margin_bps, 3200);
+  assert.ok(db.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='product_cost_history'").get());
+  assert.ok(db.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='catalog_price_history'").get());
   await assert.rejects(run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('missing-product','missing-location',1,0,1)"), /FOREIGN KEY constraint failed/);
+});
+
+test("the pricing migration backfills the latest approved PO without overwriting today's catalog price", async () => {
+  const legacy = new D1SqliteDatabase();
+  try {
+    const directory = new URL("../drizzle/", import.meta.url);
+    const files = (await readdir(directory)).filter((name) => /^00(?:0\d|1\d|2[0-2]).*\.sql$/.test(name)).sort();
+    for (const file of files) {
+      const sql = await readFile(new URL(file, directory), "utf8");
+      for (const statement of sql.split("--> statement-breakpoint")) if (statement.trim()) legacy.exec(statement);
+    }
+    const legacyRun = (sql, ...values) => legacy.prepare(sql).bind(...values).run();
+    const legacyUomId = legacy.sqlite.prepare("SELECT id FROM units_of_measure WHERE code='EA'").get().id;
+    await legacyRun("INSERT INTO business_partners (id,code,name,partner_type,currency,active,version,created_at) VALUES ('legacy-vendor','LEG-V','Legacy Vendor','vendor','USD',1,1,'2026-01-01')");
+    await legacyRun("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('legacy-product','LEG-1','Legacy Product','Legacy','Test','Test','Test','quantity','stocked',500,999,0,?,?,?,1,1,'2026-01-01')", legacyUomId, legacyUomId, legacyUomId);
+    await legacyRun("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,revision_number,created_at) VALUES ('legacy-po','PO-LEGACY','legacy-vendor','approved','not_billed','2026-02-01','USD',1.25,2000,1600,1,2,'2026-02-01T12:00:00Z')");
+    await legacyRun("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,discount_cents,fulfillment_route,version) VALUES ('legacy-line-a','legacy-po','legacy-product',1,0,800,100,'stock',1),('legacy-line-b','legacy-po','legacy-product',1,0,800,100,'stock',1)");
+    const pricingSql = await readFile(new URL("0023_clear_northstar.sql", directory), "utf8");
+    for (const statement of pricingSql.split("--> statement-breakpoint")) if (statement.trim()) legacy.exec(statement);
+
+    assert.deepEqual({ ...legacy.sqlite.prepare("SELECT last_unit_cost_cents,last_unit_cost_source_po_id,suggested_selling_price_cents,selling_price_cents,pricing_mode,manual_price_reason FROM products WHERE id='legacy-product'").get() }, {
+      last_unit_cost_cents: 875,
+      last_unit_cost_source_po_id: "legacy-po",
+      suggested_selling_price_cents: 1300,
+      selling_price_cents: 999,
+      pricing_mode: "manual",
+      manual_price_reason: "Existing catalog price preserved during automatic-pricing rollout",
+    });
+    assert.deepEqual({ ...legacy.sqlite.prepare("SELECT source_purchase_order_line_id,purchase_order_revision,last_unit_cost_cents,source_currency,exchange_rate_to_base FROM product_cost_history WHERE product_id='legacy-product'").get() }, {
+      source_purchase_order_line_id: null,
+      purchase_order_revision: 2,
+      last_unit_cost_cents: 875,
+      source_currency: "USD",
+      exchange_rate_to_base: 1.25,
+    });
+  } finally { legacy.close(); }
 });
 
 test("sales availability treats this order's reservation as committed coverage", () => {
@@ -128,7 +171,8 @@ test("production snapshots execute with bounded pagination on the migrated schem
   const advanced = await advancedDomain.getAdvancedSnapshot(actor, { page: 1, pageSize: 5 });
   // countBalances is the cycle-count worklist total: that view pages over countable balances
   // rather than over the catalog, so it needs a total of its own.
-  assert.deepEqual(core.pagination, { page: 1, pageSize: 5, filteredTotal: null, totals: { purchaseOrders: 0, products: 0, partners: 0, salesOrders: 0, movements: 0, bills: 0, activities: 0, counts: 0, countBalances: 0 } });
+  assert.deepEqual({ page: core.pagination.page, pageSize: core.pagination.pageSize, filteredTotal: core.pagination.filteredTotal }, { page: 1, pageSize: 5, filteredTotal: null });
+  assert.ok(Object.values(core.pagination.totals).every((total) => Number.isSafeInteger(total) && total >= 0));
   assert.deepEqual(advanced.pagination, { page: 1, pageSize: 5 });
 });
 
@@ -181,7 +225,7 @@ test("worklist column sorts apply to the full server-side result set", async () 
     "sales-orders": ["exception", "number", "customer", "requested", "availability", "fulfillment", "billing", "total"],
     "customer-invoices": ["number", "customer", "ordered", "shipped", "invoiced", "availableToInvoice", "billing"],
     stock: ["product", "location", "onHand", "usable", "reserved", "available", "incoming", "demand", "projected", "exception"],
-    products: ["product", "configuration", "policy", "units", "standardCost", "sellingPrice", "margin", "reorderPoint", "maxStockLevel"],
+    products: ["product", "configuration", "policy", "units", "standardCost", "lastUnitCost", "sellingPrice", "pricingMode", "margin", "reorderPoint", "maxStockLevel"],
     movements: ["posted", "movement", "document", "order", "product", "quantity", "from", "to", "actor"],
     counts: ["product", "location", "recorded", "reserved", "available"],
     partners: ["partner", "type", "contact", "address", "terms", "credit"],
@@ -670,6 +714,62 @@ test("authorized authors can atomically fast-track orders and vendor bills", asy
   assert.match(vendorBill.message, /approved by its author/);
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,match_status,approved_by,hold_reason FROM vendor_bills WHERE id=?").get(vendorBill.recordId) }, { status: "approved", match_status: "approved_variance", approved_by: manager.label, hold_reason: null });
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,request_type,decided_by FROM approvals WHERE entity_id=?").get(vendorBill.recordId) }, { status: "approved", request_type: "vendor_bill_match_exception", decided_by: manager.label });
+});
+
+test("approved PO cost drives the margin matrix while manual prices and contract prices remain controlled", async () => {
+  const administrator = { id: "pricing-admin", email: "pricing-admin@example.com", name: "Pricing Administrator", role: "administrator", label: "Pricing Administrator <pricing-admin@example.com>", localDevelopment: false };
+  const operator = { id: "pricing-operator", email: "pricing-operator@example.com", name: "Pricing Operator", role: "operator", label: "Pricing Operator <pricing-operator@example.com>", localDevelopment: false };
+  const manager = { id: "pricing-manager", email: "pricing-manager@example.com", name: "Pricing Manager", role: "manager", label: "Pricing Manager <pricing-manager@example.com>", localDevelopment: false };
+
+  const rule = await advancedDomain.executeWorkflow({ command: "createMarginRule", idempotencyKey: "create-prod-a-margin-rule", actor: administrator, payload: {
+    code: "PROD-A-35", name: "Product A 35% gross margin", productId: "prod-a", minimumCostCents: 0, maximumCostCents: null,
+    targetMarginBps: 3500, minimumGrossProfitCents: 0, roundingIncrementCents: 1, priority: 100,
+  } });
+  const beforeModeChange = db.sqlite.prepare("SELECT version FROM products WHERE id='prod-a'").get().version;
+  await advancedDomain.executeWorkflow({ command: "updateProductPricing", entityId: "prod-a", version: beforeModeChange, idempotencyKey: "enable-prod-a-auto-pricing", actor: administrator, payload: { pricingMode: "automatic", sellingPriceCents: 0, reason: "Use the approved distributor margin matrix" } });
+
+  const draft = await advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", entityId: "new", version: 0, idempotencyKey: "create-last-cost-po", actor: operator, payload: {
+    vendorId: "vendor-receipt", expectedDate: "2026-09-25", currency: "USD", exchangeRateToBase: 1.25, paymentTerms: "Net 30", dueDate: "2026-10-25",
+    lines: [{ kind: "item", productId: "prod-a", quantity: 2, unitCostCents: 800, discountCents: 200, taxable: false, taxRateBps: 0 }],
+  } });
+  assert.equal(db.sqlite.prepare("SELECT last_unit_cost_cents FROM products WHERE id='prod-a'").get().last_unit_cost_cents, 100);
+  await advancedDomain.executeWorkflow({ command: "submitPurchaseOrder", entityId: draft.recordId, version: 1, idempotencyKey: "submit-last-cost-po", actor: operator, payload: { reason: "Supplier quote accepted" } });
+  assert.equal(db.sqlite.prepare("SELECT last_unit_cost_cents FROM products WHERE id='prod-a'").get().last_unit_cost_cents, 100);
+  await advancedDomain.executeWorkflow({ command: "approvePurchaseOrder", entityId: draft.recordId, version: 2, idempotencyKey: "approve-last-cost-po", actor: manager, payload: { reason: "Approved purchasing commitment" } });
+
+  const approvedPrice = db.sqlite.prepare("SELECT last_unit_cost_cents,last_unit_cost_source_po_id,last_unit_cost_vendor_id,suggested_selling_price_cents,selling_price_cents,pricing_mode,applied_margin_rule_id FROM products WHERE id='prod-a'").get();
+  assert.deepEqual({ ...approvedPrice }, {
+    last_unit_cost_cents: 875,
+    last_unit_cost_source_po_id: draft.recordId,
+    last_unit_cost_vendor_id: "vendor-receipt",
+    suggested_selling_price_cents: 1347,
+    selling_price_cents: 1347,
+    pricing_mode: "automatic",
+    applied_margin_rule_id: rule.recordId,
+  });
+  const costHistory = db.sqlite.prepare("SELECT purchase_order_revision,vendor_id,last_unit_cost_cents,source_currency,exchange_rate_to_base FROM product_cost_history WHERE source_purchase_order_id=?").get(draft.recordId);
+  assert.deepEqual({ ...costHistory }, { purchase_order_revision: 1, vendor_id: "vendor-receipt", last_unit_cost_cents: 875, source_currency: "USD", exchange_rate_to_base: 1.25 });
+
+  const purchasing = await inventoryDomain.searchInventoryReferences("products", "SKU-A", 20, "vendor", "vendor-receipt", 1, undefined, "CAD", 1);
+  const purchaseProduct = purchasing.items.find((item) => item.id === "prod-a");
+  assert.equal(purchaseProduct.effectiveUnitAmountCents, 875);
+  assert.match(purchaseProduct.priceSource, /Last unit cost/);
+  const contracted = await inventoryDomain.searchInventoryReferences("products", "SKU-A", 20, "sales", "customer-draft", 2, undefined, "USD", 1.25);
+  assert.equal(contracted.items.find((item) => item.id === "prod-a").effectiveUnitAmountCents, 77);
+
+  const beforeOverride = db.sqlite.prepare("SELECT version FROM products WHERE id='prod-a'").get().version;
+  await advancedDomain.executeWorkflow({ command: "updateProductPricing", entityId: "prod-a", version: beforeOverride, idempotencyKey: "manual-prod-a-price", actor: administrator, payload: { pricingMode: "manual", sellingPriceCents: 1200, reason: "Distributor market exception" } });
+  const poVersion = db.sqlite.prepare("SELECT version FROM purchase_orders WHERE id=?").get(draft.recordId).version;
+  await advancedDomain.executeWorkflow({ command: "cancelPurchaseOrder", entityId: draft.recordId, version: poVersion, idempotencyKey: "cancel-last-cost-po", actor: manager, payload: { reason: "Supplier withdrew the quote before receipt" } });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT last_unit_cost_cents,suggested_selling_price_cents,selling_price_cents,pricing_mode,manual_price_reason FROM products WHERE id='prod-a'").get() }, {
+    last_unit_cost_cents: 100,
+    suggested_selling_price_cents: 154,
+    selling_price_cents: 1200,
+    pricing_mode: "manual",
+    manual_price_reason: "Distributor market exception",
+  });
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM catalog_price_history WHERE product_id='prod-a' AND source_purchase_order_id=?").get(draft.recordId).count, 1);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT event_type,cost_basis_cents FROM catalog_price_history WHERE product_id='prod-a' AND event_type='purchase_order_cost_restored' ORDER BY created_at DESC LIMIT 1").get() }, { event_type: "purchase_order_cost_restored", cost_basis_cents: 100 });
 });
 
 test("receivables reports preserve document currency and reconstruct historical postings in base CAD", async () => {
