@@ -1225,6 +1225,12 @@ input[type="checkbox"] { width: 17px; height: 17px; min-height: 0; padding: 0; b
   .app-shell, .workspace, .main-content, .dashboard-grid, .operations-workspace,
   .stack, .object-page, .panel, .workflow-panel { min-width: 0; max-width: 100%; }
 
+  /* iOS enlarges the entire viewport when a focused form control renders below 16px.
+     Keep pinch zoom available, but make controls large enough to avoid that surprise. */
+  .app-shell input:not([type="checkbox"]):not([type="radio"]),
+  .app-shell select,
+  .app-shell textarea { font-size: 16px; }
+
   .topbar-actions { flex: 1 1 auto; min-width: 0; gap: 6px; }
   .topbar-actions > * { flex: 0 0 auto; }
   .topbar-actions .warehouse-selector { flex: 1 1 auto; min-width: 0; justify-content: flex-start; gap: 5px; overflow: hidden; padding-inline: 7px; }
