@@ -439,7 +439,7 @@ td code, .product-header code { padding: 2px 5px; border-radius: 4px; background
 .product-header .object-title { flex: 1; }
 .product-header .exception-banner { flex-basis: 100%; }
 .product-pictures { overflow: hidden; }
-.product-picture-upload { display: grid; grid-template-columns: minmax(240px, 1fr) auto; gap: 8px 12px; align-items: end; padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--paper-soft); }
+.product-picture-upload { display: grid; grid-template-columns: minmax(240px, 1fr) auto; gap: 8px 12px; align-items: end; padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--paper); }
 .product-picture-upload label { display: grid; gap: 5px; }
 .product-picture-upload label > span { color: var(--ink-soft); font-size: 11px; font-weight: 750; }
 .product-picture-upload input { min-height: 38px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); }

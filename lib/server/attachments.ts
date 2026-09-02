@@ -52,6 +52,8 @@ export async function uploadAttachment(actor: ActorIdentity, form: FormData) {
   const file = form.get("file");
   if (!(file instanceof File)) throw new AttachmentError("FILE_REQUIRED", "file is required.");
   if(!allowedCategories.has(category)) throw new AttachmentError("INVALID_CATEGORY","Unsupported attachment category.");
+  if (documentType === "product" && category !== "product_photo") throw new AttachmentError("INVALID_CATEGORY", "Products accept pictures only.");
+  if (category === "product_photo" && documentType !== "product") throw new AttachmentError("INVALID_DOCUMENT_TYPE", "Product pictures must belong to a product.");
   await validateDocument(documentType, documentId);
   if (!allowedTypes.has(file.type)) throw new AttachmentError("UNSUPPORTED_CONTENT_TYPE", "Only JPEG, PNG, WebP, and PDF attachments are allowed.", 415);
   if (category === "product_photo" && !file.type.startsWith("image/")) throw new AttachmentError("UNSUPPORTED_CONTENT_TYPE", "Product pictures must be JPEG, PNG, or WebP images.", 415);
