@@ -39,6 +39,7 @@ before(async () => {
   await run("INSERT INTO business_partners (id,code,name,partner_type,email,country,currency,active,version,created_at) VALUES ('helcim-customer','C-HELCIM','Helcim Customer','customer','customer@example.test','CA','CAD',1,1,?)", now);
   await run("INSERT INTO customer_invoices (id,number,customer_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) VALUES ('helcim-invoice','INV-HELCIM','helcim-customer','posted','2026-09-01','2026-10-01',10000,500,10500,0,'CAD',1,10500,500,'GST','Net 30',?,'Billing',1)", now);
   await run("INSERT INTO customer_invoices (id,number,customer_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) VALUES ('helcim-hosted-invoice','INV-HOSTED','helcim-customer','posted','2026-09-01','2026-10-01',2000,100,2100,0,'CAD',1,2100,500,'GST','Net 30',?,'Billing',1)", now);
+  await run("INSERT INTO customer_invoices (id,number,customer_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) VALUES ('helcim-polled-invoice','INV-POLLED','helcim-customer','posted','2026-09-01','2026-10-01',3000,150,3150,0,'CAD',1,3150,500,'GST','Net 30',?,'Billing',1)", now);
 });
 
 after(() => db.close());
@@ -74,8 +75,9 @@ test("card posts once, ACH waits for clearing, and QBO uses Helcim clearing", as
           assert.equal(body.lineItems[0].taxAmount, 5);
           return Response.json({ invoiceId: 9001, invoiceNumber: body.invoiceNumber, token: "remote-invoice-token" });
         }
-        assert.equal(body.invoiceNumber, "PF-INV-HOSTED");
-        return Response.json({ invoiceId: 9002, invoiceNumber: body.invoiceNumber, token: "hosted-invoice-token" });
+        if (body.invoiceNumber === "PF-INV-HOSTED") return Response.json({ invoiceId: 9002, invoiceNumber: body.invoiceNumber, token: "hosted-invoice-token" });
+        assert.equal(body.invoiceNumber, "PF-INV-POLLED");
+        return Response.json({ invoiceId: 9003, invoiceNumber: body.invoiceNumber, token: "polled-invoice-token" });
       }
       if (url.pathname === "/v2/invoices/9001" && method === "PUT") {
         const body = JSON.parse(init.body);
@@ -94,6 +96,10 @@ test("card posts once, ACH waits for clearing, and QBO uses Helcim clearing", as
       if (url.pathname === "/v2/card-transactions/7003") {
         return Response.json({ id: 7003, dateCreated: "2026-09-02 14:00:00", status: "APPROVED", type: "purchase", amount: 21, currency: "CAD", invoiceNumber: "PF-INV-HOSTED" });
       }
+      if (url.pathname === "/v2/card-transactions" && url.searchParams.get("invoiceNumber") === "PF-INV-POLLED") {
+        return Response.json({ transactions: [{ transactionId: 7004, dateCreated: "2026-09-02 15:00:00", status: "APPROVED", type: "purchase", amount: 31.5, currency: "CAD", invoiceNumber: "PF-INV-POLLED" }] });
+      }
+      if (url.pathname === "/v2/ach/transactions" && url.searchParams.get("search") === "9003") return Response.json({ transactions: [] });
       throw new Error(`Unexpected Helcim fetch ${method} ${url}`);
     };
 
@@ -167,5 +173,16 @@ test("card posts once, ACH waits for clearing, and QBO uses Helcim clearing", as
     assert.equal(hostedInvoice.status, "paid");
     assert.equal(hostedInvoice.paid, 2100);
     assert.equal(db.sqlite.prepare("SELECT status FROM helcim_webhook_events WHERE webhook_id=?").get(webhookId).status, "processed");
+
+    env.HELCIM_WEBHOOK_VERIFIER_TOKEN = "";
+    const polledLink = await helcim.createInvoicePaymentLink("helcim-polled-invoice", accountant, "https://private-paneflow.example.test/api/payments/helcim/links");
+    assert.equal(polledLink.url, "https://paneflow-tests.myhelcim.com/order/?token=polled-invoice-token");
+    assert.equal(helcim.getHelcimConfigurationStatus().configured, true);
+    const polled = await helcim.processHelcimIntegrationBatch(10);
+    assert.equal(polled.mirrors, 1);
+    const polledInvoice = db.sqlite.prepare("SELECT status,paid_cents AS paid FROM customer_invoices WHERE id='helcim-polled-invoice'").get();
+    assert.equal(polledInvoice.status, "paid");
+    assert.equal(polledInvoice.paid, 3150);
+    assert.equal(db.sqlite.prepare("SELECT method FROM payments WHERE document_id='helcim-polled-invoice'").get().method, "helcim_card");
   } finally { globalThis.fetch = originalFetch; }
 });

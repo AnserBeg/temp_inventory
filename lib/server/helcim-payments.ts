@@ -69,7 +69,6 @@ export function getHelcimConfigurationStatus() {
   const invoiceHost = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.myhelcim\.com$/u.test(configuredInvoiceHost) ? configuredInvoiceHost : "";
   const missing = [
     ["HELCIM_API_TOKEN", runtime.HELCIM_API_TOKEN],
-    ["HELCIM_WEBHOOK_VERIFIER_TOKEN", runtime.HELCIM_WEBHOOK_VERIFIER_TOKEN],
     ["HELCIM_TOKEN_ENCRYPTION_KEY", runtime.HELCIM_TOKEN_ENCRYPTION_KEY],
     ...(checkoutMode === "hosted" ? [["HELCIM_INVOICE_HOST", invoiceHost]] : []),
   ].filter(([, value]) => !value?.trim()).map(([name]) => name);
@@ -81,6 +80,7 @@ export function getHelcimConfigurationStatus() {
     paymentMethod,
     checkoutMode,
     invoiceHost,
+    webhookConfigured: Boolean(runtime.HELCIM_WEBHOOK_VERIFIER_TOKEN?.trim()),
     message: missing.length ? `Add ${missing.join(", ")} before issuing live payment links.` : "Helcim payment collection is configured.",
   };
 }
@@ -91,7 +91,7 @@ function requiredConfiguration() {
   const runtime = runtimeEnv();
   return {
     apiToken: runtime.HELCIM_API_TOKEN!,
-    verifierToken: runtime.HELCIM_WEBHOOK_VERIFIER_TOKEN!,
+    verifierToken: runtime.HELCIM_WEBHOOK_VERIFIER_TOKEN?.trim() ?? "",
     encryptionKey: runtime.HELCIM_TOKEN_ENCRYPTION_KEY!,
     paymentMethod: status.paymentMethod,
     checkoutMode: status.checkoutMode,
@@ -516,6 +516,11 @@ async function fetchProviderTransaction(id: string, method: HelcimMethod) {
   return unwrappedTransaction(await helcimRequest(method === "eft" ? `/ach/transactions/${encodeURIComponent(id)}` : `/card-transactions/${encodeURIComponent(id)}`));
 }
 
+function providerTransactions(payload: Row) {
+  const collection = Array.isArray(payload.transactions) ? payload.transactions : Array.isArray(payload.data) ? payload.data : [];
+  return (collection as unknown[]).map((item) => item && typeof item === "object" ? unwrappedTransaction(item as Row) : null).filter((item): item is Row => Boolean(item));
+}
+
 async function matchSessionForTransaction(transaction: Row, method: HelcimMethod) {
   const id = transactionId(transaction);
   const direct = await first<{ checkoutToken: string }>("SELECT checkout_token AS checkoutToken FROM helcim_checkout_sessions WHERE provider_transaction_id=?", id);
@@ -560,6 +565,7 @@ async function hostedInvoiceSession(transaction: Row, method: HelcimMethod) {
 export async function recordHelcimWebhook(request: Request) {
   await ensureDatabase();
   const config = requiredConfiguration();
+  if (!config.verifierToken) throw new HelcimPaymentError("HELCIM_WEBHOOK_NOT_CONFIGURED", "Helcim webhook verification is not configured for this deployment.", 503);
   const webhookId = text(request.headers.get("webhook-id"));
   const timestamp = text(request.headers.get("webhook-timestamp"));
   const signatureHeader = text(request.headers.get("webhook-signature"));
@@ -614,8 +620,40 @@ async function reconcilePendingSession(session: CheckoutSession) {
   await recordTransaction(session, transaction);
 }
 
+type HostedInvoiceMirror = {
+  customerInvoiceId: string;
+  helcimInvoiceId: string;
+  helcimInvoiceNumber: string;
+};
+
+async function pollHostedInvoiceMirror(mirror: HostedInvoiceMirror) {
+  const configuration = requiredConfiguration();
+  const transactions: Array<{ transaction: Row; method: HelcimMethod }> = [];
+  if (configuration.paymentMethod.includes("cc")) {
+    const payload = await helcimRequest(`/card-transactions?invoiceNumber=${encodeURIComponent(mirror.helcimInvoiceNumber)}&limit=100&page=1`);
+    for (const transaction of providerTransactions(payload)) {
+      const type = text(transaction.type).toLowerCase();
+      if (text(transaction.invoiceNumber) !== mirror.helcimInvoiceNumber || (type && !/purchase|capture/iu.test(type))) continue;
+      transactions.push({ transaction, method: "card" });
+    }
+  }
+  if (configuration.paymentMethod.includes("ach")) {
+    const payload = await helcimRequest(`/ach/transactions?search=${encodeURIComponent(mirror.helcimInvoiceId)}&limit=125&page=1`);
+    for (const transaction of providerTransactions(payload)) {
+      if (text(transaction.orderId) !== mirror.helcimInvoiceId || Number(transaction.originalTransactionId ?? 0) !== 0) continue;
+      transactions.push({ transaction, method: "eft" });
+    }
+  }
+  transactions.sort((left, right) => text(left.transaction.dateCreated).localeCompare(text(right.transaction.dateCreated)));
+  for (const candidate of transactions) {
+    const session = await matchSessionForTransaction(candidate.transaction, candidate.method);
+    if (session) await recordTransaction(session, candidate.transaction);
+  }
+}
+
 export async function processHelcimIntegrationBatch(limit = 50) {
-  if (!getHelcimConfigurationStatus().configured) return { configured: false, webhooks: 0, sessions: 0 };
+  const configuration = getHelcimConfigurationStatus();
+  if (!configuration.configured) return { configured: false, webhooks: 0, mirrors: 0, sessions: 0 };
   await ensureDatabase();
   const bounded = Math.max(1, Math.min(100, Math.floor(limit)));
   const events = await getD1().prepare(`SELECT webhook_id AS webhookId,webhook_type AS webhookType,object_id AS objectId,body_json AS bodyJson,attempts
@@ -632,6 +670,27 @@ export async function processHelcimIntegrationBatch(limit = 50) {
       const message = error instanceof Error ? error.message.slice(0, 1_000) : "Webhook processing failed.";
       await getD1().prepare(`UPDATE helcim_webhook_events SET status=CASE WHEN attempts>=20 THEN 'failed' ELSE 'pending' END,last_error=? WHERE webhook_id=?`)
         .bind(message, event.webhookId).run();
+    }
+  }
+  const mirrors = configuration.checkoutMode === "hosted"
+    ? await getD1().prepare(`SELECT m.customer_invoice_id AS customerInvoiceId,m.helcim_invoice_id AS helcimInvoiceId,
+        m.helcim_invoice_number AS helcimInvoiceNumber FROM helcim_invoice_mirrors m
+        JOIN customer_invoices ci ON ci.id=m.customer_invoice_id
+        WHERE ci.status NOT IN ('paid','credited','void') AND ci.total_cents-ci.paid_cents-
+          COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0)>0
+        ORDER BY m.synced_at,m.customer_invoice_id LIMIT ?`).bind(bounded).all<HostedInvoiceMirror>()
+    : { results: [] as HostedInvoiceMirror[] };
+  let processedMirrors = 0;
+  for (const mirror of mirrors.results) {
+    const reconciledAt = new Date().toISOString();
+    try {
+      await pollHostedInvoiceMirror(mirror);
+      await getD1().prepare("UPDATE helcim_invoice_mirrors SET synced_at=?,last_error=NULL WHERE customer_invoice_id=?")
+        .bind(reconciledAt, mirror.customerInvoiceId).run();
+      processedMirrors += 1;
+    } catch (error) {
+      await getD1().prepare("UPDATE helcim_invoice_mirrors SET synced_at=?,last_error=? WHERE customer_invoice_id=?")
+        .bind(reconciledAt, error instanceof Error ? error.message.slice(0, 1_000) : "Hosted invoice reconciliation failed.", mirror.customerInvoiceId).run();
     }
   }
   const pending = await getD1().prepare(`SELECT id,payment_link_id AS paymentLinkId,customer_invoice_id AS customerInvoiceId,
@@ -652,7 +711,7 @@ export async function processHelcimIntegrationBatch(limit = 50) {
     getD1().prepare("UPDATE helcim_checkout_sessions SET status='expired' WHERE status='initialized' AND expires_at<=?").bind(now),
     getD1().prepare("UPDATE invoice_payment_links SET status='expired' WHERE status='active' AND expires_at<=?").bind(now),
   ]);
-  return { configured: true, webhooks: processedEvents, sessions: processedSessions };
+  return { configured: true, webhooks: processedEvents, mirrors: processedMirrors, sessions: processedSessions };
 }
 
 export async function getHelcimAdminState() {
