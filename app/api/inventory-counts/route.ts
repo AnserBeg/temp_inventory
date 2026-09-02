@@ -1,4 +1,5 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
+import { PolicyError } from "@/lib/server/policy";
 import {
   addCountLine,
   approveCountLine,
@@ -7,6 +8,7 @@ import {
   createCountSession,
   getCountSessionWorkspace,
   postCountSession,
+  refreshCountLine,
   reopenCountSession,
   requestCountLineApproval,
   saveCountLine,
@@ -28,6 +30,7 @@ export async function GET(request: Request) {
     return Response.json(result, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof AuthorizationError) return authorizationResponse(error);
+    if (error instanceof PolicyError) return Response.json({ error: { code: error.code, message: error.message } }, { status: error.status });
     const known = asCountSessionError(error);
     if (known) return Response.json({ error: { code: known.code, message: known.message, currentVersion: known.currentVersion } }, { status: known.status });
     return Response.json({ error: { code: "COUNT_SESSION_FAILED", message: error instanceof Error ? error.message : "Unable to load inventory counts." } }, { status: 500 });
@@ -44,6 +47,7 @@ export async function POST(request: Request) {
       createSession: () => createCountSession(actor, payload),
       addLine: () => addCountLine(actor, payload),
       saveLine: () => saveCountLine(actor, payload),
+      refreshLine: () => refreshCountLine(actor, payload),
       submitSession: () => submitCountSession(actor, payload),
       reopenSession: () => reopenCountSession(actor, payload),
       requestLineApproval: () => requestCountLineApproval(actor, payload),
@@ -56,6 +60,7 @@ export async function POST(request: Request) {
     return Response.json(await handler(), { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof AuthorizationError) return authorizationResponse(error);
+    if (error instanceof PolicyError) return Response.json({ error: { code: error.code, message: error.message } }, { status: error.status });
     const known = asCountSessionError(error);
     if (known) return Response.json({ error: { code: known.code, message: known.message, currentVersion: known.currentVersion } }, { status: known.status });
     return Response.json({ error: { code: "COUNT_SESSION_FAILED", message: error instanceof Error ? error.message : "Unable to update inventory count." } }, { status: 500 });

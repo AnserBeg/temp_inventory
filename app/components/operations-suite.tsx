@@ -570,6 +570,16 @@ function MarginMatrixPanel({ state, refresh }: { state: WorkflowState; refresh: 
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Margin rule change failed."); }
     finally { setBusy(false); }
   };
+  const adoptCatalogDefault = async (event: FormEvent) => {
+    event.preventDefault(); const idempotencyKey = crypto.randomUUID(); setBusy(true); setMessage("");
+    try {
+      const response = await fetch("/api/workflows", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": idempotencyKey }, body: JSON.stringify({ command: "adoptMarginMatrixForCatalog", idempotencyKey, payload: {} }) });
+      const result = await response.json() as { message?: string; error?: { message?: string } };
+      if (!response.ok) throw new Error(result.error?.message ?? "The catalog pricing default could not be changed.");
+      setMessage(result.message ?? "The margin matrix is now the catalog pricing default."); await refresh();
+    } catch (caught) { setMessage(caught instanceof Error ? caught.message : "The catalog pricing default could not be changed."); }
+    finally { setBusy(false); }
+  };
   const invalidRange = !openEnded && maximumCost <= minimumCost;
   return <Section title="Automatic margin matrix" detail="Suggested catalog prices use gross margin: price = cost ÷ (1 − margin), rounded up. Product rules win over category rules, which win over global rules.">
     <div className="workflow-action-grid"><form className="master-data-form" onSubmit={submit}>
@@ -587,6 +597,12 @@ function MarginMatrixPanel({ state, refresh }: { state: WorkflowState; refresh: 
         <label><span>Valid from (optional)</span><input type="date" value={validFrom} onChange={(event) => setValidFrom(event.target.value)} /></label><label><span>Valid to (optional)</span><input type="date" value={validTo} onChange={(event) => setValidTo(event.target.value)} /></label>
       </>}
       <button className="workflow-action primary" disabled={!state.permissions.canAdminister || busy || (mode !== "create" && !selected) || (mode === "deactivate" && !reason.trim()) || (mode !== "deactivate" && (!code.trim() || !name.trim() || invalidRange || targetMargin < 0 || targetMargin >= 100 || roundingIncrement <= 0 || (scope === "category" && !category.trim()) || (scope === "product" && !productId)))}>{busy ? "Saving…" : mode === "create" ? "Create rule" : mode === "update" ? "Save rule" : "Deactivate rule"}</button>
+    </form>
+    <form className="master-data-form" onSubmit={adoptCatalogDefault}>
+      <h3>Catalog-wide default</h3>
+      <p>Apply these cost-band rules to active catalog items in one step. Existing product-specific manual overrides remain unchanged.</p>
+      <p className="read-only-label">Each automatic item uses its last approved purchase-order cost, falling back to standard cost until one exists.</p>
+      <button className="workflow-action" disabled={!state.permissions.canAdminister || busy}>{busy ? "Applying…" : "Use matrix for catalog defaults"}</button>
     </form></div>
     {message ? <p role="status" className="workflow-banner">{message}</p> : null}
     <RecordTable records={state.marginRules} columns={["number", "party", "reference", "detail", "status"]} />

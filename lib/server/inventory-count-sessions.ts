@@ -103,6 +103,33 @@ async function requireMutableSession(sessionId: string, allowed: SessionStatus[]
   return session;
 }
 
+function lineStatusFor(countedQuantity: number | null, varianceQuantity: number | null, reason: string | null) {
+  if (countedQuantity == null) return "uncounted";
+  if (Math.abs(Number(varianceQuantity ?? 0)) < 0.000001) return "counted";
+  return reason?.trim() ? "variance" : "needs_reason";
+}
+
+/**
+ * A session waits for approval only while a line still needs one. Once every approval is decided,
+ * withdrawn, or released by a recount the session returns to review so it can be posted or reopened.
+ */
+async function settleAwaitingApproval(sessionId: string) {
+  await getD1().prepare(`UPDATE inventory_count_sessions SET status='review',version=version+1
+    WHERE id=? AND status='awaiting_approval' AND NOT EXISTS (
+      SELECT 1 FROM inventory_count_session_lines l LEFT JOIN approvals a ON a.id=l.approval_id
+      WHERE l.session_id=? AND l.status NOT IN ('posted','cancelled') AND (l.status='needs_approval' OR a.status='pending'))`)
+    .bind(sessionId, sessionId).run();
+}
+
+/** A blind count hides the book quantity, and everything derived from it, until the count is submitted. */
+function concealsBook(session: { blindCount: number | boolean; status: string }) {
+  return Boolean(session.blindCount) && (session.status === "draft" || session.status === "counting");
+}
+
+function concealSessionSummary<T extends SessionRow>(session: T): T {
+  return concealsBook(session) ? { ...session, varianceCount: 0, varianceQuantity: 0, varianceValueCents: 0 } : session;
+}
+
 async function auditSession(actor: ActorIdentity, sessionId: string, action: string, summary: string, metadata: Record<string, unknown> = {}) {
   await getD1().prepare(`INSERT INTO audit_events
     (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
@@ -136,9 +163,10 @@ export async function getCountSessionWorkspace(input: { warehouseId?: string; se
     FROM locations l JOIN warehouses w ON w.id=l.warehouse_id WHERE l.active=1 AND w.active=1
       AND (?='' OR l.warehouse_id=?) ORDER BY w.code,l.code`, warehouseId, warehouseId);
 
-  if (!input.sessionId) return { sessions, warehouses, locations };
+  const visibleSessions = sessions.map(concealSessionSummary);
+  if (!input.sessionId) return { sessions: visibleSessions, warehouses, locations };
   const session = await sessionById(input.sessionId);
-  const lines = await all<Record<string, unknown>>(`SELECT l.id,l.session_id AS sessionId,l.product_id AS productId,l.location_id AS locationId,
+  const rows = await all<Record<string, unknown>>(`SELECT l.id,l.session_id AS sessionId,l.product_id AS productId,l.location_id AS locationId,
     l.tracking_policy AS trackingPolicy,l.expected_qty AS expectedQuantity,l.expected_balance_version AS expectedBalanceVersion,
     l.counted_qty AS countedQuantity,l.variance_qty AS varianceQuantity,l.unit_cost_cents AS unitCostCents,l.reason,l.status,
     l.approval_id AS approvalId,a.status AS approvalStatus,a.version AS approvalVersion,l.posted_count_id AS postedCountId,
@@ -150,7 +178,12 @@ export async function getCountSessionWorkspace(input: { warehouseId?: string; se
     JOIN locations loc ON loc.id=l.location_id JOIN warehouses w ON w.id=loc.warehouse_id
     LEFT JOIN units_of_measure u ON u.id=p.base_uom_id LEFT JOIN approvals a ON a.id=l.approval_id
     WHERE l.session_id=? ORDER BY loc.code,p.sku`, input.sessionId);
-  return { sessions, warehouses, locations, session, lines };
+  // Blind counting: the counter must not learn the book quantity, the variance, or even whether a
+  // variance exists. Everything is revealed once the session is submitted for review.
+  const lines = concealsBook(session)
+    ? rows.map((line) => ({ ...line, expectedQuantity: null, varianceQuantity: null, status: line.status === "variance" || line.status === "needs_reason" ? "counted" : line.status }))
+    : rows;
+  return { sessions: visibleSessions, warehouses, locations, session: concealSessionSummary(session), lines };
 }
 
 export async function createCountSession(actor: ActorIdentity, payload: Record<string, unknown>) {
@@ -166,9 +199,10 @@ export async function createCountSession(actor: ActorIdentity, payload: Record<s
   const warehouse = await first<{ id: string }>("SELECT id FROM warehouses WHERE id=? AND active=1", warehouseId);
   if (!warehouse) throw new CountSessionError("INVALID_WAREHOUSE", "Select an active warehouse.", 404);
   const locationIds = normalizeLocationIds(payload.locationIds);
+  // D1 caps a statement at 100 bound parameters, so the selected locations travel as one JSON value.
+  const locationIdsJson = JSON.stringify(locationIds);
   if (locationIds.length) {
-    const placeholders = locationIds.map(() => "?").join(",");
-    const matched = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM locations WHERE active=1 AND warehouse_id=? AND id IN (${placeholders})`, warehouseId, ...locationIds);
+    const matched = await first<{ count: number }>("SELECT COUNT(*) AS count FROM locations WHERE active=1 AND warehouse_id=? AND id IN (SELECT value FROM json_each(?))", warehouseId, locationIdsJson);
     if (Number(matched?.count ?? 0) !== locationIds.length) throw new CountSessionError("INVALID_LOCATION", "Every selected location must belong to the active warehouse.", 409);
   }
   const effectiveDate = validDate(payload.effectiveDate ?? new Date().toISOString().slice(0, 10), "effectiveDate");
@@ -185,14 +219,14 @@ export async function createCountSession(actor: ActorIdentity, payload: Record<s
       actor.label, actor.id, actor.email, now, idempotencyKey).run();
 
   if (!["correction", "opening"].includes(countType)) {
-    const locationPredicate = locationIds.length ? `AND ib.location_id IN (${locationIds.map(() => "?").join(",")})` : "";
+    const locationPredicate = locationIds.length ? "AND ib.location_id IN (SELECT value FROM json_each(?))" : "";
     await db.prepare(`INSERT OR IGNORE INTO inventory_count_session_lines
       (id,session_id,product_id,location_id,tracking_policy,expected_qty,expected_balance_version,unit_cost_cents,status,created_at,version)
       SELECT 'count-line-' || lower(hex(randomblob(16))),?,ib.product_id,ib.location_id,p.tracking_policy,
         ib.on_hand_qty,ib.version,p.standard_cost_cents,'uncounted',?,1
       FROM inventory_balances ib JOIN locations loc ON loc.id=ib.location_id JOIN products p ON p.id=ib.product_id
       WHERE loc.active=1 AND p.active=1 AND p.inventory_policy<>'drop_ship' AND loc.warehouse_id=? ${locationPredicate}`)
-      .bind(sessionId, now, warehouseId, ...locationIds).run();
+      .bind(sessionId, now, warehouseId, ...(locationIds.length ? [locationIdsJson] : [])).run();
   }
   await auditSession(actor, sessionId, "inventory_count_session_created", `${number} created as a ${countType} count.`, { countType, warehouseId, locationIds, blindCount: booleanValue(payload.blindCount) });
   return { message: `${number} created.`, session: await sessionById(sessionId) };
@@ -230,11 +264,16 @@ export async function saveCountLine(actor: ActorIdentity, payload: Record<string
   const lineId = requiredText(payload.lineId, "lineId");
   const expectedLineVersion = Number(payload.version);
   if (!Number.isInteger(expectedLineVersion) || expectedLineVersion < 1) throw new CountSessionError("VALIDATION_ERROR", "A current line version is required.");
-  const line = await first<{ productId: string; expectedQuantity: number; version: number; approvalId: string | null; status: string }>(
-    "SELECT product_id AS productId,expected_qty AS expectedQuantity,version,approval_id AS approvalId,status FROM inventory_count_session_lines WHERE id=? AND session_id=?", lineId, sessionId);
+  const line = await first<{ productId: string; expectedQuantity: number; version: number; approvalId: string | null; approvalStatus: string | null; status: string }>(
+    `SELECT l.product_id AS productId,l.expected_qty AS expectedQuantity,l.version,l.approval_id AS approvalId,a.status AS approvalStatus,l.status
+      FROM inventory_count_session_lines l LEFT JOIN approvals a ON a.id=l.approval_id WHERE l.id=? AND l.session_id=?`, lineId, sessionId);
   if (!line) throw new CountSessionError("NOT_FOUND", "Count line was not found.", 404);
   if (line.status === "posted") throw new CountSessionError("INVALID_STATE", "A posted count line is immutable.", 409, line.version);
-  if (line.approvalId) throw new CountSessionError("APPROVAL_ALREADY_REQUESTED", "This line is locked to its approval request. Recount it in a new correction session if the quantity is wrong.", 409, line.version);
+  if (line.status === "cancelled") throw new CountSessionError("INVALID_STATE", "A cancelled count line cannot be counted.", 409, line.version);
+  // A pending or approved request pins the line to the quantities the approver saw. A rejected (or
+  // withdrawn) request releases it: the counter may recount and ask for approval again.
+  const releaseApproval = line.approvalId != null && (line.approvalStatus == null || line.approvalStatus === "rejected" || line.approvalStatus === "canceled");
+  if (line.approvalId && !releaseApproval) throw new CountSessionError("APPROVAL_ALREADY_REQUESTED", "This line is locked to its approval request until the approval is decided.", 409, line.version);
   if (line.version !== expectedLineVersion) throw new CountSessionError("VERSION_CONFLICT", "This count line changed. Refresh before saving it again.", 409, line.version);
   const requestedQuantity = Number(payload.countedQuantity);
   let countedQuantity: number;
@@ -249,15 +288,18 @@ export async function saveCountLine(actor: ActorIdentity, payload: Record<string
   const unitCostCents = payload.unitCostCents == null || payload.unitCostCents === "" ? null : Math.round(Number(payload.unitCostCents));
   if (unitCostCents != null && (!Number.isSafeInteger(unitCostCents) || unitCostCents < 0)) throw new CountSessionError("VALIDATION_ERROR", "Unit cost must be a non-negative whole number of cents.");
   if (session.countType === "opening" && countedQuantity > 0 && unitCostCents == null) throw new CountSessionError("VALIDATION_ERROR", "Opening inventory requires a unit cost.");
-  const status = varianceQuantity === 0 ? "counted" : reason ? "variance" : "needs_reason";
+  const status = lineStatusFor(countedQuantity, varianceQuantity, reason);
   const now = new Date().toISOString();
   const result = await getD1().prepare(`UPDATE inventory_count_session_lines SET counted_qty=?,variance_qty=?,reason=?,unit_cost_cents=COALESCE(?,unit_cost_cents),
-    status=?,counted_by=?,counted_by_id=?,counted_at=?,last_error=NULL,version=version+1 WHERE id=? AND session_id=? AND version=?`)
-    .bind(countedQuantity, varianceQuantity, reason || null, unitCostCents, status, actor.label, actor.id, now, lineId, sessionId, expectedLineVersion).run();
+    status=?,approval_id=CASE WHEN ?=1 THEN NULL ELSE approval_id END,counted_by=?,counted_by_id=?,counted_at=?,last_error=NULL,version=version+1
+    WHERE id=? AND session_id=? AND version=?`)
+    .bind(countedQuantity, varianceQuantity, reason || null, unitCostCents, status, releaseApproval ? 1 : 0, actor.label, actor.id, now, lineId, sessionId, expectedLineVersion).run();
   if (!result.meta?.changes) throw new CountSessionError("VERSION_CONFLICT", "This count line changed before it could be saved.", 409);
   if (session.status === "draft") {
     await getD1().prepare("UPDATE inventory_count_sessions SET status='counting',started_at=COALESCE(started_at,?),version=version+1 WHERE id=? AND status='draft'").bind(now, sessionId).run();
   }
+  if (session.status === "awaiting_approval") await settleAwaitingApproval(sessionId);
+  if (concealsBook(session)) return { message: "Count saved." };
   return { message: varianceQuantity === 0 ? "Count saved." : `Count saved with a ${varianceQuantity > 0 ? "+" : ""}${varianceQuantity} variance.` };
 }
 
@@ -278,9 +320,28 @@ export async function submitCountSession(actor: ActorIdentity, payload: Record<s
 export async function reopenCountSession(actor: ActorIdentity, payload: Record<string, unknown>) {
   const sessionId = requiredText(payload.sessionId, "sessionId");
   const session = await requireMutableSession(sessionId, ["review", "awaiting_approval"]);
-  if (session.postedCount > 0) throw new CountSessionError("PARTIALLY_POSTED", "Posted count lines are immutable; resolve the remaining lines without reopening the session.", 409);
-  await getD1().prepare("UPDATE inventory_count_sessions SET status='counting',submitted_at=NULL,version=version+1 WHERE id=?").bind(sessionId).run();
-  await auditSession(actor, sessionId, "inventory_count_session_reopened", `${session.number} returned to counting.`);
+  const db = getD1();
+  // Posted lines and their stock movements stand. Every other line goes back to counting against the
+  // current balance, so a line that conflicted while the session sat in review can simply be recounted.
+  // Lines pinned to a live (pending or approved) request keep their snapshot; the approver's scope must
+  // stay exact until it is consumed or refreshed explicitly.
+  const balanceQuantity = "(SELECT ib.on_hand_qty FROM inventory_balances ib WHERE ib.product_id=inventory_count_session_lines.product_id AND ib.location_id=inventory_count_session_lines.location_id)";
+  const balanceVersion = "(SELECT ib.version FROM inventory_balances ib WHERE ib.product_id=inventory_count_session_lines.product_id AND ib.location_id=inventory_count_session_lines.location_id)";
+  const liveApproval = "EXISTS (SELECT 1 FROM approvals a WHERE a.id=inventory_count_session_lines.approval_id AND (a.status='pending' OR (a.status='approved' AND a.consumed_at IS NULL)))";
+  await db.batch([
+    db.prepare(`UPDATE inventory_count_session_lines SET expected_qty=COALESCE(${balanceQuantity},0),expected_balance_version=COALESCE(${balanceVersion},1),
+        approval_id=NULL,last_error=NULL,version=version+1
+      WHERE session_id=? AND status NOT IN ('posted','cancelled') AND NOT ${liveApproval}`).bind(sessionId),
+    db.prepare(`UPDATE inventory_count_session_lines SET
+        variance_qty=CASE WHEN counted_qty IS NULL THEN NULL ELSE ROUND(counted_qty-expected_qty,3) END,
+        status=CASE WHEN counted_qty IS NULL THEN 'uncounted' WHEN ABS(counted_qty-expected_qty)<0.000001 THEN 'counted'
+          WHEN COALESCE(TRIM(reason),'')<>'' THEN 'variance' ELSE 'needs_reason' END
+      WHERE session_id=? AND status NOT IN ('posted','cancelled') AND approval_id IS NULL`).bind(sessionId),
+    db.prepare("UPDATE inventory_count_sessions SET status='counting',submitted_at=NULL,version=version+1 WHERE id=? AND status IN ('review','awaiting_approval')").bind(sessionId),
+  ]);
+  await auditSession(actor, sessionId, "inventory_count_session_reopened", session.postedCount > 0
+    ? `${session.number} returned to counting; ${session.postedCount} posted line${session.postedCount === 1 ? "" : "s"} remain posted.`
+    : `${session.number} returned to counting.`, { postedCount: session.postedCount });
   return { message: `${session.number} returned to counting.` };
 }
 
@@ -288,11 +349,14 @@ export async function requestCountLineApproval(actor: ActorIdentity, payload: Re
   const sessionId = requiredText(payload.sessionId, "sessionId");
   const session = await requireMutableSession(sessionId, ["review", "awaiting_approval"]);
   const lineId = requiredText(payload.lineId, "lineId");
-  const line = await first<{ productId: string; locationId: string; expectedQuantity: number; countedQuantity: number | null; varianceQuantity: number; reason: string | null; approvalId: string | null }>(
-    `SELECT product_id AS productId,location_id AS locationId,expected_qty AS expectedQuantity,counted_qty AS countedQuantity,
-      variance_qty AS varianceQuantity,reason,approval_id AS approvalId FROM inventory_count_session_lines WHERE id=? AND session_id=?`, lineId, sessionId);
+  const line = await first<{ productId: string; locationId: string; expectedQuantity: number; countedQuantity: number | null; varianceQuantity: number; reason: string | null; approvalId: string | null; approvalStatus: string | null; status: string }>(
+    `SELECT l.product_id AS productId,l.location_id AS locationId,l.expected_qty AS expectedQuantity,l.counted_qty AS countedQuantity,
+      l.variance_qty AS varianceQuantity,l.reason,l.approval_id AS approvalId,a.status AS approvalStatus,l.status
+      FROM inventory_count_session_lines l LEFT JOIN approvals a ON a.id=l.approval_id WHERE l.id=? AND l.session_id=?`, lineId, sessionId);
   if (!line || line.countedQuantity == null) throw new CountSessionError("NOT_FOUND", "A completed count line is required.", 404);
-  if (line.approvalId) return { message: "This variance already has an approval request.", approvalId: line.approvalId };
+  if (line.status === "posted" || line.status === "cancelled") throw new CountSessionError("INVALID_STATE", `A ${line.status} count line cannot request approval.`, 409);
+  // Only a live request blocks a new one; a rejected or withdrawn request may be re-requested.
+  if (line.approvalId && (line.approvalStatus === "pending" || line.approvalStatus === "approved")) return { message: "This variance already has an approval request.", approvalId: line.approvalId };
   if (Math.abs(Number(line.varianceQuantity)) < 0.000001) throw new CountSessionError("NO_VARIANCE", "A matching count does not need approval.", 409);
   const result = await executeWorkflow({
     command: "requestApproval",
@@ -314,7 +378,8 @@ export async function requestCountLineApproval(actor: ActorIdentity, payload: Re
       },
     },
   });
-  await getD1().prepare("UPDATE inventory_count_session_lines SET approval_id=?,version=version+1 WHERE id=? AND approval_id IS NULL").bind(result.recordId, lineId).run();
+  await getD1().prepare("UPDATE inventory_count_session_lines SET approval_id=?,last_error=NULL,version=version+1 WHERE id=? AND (approval_id IS NULL OR approval_id=?)")
+    .bind(result.recordId, lineId, line.approvalId).run();
   await getD1().prepare("UPDATE inventory_count_sessions SET status='awaiting_approval',version=version+1 WHERE id=? AND status='review'").bind(sessionId).run();
   return { message: result.message, approvalId: result.recordId };
 }
@@ -331,6 +396,56 @@ export async function approveCountLine(actor: ActorIdentity, payload: Record<str
     idempotencyKey: requiredText(payload.idempotencyKey, "idempotencyKey"), actor,
     payload: { reason: requiredText(payload.reason ?? "Approved after inventory count review", "approval reason") } });
   return { message: result.message };
+}
+
+/**
+ * Re-snapshots one line against the current inventory balance while keeping the physical count.
+ * This is the way out of a "conflict" line (stock moved after the line was prepared) and the way to
+ * release a line whose variance approval was rejected. A live approval whose scope still matches is
+ * kept; one whose book quantity changed can never be consumed, so it is withdrawn and detached.
+ */
+export async function refreshCountLine(actor: ActorIdentity, payload: Record<string, unknown>) {
+  await ensureDatabase();
+  const sessionId = requiredText(payload.sessionId, "sessionId");
+  const session = await requireMutableSession(sessionId, ["draft", "counting", "review", "awaiting_approval"]);
+  const lineId = requiredText(payload.lineId, "lineId");
+  const line = await first<{ productId: string; locationId: string; expectedQuantity: number; expectedBalanceVersion: number; countedQuantity: number | null; reason: string | null; status: string; approvalId: string | null; approvalStatus: string | null; approvalConsumedAt: string | null; version: number }>(
+    `SELECT l.product_id AS productId,l.location_id AS locationId,l.expected_qty AS expectedQuantity,l.expected_balance_version AS expectedBalanceVersion,
+      l.counted_qty AS countedQuantity,l.reason,l.status,l.approval_id AS approvalId,a.status AS approvalStatus,a.consumed_at AS approvalConsumedAt,l.version
+      FROM inventory_count_session_lines l LEFT JOIN approvals a ON a.id=l.approval_id WHERE l.id=? AND l.session_id=?`, lineId, sessionId);
+  if (!line) throw new CountSessionError("NOT_FOUND", "Count line was not found.", 404);
+  if (line.status === "posted") throw new CountSessionError("INVALID_STATE", "A posted count line is immutable.", 409, line.version);
+  if (line.status === "cancelled") throw new CountSessionError("INVALID_STATE", "A cancelled count line cannot be refreshed.", 409, line.version);
+  const balance = await first<{ quantity: number; version: number }>("SELECT on_hand_qty AS quantity,version FROM inventory_balances WHERE product_id=? AND location_id=?", line.productId, line.locationId);
+  const expectedQuantity = Number(balance?.quantity ?? 0);
+  const expectedBalanceVersion = Number(balance?.version ?? 1);
+  const countedQuantity = line.countedQuantity == null ? null : Number(line.countedQuantity);
+  const varianceQuantity = countedQuantity == null ? null : roundQuantity(countedQuantity - expectedQuantity);
+  const bookChanged = Number(line.expectedQuantity) !== expectedQuantity;
+  const now = new Date().toISOString();
+  let approvalDisposition: "none" | "kept" | "released" | "withdrawn" = line.approvalId ? "kept" : "none";
+  if (line.approvalId) {
+    const live = line.approvalStatus === "pending" || (line.approvalStatus === "approved" && !line.approvalConsumedAt);
+    if (!live) approvalDisposition = "released";
+    else if (bookChanged) {
+      approvalDisposition = line.approvalStatus === "pending" ? "withdrawn" : "released";
+      if (line.approvalStatus === "pending") {
+        await getD1().prepare("UPDATE approvals SET status='canceled',decided_by=?,decision_reason=?,decided_at=?,version=version+1 WHERE id=? AND status='pending'")
+          .bind(actor.label, `Withdrawn: the book quantity behind this ${session.number} variance changed before it was decided.`, now, line.approvalId).run();
+      }
+    }
+  }
+  const keepApproval = approvalDisposition === "kept";
+  const status = keepApproval && line.status === "needs_approval" ? "needs_approval" : lineStatusFor(countedQuantity, varianceQuantity, line.reason);
+  const result = await getD1().prepare(`UPDATE inventory_count_session_lines SET expected_qty=?,expected_balance_version=?,variance_qty=?,status=?,approval_id=?,last_error=NULL,version=version+1
+    WHERE id=? AND session_id=? AND version=? AND status NOT IN ('posted','cancelled')`)
+    .bind(expectedQuantity, expectedBalanceVersion, varianceQuantity, status, keepApproval ? line.approvalId : null, lineId, sessionId, line.version).run();
+  if (!result.meta?.changes) throw new CountSessionError("VERSION_CONFLICT", "This count line changed before it could be refreshed.", 409);
+  await settleAwaitingApproval(sessionId);
+  await auditSession(actor, sessionId, "inventory_count_line_refreshed", "A count line was refreshed against the current inventory balance.",
+    { lineId, previousExpectedQuantity: Number(line.expectedQuantity), expectedQuantity, previousStatus: line.status, status, approvalId: line.approvalId, approvalDisposition });
+  if (concealsBook(session) || varianceQuantity == null) return { message: "Line refreshed against the current inventory balance." };
+  return { message: varianceQuantity === 0 ? "Line refreshed; the count now matches the book quantity." : `Line refreshed with a ${varianceQuantity > 0 ? "+" : ""}${varianceQuantity} variance.` };
 }
 
 export async function postCountSession(actor: ActorIdentity, payload: Record<string, unknown>) {
@@ -406,9 +521,21 @@ export async function postCountSession(actor: ActorIdentity, payload: Record<str
 export async function cancelCountSession(actor: ActorIdentity, payload: Record<string, unknown>) {
   const sessionId = requiredText(payload.sessionId, "sessionId");
   const session = await requireMutableSession(sessionId, ["draft", "counting", "review", "awaiting_approval"]);
-  if (session.postedCount > 0) throw new CountSessionError("PARTIALLY_POSTED", "A partially posted session cannot be cancelled.", 409);
-  await getD1().prepare("UPDATE inventory_count_sessions SET status='cancelled',version=version+1 WHERE id=?").bind(sessionId).run();
-  await auditSession(actor, sessionId, "inventory_count_session_cancelled", `${session.number} cancelled.`, { reason: typeof payload.reason === "string" ? payload.reason.trim() : "" });
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  const now = new Date().toISOString();
+  const db = getD1();
+  // Posted lines and their stock movements stand; the rest are cancelled and their pending approval
+  // requests withdrawn so nothing lingers in the approval queue for a session that will never post.
+  await db.batch([
+    db.prepare(`UPDATE approvals SET status='canceled',decided_by=?,decision_reason=?,decided_at=?,version=version+1
+      WHERE status='pending' AND id IN (SELECT approval_id FROM inventory_count_session_lines WHERE session_id=? AND status<>'posted' AND approval_id IS NOT NULL)`)
+      .bind(actor.label, `Withdrawn: ${session.number} cancelled${reason ? ` (${reason})` : ""}.`, now, sessionId),
+    db.prepare("UPDATE inventory_count_session_lines SET status='cancelled',last_error=NULL,version=version+1 WHERE session_id=? AND status<>'posted'").bind(sessionId),
+    db.prepare("UPDATE inventory_count_sessions SET status='cancelled',version=version+1 WHERE id=? AND status IN ('draft','counting','review','awaiting_approval')").bind(sessionId),
+  ]);
+  await auditSession(actor, sessionId, "inventory_count_session_cancelled", session.postedCount > 0
+    ? `${session.number} cancelled; ${session.postedCount} posted line${session.postedCount === 1 ? "" : "s"} remain posted.`
+    : `${session.number} cancelled.`, { reason, postedCount: session.postedCount });
   return { message: `${session.number} cancelled.` };
 }
 

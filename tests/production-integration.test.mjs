@@ -348,7 +348,7 @@ test("receipts reject unknown locations before creating physical or financial re
   );
   await assert.rejects(
     inventoryDomain.executeInventoryCommand({ command: "postReceipt", entityId: "po-location", version: 1, idempotencyKey: "missing-location-receipt", payload: { lineId: "pol-location", quantity: 1, postingDate: "2026-08-01", actor: "Tester" } }),
-    (error) => error?.code === "VALIDATION_ERROR" && /locationId is required/.test(error.message),
+    (error) => error?.code === "VALIDATION_ERROR" && /warehouseId is required/.test(error.message),
   );
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM receipts WHERE purchase_order_id='po-location'").get().count, 0);
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM inventory_value_entries WHERE reference_id='po-location'").get().count, 0);
@@ -490,26 +490,29 @@ test("purchase draft edits retain line discounts, tax, and charges after reload"
   assert.equal(snapshot.purchaseOrders[0].lines[0].taxRateBps, 500);
 });
 
-test("dedicated supply links are unique, editable by their owner, and claimed atomically", async () => {
+test("dedicated supply allocations are quantity based, editable by their owner, and claimed atomically", async () => {
   const actor = { id: "operator", email: "operator@example.com", name: "Operator", role: "operator", label: "Operator <operator@example.com>", localDevelopment: false };
   await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-supply-link','SO-SUPPLY-LINK','customer-draft','draft','not_invoiced','2026-08-25','CAD',1,600,600,1,'2026-08-01')");
-  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-supply-link','so-supply-link','prod-a',2,0,200,'special_order',0,0,0),('sol-supply-duplicate','so-supply-link','prod-a',1,0,200,'special_order',0,0,0),('sol-supply-atomic','so-supply-link','prod-a',1,0,200,'special_order',0,0,0)");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-supply-link','so-supply-link','prod-a',4,0,200,'special_order',0,0,0),('sol-supply-duplicate','so-supply-link','prod-a',1,0,200,'special_order',0,0,0),('sol-supply-atomic','so-supply-link','prod-a',1,0,200,'special_order',0,0,0)");
   const basePayload = { vendorId: "vendor-receipt", expectedDate: "2026-08-30", currency: "CAD", exchangeRateToBase: 1, paymentTerms: "Net 30", dueDate: "2026-09-29" };
-  const linked = await advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", entityId: "new", version: 0, idempotencyKey: "create-linked-supply-po", actor, payload: { ...basePayload, lines: [{ kind: "item", productId: "prod-a", quantity: 2, unitCostCents: 100, taxable: false, taxRateBps: 0, fulfillmentRoute: "special_order", sourceSalesOrderLineId: "sol-supply-link" }] } });
+  const linked = await advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", entityId: "new", version: 0, idempotencyKey: "create-linked-supply-po", actor, payload: { ...basePayload, lines: [{ kind: "item", productId: "prod-a", quantity: 3, unitCostCents: 100, taxable: false, taxRateBps: 0, fulfillmentRoute: "special_order", supplyAllocations: [{ salesOrderLineId: "sol-supply-link", quantity: 2 }] }] } });
   const originalLine = db.sqlite.prepare("SELECT id FROM purchase_order_lines WHERE purchase_order_id=?").get(linked.recordId).id;
   assert.equal(db.sqlite.prepare("SELECT linked_purchase_order_line_id FROM sales_order_lines WHERE id='sol-supply-link'").get().linked_purchase_order_line_id, originalLine);
-  assert.equal((await inventoryDomain.searchInventoryReferences("salesOrderLines", "SO-SUPPLY-LINK", 20, "special_order")).items.some((item) => item.id === "sol-supply-link"), false);
+  assert.equal(db.sqlite.prepare("SELECT allocated_qty FROM supply_allocations WHERE purchase_order_line_id=?").get(originalLine).allocated_qty, 2);
+  assert.equal((await inventoryDomain.searchInventoryReferences("salesOrderLines", "SO-SUPPLY-LINK", 20, "special_order")).items.find((item) => item.id === "sol-supply-link").availableToAllocateQuantity, 2);
   assert.equal((await inventoryDomain.searchInventoryReferences("salesOrderLines", "SO-SUPPLY-LINK", 20, "special_order", linked.recordId)).items.some((item) => item.id === "sol-supply-link"), true);
   await assert.rejects(advancedDomain.executeWorkflow({ command: "updateSalesOrderDraft", entityId: "so-supply-link", version: 1, idempotencyKey: "reject-demand-replacement-with-supply", actor, payload: {} }), (error) => error?.code === "SUPPLY_COMMITMENT_EXISTS");
   await assert.rejects(advancedDomain.executeWorkflow({ command: "cancelSalesOrder", entityId: "so-supply-link", version: 1, idempotencyKey: "reject-demand-cancel-with-supply", actor, payload: { reason: "Customer changed scope" } }), (error) => error?.code === "SUPPLY_COMMITMENT_EXISTS");
 
-  await assert.rejects(advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", entityId: "new", version: 0, idempotencyKey: "reject-reused-supply-link", actor, payload: { ...basePayload, lines: [{ kind: "item", productId: "prod-a", quantity: 2, unitCostCents: 100, fulfillmentRoute: "special_order", sourceSalesOrderLineId: "sol-supply-link" }] } }), (error) => error?.code === "SUPPLY_LINK_IN_USE");
+  const shared = await advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", entityId: "new", version: 0, idempotencyKey: "share-supply-demand", actor, payload: { ...basePayload, lines: [{ kind: "item", productId: "prod-a", quantity: 2, unitCostCents: 100, fulfillmentRoute: "special_order", supplyAllocations: [{ salesOrderLineId: "sol-supply-link", quantity: 1 }] }] } });
+  const sharedLine = db.sqlite.prepare("SELECT id FROM purchase_order_lines WHERE purchase_order_id=?").get(shared.recordId).id;
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM supply_allocations WHERE sales_order_line_id='sol-supply-link' AND status='active'").get().count, 2);
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", entityId: "new", version: 0, idempotencyKey: "reject-over-allocation", actor, payload: { ...basePayload, lines: [{ kind: "item", productId: "prod-a", quantity: 2, unitCostCents: 100, fulfillmentRoute: "special_order", supplyAllocations: [{ salesOrderLineId: "sol-supply-link", quantity: 2 }] }] } }), (error) => error?.code === "OVER_ALLOCATION");
   await assert.rejects(advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", entityId: "new", version: 0, idempotencyKey: "reject-duplicate-supply-link", actor, payload: { ...basePayload, lines: [
-    { kind: "item", productId: "prod-a", quantity: 1, unitCostCents: 100, fulfillmentRoute: "special_order", sourceSalesOrderLineId: "sol-supply-duplicate" },
-    { kind: "item", productId: "prod-a", quantity: 1, unitCostCents: 100, fulfillmentRoute: "special_order", sourceSalesOrderLineId: "sol-supply-duplicate" },
-  ] } }), (error) => error?.code === "DUPLICATE_SUPPLY_LINK");
+    { kind: "item", productId: "prod-a", quantity: 2, unitCostCents: 100, fulfillmentRoute: "special_order", supplyAllocations: [{ salesOrderLineId: "sol-supply-duplicate", quantity: 1 }, { salesOrderLineId: "sol-supply-duplicate", quantity: 1 }] },
+  ] } }), (error) => error?.code === "DUPLICATE_SUPPLY_ALLOCATION");
 
-  await advancedDomain.executeWorkflow({ command: "updatePurchaseOrderDraft", entityId: linked.recordId, version: 1, idempotencyKey: "retain-owned-supply-link", actor, payload: { ...basePayload, lines: [{ kind: "item", productId: "prod-a", quantity: 3, unitCostCents: 110, fulfillmentRoute: "special_order", sourceSalesOrderLineId: "sol-supply-link" }] } });
+  await advancedDomain.executeWorkflow({ command: "updatePurchaseOrderDraft", entityId: linked.recordId, version: 1, idempotencyKey: "retain-owned-supply-link", actor, payload: { ...basePayload, lines: [{ kind: "item", productId: "prod-a", quantity: 4, unitCostCents: 110, fulfillmentRoute: "special_order", supplyAllocations: [{ salesOrderLineId: "sol-supply-link", quantity: 3 }] }] } });
   const replacementLine = db.sqlite.prepare("SELECT id FROM purchase_order_lines WHERE purchase_order_id=?").get(linked.recordId).id;
   assert.notEqual(replacementLine, originalLine);
   assert.equal(db.sqlite.prepare("SELECT linked_purchase_order_line_id FROM sales_order_lines WHERE id='sol-supply-link'").get().linked_purchase_order_line_id, replacementLine);
@@ -520,13 +523,39 @@ test("dedicated supply links are unique, editable by their owner, and claimed at
     advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", entityId: "new", version: 0, idempotencyKey: "atomic-supply-link-b", actor, payload: concurrentPayload }),
   ]);
   assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 1);
-  assert.equal(attempts.filter((attempt) => attempt.status === "rejected" && ["CREATE_CONFLICT", "SUPPLY_LINK_IN_USE"].includes(attempt.reason?.code)).length, 1);
-  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM purchase_order_lines WHERE source_sales_order_line_id='sol-supply-atomic'").get().count, 1);
+  assert.equal(attempts.filter((attempt) => attempt.status === "rejected" && ["CREATE_CONFLICT", "OVER_ALLOCATION"].includes(attempt.reason?.code)).length, 1);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM supply_allocations WHERE sales_order_line_id='sol-supply-atomic' AND status='active'").get().count, 1);
 
   await advancedDomain.executeWorkflow({ command: "cancelPurchaseOrder", entityId: linked.recordId, version: 2, idempotencyKey: "cancel-linked-supply-po", actor, payload: { reason: "Customer demand was revised before commitment" } });
   assert.deepEqual({ ...db.sqlite.prepare("SELECT lifecycle_status,version FROM purchase_orders WHERE id=?").get(linked.recordId) }, { lifecycle_status: "canceled", version: 3 });
-  assert.equal(db.sqlite.prepare("SELECT linked_purchase_order_line_id FROM sales_order_lines WHERE id='sol-supply-link'").get().linked_purchase_order_line_id, null);
+  assert.equal(db.sqlite.prepare("SELECT linked_purchase_order_line_id FROM sales_order_lines WHERE id='sol-supply-link'").get().linked_purchase_order_line_id, sharedLine);
+  assert.equal(db.sqlite.prepare("SELECT status FROM supply_allocations WHERE purchase_order_line_id=?").get(replacementLine).status, "released");
   await assert.rejects(advancedDomain.executeWorkflow({ command: "cancelPurchaseOrder", entityId: "po-batch", version: 4, idempotencyKey: "reject-cancel-po-with-receipt-history", actor, payload: { reason: "Cannot erase receipt history" } }), (error) => error?.code === "RECEIPT_HISTORY_EXISTS");
+});
+
+test("usable receipts auto-reserve allocated sales demand and reversal unwinds its own allocation", async () => {
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('prod-auto-allocation','SKU-AUTO','Auto allocation product','test','test','test','test','quantity','special_order',125,250,0,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-auto-early','SO-AUTO-1','customer-draft','confirmed','not_invoiced','2026-08-20','CAD',1,500,500,1,'2026-08-01'),('so-auto-late','SO-AUTO-2','customer-draft','confirmed','not_invoiced','2026-08-21','CAD',1,750,750,1,'2026-08-01')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-auto-early','so-auto-early','prod-auto-allocation',2,0,250,'special_order',0,0,0),('sol-auto-late','so-auto-late','prod-auto-allocation',3,0,250,'special_order',0,0,0)");
+  await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('po-auto-allocation','PO-AUTO','vendor-receipt','approved','not_billed','2026-08-15','CAD',1,750,750,1,'2026-08-01')");
+  await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,fulfillment_route,source_sales_order_line_id,version) VALUES ('pol-auto-allocation','po-auto-allocation','prod-auto-allocation',6,0,125,'special_order','sol-auto-early',1)");
+  await run("INSERT INTO supply_allocations (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version) VALUES ('allocation-auto-early','pol-auto-allocation','sol-auto-early',2,0,'active','2026-08-01T00:00:00Z','2026-08-01T00:00:00Z',1),('allocation-auto-late','pol-auto-allocation','sol-auto-late',3,0,'active','2026-08-01T00:00:01Z','2026-08-01T00:00:01Z',1)");
+
+  const receipt = await inventoryDomain.executeInventoryCommand({ command: "postReceipt", entityId: "po-auto-allocation", version: 1, idempotencyKey: "auto-allocated-receipt", payload: { lineId: "pol-auto-allocation", quantity: 4, damagedQuantity: 1, locationId: "loc-a", quarantineLocationId: "loc-tracked-return", postingDate: "2026-08-01", actor: "Receiver" } });
+  assert.deepEqual({ reserved: receipt.impact.reservedDelta, available: receipt.impact.availableDelta }, { reserved: 3, available: 0 });
+  assert.deepEqual(db.sqlite.prepare("SELECT id,received_qty FROM supply_allocations WHERE purchase_order_line_id='pol-auto-allocation' ORDER BY id").all().map((row) => ({ ...row })), [{ id: "allocation-auto-early", received_qty: 2 }, { id: "allocation-auto-late", received_qty: 2 }]);
+  assert.equal(db.sqlite.prepare("SELECT COALESCE(SUM(quantity),0) AS quantity FROM reservations WHERE product_id='prod-auto-allocation' AND status='active'").get().quantity, 3);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT on_hand_qty,reserved_qty FROM inventory_balances WHERE product_id='prod-auto-allocation' AND location_id='loc-a'").get() }, { on_hand_qty: 3, reserved_qty: 3 });
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM supply_allocation_receipts sar JOIN stock_movements sm ON sm.id=sar.receipt_movement_id WHERE sm.purchase_order_line_id='pol-auto-allocation'").get().count, 3);
+  assert.equal(db.sqlite.prepare("SELECT COALESCE(SUM(sar.quantity),0) AS quantity FROM supply_allocation_receipts sar JOIN stock_movements sm ON sm.id=sar.receipt_movement_id WHERE sm.inventory_status='quarantine' AND sm.purchase_order_line_id='pol-auto-allocation'").get().quantity, 1);
+
+  const postedReceipt = db.sqlite.prepare("SELECT id,version FROM receipts WHERE purchase_order_id='po-auto-allocation'").get();
+  const reversed = await inventoryDomain.executeInventoryCommand({ command: "reverseReceipt", entityId: postedReceipt.id, version: postedReceipt.version, idempotencyKey: "reverse-auto-allocated-receipt", payload: { lineId: "pol-auto-allocation", quantity: 1, disposition: "reopen", reason: "One usable piece was entered in error", postingDate: "2026-08-01", actor: "Receiver" } });
+  assert.equal(reversed.impact.reservedDelta, -1);
+  assert.equal(db.sqlite.prepare("SELECT COALESCE(SUM(received_qty),0) AS quantity FROM supply_allocations WHERE purchase_order_line_id='pol-auto-allocation'").get().quantity, 3);
+  assert.equal(db.sqlite.prepare("SELECT COALESCE(SUM(quantity),0) AS quantity FROM reservations WHERE product_id='prod-auto-allocation' AND status='active'").get().quantity, 2);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT on_hand_qty,reserved_qty FROM inventory_balances WHERE product_id='prod-auto-allocation' AND location_id='loc-a'").get() }, { on_hand_qty: 2, reserved_qty: 2 });
+  assert.equal(db.sqlite.prepare("SELECT COALESCE(SUM(reversed_qty),0) AS quantity FROM supply_allocation_receipts").get().quantity, 1);
 });
 
 test("customer contract prices override catalog defaults in server product search", async () => {
@@ -911,10 +940,10 @@ test("counter sale creates its hidden order, shipment, invoice, and full payment
   await run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('prod-counter','loc-a',5,0,1)");
   await run("INSERT INTO valuation_policies (product_id,method,standard_cost_cents,average_cost_cents,version,updated_at,updated_by) VALUES ('prod-counter','fifo',400,400,1,'2026-08-01','Tester')");
   await run("INSERT INTO cost_layers (id,product_id,received_qty,remaining_qty,unit_cost_cents,landed_cost_cents,received_at,status) VALUES ('layer-counter','prod-counter',5,5,400,0,'2026-08-01','open')");
-  await run("INSERT INTO business_partners (id,code,name,partner_type,payment_terms,currency,credit_limit_cents,credit_hold,active,version,created_at) VALUES ('customer-counter','CUST-COUNTER','Walk-in Customer','customer','Net 30','CAD',100000,0,1,1,'2026-08-01')");
+  await run("INSERT INTO business_partners (id,code,name,partner_type,payment_terms,currency,credit_limit_cents,credit_hold,active,version,created_at) VALUES ('customer-counter-account','CUST-COUNTER','Counter Account Customer','customer','Net 30','CAD',100000,0,1,1,'2026-08-01')");
 
   const command = { command: "postCounterSale", entityId: "counter-sale-request-1", version: 1, idempotencyKey: "post-counter-sale", payload: {
-    customerId: "customer-counter", postingDate: "2026-08-25", settlement: "pay_now", currency: "CAD", exchangeRateToBase: 1,
+    customerId: "customer-walk-in", postingDate: "2026-08-25", settlement: "pay_now", currency: "CAD", exchangeRateToBase: 1,
     paymentMethod: "cash", paymentReference: "TILL-0042", actor: "Tester", actorId: "tester", actorEmail: "tester@example.com",
     lines: [
       { kind: "item", productId: "prod-counter", quantity: 1, uomId: "uom-each", unitPriceCents: 1000, discountCents: 0, taxable: true, taxCode: "GST", taxRateBps: 500, fulfillmentRoute: "stock", locationId: "loc-a" },
@@ -927,6 +956,8 @@ test("counter sale creates its hidden order, shipment, invoice, and full payment
   assert.ok(result.invoiceId);
   assert.ok(result.paymentId);
   assert.match(result.message, new RegExp(`${result.invoiceNumber} paid.*${result.salesOrderNumber}`));
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT code,name,payment_terms FROM business_partners WHERE id='customer-walk-in'").get() }, { code: "WALK-IN", name: "Walk-in Customer", payment_terms: "Due on receipt" });
+  assert.equal(db.sqlite.prepare("SELECT customer_id FROM sales_orders WHERE id=?").get(result.salesOrderId).customer_id, "customer-walk-in");
   assert.deepEqual({ ...db.sqlite.prepare("SELECT lifecycle_status,billing_status,total_cents,version FROM sales_orders WHERE id=?").get(result.salesOrderId) }, { lifecycle_status: "confirmed", billing_status: "invoiced", total_cents: 2940, version: 1 });
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM sales_order_lines WHERE sales_order_id=?").get(result.salesOrderId).count, 2);
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,paid_cents,subtotal_cents,tax_cents,total_cents,payment_terms FROM customer_invoices WHERE id=?").get(result.invoiceId) }, { status: "paid", paid_cents: 2940, subtotal_cents: 2800, tax_cents: 140, total_cents: 2940, payment_terms: "Due on receipt" });
@@ -942,12 +973,17 @@ test("counter sale creates its hidden order, shipment, invoice, and full payment
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM customer_invoices WHERE sales_order_id=?").get(result.salesOrderId).count, 1);
 
   const accountSale = await inventoryDomain.executeInventoryCommand({ ...command, entityId: "counter-sale-request-account", idempotencyKey: "post-counter-sale-account", payload: {
-    ...command.payload, settlement: "on_account", paymentMethod: undefined, paymentReference: undefined, paymentTerms: "Net 30", dueDate: "2026-09-24",
+    ...command.payload, customerId: "customer-counter-account", settlement: "on_account", paymentMethod: undefined, paymentReference: undefined, paymentTerms: "Net 30", dueDate: "2026-09-24",
     lines: [{ ...command.payload.lines[0], quantity: 1 }],
   } });
   assert.equal(accountSale.paymentId, undefined);
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,paid_cents,payment_terms,due_date FROM customer_invoices WHERE id=?").get(accountSale.invoiceId) }, { status: "posted", paid_cents: 0, payment_terms: "Net 30", due_date: "2026-09-24" });
   assert.equal(db.sqlite.prepare("SELECT on_hand_qty FROM inventory_balances WHERE product_id='prod-counter' AND location_id='loc-a'").get().on_hand_qty, 1);
+
+  await assert.rejects(inventoryDomain.executeInventoryCommand({ ...command, entityId: "counter-sale-request-walk-in-account", idempotencyKey: "post-counter-sale-walk-in-account", payload: {
+    ...command.payload, settlement: "on_account", paymentMethod: undefined, paymentReference: undefined, paymentTerms: "Net 30", dueDate: "2026-09-24",
+    lines: [{ ...command.payload.lines[0], quantity: 1 }],
+  } }), (error) => error?.code === "WALK_IN_PAYMENT_REQUIRED");
 
   await assert.rejects(inventoryDomain.executeInventoryCommand({ ...command, entityId: "counter-sale-request-short", idempotencyKey: "post-counter-sale-short", payload: { ...command.payload, lines: [
     { ...command.payload.lines[0], quantity: 2 }, { ...command.payload.lines[1], quantity: 1, discountCents: 0 },
@@ -1174,4 +1210,25 @@ test("opening inventory uses opening balance accounting and stale count sessions
   assert.equal(result.blocked[0].code, "VERSION_CONFLICT");
   assert.equal(db.sqlite.prepare("SELECT on_hand_qty FROM inventory_balances WHERE product_id='product-conflict-test' AND location_id='location-opening-test'").get().on_hand_qty, 2);
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM inventory_counts WHERE count_session_id=?").get(conflict.session.id).count, 0);
+});
+
+test("the margin matrix can become the catalog default without replacing specific manual overrides", async () => {
+  const administrator = { id: "catalog-pricing-admin", email: "catalog-pricing-admin@example.com", name: "Catalog Pricing Admin", role: "administrator", label: "Catalog Pricing Admin <catalog-pricing-admin@example.com>", localDevelopment: false };
+  await run(`INSERT INTO products
+    (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,last_unit_cost_cents,
+     selling_price_cents,suggested_selling_price_cents,pricing_mode,manual_price_reason,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at)
+    VALUES
+    ('product-catalog-matrix','MATRIX-DEFAULT','Matrix default product','matrix-test','test','test','test','quantity','stocked',1000,800,1999,1200,'manual','Imported from Max Green inventory count sheet',0,'uom-each','uom-each','uom-each',1,1,'2026-09-02'),
+    ('product-manual-exception','MATRIX-MANUAL','Manual exception product','matrix-test','test','test','test','quantity','stocked',1000,800,2222,1200,'manual','Market-specific distributor override',0,'uom-each','uom-each','uom-each',1,1,'2026-09-02')`);
+
+  assert.equal(advancedDomain.workflowCapability("adoptMarginMatrixForCatalog"), "administer");
+  const result = await advancedDomain.executeWorkflow({ command: "adoptMarginMatrixForCatalog", idempotencyKey: "adopt-margin-matrix-catalog", actor: administrator, payload: {} });
+  assert.match(result.message, /now use the automatic margin matrix/);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT pricing_mode,selling_price_cents,manual_price_reason FROM products WHERE id='product-catalog-matrix'").get() }, {
+    pricing_mode: "automatic", selling_price_cents: 1200, manual_price_reason: null,
+  });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT pricing_mode,selling_price_cents,manual_price_reason FROM products WHERE id='product-manual-exception'").get() }, {
+    pricing_mode: "manual", selling_price_cents: 2222, manual_price_reason: "Market-specific distributor override",
+  });
+  assert.equal(db.sqlite.prepare("SELECT event_type FROM catalog_price_history WHERE product_id='product-catalog-matrix' ORDER BY created_at DESC LIMIT 1").get().event_type, "catalog_matrix_adopted");
 });

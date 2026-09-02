@@ -1556,3 +1556,70 @@ export const partnerAddresses = sqliteTable(
     index("idx_partner_addresses_partner_active").on(table.partnerId, table.active, table.isDefault),
   ]
 );
+
+/** Alternate SKU, manufacturer, and legacy descriptions that resolve to one stock item. */
+export const productAliases = sqliteTable(
+  "product_aliases",
+  {
+    id: text("id").primaryKey(),
+    productId: text("product_id").notNull().references(() => products.id),
+    alias: text("alias").notNull(),
+    normalizedAlias: text("normalized_alias").notNull(),
+    aliasType: text("alias_type").notNull().default("alternate"),
+    createdAt: text("created_at").notNull(),
+    createdBy: text("created_by").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_product_aliases_normalized").on(table.normalizedAlias),
+    index("idx_product_aliases_product").on(table.productId, table.alias),
+    check("product_aliases_type_check", sql`${table.aliasType} IN ('alternate','sku','manufacturer_sku','name','merged_record')`),
+  ]
+);
+
+/** The bin a part should default to when it is received into a specific warehouse. */
+export const productDefaultLocations = sqliteTable(
+  "product_default_locations",
+  {
+    productId: text("product_id").notNull().references(() => products.id),
+    warehouseId: text("warehouse_id").notNull().references(() => warehouses.id),
+    locationId: text("location_id").notNull().references(() => locations.id),
+    version: integer("version").notNull().default(1),
+    updatedAt: text("updated_at").notNull(),
+    updatedBy: text("updated_by").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.productId, table.warehouseId] }),
+    index("idx_product_default_locations_location").on(table.locationId),
+  ]
+);
+
+/** Durable redirects preserve the identity of master records retired by a merge. */
+export const masterRecordMerges = sqliteTable(
+  "master_record_merges",
+  {
+    id: text("id").primaryKey(),
+    entityType: text("entity_type").notNull(),
+    sourceId: text("source_id").notNull(),
+    targetId: text("target_id").notNull(),
+    sourceLabel: text("source_label").notNull(),
+    mergedAt: text("merged_at").notNull(),
+    mergedBy: text("merged_by").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_master_record_merges_source").on(table.entityType, table.sourceId),
+    index("idx_master_record_merges_target").on(table.entityType, table.targetId),
+    check("master_record_merges_type_check", sql`${table.entityType} IN ('product','business_partner')`),
+  ]
+);
+
+/** A retired draft PO points to the draft that absorbed its lines and charges. */
+export const purchaseOrderMerges = sqliteTable(
+  "purchase_order_merges",
+  {
+    sourcePurchaseOrderId: text("source_purchase_order_id").primaryKey().references(() => purchaseOrders.id),
+    targetPurchaseOrderId: text("target_purchase_order_id").notNull().references(() => purchaseOrders.id),
+    mergedAt: text("merged_at").notNull(),
+    mergedBy: text("merged_by").notNull(),
+  },
+  (table) => [index("idx_purchase_order_merges_target").on(table.targetPurchaseOrderId)]
+);

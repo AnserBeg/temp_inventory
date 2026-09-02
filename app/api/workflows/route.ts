@@ -1,6 +1,7 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
 import { executeWorkflow, getWorkflowSnapshot, workflowCapability, WorkflowError, type WorkflowCommand } from "@/lib/server/advanced-domain";
 import { processOutboxBatch } from "@/lib/server/outbox";
+import { PolicyError } from "@/lib/server/policy";
 
 export const dynamic = "force-dynamic";
 
@@ -36,6 +37,7 @@ export async function POST(request: Request) {
     return Response.json(result, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof AuthorizationError) return authorizationResponse(error);
+    if (error instanceof PolicyError) return Response.json({ error: { code: error.code, message: error.message } }, { status: error.status });
     if (error instanceof WorkflowError) {
       return Response.json({ error: { code: error.code, message: error.message, currentVersion: error.currentVersion } }, { status: error.status });
     }

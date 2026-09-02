@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { NumberField } from "./number-field";
 import { useDialogDismiss } from "./use-dialog-dismiss";
 
 export type PickerOption = {
@@ -38,38 +39,80 @@ const quickCreateLabels: Record<QuickCreateKind, string> = {
   assetType: "New returnable asset type",
 };
 
+/** The viewer's capability flags, as the snapshot reports them. */
+export type PickerPermissions = { canOperate?: boolean; canPostFinancial?: boolean; canApprove?: boolean; canAdminister?: boolean };
+
+/**
+ * Which capability each inline create command needs. Mirrors `workflowCapabilities` in
+ * lib/server/advanced-domain: createBusinessPartner / createProduct / createLocation /
+ * createReturnableAssetType need "approve"; units and price lists need "administer". Offering
+ * "+ New customer" to an operator only moved the refusal to a server error after they had
+ * keyed the whole record.
+ */
+const quickCreateCapability: Record<QuickCreateKind, keyof PickerPermissions> = {
+  customer: "canApprove", vendor: "canApprove", partner: "canApprove", product: "canApprove", location: "canApprove", assetType: "canApprove",
+  uom: "canAdminister", priceList: "canAdminister",
+};
+
+/** Set once at the application root so every picker beneath it knows what the viewer may create. */
+export const PickerPermissionsContext = createContext<PickerPermissions | undefined>(undefined);
+
+export function quickCreatePermitted(kind: QuickCreateKind | undefined, permissions: PickerPermissions | undefined): kind is QuickCreateKind {
+  if (!kind) return false;
+  return permissions?.[quickCreateCapability[kind]] === true;
+}
+
+/** The permissions a picker consults: an explicit prop wins over the root context. */
+function usePickerPermissions(explicit?: PickerPermissions) {
+  const fromContext = useContext(PickerPermissionsContext);
+  return explicit ?? fromContext;
+}
+
+/** The name assistive technology reads for an option row: the label, then the detail. */
+function optionName(label: string, detail?: string) {
+  return detail ? `${label}, ${detail}` : label;
+}
+
 /**
  * Arrow / Enter / Escape handling shared by both pickers. Rows are addressed by index so the
  * inline "create new" and "use what I typed" actions are reachable from the keyboard like any
  * other option — order entry at this volume is a typing job, not a pointing job.
  */
-function useListboxKeys({ open, setOpen, count, choose }: { open: boolean; setOpen: (open: boolean) => void; count: number; choose: (index: number) => void }) {
+function useListboxKeys({ open, setOpen, count, choose, preferred }: { open: boolean; setOpen: (open: boolean) => void; count: number; choose: (index: number) => void; preferred?: number }) {
   const [active, setActive] = useState(0);
+  // Whether the highlight has been moved on purpose since the list last changed. Until it has,
+  // Enter takes `preferred` (the "Use what I typed" row) over the first partial match.
+  const [navigated, setNavigated] = useState(false);
   const [listSignature, setListSignature] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
   // Adjusted during render rather than in an effect: filtering to three rows while the cursor
   // sits on row nine must not paint one frame with the cursor off the end of the list.
   const signature = `${open}:${count}`;
-  if (listSignature !== signature) { setListSignature(signature); setActive(0); }
+  if (listSignature !== signature) { setListSignature(signature); setActive(0); setNavigated(false); }
   useEffect(() => { if (open) listRef.current?.querySelector<HTMLElement>('[data-active="true"]')?.scrollIntoView({ block: "nearest" }); }, [active, open]);
+  const highlight = (index: number) => { setActive(index); setNavigated(true); };
   const onKeyDown = (event: ReactKeyboardEvent) => {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       if (!open) return setOpen(true);
-      if (count) setActive((current) => (current + (event.key === "ArrowDown" ? 1 : count - 1)) % count);
+      if (count) highlight((active + (event.key === "ArrowDown" ? 1 : count - 1)) % count);
     } else if (event.key === "Enter" && open && count) {
-      // Without this the surrounding order form submits instead of taking the highlighted row.
+      // Without this the surrounding order form submits instead of taking the highlighted row,
+      // and a quick-create dialog listening for Enter would post its half-filled record.
       event.preventDefault();
-      choose(active);
+      event.stopPropagation();
+      choose(preferred != null && !navigated ? preferred : active);
     } else if (event.key === "Escape" && open) {
+      // The key belongs to the list: closing it must not also close the dialog behind it.
       event.preventDefault();
+      event.stopPropagation();
       setOpen(false);
     } else if ((event.key === "Home" || event.key === "End") && open && count) {
       event.preventDefault();
-      setActive(event.key === "Home" ? 0 : count - 1);
+      highlight(event.key === "Home" ? 0 : count - 1);
     } else if (event.key === "Tab") setOpen(false);
   };
-  return { active, setActive, listRef, onKeyDown };
+  return { active, setActive: highlight, listRef, onKeyDown };
 }
 
 /**
@@ -77,7 +120,7 @@ function useListboxKeys({ open, setOpen, count, choose }: { open: boolean; setOp
  * filterable listbox once the list can realistically outgrow a glance. Both forms can
  * offer an inline "create new" action so a missing record never dead-ends the task.
  */
-export function SearchableSelect({ label, value, options, setValue, disabled = false, quickCreate, onCreated, placeholder, hideLabel = false, className, allowCustom = false }: {
+export function SearchableSelect({ label, value, options, setValue, disabled = false, quickCreate, onCreated, placeholder, hideLabel = false, className, allowCustom = false, permissions }: {
   label: string;
   value: string;
   options: PickerOption[];
@@ -91,30 +134,47 @@ export function SearchableSelect({ label, value, options, setValue, disabled = f
   className?: string;
   /** Keeps a typed value that matches no option. Reason lists can never enumerate a real day. */
   allowCustom?: boolean;
+  /** The viewer's capabilities; defaults to the PickerPermissionsContext set at the app root. */
+  permissions?: PickerPermissions;
 }) {
   const listboxId = useId();
   const [creating, setCreating] = useState(false);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const selected = options.find((option) => option.id === value);
-  const searchable = options.length > SEARCHABLE_THRESHOLD || Boolean(quickCreate) || allowCustom;
+  // Only offered when the viewer can actually post the create command.
+  const offerCreate = quickCreatePermitted(quickCreate, usePickerPermissions(permissions)) ? quickCreate : undefined;
+  const searchable = options.length > SEARCHABLE_THRESHOLD || Boolean(offerCreate) || allowCustom;
   const filtered = useMemo(() => {
     const term = query.trim().toLowerCase();
     if (!term) return options.slice(0, 50);
     return options.filter((option) => `${option.label} ${option.detail ?? ""}`.toLowerCase().includes(term)).slice(0, 50);
   }, [options, query]);
   const term = query.trim();
-  const custom = allowCustom && term && !options.some((option) => option.label.toLowerCase() === term.toLowerCase()) ? term : "";
-  const rows = filtered.length + (custom ? 1 : 0) + (quickCreate ? 1 : 0);
+  const exact = term ? options.find((option) => option.label.toLowerCase() === term.toLowerCase()) : undefined;
+  const custom = allowCustom && term && !exact ? term : "";
+  const rows = filtered.length + (custom ? 1 : 0) + (offerCreate ? 1 : 0);
 
   const created = async (option: PickerOption) => { setCreating(false); setValue(option.id, option); setQuery(""); setOpen(false); await onCreated?.(); };
   const choose = (index: number) => {
     setOpen(false);
     if (index < filtered.length) { setQuery(""); return setValue(filtered[index].id, filtered[index]); }
     if (custom && index === filtered.length) { setQuery(""); return setValue(custom); }
-    setCreating(true);
+    if (offerCreate) setCreating(true);
   };
-  const { active, setActive, listRef, onKeyDown } = useListboxKeys({ open, setOpen, count: rows, choose });
+  /**
+   * A typed reason used to survive only if the "Use …" row was picked. Clicking the submit
+   * button instead blurred the field and lost it, so the command posted with the old reason
+   * or none. Whatever is typed when focus leaves (or Escape closes the list) is the value.
+   */
+  const commitTyped = () => {
+    if (!allowCustom || !open) return;
+    if (exact) setValue(exact.id, exact);
+    else if (custom) setValue(custom);
+  };
+  // Enter takes the typed text itself while it matches no option exactly, rather than whichever
+  // partial match happened to sort first.
+  const { active, setActive, listRef, onKeyDown } = useListboxKeys({ open, setOpen, count: rows, choose, preferred: custom ? filtered.length : undefined });
 
   if (!searchable) {
     return <label className={className}>{hideLabel ? <span className="sr-only">{label}</span> : <span>{label}</span>}<select value={value} onChange={(event) => setValue(event.target.value, options.find((option) => option.id === event.target.value))} disabled={disabled} required>
@@ -125,9 +185,11 @@ export function SearchableSelect({ label, value, options, setValue, disabled = f
     </select></label>;
   }
 
-  const row = (index: number, key: string, className: string, children: ReactNode, isSelected: boolean) => <button
+  // aria-label is explicit: the row sits inside the field's <label>, and the tree read it as a
+  // bare "option" with no name.
+  const row = (index: number, key: string, className: string, children: ReactNode, isSelected: boolean, name: string) => <button
     type="button" role="option" key={key} id={`${listboxId}-row-${index}`} className={className}
-    data-active={index === active} aria-selected={isSelected}
+    data-active={index === active} aria-selected={isSelected} aria-label={name}
     onMouseEnter={() => setActive(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => choose(index)}
   >{children}</button>;
 
@@ -143,25 +205,25 @@ export function SearchableSelect({ label, value, options, setValue, disabled = f
       aria-autocomplete="list"
       aria-activedescendant={open && rows ? `${listboxId}-row-${active}` : undefined}
       onFocus={() => { setQuery(""); setOpen(true); }}
-      onBlur={() => window.setTimeout(() => setOpen(false), 140)}
-      onKeyDown={onKeyDown}
+      onBlur={() => { commitTyped(); window.setTimeout(() => setOpen(false), 140); }}
+      onKeyDown={(event) => { if (event.key === "Escape") commitTyped(); onKeyDown(event); }}
       onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
     />
-    {open ? <div id={listboxId} ref={listRef} className="reference-results" role="listbox">
-      {filtered.map((option, index) => row(index, option.id, "", <><strong>{option.label}</strong>{option.detail ? <small>{option.detail}</small> : null}</>, option.id === value))}
+    {open ? <div id={listboxId} ref={listRef} className="reference-results" role="listbox" aria-label={label}>
+      {filtered.map((option, index) => row(index, option.id, "", <><strong>{option.label}</strong>{option.detail ? <small>{option.detail}</small> : null}</>, option.id === value, optionName(option.label, option.detail)))}
       {!filtered.length && !custom ? <span className="reference-status">No matching records</span> : null}
-      {custom ? row(filtered.length, "custom", "reference-create", <>Use “{custom}”</>, false) : null}
-      {quickCreate ? row(rows - 1, "create", "reference-create", <>+ {quickCreateLabels[quickCreate]}</>, false) : null}
+      {custom ? row(filtered.length, "custom", "reference-create", <>Use “{custom}”</>, false, `Use “${custom}”`) : null}
+      {offerCreate ? row(rows - 1, "create", "reference-create", <>+ {quickCreateLabels[offerCreate]}</>, false, quickCreateLabels[offerCreate]) : null}
     </div> : null}
   </label>
-  {creating && quickCreate ? <QuickCreateDialog kind={quickCreate} onClose={() => setCreating(false)} onCreated={created} /> : null}</>;
+  {creating && offerCreate ? <QuickCreateDialog kind={offerCreate} onClose={() => setCreating(false)} onCreated={created} /> : null}</>;
 }
 
 /**
  * Server-backed picker for the tables too large to ship to the browser. Opening it always
  * lists the first page rather than re-searching whatever is already selected.
  */
-export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, locationId, quantity, warehouseId, currency, exchangeRateToBase, label, placeholder, value, initialOptions, onSelect, quickCreate, mapItem, hideLabel, onCreated }: {
+export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, locationId, quantity, warehouseId, currency, exchangeRateToBase, label, placeholder, value, valueLabel, initialOptions, onSelect, quickCreate, mapItem, hideLabel, onCreated, permissions }: {
   kind: LookupKind;
   role?: string;
   partnerId?: string;
@@ -175,12 +237,16 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
   label?: string;
   placeholder: string;
   value: string;
+  /** Shown for a value set programmatically that no fetched option has described yet. */
+  valueLabel?: string;
   initialOptions: PickerOption[];
   onSelect: (option: PickerOption) => void;
   quickCreate?: QuickCreateKind;
   mapItem: (item: Record<string, unknown>) => PickerOption;
   hideLabel?: boolean;
   onCreated?: () => void | Promise<void>;
+  /** The viewer's capabilities; defaults to the PickerPermissionsContext set at the app root. */
+  permissions?: PickerPermissions;
 }) {
   const listboxId = useId();
   const [creating, setCreating] = useState(false);
@@ -192,7 +258,10 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
   const [known, setKnown] = useState<Record<string, PickerOption>>(() => Object.fromEntries(initialOptions.map((option) => [option.id, option])));
   const mapRef = useRef(mapItem);
   const fallbackRef = useRef(initialOptions);
-  const selectedLabel = known[value]?.label ?? initialOptions.find((option) => option.id === value)?.label ?? "";
+  const offerCreate = quickCreatePermitted(quickCreate, usePickerPermissions(permissions)) ? quickCreate : undefined;
+  // A value chosen elsewhere (a product's sales unit, a rule's price list) is not necessarily on
+  // any page this picker has fetched; the caller's own label keeps the field from reading blank.
+  const selectedLabel = known[value]?.label ?? initialOptions.find((option) => option.id === value)?.label ?? (value ? valueLabel ?? "" : "");
 
   // Both kept in refs: callers build these inline, so a fresh identity on every parent render
   // would otherwise restart the lookup — a refetch per keystroke in a neighbouring field.
@@ -236,12 +305,12 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
   }, [currency, exchangeRateToBase, kind, lineId, locationId, open, partnerId, productId, quantity, query, role, warehouseId]);
 
   const choose = (option: PickerOption) => { setKnown((current) => ({ ...current, [option.id]: option })); onSelect(option); setOpen(false); };
-  const rows = loading ? 0 : options.length + (quickCreate ? 1 : 0);
-  const chooseRow = (index: number) => { if (index < options.length) return choose(options[index]); setOpen(false); setCreating(true); };
+  const rows = loading ? 0 : options.length + (offerCreate ? 1 : 0);
+  const chooseRow = (index: number) => { if (index < options.length) return choose(options[index]); if (!offerCreate) return; setOpen(false); setCreating(true); };
   const { active, setActive, listRef, onKeyDown } = useListboxKeys({ open, setOpen, count: rows, choose: chooseRow });
-  const row = (index: number, key: string, className: string, children: ReactNode, isSelected: boolean) => <button
+  const row = (index: number, key: string, className: string, children: ReactNode, isSelected: boolean, name: string) => <button
     type="button" role="option" key={key} id={`${listboxId}-row-${index}`} className={className}
-    data-active={index === active} aria-selected={isSelected}
+    data-active={index === active} aria-selected={isSelected} aria-label={name}
     onMouseEnter={() => setActive(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => chooseRow(index)}
   >{children}</button>;
 
@@ -261,16 +330,16 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
       onKeyDown={onKeyDown}
       onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
     />
-    {open ? <div id={listboxId} ref={listRef} className="reference-results" role="listbox">
-      {loading ? <span className="reference-status">Searching…</span> : options.map((option, index) => row(index, option.id, "", <><strong>{option.label}</strong>{option.detail ? <small>{option.detail}</small> : null}</>, option.id === value))}
+    {open ? <div id={listboxId} ref={listRef} className="reference-results" role="listbox" aria-label={label ?? placeholder}>
+      {loading ? <span className="reference-status">Searching…</span> : options.map((option, index) => row(index, option.id, "", <><strong>{option.label}</strong>{option.detail ? <small>{option.detail}</small> : null}</>, option.id === value, optionName(option.label, option.detail)))}
       {!loading && lookupError ? <span className="reference-status" role="alert">{lookupError} Type again to retry.</span> : null}
       {!loading && !lookupError && !options.length ? <span className="reference-status">No matching active records</span> : null}
-      {quickCreate && !loading ? row(rows - 1, "create", "reference-create", <>+ {quickCreateLabels[quickCreate]}</>, false) : null}
+      {offerCreate && !loading ? row(rows - 1, "create", "reference-create", <>+ {quickCreateLabels[offerCreate]}</>, false, quickCreateLabels[offerCreate]) : null}
     </div> : null}
   </div>;
 
   return <>{label && !hideLabel ? <label className="reference-field"><span>{label}</span>{field}</label> : field}
-    {creating && quickCreate ? <QuickCreateDialog kind={quickCreate} onClose={() => setCreating(false)} onCreated={async (option) => { choose(option); setCreating(false); await onCreated?.(); }} /> : null}</>;
+    {creating && offerCreate ? <QuickCreateDialog kind={offerCreate} onClose={() => setCreating(false)} onCreated={async (option) => { choose(option); setCreating(false); await onCreated?.(); }} /> : null}</>;
 }
 
 /** Minimal create form for the records people discover they are missing mid-task. */
@@ -397,10 +466,10 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
             {field("Finish", <input value={finish} onChange={(event) => setFinish(event.target.value)} required />)}
             {field("Tracking policy", <select value={trackingPolicy} onChange={(event) => setTrackingPolicy(event.target.value)}><option value="quantity">Quantity</option><option value="lot">Lot</option><option value="serial">Serial</option></select>)}
             {field("Inventory policy", <select value={inventoryPolicy} onChange={(event) => setInventoryPolicy(event.target.value)}><option value="stocked">Stocked</option><option value="special_order">Special order</option><option value="drop_ship">Drop ship</option></select>)}
-            {field("Reorder point", <input type="number" min="0" step="0.001" value={reorderPoint} onChange={(event) => { const value = Number(event.target.value); setReorderPoint(value); setMaxStockLevel((current) => Math.max(current, value)); }} />)}
-            {field("Reorder up to", <input type="number" min={reorderPoint} step="0.001" value={maxStockLevel} onChange={(event) => setMaxStockLevel(Number(event.target.value))} />)}
-            {field("Standard cost", <input type="number" min="0" step="0.01" value={cost} onChange={(event) => setCost(Number(event.target.value))} />)}
-            {field("Selling price", <input type="number" min="0" step="0.01" value={price} onChange={(event) => setPrice(Number(event.target.value))} />)}
+            {field("Reorder point", <NumberField min="0" step="0.001" value={reorderPoint} onChange={(value) => { setReorderPoint(value); setMaxStockLevel((current) => Math.max(current, value)); }} />)}
+            {field("Reorder up to", <NumberField min={reorderPoint} step="0.001" value={maxStockLevel} onChange={setMaxStockLevel} />)}
+            {field("Standard cost", <NumberField min="0" step="0.01" value={cost} onChange={setCost} />)}
+            {field("Selling price", <NumberField min="0" step="0.01" value={price} onChange={setPrice} />)}
           </> : null}
           {kind === "location" ? <>
             <RemoteSearchSelect kind="warehouses" label="Warehouse" placeholder="Search active warehouses" value={warehouseId} initialOptions={[]} onSelect={(option) => setWarehouseId(option.id)} mapItem={(item) => ({ id: String(item.id), label: `${String(item.code)} · ${String(item.name)}`, detail: String(item.timezone ?? "") })} />
@@ -408,15 +477,15 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
           </> : null}
           {kind === "uom" ? <>
             {field("Dimension", <select value={dimension} onChange={(event) => setDimension(event.target.value)}><option value="quantity">Quantity</option><option value="length">Length</option><option value="area">Area</option><option value="weight">Weight</option><option value="volume">Volume</option></select>)}
-            {field("Decimal precision", <input type="number" min="0" max="3" step="1" value={precision} onChange={(event) => setPrecision(Number(event.target.value))} />)}
+            {field("Decimal precision", <NumberField min="0" max="3" step="1" value={precision} onChange={setPrecision} />)}
           </> : null}
           {kind === "priceList" ? <>
             {field("Currency", <select value={currency} onChange={(event) => setCurrency(event.target.value)}><option>CAD</option><option>USD</option><option>EUR</option></select>)}
-            {field("Priority", <input type="number" min="0" step="1" value={priority} onChange={(event) => setPriority(Number(event.target.value))} />)}
+            {field("Priority", <NumberField min="0" step="1" value={priority} onChange={setPriority} />)}
           </> : null}
           {kind === "assetType" ? <>
             {field("Asset class", <input value={assetClass} onChange={(event) => setAssetClass(event.target.value)} placeholder="Rack, core, stillage, crate…" />)}
-            {field("Unit deposit", <input type="number" min="0" step="0.01" value={deposit} onChange={(event) => setDeposit(Number(event.target.value))} />)}
+            {field("Unit deposit", <NumberField min="0" step="0.01" value={deposit} onChange={setDeposit} />)}
           </> : null}
         </div>
         {/* Naming what is still missing. The button used to grey out with no explanation, and

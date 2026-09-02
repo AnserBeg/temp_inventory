@@ -63,6 +63,8 @@ test("includes responsive, focus-visible, reduced-motion, and print behavior", a
   assert.match(css, /\.quick-create-dialog > div:not\(\.dialog-header\)\s*\{[^}]*padding:\s*18px 20px 20px/);
   assert.match(css, /\.command-dialog\s*\{[^}]*max-height:\s*calc\(100dvh - 36px\)/);
   assert.match(css, /input\[type="checkbox"\]\s*\{[^}]*width:\s*17px/);
+  assert.match(css, /\.app-shell input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\)[\s\S]*?font-size:\s*16px/);
+  assert.match(css, /\.supply-allocation-row\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/);
 });
 
 test("declares durable D1 data and explicit command and record APIs", async () => {

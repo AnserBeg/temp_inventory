@@ -91,9 +91,15 @@ export const workflowCapabilities = {
   createBusinessPartner: "approve",
   updateBusinessPartner: "approve",
   deactivateBusinessPartner: "approve",
+  mergeBusinessPartners: "administer",
   createProduct: "approve",
   updateProduct: "approve",
   deactivateProduct: "approve",
+  addProductAlias: "approve",
+  removeProductAlias: "approve",
+  setProductDefaultLocation: "approve",
+  mergeProducts: "administer",
+  mergePurchaseOrders: "operationalWrite",
   createUnitOfMeasure: "administer",
   createUomConversion: "administer",
   createPriceList: "administer",
@@ -108,6 +114,7 @@ export const workflowCapabilities = {
   createMarginRule: "administer",
   updateMarginRule: "administer",
   deactivateMarginRule: "administer",
+  adoptMarginMatrixForCatalog: "administer",
   updateProductPricing: "approve",
   createWarehouse: "approve",
   updateWarehouse: "approve",
@@ -352,8 +359,7 @@ async function updateSalesOrderDraft(command: WorkflowCommand) {
   if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Sales order changed; refresh before editing the draft.", 409, current.version);
   if (current.status !== "draft") throw new WorkflowError("INVALID_STATE", "Only draft sales orders can be edited.", 409, current.version);
   if (await first(`SELECT sol.id FROM sales_order_lines sol
-    WHERE sol.sales_order_id=? AND (sol.linked_purchase_order_line_id IS NOT NULL
-      OR EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.source_sales_order_line_id=sol.id)) LIMIT 1`, id)) {
+    WHERE sol.sales_order_id=? AND EXISTS (SELECT 1 FROM supply_allocations sa WHERE sa.sales_order_line_id=sol.id AND sa.status='active') LIMIT 1`, id)) {
     throw new WorkflowError("SUPPLY_COMMITMENT_EXISTS", "Cancel the linked purchase order before replacing sales-order lines that have dedicated supply.", 409, current.version);
   }
   const customerId = textValue(payload, "customerId");
@@ -396,8 +402,8 @@ async function updateSalesOrderDraft(command: WorkflowCommand) {
       AND NOT EXISTS (SELECT 1 FROM reservations r JOIN sales_order_lines sol ON sol.id=r.sales_order_line_id WHERE sol.sales_order_id=so.id AND r.status='active')
       AND NOT EXISTS (SELECT 1 FROM shipments sh WHERE sh.sales_order_id=so.id)
       AND NOT EXISTS (SELECT 1 FROM customer_invoices ci WHERE ci.sales_order_id=so.id AND ci.status<>'void')
-      AND NOT EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.sales_order_id=so.id AND (sol.linked_purchase_order_line_id IS NOT NULL
-        OR EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.source_sales_order_line_id=sol.id)))`)
+      AND NOT EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.sales_order_id=so.id
+        AND EXISTS (SELECT 1 FROM supply_allocations sa WHERE sa.sales_order_line_id=sol.id AND sa.status='active'))`)
       .bind(...claimValues(command, result, id), id, version),
     db.prepare(`UPDATE sales_orders SET customer_id=?,requested_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,ship_to_name=?,ship_to_address_line_1=?,ship_to_address_line_2=?,ship_to_city=?,ship_to_region=?,ship_to_postal_code=?,ship_to_country=?,delivery_instructions=?,version=version+1
       WHERE id=? AND version=? AND lifecycle_status='draft' AND ${marker(command)}`)
@@ -459,19 +465,24 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
   };
   const db = commandD1(command);
   const when = new Date().toISOString();
-  const sourceLines = prepared.items.filter((line) => line.sourceSalesOrderLineId);
-  const sourceClaims = sourceLines.map(() => ` AND EXISTS (SELECT 1 FROM sales_order_lines sol
-    LEFT JOIN purchase_order_lines linked ON linked.id=sol.linked_purchase_order_line_id
-    WHERE sol.id=? AND sol.product_id=? AND sol.fulfillment_route=?
-      AND (sol.linked_purchase_order_line_id IS NULL OR linked.purchase_order_id=?)
-      AND NOT EXISTS (SELECT 1 FROM purchase_order_lines other WHERE other.source_sales_order_line_id=sol.id AND other.purchase_order_id<>?))`).join("");
-  const sourceClaimValues = sourceLines.flatMap((line) => [line.sourceSalesOrderLineId!, line.productId, line.fulfillmentRoute, id, id]);
+  const allocationDemand = new Map<string, { quantity: number; productId: string; route: string }>();
+  for (const line of prepared.items) for (const allocation of line.supplyAllocations) {
+    const currentAllocation = allocationDemand.get(allocation.salesOrderLineId);
+    allocationDemand.set(allocation.salesOrderLineId, { quantity: (currentAllocation?.quantity ?? 0) + allocation.quantity, productId: line.productId, route: line.fulfillmentRoute });
+  }
+  const allocationClaims = [...allocationDemand].map(() => ` AND EXISTS (SELECT 1 FROM sales_order_lines sol
+    JOIN sales_orders so ON so.id=sol.sales_order_id
+    WHERE sol.id=? AND sol.product_id=? AND sol.fulfillment_route=? AND so.lifecycle_status<>'canceled'
+      AND sol.ordered_qty-sol.canceled_qty-COALESCE((SELECT SUM(sa.allocated_qty) FROM supply_allocations sa
+        JOIN purchase_order_lines other_line ON other_line.id=sa.purchase_order_line_id
+        WHERE sa.sales_order_line_id=sol.id AND sa.status='active' AND other_line.purchase_order_id<>?),0)>=?)`).join("");
+  const allocationClaimValues = [...allocationDemand].flatMap(([salesOrderLineId, allocation]) => [salesOrderLineId, allocation.productId, allocation.route, id, allocation.quantity]);
   const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM purchase_orders po WHERE po.id=? AND po.version=? AND po.lifecycle_status='draft'
       AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.purchase_order_id=po.id)
-      AND NOT EXISTS (SELECT 1 FROM vendor_bills vb WHERE vb.purchase_order_id=po.id AND vb.status<>'void')${sourceClaims}`)
-      .bind(...claimValues(command, result, id), id, version, ...sourceClaimValues),
+      AND NOT EXISTS (SELECT 1 FROM vendor_bills vb WHERE vb.purchase_order_id=po.id AND vb.status<>'void')${allocationClaims}`)
+      .bind(...claimValues(command, result, id), id, version, ...allocationClaimValues),
     db.prepare(`UPDATE purchase_orders SET vendor_id=?,expected_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,version=version+1
       WHERE id=? AND version=? AND lifecycle_status='draft' AND ${marker(command)}`)
       .bind(vendorId, expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, prepared.totalCents, projectReference, id, version),
@@ -485,7 +496,14 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
       (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
       SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
       .bind(lineId, id, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.sourceSalesOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps));
-    if (line.sourceSalesOrderLineId) statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=? WHERE id=? AND product_id=? AND linked_purchase_order_line_id IS NULL AND ${marker(command)}`).bind(lineId, line.sourceSalesOrderLineId, line.productId));
+    for (const allocation of line.supplyAllocations) {
+      statements.push(db.prepare(`INSERT INTO supply_allocations
+        (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version)
+        SELECT ?,?,?,?,0,'active',?,?,1 WHERE ${marker(command)}`)
+        .bind(newId("allocation"), lineId, allocation.salesOrderLineId, allocation.quantity, when, when));
+      statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=COALESCE(linked_purchase_order_line_id,?) WHERE id=? AND product_id=? AND ${marker(command)}`)
+        .bind(lineId, allocation.salesOrderLineId, line.productId));
+    }
   }
   for (const charge of prepared.charges) statements.push(db.prepare(`INSERT INTO document_charges
     (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at)
@@ -534,7 +552,10 @@ async function cancelPurchaseOrder(command: WorkflowCommand) {
         AND NOT EXISTS (SELECT 1 FROM vendor_bills vb WHERE vb.purchase_order_id=po.id AND vb.status<>'void')
         AND NOT EXISTS (SELECT 1 FROM drop_ship_deliveries d JOIN purchase_order_lines pol ON pol.id=d.purchase_order_line_id WHERE pol.purchase_order_id=po.id)`)
       .bind(...claimValues(command, result, id), id, version),
-    db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=NULL
+    db.prepare(`UPDATE supply_allocations SET status='released',updated_at=?,version=version+1
+      WHERE purchase_order_line_id IN (SELECT id FROM purchase_order_lines WHERE purchase_order_id=?) AND status='active' AND ${marker(command)}`).bind(when, id),
+    db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=(SELECT sa.purchase_order_line_id FROM supply_allocations sa
+        WHERE sa.sales_order_line_id=sales_order_lines.id AND sa.status='active' ORDER BY sa.created_at,sa.id LIMIT 1)
       WHERE linked_purchase_order_line_id IN (SELECT id FROM purchase_order_lines WHERE purchase_order_id=?) AND ${marker(command)}`).bind(id),
     db.prepare(`UPDATE purchase_orders SET lifecycle_status='canceled',version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(id, version),
     db.prepare(`UPDATE purchase_order_revisions SET lifecycle_status='canceled' WHERE purchase_order_id=? AND revision_number=? AND ${marker(command)}`).bind(id, current.revision),
@@ -672,10 +693,11 @@ async function amendPurchaseOrder(command: WorkflowCommand) {
   if (order.status !== "approved") throw new WorkflowError("INVALID_STATE", "Only approved purchase orders can be amended.", 409);
   const changeIds = changes.map((change) => textValue(change, "lineId"));
   if (new Set(changeIds).size !== changeIds.length) throw new WorkflowError("DUPLICATE_DOCUMENT_LINE", "Each purchase-order line may be amended only once.");
-  const existingLines = await all<{ id: string; productId: string; ordered: number; closed: number; unitCost: number; configuration: string | null; route: string; sourceSalesLineId: string | null; discountCents: number; taxable: number; taxRateBps: number; retained: number }>(`SELECT pol.id,pol.product_id AS productId,pol.ordered_qty AS ordered,pol.closed_qty AS closed,pol.unit_cost_cents AS unitCost,pol.configuration_snapshot AS configuration,pol.fulfillment_route AS route,pol.source_sales_order_line_id AS sourceSalesLineId,pol.discount_cents AS discountCents,pol.taxable,pol.tax_rate_bps AS taxRateBps,
+  const existingLines = await all<{ id: string; productId: string; ordered: number; closed: number; unitCost: number; configuration: string | null; route: string; sourceSalesLineId: string | null; discountCents: number; taxable: number; taxRateBps: number; retained: number; allocated: number }>(`SELECT pol.id,pol.product_id AS productId,pol.ordered_qty AS ordered,pol.closed_qty AS closed,pol.unit_cost_cents AS unitCost,pol.configuration_snapshot AS configuration,pol.fulfillment_route AS route,pol.source_sales_order_line_id AS sourceSalesLineId,pol.discount_cents AS discountCents,pol.taxable,pol.tax_rate_bps AS taxRateBps,
       CASE WHEN pol.fulfillment_route='drop_ship'
         THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
-        ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END AS retained
+        ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END AS retained,
+      COALESCE((SELECT SUM(sa.allocated_qty) FROM supply_allocations sa WHERE sa.purchase_order_line_id=pol.id AND sa.status='active'),0) AS allocated
     FROM purchase_order_lines pol WHERE pol.purchase_order_id=? ORDER BY pol.id`, id);
   if (changeIds.some((lineId) => !existingLines.some((line) => line.id === lineId))) throw new WorkflowError("INVALID_PO_LINE", "Every amendment line must belong to this purchase order.", 409);
   const amendedLines = existingLines.map((line) => {
@@ -683,7 +705,7 @@ async function amendPurchaseOrder(command: WorkflowCommand) {
     if (!change) return line;
     const ordered = roundQuantity(numberValue(change, "orderedQuantity"));
     const unitCost = change.unitCostCents == null ? line.unitCost : numberValue(change, "unitCostCents", { integer: true });
-    const amendmentFloor = roundQuantity(line.retained + line.closed);
+    const amendmentFloor = roundQuantity(Math.max(line.retained + line.closed, line.allocated + line.closed));
     if (ordered < amendmentFloor) throw new WorkflowError("BELOW_RETAINED_OR_CLOSED", `Line ${line.id} cannot be amended below ${amendmentFloor}: ${line.retained} retained plus ${line.closed} closed.`, 409);
     return { ...line, ordered, unitCost };
   });
@@ -1876,7 +1898,12 @@ async function saveProduct(command: WorkflowCommand) {
   if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Product not found.", 404);
   if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Product changed.", 409, current.version);
   if (await first("SELECT id FROM products WHERE sku=? AND id<>?", sku, id)) throw new WorkflowError("DUPLICATE_PRODUCT_SKU", `SKU ${sku} already exists.`, 409);
-  const requestedPricingMode = optionalText(payload, "pricingMode") ?? current?.pricingMode ?? "manual";
+  for (const identifier of [sku, optionalText(payload, "manufacturerSku"), name].filter((value): value is string => Boolean(value))) {
+    if (await first("SELECT id FROM product_aliases WHERE normalized_alias=? AND product_id<>?", normalizedAlias(identifier), id)) {
+      throw new WorkflowError("DUPLICATE_PRODUCT_ALIAS", `“${identifier}” is already an alias for another product.`, 409);
+    }
+  }
+  const requestedPricingMode = optionalText(payload, "pricingMode") ?? current?.pricingMode ?? "automatic";
   if (!["automatic", "manual"].includes(requestedPricingMode)) throw new WorkflowError("VALIDATION_ERROR", "pricingMode must be automatic or manual.");
   const pricingMode = requestedPricingMode as "automatic" | "manual";
   const costBasisCents = Number(current?.lastUnitCostCents ?? standard);
@@ -1927,6 +1954,327 @@ async function saveProduct(command: WorkflowCommand) {
     outboxStatement(command, creating ? "master.product_created" : "master.product_updated", "product", id, { sku, active, pricingMode, sellingPriceCents: price }, when),
   );
   await db.batch(statements);
+  return finish(command);
+}
+
+function normalizedAlias(value: string) {
+  return value.normalize("NFKC").trim().toLocaleLowerCase("en-CA").replaceAll(/\s+/g, " ");
+}
+
+async function addProductAlias(command: WorkflowCommand) {
+  const productId = textValue({ entityId: command.entityId }, "entityId");
+  const version = command.version ?? 0;
+  const alias = textValue(command.payload ?? {}, "alias");
+  const normalized = normalizedAlias(alias);
+  const product = await first<{ version: number; active: number; sku: string; name: string; manufacturerSku: string | null }>(
+    "SELECT version,active,sku,name,manufacturer_sku AS manufacturerSku FROM products WHERE id=?", productId,
+  );
+  if (!product) throw new WorkflowError("NOT_FOUND", "Product not found.", 404);
+  if (!product.active) throw new WorkflowError("INVALID_STATE", "Aliases can only be added to an active product.", 409, product.version);
+  if (product.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Product changed; refresh before adding an alias.", 409, product.version);
+  if ([product.sku, product.name, product.manufacturerSku ?? ""].some((value) => value && normalizedAlias(value) === normalized)) {
+    throw new WorkflowError("DUPLICATE_PRODUCT_ALIAS", "That value already identifies this product.", 409, product.version);
+  }
+  const collision = await first<{ productId: string }>(`SELECT product_id AS productId FROM product_aliases WHERE normalized_alias=?
+    UNION ALL SELECT id FROM products WHERE active=1 AND (lower(trim(sku))=? OR lower(trim(name))=? OR lower(trim(COALESCE(manufacturer_sku,'')))=?) LIMIT 1`,
+    normalized, normalized, normalized, normalized);
+  if (collision) throw new WorkflowError("DUPLICATE_PRODUCT_ALIAS", "That alias already belongs to a product.", 409, product.version);
+  const id = newId("product-alias");
+  const result: WorkflowResult = { recordId: productId, message: `Alias “${alias}” added to ${product.sku}.`, impact: { physical: "No inventory changed.", commercial: "The part can now be found by this alternate name or number.", onHandDelta: 0 } };
+  const db = commandD1(command); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM products p WHERE p.id=? AND p.version=? AND p.active=1
+        AND NOT EXISTS (SELECT 1 FROM product_aliases WHERE normalized_alias=?)
+        AND NOT EXISTS (SELECT 1 FROM products other WHERE other.active=1 AND (lower(trim(other.sku))=? OR lower(trim(other.name))=? OR lower(trim(COALESCE(other.manufacturer_sku,'')))=?))`)
+      .bind(...claimValues(command, result, productId), productId, version, normalized, normalized, normalized, normalized),
+    db.prepare(`INSERT INTO product_aliases (id,product_id,alias,normalized_alias,alias_type,created_at,created_by)
+      SELECT ?,?,?,?,'alternate',?,? WHERE ${marker(command)}`).bind(id, productId, alias, normalized, when, command.actor.label),
+    db.prepare(`UPDATE products SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(productId, version),
+    auditStatement(command, "product", productId, "alias_added", result.message, { alias, aliasId: id }, when),
+    outboxStatement(command, "master.product_alias_added", "product", productId, { alias, aliasId: id }, when),
+  ]);
+  return finish(command);
+}
+
+async function removeProductAlias(command: WorkflowCommand) {
+  const productId = textValue({ entityId: command.entityId }, "entityId");
+  const version = command.version ?? 0;
+  const aliasId = textValue(command.payload ?? {}, "aliasId");
+  const row = await first<{ alias: string; aliasType: string; version: number }>(`SELECT pa.alias,pa.alias_type AS aliasType,p.version FROM product_aliases pa JOIN products p ON p.id=pa.product_id
+    WHERE pa.id=? AND pa.product_id=? AND p.active=1`, aliasId, productId);
+  if (!row) throw new WorkflowError("NOT_FOUND", "Product alias not found.", 404);
+  if (row.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Product changed; refresh before removing the alias.", 409, row.version);
+  if (row.aliasType === "merged_record") throw new WorkflowError("MERGED_ALIAS_REQUIRED", "Aliases retained from a merged product are permanent audit identifiers.", 409, row.version);
+  const result: WorkflowResult = { recordId: productId, message: `Alias “${row.alias}” removed.`, impact: { physical: "No inventory changed.", commercial: "This alternate search term no longer resolves to the product.", onHandDelta: 0 } };
+  const db = commandD1(command); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM products p JOIN product_aliases pa ON pa.product_id=p.id WHERE p.id=? AND p.version=? AND p.active=1 AND pa.id=?`)
+      .bind(...claimValues(command, result, productId), productId, version, aliasId),
+    db.prepare(`DELETE FROM product_aliases WHERE id=? AND product_id=? AND ${marker(command)}`).bind(aliasId, productId),
+    db.prepare(`UPDATE products SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(productId, version),
+    auditStatement(command, "product", productId, "alias_removed", result.message, { alias: row.alias, aliasId }, when),
+    outboxStatement(command, "master.product_alias_removed", "product", productId, { alias: row.alias, aliasId }, when),
+  ]);
+  return finish(command);
+}
+
+async function setProductDefaultLocation(command: WorkflowCommand) {
+  const productId = textValue({ entityId: command.entityId }, "entityId");
+  const version = command.version ?? 0;
+  const payload = command.payload ?? {};
+  const warehouseId = textValue(payload, "warehouseId");
+  const locationId = textValue(payload, "locationId");
+  const current = await first<{ version: number; sku: string }>("SELECT version,sku FROM products WHERE id=? AND active=1", productId);
+  if (!current) throw new WorkflowError("NOT_FOUND", "Active product not found.", 404);
+  if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Product changed; refresh before changing its preferred bin.", 409, current.version);
+  const location = await first<{ code: string; name: string }>(`SELECT code,name FROM locations
+    WHERE id=? AND warehouse_id=? AND active=1 AND inventory_status='usable'`, locationId, warehouseId);
+  if (!location) throw new WorkflowError("INVALID_DEFAULT_LOCATION", "Select an active usable bin in the chosen warehouse.", 409, current.version);
+  const result: WorkflowResult = { recordId: productId, message: `${current.sku} will default to ${location.code} in this warehouse.`, impact: { physical: "Existing inventory did not move.", commercial: "Future receipts default to the selected bin.", onHandDelta: 0 } };
+  const db = commandD1(command); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM products p WHERE p.id=? AND p.version=? AND p.active=1
+        AND EXISTS (SELECT 1 FROM locations l WHERE l.id=? AND l.warehouse_id=? AND l.active=1 AND l.inventory_status='usable')`)
+      .bind(...claimValues(command, result, productId), productId, version, locationId, warehouseId),
+    db.prepare(`INSERT INTO product_default_locations (product_id,warehouse_id,location_id,version,updated_at,updated_by)
+      SELECT ?,?,?,1,?,? WHERE ${marker(command)}
+      ON CONFLICT(product_id,warehouse_id) DO UPDATE SET location_id=excluded.location_id,version=product_default_locations.version+1,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+      .bind(productId, warehouseId, locationId, when, command.actor.label),
+    db.prepare(`UPDATE products SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(productId, version),
+    auditStatement(command, "product", productId, "default_location_set", result.message, { warehouseId, locationId }, when),
+    outboxStatement(command, "master.product_default_location_set", "product", productId, { warehouseId, locationId }, when),
+  ]);
+  return finish(command);
+}
+
+async function mergeProducts(command: WorkflowCommand) {
+  const targetId = textValue({ entityId: command.entityId }, "entityId");
+  const sourceId = textValue(command.payload ?? {}, "sourceProductId");
+  if (targetId === sourceId) throw new WorkflowError("INVALID_MERGE", "Choose a different product to merge.");
+  const version = command.version ?? 0;
+  const products = await all<{ id: string; sku: string; name: string; manufacturerSku: string | null; trackingPolicy: string; baseUomId: string; version: number; active: number }>(
+    `SELECT id,sku,name,manufacturer_sku AS manufacturerSku,tracking_policy AS trackingPolicy,base_uom_id AS baseUomId,version,active FROM products WHERE id IN (?,?)`, targetId, sourceId,
+  );
+  const target = products.find((product) => product.id === targetId);
+  const source = products.find((product) => product.id === sourceId);
+  if (!target || !source) throw new WorkflowError("NOT_FOUND", "Both products must exist.", 404);
+  if (!target.active || !source.active) throw new WorkflowError("INVALID_STATE", "Only two active products can be merged.", 409);
+  if (target.version !== version) throw new WorkflowError("VERSION_CONFLICT", "The surviving product changed; refresh before merging.", 409, target.version);
+  if (target.baseUomId !== source.baseUomId) throw new WorkflowError("MERGE_UOM_MISMATCH", "Products must use the same base unit before their quantities can be combined.", 409);
+  if (target.trackingPolicy !== source.trackingPolicy) throw new WorkflowError("MERGE_TRACKING_MISMATCH", "Products must use the same tracking policy before they can be merged.", 409);
+  const openCount = await first<{ number: string }>(`SELECT session.number FROM inventory_count_session_lines line
+    JOIN inventory_count_sessions session ON session.id=line.session_id
+    WHERE line.product_id IN (?,?) AND session.status IN ('draft','counting','review','awaiting_approval') LIMIT 1`, targetId, sourceId);
+  if (openCount) throw new WorkflowError("ACTIVE_COUNT_EXISTS", `Finish or cancel inventory count ${openCount.number} before merging these products.`, 409);
+  const serialCollision = await first<{ serial: string }>(`SELECT source.serial_number AS serial FROM inventory_units source
+    JOIN inventory_units target ON target.product_id=? AND target.serial_number=source.serial_number WHERE source.product_id=? LIMIT 1`, targetId, sourceId);
+  if (serialCollision) throw new WorkflowError("MERGE_SERIAL_COLLISION", `Serial ${serialCollision.serial} exists on both products. Resolve that identity before merging.`, 409);
+  const aliasCandidates = [source.sku, source.name, source.manufacturerSku].filter((value): value is string => Boolean(value?.trim()));
+  for (const alias of aliasCandidates) {
+    const normalized = normalizedAlias(alias);
+    const collision = await first<{ productId: string }>(`SELECT product_id AS productId FROM product_aliases WHERE normalized_alias=? AND product_id NOT IN (?,?)
+      UNION ALL SELECT id FROM products WHERE active=1 AND id NOT IN (?,?) AND (lower(trim(sku))=? OR lower(trim(name))=? OR lower(trim(COALESCE(manufacturer_sku,'')))=?) LIMIT 1`,
+      normalized, targetId, sourceId, targetId, sourceId, normalized, normalized, normalized);
+    if (collision) throw new WorkflowError("DUPLICATE_PRODUCT_ALIAS", `The merged identifier “${alias}” already belongs to another product.`, 409);
+  }
+  const duplicateLots = await all<{ sourceLotId: string; targetLotId: string }>(`SELECT source.id AS sourceLotId,target.id AS targetLotId FROM inventory_lots source
+    JOIN inventory_lots target ON target.product_id=? AND target.lot_number=source.lot_number WHERE source.product_id=?`, targetId, sourceId);
+  const sourceBalance = await first<{ onHand: number; reserved: number }>("SELECT COALESCE(SUM(on_hand_qty),0) AS onHand,COALESCE(SUM(reserved_qty),0) AS reserved FROM inventory_balances WHERE product_id=?", sourceId);
+  const result: WorkflowResult = {
+    recordId: targetId,
+    message: `${source.sku} merged into ${target.sku}; aliases and ${Number(sourceBalance?.onHand ?? 0)} on-hand units were consolidated.`,
+    impact: { physical: "On-hand and reserved balances were summed by bin; no movement posting was created.", commercial: "Open order, allocation, pricing, and product references now use the surviving item.", financial: "Inventory value and cost layers now report under the surviving item.", onHandDelta: 0 },
+  };
+  const db = commandD1(command); const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM products target JOIN products source ON source.id=?
+      WHERE target.id=? AND target.version=? AND target.active=1 AND source.active=1
+        AND target.base_uom_id=source.base_uom_id AND target.tracking_policy=source.tracking_policy
+        AND NOT EXISTS (SELECT 1 FROM inventory_units su JOIN inventory_units tu ON tu.product_id=target.id AND tu.serial_number=su.serial_number WHERE su.product_id=source.id)`)
+      .bind(...claimValues(command, result, targetId), sourceId, targetId, version),
+    db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version)
+      SELECT ?,location_id,on_hand_qty,reserved_qty,1 FROM inventory_balances WHERE product_id=? AND ${marker(command)}
+      ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=inventory_balances.on_hand_qty+excluded.on_hand_qty,reserved_qty=inventory_balances.reserved_qty+excluded.reserved_qty,version=inventory_balances.version+1`).bind(targetId, sourceId),
+    db.prepare(`DELETE FROM inventory_balances WHERE product_id=? AND ${marker(command)}`).bind(sourceId),
+  ];
+  for (const lot of duplicateLots) statements.push(
+    db.prepare(`UPDATE movement_assignments SET lot_id=? WHERE lot_id=? AND ${marker(command)}`).bind(lot.targetLotId, lot.sourceLotId),
+    db.prepare(`UPDATE inventory_units SET lot_id=? WHERE lot_id=? AND ${marker(command)}`).bind(lot.targetLotId, lot.sourceLotId),
+    db.prepare(`DELETE FROM inventory_lots WHERE id=? AND ${marker(command)}`).bind(lot.sourceLotId),
+  );
+  const productTables = [
+    "purchase_order_lines", "receipt_lines", "sales_order_lines", "drop_ship_deliveries", "reservations", "shipment_lines",
+    "vendor_returns", "customer_returns", "inventory_counts", "inventory_units",
+    "vendor_bill_lines", "customer_invoice_lines", "cost_layers", "inventory_value_entries", "margin_rules",
+    "catalog_price_history", "inventory_transfer_lines",
+  ];
+  statements.push(db.prepare(`UPDATE inventory_lots SET product_id=? WHERE product_id=? AND ${marker(command)}`).bind(targetId, sourceId));
+  for (const table of productTables) statements.push(db.prepare(`UPDATE ${table} SET product_id=? WHERE product_id=? AND ${marker(command)}`).bind(targetId, sourceId));
+  statements.push(
+    db.prepare(`DELETE FROM uom_conversions WHERE product_id=? AND EXISTS (SELECT 1 FROM uom_conversions target WHERE target.product_id=? AND target.from_uom_id=uom_conversions.from_uom_id AND target.to_uom_id=uom_conversions.to_uom_id) AND ${marker(command)}`).bind(sourceId, targetId),
+    db.prepare(`UPDATE uom_conversions SET product_id=? WHERE product_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`DELETE FROM price_list_entries WHERE product_id=? AND EXISTS (SELECT 1 FROM price_list_entries target WHERE target.product_id=? AND target.price_list_id=price_list_entries.price_list_id AND target.uom_id=price_list_entries.uom_id AND target.minimum_quantity=price_list_entries.minimum_quantity) AND ${marker(command)}`).bind(sourceId, targetId),
+    db.prepare(`UPDATE price_list_entries SET product_id=? WHERE product_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`DELETE FROM product_cost_history WHERE product_id=? AND EXISTS (SELECT 1 FROM product_cost_history target WHERE target.product_id=? AND target.source_purchase_order_id=product_cost_history.source_purchase_order_id AND target.purchase_order_revision=product_cost_history.purchase_order_revision) AND ${marker(command)}`).bind(sourceId, targetId),
+    db.prepare(`UPDATE product_cost_history SET product_id=? WHERE product_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE valuation_policies SET product_id=? WHERE product_id=? AND NOT EXISTS (SELECT 1 FROM valuation_policies WHERE product_id=?) AND ${marker(command)}`).bind(targetId, sourceId, targetId),
+    db.prepare(`DELETE FROM valuation_policies WHERE product_id=? AND ${marker(command)}`).bind(sourceId),
+    db.prepare(`DELETE FROM product_default_locations WHERE product_id=? AND EXISTS (SELECT 1 FROM product_default_locations target WHERE target.product_id=? AND target.warehouse_id=product_default_locations.warehouse_id) AND ${marker(command)}`).bind(sourceId, targetId),
+    db.prepare(`UPDATE product_default_locations SET product_id=? WHERE product_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE product_aliases SET product_id=? WHERE product_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE attachments SET document_id=? WHERE document_type='product' AND document_id=? AND deleted_at IS NULL AND ${marker(command)}`).bind(targetId, sourceId),
+  );
+  for (const alias of aliasCandidates) statements.push(db.prepare(`INSERT OR IGNORE INTO product_aliases
+    (id,product_id,alias,normalized_alias,alias_type,created_at,created_by) SELECT ?,?,?,?,'merged_record',?,? WHERE ${marker(command)}`)
+    .bind(newId("product-alias"), targetId, alias, normalizedAlias(alias), when, command.actor.label));
+  statements.push(
+    db.prepare(`UPDATE approvals SET entity_id=? WHERE entity_type='product' AND entity_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE qbo_entity_links SET status='inactive',last_error='Local product merged into another master record' WHERE local_entity_type='product' AND local_entity_id=? AND ${marker(command)}`).bind(sourceId),
+    db.prepare(`UPDATE master_record_merges SET target_id=? WHERE entity_type='product' AND target_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`INSERT INTO master_record_merges (id,entity_type,source_id,target_id,source_label,merged_at,merged_by)
+      SELECT ?,'product',?,?,?,?,? WHERE ${marker(command)}`).bind(newId("merge"), sourceId, targetId, `${source.sku} · ${source.name}`, when, command.actor.label),
+    db.prepare(`UPDATE products SET active=0,version=version+1 WHERE id=? AND active=1 AND ${marker(command)}`).bind(sourceId),
+    db.prepare(`UPDATE products SET
+      last_unit_cost_cents=COALESCE((SELECT last_unit_cost_cents FROM product_cost_history WHERE product_id=? ORDER BY effective_at DESC,id DESC LIMIT 1),last_unit_cost_cents),
+      last_unit_cost_source_po_id=COALESCE((SELECT source_purchase_order_id FROM product_cost_history WHERE product_id=? ORDER BY effective_at DESC,id DESC LIMIT 1),last_unit_cost_source_po_id),
+      last_unit_cost_source_po_line_id=(SELECT source_purchase_order_line_id FROM product_cost_history WHERE product_id=? ORDER BY effective_at DESC,id DESC LIMIT 1),
+      last_unit_cost_vendor_id=COALESCE((SELECT vendor_id FROM product_cost_history WHERE product_id=? ORDER BY effective_at DESC,id DESC LIMIT 1),last_unit_cost_vendor_id),
+      last_unit_cost_at=COALESCE((SELECT effective_at FROM product_cost_history WHERE product_id=? ORDER BY effective_at DESC,id DESC LIMIT 1),last_unit_cost_at),version=version+1
+      WHERE id=? AND version=? AND ${marker(command)}`).bind(targetId, targetId, targetId, targetId, targetId, targetId, version),
+    auditStatement(command, "product", targetId, "products_merged", result.message, { sourceProductId: sourceId, sourceSku: source.sku, sourceOnHand: Number(sourceBalance?.onHand ?? 0), sourceReserved: Number(sourceBalance?.reserved ?? 0) }, when),
+    outboxStatement(command, "master.products_merged", "product", targetId, { sourceProductId: sourceId, sourceSku: source.sku }, when),
+  );
+  await db.batch(statements);
+  return finish(command);
+}
+
+async function mergeBusinessPartners(command: WorkflowCommand) {
+  const targetId = textValue({ entityId: command.entityId }, "entityId");
+  const sourceId = textValue(command.payload ?? {}, "sourcePartnerId");
+  if (targetId === sourceId) throw new WorkflowError("INVALID_MERGE", "Choose a different vendor or customer to merge.");
+  const version = command.version ?? 0;
+  const partners = await all<{ id: string; code: string; name: string; type: string; version: number; active: number }>(
+    "SELECT id,code,name,partner_type AS type,version,active FROM business_partners WHERE id IN (?,?)", targetId, sourceId,
+  );
+  const target = partners.find((partner) => partner.id === targetId);
+  const source = partners.find((partner) => partner.id === sourceId);
+  if (!target || !source) throw new WorkflowError("NOT_FOUND", "Both business partners must exist.", 404);
+  if (!target.active || !source.active) throw new WorkflowError("INVALID_STATE", "Only two active business partners can be merged.", 409);
+  if (target.version !== version) throw new WorkflowError("VERSION_CONFLICT", "The surviving partner changed; refresh before merging.", 409, target.version);
+  const mergedType = target.type === source.type ? target.type : "both";
+  const targetAddresses = await all<{ label: string }>("SELECT label FROM partner_addresses WHERE partner_id=?", targetId);
+  const sourceAddresses = await all<{ id: string; label: string }>("SELECT id,label FROM partner_addresses WHERE partner_id=?", sourceId);
+  const usedLabels = new Set(targetAddresses.map((row) => row.label));
+  const renamedAddresses = sourceAddresses.map((row) => {
+    let label = row.label;
+    if (usedLabels.has(label)) {
+      label = `${row.label} (${source.code})`;
+      let suffix = 2;
+      while (usedLabels.has(label)) label = `${row.label} (${source.code} ${suffix++})`;
+    }
+    usedLabels.add(label);
+    return { ...row, label };
+  });
+  const result: WorkflowResult = { recordId: targetId, message: `${source.code} merged into ${target.code}; orders, billing, addresses, and history now use ${target.name}.`, impact: { physical: "No inventory quantity changed.", commercial: "Vendor and customer documents now reference the surviving account.", financial: "Open receivables, payables, credits, and payments remain intact under the surviving account.", onHandDelta: 0 } };
+  const db = commandD1(command); const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM business_partners target JOIN business_partners source ON source.id=?
+      WHERE target.id=? AND target.version=? AND target.active=1 AND source.active=1`)
+      .bind(...claimValues(command, result, targetId), sourceId, targetId, version),
+  ];
+  for (const address of renamedAddresses) if (address.label !== sourceAddresses.find((row) => row.id === address.id)?.label) {
+    statements.push(db.prepare(`UPDATE partner_addresses SET label=?,updated_at=?,version=version+1 WHERE id=? AND partner_id=? AND ${marker(command)}`).bind(address.label, when, address.id, sourceId));
+  }
+  statements.push(
+    db.prepare(`UPDATE products SET last_unit_cost_vendor_id=? WHERE last_unit_cost_vendor_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE purchase_orders SET vendor_id=? WHERE vendor_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE sales_orders SET customer_id=? WHERE customer_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE vendor_bills SET vendor_id=? WHERE vendor_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE inventory_lots SET vendor_id=? WHERE vendor_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE vendor_credits SET vendor_id=? WHERE vendor_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE customer_invoices SET customer_id=? WHERE customer_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE customer_credits SET customer_id=? WHERE customer_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE payments SET partner_id=? WHERE partner_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE returnable_obligations SET partner_id=? WHERE partner_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE product_cost_history SET vendor_id=? WHERE vendor_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`DELETE FROM price_list_assignments WHERE partner_id=? AND EXISTS (SELECT 1 FROM price_list_assignments target WHERE target.partner_id=? AND target.price_list_id=price_list_assignments.price_list_id) AND ${marker(command)}`).bind(sourceId, targetId),
+    db.prepare(`UPDATE price_list_assignments SET partner_id=? WHERE partner_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE partner_addresses SET is_default=0 WHERE partner_id=? AND is_default=1 AND EXISTS (SELECT 1 FROM partner_addresses target WHERE target.partner_id=? AND target.is_default=1 AND target.active=1) AND ${marker(command)}`).bind(sourceId, targetId),
+    db.prepare(`UPDATE partner_addresses SET partner_id=?,updated_at=?,version=version+1 WHERE partner_id=? AND ${marker(command)}`).bind(targetId, when, sourceId),
+    db.prepare(`UPDATE qbo_entity_links SET status='inactive',last_error='Local partner merged into another master record' WHERE local_entity_type='business_partner' AND local_entity_id=? AND ${marker(command)}`).bind(sourceId),
+    db.prepare(`UPDATE master_record_merges SET target_id=? WHERE entity_type='business_partner' AND target_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`INSERT INTO master_record_merges (id,entity_type,source_id,target_id,source_label,merged_at,merged_by)
+      SELECT ?,'business_partner',?,?,?,?,? WHERE ${marker(command)}`).bind(newId("merge"), sourceId, targetId, `${source.code} · ${source.name}`, when, command.actor.label),
+    db.prepare(`UPDATE business_partners SET active=0,version=version+1 WHERE id=? AND active=1 AND ${marker(command)}`).bind(sourceId),
+    db.prepare(`UPDATE business_partners SET partner_type=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(mergedType, targetId, version),
+    auditStatement(command, "business_partner", targetId, "business_partners_merged", result.message, { sourcePartnerId: sourceId, sourceCode: source.code, previousTargetType: target.type, mergedType }, when),
+    outboxStatement(command, "master.business_partners_merged", "business_partner", targetId, { sourcePartnerId: sourceId, sourceCode: source.code, mergedType }, when),
+  );
+  await db.batch(statements);
+  return finish(command);
+}
+
+async function mergePurchaseOrders(command: WorkflowCommand) {
+  const targetId = textValue({ entityId: command.entityId }, "entityId");
+  const sourceId = textValue(command.payload ?? {}, "sourcePurchaseOrderId");
+  if (targetId === sourceId) throw new WorkflowError("INVALID_MERGE", "Choose a different purchase order to merge.");
+  const version = command.version ?? 0;
+  const orders = await all<{ id: string; number: string; vendorId: string; status: string; currency: string; exchange: number; total: number; baseTotal: number; revision: number; version: number }>(
+    `SELECT id,number,vendor_id AS vendorId,lifecycle_status AS status,currency,exchange_rate_to_base AS exchange,total_cents AS total,base_total_cents AS baseTotal,revision_number AS revision,version
+      FROM purchase_orders WHERE id IN (?,?)`, targetId, sourceId,
+  );
+  const target = orders.find((order) => order.id === targetId);
+  const source = orders.find((order) => order.id === sourceId);
+  if (!target || !source) throw new WorkflowError("NOT_FOUND", "Both purchase orders must exist.", 404);
+  if (target.version !== version) throw new WorkflowError("VERSION_CONFLICT", "The surviving purchase order changed; refresh before merging.", 409, target.version);
+  if (target.status !== "draft" || source.status !== "draft") throw new WorkflowError("INVALID_STATE", "Only draft purchase orders that have not been submitted can be merged.", 409);
+  if (target.vendorId !== source.vendorId) throw new WorkflowError("MERGE_VENDOR_MISMATCH", "Purchase orders must use the same vendor.", 409);
+  if (target.currency !== source.currency || Math.abs(target.exchange - source.exchange) > 0.000000001) throw new WorkflowError("MERGE_CURRENCY_MISMATCH", "Purchase orders must use the same currency and exchange rate.", 409);
+  const posting = await first<{ id: string }>(`SELECT id FROM (
+    SELECT id FROM receipts WHERE purchase_order_id IN (?,?) UNION ALL
+    SELECT id FROM vendor_bills WHERE purchase_order_id IN (?,?) AND status<>'void' UNION ALL
+    SELECT d.id FROM drop_ship_deliveries d JOIN purchase_order_lines pol ON pol.id=d.purchase_order_line_id WHERE pol.purchase_order_id IN (?,?) UNION ALL
+    SELECT id FROM document_email_deliveries WHERE document_type='purchase_order' AND document_id IN (?,?)
+  ) LIMIT 1`, targetId, sourceId, targetId, sourceId, targetId, sourceId, targetId, sourceId);
+  if (posting) throw new WorkflowError("PURCHASE_ORDER_ALREADY_USED", "A sent, received, delivered, or billed purchase order cannot be merged.", 409);
+  const lines = await all<Record<string, unknown>>(`SELECT id,product_id AS productId,ordered_qty AS quantity,unit_cost_cents AS unitAmountCents,
+    ordered_uom_id AS uomId,ordered_uom_qty AS enteredQuantity,ordered_uom_unit_cost_cents AS enteredUnitAmountCents,configuration_snapshot AS configurationSnapshot,
+    fulfillment_route AS fulfillmentRoute,source_sales_order_line_id AS sourceSalesOrderLineId,discount_cents AS discountCents,taxable,tax_code AS taxCode,tax_rate_bps AS taxRateBps
+    FROM purchase_order_lines WHERE purchase_order_id IN (?,?) ORDER BY purchase_order_id,id`, targetId, sourceId);
+  const charges = await all<Record<string, unknown>>(`SELECT charge_type AS chargeType,description,amount_cents AS amountCents,direction,taxable,refundable,tax_code AS taxCode,tax_rate_bps AS taxRateBps,tax_amount_cents AS taxAmountCents
+    FROM document_charges WHERE document_type='purchase_order' AND document_id IN (?,?) ORDER BY document_id,id`, targetId, sourceId);
+  const mergedTotal = target.total + source.total;
+  const mergedBaseTotal = target.baseTotal + source.baseTotal;
+  const result: WorkflowResult = { recordId: targetId, message: `${source.number} merged into ${target.number}; ${lines.length} draft lines are now on one order.`, impact: { physical: "No inventory changed.", commercial: "Only the surviving draft can be submitted to the vendor.", financial: `Draft total is now ${mergedTotal} ${target.currency} cents; no payable was created.`, onHandDelta: 0 } };
+  const db = commandD1(command); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders target JOIN purchase_orders source ON source.id=?
+      WHERE target.id=? AND target.version=? AND target.lifecycle_status='draft' AND source.lifecycle_status='draft'
+        AND target.vendor_id=source.vendor_id AND target.currency=source.currency AND target.exchange_rate_to_base=source.exchange_rate_to_base
+        AND NOT EXISTS (SELECT 1 FROM receipts WHERE purchase_order_id IN (target.id,source.id))
+        AND NOT EXISTS (SELECT 1 FROM vendor_bills WHERE purchase_order_id IN (target.id,source.id) AND status<>'void')
+        AND NOT EXISTS (SELECT 1 FROM drop_ship_deliveries d JOIN purchase_order_lines pol ON pol.id=d.purchase_order_line_id WHERE pol.purchase_order_id IN (target.id,source.id))
+        AND NOT EXISTS (SELECT 1 FROM document_email_deliveries WHERE document_type='purchase_order' AND document_id IN (target.id,source.id))`)
+      .bind(...claimValues(command, result, targetId), sourceId, targetId, version),
+    db.prepare(`UPDATE purchase_order_lines SET purchase_order_id=? WHERE purchase_order_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE document_charges SET document_id=? WHERE document_type='purchase_order' AND document_id=? AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE attachments SET document_id=? WHERE document_type='purchase_order' AND document_id=? AND deleted_at IS NULL AND ${marker(command)}`).bind(targetId, sourceId),
+    db.prepare(`UPDATE purchase_orders SET total_cents=?,base_total_cents=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(mergedTotal, mergedBaseTotal, targetId, version),
+    db.prepare(`UPDATE purchase_order_revisions SET snapshot_json=?,reason=?,created_by=?,created_at=? WHERE purchase_order_id=? AND revision_number=? AND lifecycle_status='draft' AND ${marker(command)}`)
+      .bind(JSON.stringify({ number: target.number, vendorId: target.vendorId, items: lines, charges, totalCents: mergedTotal, currency: target.currency, exchangeRateToBase: target.exchange }), `Merged draft ${source.number}`, command.actor.label, when, targetId, target.revision),
+    db.prepare(`UPDATE purchase_order_revisions SET lifecycle_status='canceled',reason=? WHERE purchase_order_id=? AND lifecycle_status='draft' AND ${marker(command)}`).bind(`Merged into ${target.number}`, sourceId),
+    db.prepare(`UPDATE purchase_orders SET lifecycle_status='canceled',total_cents=0,base_total_cents=0,version=version+1 WHERE id=? AND lifecycle_status='draft' AND ${marker(command)}`).bind(sourceId),
+    db.prepare(`INSERT INTO purchase_order_merges (source_purchase_order_id,target_purchase_order_id,merged_at,merged_by) SELECT ?,?,?,? WHERE ${marker(command)}`).bind(sourceId, targetId, when, command.actor.label),
+    db.prepare(`UPDATE qbo_entity_links SET status='inactive',last_error='Draft purchase order merged before submission' WHERE local_entity_type='purchase_order' AND local_entity_id=? AND ${marker(command)}`).bind(sourceId),
+    auditStatement(command, "purchase_order", targetId, "draft_purchase_orders_merged", result.message, { sourcePurchaseOrderId: sourceId, sourceNumber: source.number, sourceTotalCents: source.total, lineCount: lines.length }, when),
+    outboxStatement(command, "purchase_order.drafts_merged", "purchase_order", targetId, { sourcePurchaseOrderId: sourceId, sourceNumber: source.number, totalCents: mergedTotal }, when),
+  ]);
   return finish(command);
 }
 
@@ -2046,6 +2394,67 @@ async function updateProductPricing(command: WorkflowCommand) {
     auditStatement(command, "product", id, "pricing_mode_changed", result.message, { costBasisCents, suggestedSellingPriceCents, sellingPriceCents, pricingMode, marginRuleId: rule.id, reason }, when),
     outboxStatement(command, "pricing.product_mode_changed", "product", id, { sellingPriceCents, suggestedSellingPriceCents, pricingMode, marginRuleId: rule.id }, when),
   ]);
+  return finish(command);
+}
+
+async function adoptMarginMatrixForCatalog(command: WorkflowCommand) {
+  const products = await all<{
+    id: string; sku: string; category: string; standardCostCents: number; lastUnitCostCents: number | null;
+    sellingPriceCents: number; lastUnitCostSourcePoId: string | null; version: number;
+  }>(`SELECT id,sku,category,standard_cost_cents AS standardCostCents,last_unit_cost_cents AS lastUnitCostCents,
+      selling_price_cents AS sellingPriceCents,last_unit_cost_source_po_id AS lastUnitCostSourcePoId,version
+    FROM products
+    WHERE active=1 AND pricing_mode='manual' AND (manual_price_reason IS NULL OR manual_price_reason IN (
+      'Existing catalog price preserved during automatic-pricing rollout',
+      'Imported from Max Green inventory count sheet',
+      'Initial catalog price'
+    ))
+    ORDER BY id`);
+  const count = products.length;
+  const result: WorkflowResult = {
+    message: count
+      ? `${count} catalog item${count === 1 ? "" : "s"} now use the automatic margin matrix; specific manual overrides were preserved.`
+      : "The catalog already uses the automatic margin matrix; specific manual overrides were preserved.",
+    impact: {
+      physical: "No inventory posting.",
+      commercial: count ? "Eligible catalog prices were recalculated from last unit cost (or standard cost until a PO cost exists)." : "No catalog prices changed.",
+      onHandDelta: 0,
+    },
+    recordId: "catalog",
+  };
+  const db = commandD1(command);
+  const when = new Date().toISOString();
+  const reason = "Automatic margin matrix adopted as the catalog default";
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      VALUES (?,?,?,?,?,?,?)`).bind(...claimValues(command, result, "catalog")),
+  ];
+  for (const product of products) {
+    const costBasisCents = Number(product.lastUnitCostCents ?? product.standardCostCents);
+    const { rule, suggestedSellingPriceCents } = await suggestedPriceForProduct({ productId: product.id, category: product.category, costBasisCents });
+    statements.push(
+      db.prepare(`UPDATE products SET pricing_mode='automatic',selling_price_cents=?,suggested_selling_price_cents=?,
+          applied_margin_rule_id=?,manual_price_reason=NULL,pricing_updated_at=?,version=version+1
+        WHERE id=? AND version=? AND active=1 AND pricing_mode='manual'
+          AND (manual_price_reason IS NULL OR manual_price_reason IN (
+            'Existing catalog price preserved during automatic-pricing rollout',
+            'Imported from Max Green inventory count sheet',
+            'Initial catalog price'
+          )) AND ${marker(command)}`)
+        .bind(suggestedSellingPriceCents, suggestedSellingPriceCents, rule.id, when, product.id, product.version),
+      db.prepare(`INSERT INTO catalog_price_history
+        (id,product_id,event_type,cost_basis_cents,previous_selling_price_cents,suggested_selling_price_cents,effective_selling_price_cents,pricing_mode,margin_rule_id,source_purchase_order_id,reason,created_at,created_by)
+        SELECT ?,?,'catalog_matrix_adopted',?,?,?,?,?,?,?,?,?,?
+        WHERE EXISTS (SELECT 1 FROM products WHERE id=? AND version=? AND pricing_mode='automatic' AND pricing_updated_at=?)
+          AND ${marker(command)}`)
+        .bind(newId("catalog-price"), product.id, costBasisCents, product.sellingPriceCents, suggestedSellingPriceCents, suggestedSellingPriceCents, "automatic", rule.id, product.lastUnitCostSourcePoId, reason, when, command.actor.label, product.id, product.version + 1, when),
+    );
+  }
+  statements.push(
+    auditStatement(command, "catalog_pricing", "catalog", "margin_matrix_adopted", result.message, { productCount: count }, when),
+    outboxStatement(command, "pricing.catalog_matrix_adopted", "catalog_pricing", "catalog", { productCount: count }, when),
+  );
+  await db.batch(statements);
   return finish(command);
 }
 
@@ -2407,13 +2816,11 @@ async function setSalesOrderLifecycle(command: WorkflowCommand, target: "confirm
   const id = textValue({ entityId: command.entityId }, "entityId");
   const version = command.version ?? 0;
   const openDedicatedSupplySql = `EXISTS (SELECT 1 FROM sales_order_lines demand
-    JOIN purchase_order_lines supply ON supply.source_sales_order_line_id=demand.id
+    JOIN supply_allocations allocation ON allocation.sales_order_line_id=demand.id AND allocation.status='active'
+    JOIN purchase_order_lines supply ON supply.id=allocation.purchase_order_line_id
     JOIN purchase_orders source_po ON source_po.id=supply.purchase_order_id
     WHERE demand.sales_order_id=so.id AND source_po.lifecycle_status IN ('draft','pending_approval','approved')
-      AND supply.ordered_qty-supply.closed_qty-
-        CASE WHEN supply.fulfillment_route='drop_ship'
-          THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=supply.id),0)
-          ELSE COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=supply.id),0) END>0)`;
+      AND allocation.allocated_qty-allocation.received_qty>0)`;
   const outstandingBaseSql = `COALESCE((SELECT SUM(MAX(ci.base_total_cents-ROUND(ci.paid_cents*ci.exchange_rate_to_base)-
     COALESCE((SELECT SUM(cc.base_amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0),0))
     FROM customer_invoices ci WHERE ci.customer_id=so.customer_id AND ci.status<>'void'),0)`;
@@ -2494,22 +2901,24 @@ async function postDropShipDelivery(command: WorkflowCommand) {
   const source = await first<{
     productId: string; salesOrderId: string; salesVersion: number; salesStatus: string; salesOrdered: number; salesCanceled: number;
     purchaseLineId: string; purchaseOrderId: string; purchaseVersion: number; purchaseStatus: string; purchaseOrdered: number;
-    deliveredSales: number; deliveredPurchase: number;
+    allocationId: string; allocationVersion: number; allocationQuantity: number; allocationReceived: number; deliveredSales: number; deliveredPurchase: number;
   }>(`SELECT sol.product_id AS productId,sol.sales_order_id AS salesOrderId,so.version AS salesVersion,so.lifecycle_status AS salesStatus,
       sol.ordered_qty AS salesOrdered,sol.canceled_qty AS salesCanceled,pol.id AS purchaseLineId,pol.purchase_order_id AS purchaseOrderId,
       po.version AS purchaseVersion,po.lifecycle_status AS purchaseStatus,pol.ordered_qty AS purchaseOrdered,
+      sa.id AS allocationId,sa.version AS allocationVersion,sa.allocated_qty AS allocationQuantity,sa.received_qty AS allocationReceived,
       COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0) AS deliveredSales,
       COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0) AS deliveredPurchase
     FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id
     JOIN purchase_order_lines pol ON pol.id=sol.linked_purchase_order_line_id
     JOIN purchase_orders po ON po.id=pol.purchase_order_id
+    JOIN supply_allocations sa ON sa.purchase_order_line_id=pol.id AND sa.sales_order_line_id=sol.id AND sa.status='active'
     WHERE sol.id=? AND sol.fulfillment_route='drop_ship' AND pol.fulfillment_route='drop_ship'
       AND pol.source_sales_order_line_id=sol.id AND pol.product_id=sol.product_id`, salesLineId);
   if (!source) throw new WorkflowError("DROP_SHIP_LINK_REQUIRED", "A symmetric drop-ship PO/SO line link is required.", 409);
   if (source.salesStatus !== "confirmed" || source.purchaseStatus !== "approved") throw new WorkflowError("INVALID_STATE", "Drop-ship delivery requires a confirmed sales order and approved purchase order.", 409);
   if (command.version != null && command.version !== source.salesVersion) throw new WorkflowError("VERSION_CONFLICT", "Sales order changed; refresh before posting delivery.", 409, source.salesVersion);
   const salesRemaining = roundQuantity(source.salesOrdered - source.salesCanceled - source.deliveredSales);
-  const purchaseRemaining = roundQuantity(source.purchaseOrdered - source.deliveredPurchase);
+  const purchaseRemaining = roundQuantity(Math.min(source.purchaseOrdered - source.deliveredPurchase, source.allocationQuantity - source.allocationReceived));
   if (quantity > Math.min(salesRemaining, purchaseRemaining)) throw new WorkflowError("OVER_DELIVERY", "Drop-ship delivery exceeds linked open sales or purchase quantity.", 409);
   const id = newId("drop-delivery");
   const number = await nextDocumentNumber("DSD");
@@ -2519,15 +2928,19 @@ async function postDropShipDelivery(command: WorkflowCommand) {
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM sales_orders so JOIN sales_order_lines sol ON sol.sales_order_id=so.id
       JOIN purchase_order_lines pol ON pol.id=sol.linked_purchase_order_line_id JOIN purchase_orders po ON po.id=pol.purchase_order_id
+      JOIN supply_allocations sa ON sa.purchase_order_line_id=pol.id AND sa.sales_order_line_id=sol.id
       WHERE sol.id=? AND sol.fulfillment_route='drop_ship' AND pol.fulfillment_route='drop_ship' AND pol.source_sales_order_line_id=sol.id
         AND so.lifecycle_status='confirmed' AND so.version=? AND po.lifecycle_status='approved' AND po.version=?
+        AND sa.status='active' AND sa.version=? AND sa.allocated_qty-sa.received_qty>=?
         AND sol.ordered_qty-sol.canceled_qty-COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)>=?
         AND pol.ordered_qty-COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)>=?`)
-      .bind(...claimValues(command, result, id), salesLineId, source.salesVersion, source.purchaseVersion, quantity, quantity),
+      .bind(...claimValues(command, result, id), salesLineId, source.salesVersion, source.purchaseVersion, source.allocationVersion, quantity, quantity, quantity),
     db.prepare(`INSERT INTO drop_ship_deliveries (id,number,purchase_order_id,purchase_order_line_id,sales_order_id,sales_order_line_id,product_id,quantity,reversed_qty,status,delivery_date,external_reference,posted_at,posted_by,version)
       SELECT ?,?,?,?,?,?,?,?,0,'posted',?,?,?,?,1 WHERE ${marker(command)}`).bind(id, number, source.purchaseOrderId, source.purchaseLineId, source.salesOrderId, salesLineId, source.productId, quantity, deliveryDate, externalReference, postedAt, command.actor.label),
     db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(source.salesOrderId, source.salesVersion),
     db.prepare(`UPDATE purchase_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(source.purchaseOrderId, source.purchaseVersion),
+    db.prepare(`UPDATE supply_allocations SET received_qty=received_qty+?,updated_at=?,version=version+1 WHERE id=? AND version=? AND allocated_qty-received_qty>=? AND ${marker(command)}`)
+      .bind(quantity, when, source.allocationId, source.allocationVersion, quantity),
     auditStatement(command, "drop_ship_delivery", id, "drop_ship_delivery_posted", result.message, { number, quantity, deliveryDate, externalReference, salesOrderId: source.salesOrderId, salesOrderLineId: salesLineId, purchaseOrderId: source.purchaseOrderId, purchaseOrderLineId: source.purchaseLineId }, when),
     outboxStatement(command, "drop_ship.delivery_posted", "drop_ship_delivery", id, { quantity, salesOrderId: source.salesOrderId, purchaseOrderId: source.purchaseOrderId }, when),
   ]);
@@ -2542,11 +2955,13 @@ async function reverseDropShipDelivery(command: WorkflowCommand) {
   const postingDate = dateValue(payload, "postingDate", today());
   await assertPeriodOpen("sales", postingDate);
   await assertPeriodOpen("purchasing", postingDate);
-  const delivery = await first<{ version: number; quantity: number; reversed: number; salesOrderId: string; salesLineId: string; salesVersion: number; purchaseOrderId: string; purchaseLineId: string; purchaseVersion: number; netDelivered: number; invoiced: number }>(`SELECT d.version,d.quantity,d.reversed_qty AS reversed,d.sales_order_id AS salesOrderId,d.sales_order_line_id AS salesLineId,so.version AS salesVersion,
+  const delivery = await first<{ version: number; quantity: number; reversed: number; salesOrderId: string; salesLineId: string; salesVersion: number; purchaseOrderId: string; purchaseLineId: string; purchaseVersion: number; allocationId: string; allocationVersion: number; allocationReceived: number; netDelivered: number; invoiced: number }>(`SELECT d.version,d.quantity,d.reversed_qty AS reversed,d.sales_order_id AS salesOrderId,d.sales_order_line_id AS salesLineId,so.version AS salesVersion,
       d.purchase_order_id AS purchaseOrderId,d.purchase_order_line_id AS purchaseLineId,po.version AS purchaseVersion,
+      sa.id AS allocationId,sa.version AS allocationVersion,sa.received_qty AS allocationReceived,
       COALESCE((SELECT SUM(other.quantity-other.reversed_qty) FROM drop_ship_deliveries other WHERE other.sales_order_line_id=d.sales_order_line_id),0) AS netDelivered,
       COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=d.sales_order_line_id AND ci.status<>'void'),0) AS invoiced
-    FROM drop_ship_deliveries d JOIN sales_orders so ON so.id=d.sales_order_id JOIN purchase_orders po ON po.id=d.purchase_order_id WHERE d.id=?`, id);
+    FROM drop_ship_deliveries d JOIN sales_orders so ON so.id=d.sales_order_id JOIN purchase_orders po ON po.id=d.purchase_order_id
+    JOIN supply_allocations sa ON sa.purchase_order_line_id=d.purchase_order_line_id AND sa.sales_order_line_id=d.sales_order_line_id WHERE d.id=?`, id);
   if (!delivery) throw new WorkflowError("NOT_FOUND", "Drop-ship delivery was not found.", 404);
   if (delivery.version !== (command.version ?? 0)) throw new WorkflowError("VERSION_CONFLICT", "Drop-ship delivery changed; refresh before reversing.", 409, delivery.version);
   if (quantity > delivery.quantity - delivery.reversed) throw new WorkflowError("INVALID_QUANTITY", "Reversal exceeds the delivery's remaining quantity.", 409);
@@ -2559,11 +2974,14 @@ async function reverseDropShipDelivery(command: WorkflowCommand) {
         AND COALESCE((SELECT SUM(other.quantity-other.reversed_qty) FROM drop_ship_deliveries other WHERE other.sales_order_line_id=d.sales_order_line_id),0)-?
           >=COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=d.sales_order_line_id AND ci.status<>'void'),0)
         AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=d.sales_order_id AND so.version=?)
-        AND EXISTS (SELECT 1 FROM purchase_orders po WHERE po.id=d.purchase_order_id AND po.version=?)`)
-      .bind(...claimValues(command, result, id), id, delivery.version, quantity, quantity, delivery.salesVersion, delivery.purchaseVersion),
+        AND EXISTS (SELECT 1 FROM purchase_orders po WHERE po.id=d.purchase_order_id AND po.version=?)
+        AND EXISTS (SELECT 1 FROM supply_allocations sa WHERE sa.id=? AND sa.version=? AND sa.received_qty>=?)`)
+      .bind(...claimValues(command, result, id), id, delivery.version, quantity, quantity, delivery.salesVersion, delivery.purchaseVersion, delivery.allocationId, delivery.allocationVersion, quantity),
     db.prepare(`UPDATE drop_ship_deliveries SET reversed_qty=reversed_qty+?,status=CASE WHEN reversed_qty+?=quantity THEN 'reversed' ELSE 'partially_reversed' END,version=version+1 WHERE id=? AND version=? AND quantity-reversed_qty>=? AND ${marker(command)}`).bind(quantity, quantity, id, delivery.version, quantity),
     db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(delivery.salesOrderId, delivery.salesVersion),
     db.prepare(`UPDATE purchase_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(delivery.purchaseOrderId, delivery.purchaseVersion),
+    db.prepare(`UPDATE supply_allocations SET received_qty=received_qty-?,updated_at=?,version=version+1 WHERE id=? AND version=? AND received_qty>=? AND ${marker(command)}`)
+      .bind(quantity, when, delivery.allocationId, delivery.allocationVersion, quantity),
     auditStatement(command, "drop_ship_delivery", id, "drop_ship_delivery_reversed", result.message, { quantity, reason, postingDate, salesOrderLineId: delivery.salesLineId, purchaseOrderLineId: delivery.purchaseLineId }, when),
     outboxStatement(command, "drop_ship.delivery_reversed", "drop_ship_delivery", id, { quantity, reason }, when),
   ]);
@@ -3051,8 +3469,14 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
     case "deactivatepartneraddress": return deactivatePartnerAddress(command);
     case "createbusinesspartner": case "updatebusinesspartner": return saveBusinessPartner(command);
     case "deactivatebusinesspartner": return deactivateMaster(command,"business_partners","business_partner");
+    case "mergebusinesspartners": return mergeBusinessPartners(command);
     case "createproduct": case "updateproduct": return saveProduct(command);
     case "deactivateproduct": return deactivateMaster(command,"products","product");
+    case "addproductalias": return addProductAlias(command);
+    case "removeproductalias": return removeProductAlias(command);
+    case "setproductdefaultlocation": return setProductDefaultLocation(command);
+    case "mergeproducts": return mergeProducts(command);
+    case "mergepurchaseorders": return mergePurchaseOrders(command);
     case "createunitofmeasure": return createUnitOfMeasure(command);
     case "createuomconversion": return createUomConversion(command);
     case "createpricelist": case "updatepricelist": return savePriceList(command);
@@ -3064,6 +3488,7 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
     case "deactivatepricelistentry": return deactivatePriceListEntry(command);
     case "createmarginrule": case "updatemarginrule": return saveMarginRule(command);
     case "deactivatemarginrule": return deactivateMarginRule(command);
+    case "adoptmarginmatrixforcatalog": return adoptMarginMatrixForCatalog(command);
     case "updateproductpricing": return updateProductPricing(command);
     case "createwarehouse": case "updatewarehouse": return saveWarehouse(command);
     case "deactivatewarehouse": return deactivateMaster(command,"warehouses","warehouse");

@@ -44,10 +44,22 @@ type PurchaseLine = {
   fulfillmentRoute?: string;
   trackingPolicy: string;
   sourceSalesOrderLineId?: string;
+  supplyAllocations: Array<{ id: string; salesOrderLineId: string; quantity: number; receivedQuantity: number; status: string; salesOrderNumber: string; customerName: string }>;
+  defaultLocations: ProductDefaultLocation[];
   discountCents: number;
   taxable: boolean;
   taxRateBps: number;
   version: number;
+};
+
+type ProductDefaultLocation = {
+  warehouseId: string;
+  warehouseCode: string;
+  warehouseName: string;
+  locationId?: string;
+  locationCode?: string;
+  locationName?: string;
+  version?: number;
 };
 
 type SalesLine = {
@@ -166,6 +178,8 @@ type Product = {
   dimensions: string;
   finish: string;
   trackingPolicy: string;
+  aliases: string[];
+  defaultLocations: ProductDefaultLocation[];
 };
 
 type ProductPicture = {
@@ -418,6 +432,7 @@ type ComposerLine = {
   route: string;
   projectReference: string;
   sourceSalesOrderLineId: string;
+  supplyAllocations: Array<{ id: string; salesOrderLineId: string; quantity: number; label: string }>;
   linkedPurchaseOrderLineId: string;
 };
 
@@ -624,7 +639,9 @@ function dueDateForTerms(baseDate: string, terms: string) {
 }
 
 
-const navGroups: Array<{ label?: string; items: Array<{ key: ViewKey; label: string; glyph: string }> }> = [
+type NavItem = { key: ViewKey; label: string; glyph: string; tab?: string };
+
+const navGroups: Array<{ label?: string; items: NavItem[] }> = [
   { items: [{ key: "home", label: "Home", glyph: "H" }] },
   {
     label: "Purchasing",
@@ -664,8 +681,9 @@ const navGroups: Array<{ label?: string; items: Array<{ key: ViewKey; label: str
     items: [
       { key: "products", label: "Catalog", glyph: "◇" },
       { key: "partners", label: "Partners", glyph: "◎" },
-      // Reports share this item with system policies, period locks, user access, integrations,
-      // pricing, units, and master data — the whole administrative half of the product.
+      { key: "reports", label: "Pricing", glyph: "%", tab: "pricing" },
+      // The remaining control tabs stay together; pricing gets a direct route because it is a
+      // routine commercial task rather than an occasional system-administration setting.
       { key: "reports", label: "Reports & admin", glyph: "▥" },
       { key: "warehouse", label: "Warehouse mode", glyph: "▣" },
     ],
@@ -1299,10 +1317,10 @@ export function InventoryApp() {
               {group.label && <p className="nav-label">{group.label}</p>}
               {group.items.map((item) => (
                 <button
-                  key={item.key}
-                  className={`nav-item ${view === item.key ? "active" : ""}`}
-                  onClick={() => navigate(item.key)}
-                  aria-current={view === item.key ? "page" : undefined}
+                  key={`${item.key}:${item.tab ?? "overview"}`}
+                  className={`nav-item ${view === item.key && (item.tab ? workspaceTab === item.tab : item.key !== "reports" || workspaceTab !== "pricing") ? "active" : ""}`}
+                  onClick={() => navigate(item.key, undefined, item.tab ?? "overview")}
+                  aria-current={view === item.key && (item.tab ? workspaceTab === item.tab : item.key !== "reports" || workspaceTab !== "pricing") ? "page" : undefined}
                 >
                   <span className="nav-glyph" aria-hidden="true">{item.glyph}</span>
                   <span>{item.label}</span>
@@ -1349,7 +1367,7 @@ export function InventoryApp() {
           <div className="page-heading">
             <div>
               <div className="eyebrow-row"><span className={`connection ${source}`}>{source === "server" ? "Connected" : source === "loading" ? "Connecting" : "Connection interrupted"}</span><span>{lastUpdatedAt ? `Last updated ${lastUpdatedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : "No successful refresh yet"}</span></div>
-              <h1>{viewTitles[view].title}</h1>
+              <h1>{view === "reports" && workspaceTab === "pricing" ? "Pricing" : viewTitles[view].title}</h1>
               {viewTitles[view].description ? <p>{viewTitles[view].description}</p> : null}
             </div>
             <PageActions view={view} source={source} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} onNavigate={navigate} onCreate={setCreateOrder} onCreatePartner={() => setEditingPartner("new")} onCreateProduct={() => setCreatingProduct(true)} />
@@ -1367,7 +1385,7 @@ export function InventoryApp() {
               {view === "purchase-orders" && (
                 <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} onCreateOrder={() => setCreateOrder("purchaseOrder")}>
                 {selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} />
+                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1375,7 +1393,7 @@ export function InventoryApp() {
               )}
               {view === "expected-receipts" && (
                 selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} />
+                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )
@@ -1406,10 +1424,10 @@ export function InventoryApp() {
               {view === "customer-returns" && <CustomerReturnsView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onReturn={(so) => setActiveCommand({ kind: "customer-return", entityId: so.id, entityNumber: so.number })} />}
               {view === "stock" && (
                 <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}>
-                  {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="inventory" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} warehouseId={warehouseId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
+                  {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="inventory" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} warehouseId={warehouseId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
                 </OperationsWorkspace>
               )}
-              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="the catalog" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} /> : <CatalogView products={snapshot.products} onOpen={setSelectedProductId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />)}
+              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="the catalog" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <CatalogView products={snapshot.products} onOpen={setSelectedProductId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />)}
               {/* Jumping to the order a movement belongs to: navigate first, then select, since
                   navigate clears the current selection. The worklist is searched by the order
                   number so the target is on the page that loads. */}
@@ -1424,7 +1442,7 @@ export function InventoryApp() {
               {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InventoryCountSessions warehouseId={warehouseId} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} canAdminister={snapshot.viewer.permissions.canAdminister} onDurableRefresh={loadSnapshot} /></OperationsWorkspace>}
               {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} /></OperationsWorkspace>}
               {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} /></OperationsWorkspace>}
-              {view === "partners" && <PartnersView partners={snapshot.partners} selectedId={selectedPartnerId} canApprove={snapshot.viewer.permissions.canApprove} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPartnerId} onEdit={setEditingPartner} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
+              {view === "partners" && <PartnersView partners={snapshot.partners} selectedId={selectedPartnerId} canApprove={snapshot.viewer.permissions.canApprove} canOperate={snapshot.viewer.permissions.canOperate} canAdminister={snapshot.viewer.permissions.canAdminister} onOpen={setSelectedPartnerId} onEdit={setEditingPartner} onChanged={(message) => { setToast(message); void loadSnapshot(); }} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
               {view === "reports" && <OperationsWorkspace workspace="controls" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><ReportsView snapshot={snapshot} warehouseId={warehouseId} /></OperationsWorkspace>}
               {view === "warehouse" && <WarehouseView snapshot={snapshot} source={source} canOperate={snapshot.viewer.permissions.canOperate} navigate={navigate} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} />}
             </>
@@ -1806,10 +1824,11 @@ function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSo
   </section>;
 }
 
-function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpenVendorBilling, onSubmitForApproval }: { po: PurchaseOrder; canOperate: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: () => void; onSubmitForApproval: (reason: string) => Promise<void> }) {
+function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpenVendorBilling, onSubmitForApproval, onChanged }: { po: PurchaseOrder; canOperate: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   const [submitNote, setSubmitNote] = useState("");
+  const [mergeOpen, setMergeOpen] = useState(false);
   const isDraft = po.lifecycle.toLowerCase() === "draft";
   const overallStage = purchaseOrderStage(po);
   const billingIsNext = overallStage === "Awaiting vendor bill" || overallStage === "Partially billed";
@@ -1829,7 +1848,7 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
       {billingIsNext ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>{overallStage === "Partially billed" ? "Finish entering the vendor bill" : fullyReceived ? "Receipt complete · vendor bill pending" : "Receiving closed · vendor bill pending"}</strong><p>Record the supplier&apos;s invoice against this PO and its posted receipt. This creates the payable without moving inventory again.</p></div><button className="button primary" type="button" onClick={onOpenVendorBilling}>Open vendor billing</button></div> : null}
       {po.exception && <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Action needed</strong><p>{po.exception}</p></div></div>}
       {activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}
-      {isDraft && canOperate ? <form className="draft-activation" onSubmit={submit}><label>Submission note<input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required /></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button></form> : null}
+      {isDraft && canOperate ? <form className="draft-activation" onSubmit={submit}><label>Submission note<input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required /></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button><button className="button secondary" type="button" onClick={() => setMergeOpen(true)}>Merge another draft</button></form> : null}
       {canOperate ? <div className="object-actions">
         {po.lifecycle.toLowerCase() === "approved" && <EmailDocumentButton documentType="purchase_order" documentId={po.id} documentNumber={po.number}>Email purchase order</EmailDocumentButton>}
         {po.lifecycle.toLowerCase() === "approved" && po.open > 0 && <button className="button primary" onClick={() => onCommand("receive")}>Receive remaining</button>}
@@ -1864,7 +1883,15 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
     </div>
     <div className="detail-columns"><section className="panel"><PanelHeading title="Related state" /><dl className="definition-list"><div><dt>Purchase order</dt><dd>{po.number} · revision {po.revision}</dd></div><div><dt>Latest receipt</dt><dd>{po.latestReceiptNumber ? <>{po.latestReceiptNumber}<br /><small>{formatDocumentDate(po.latestReceiptPostedAt)}</small></> : po.received > 0 ? "Recorded stock movements" : "No receipt posted"}</dd></div><div><dt>Packing slip</dt><dd>{po.latestReceiptPackingSlip ?? (po.latestReceiptNumber ? "Not recorded" : "—")}</dd></div><div><dt>Linked demand</dt><dd>{po.customerRef ?? "Stock replenishment"}</dd></div><div><dt>Billing</dt><dd>{po.billing}</dd></div></dl></section>
       <section className="panel"><PanelHeading title="Posting summary" /><div className="timeline"><div className="timeline-item"><span className="timeline-dot info" /><div><strong>Revision {po.revision} · {po.lifecycle}</strong><p>Commercial state is version checked independently of inventory.</p><small>Raised by {po.buyer || "an unrecorded buyer"}</small>{po.submissionNote ? <p className="submission-note">“{po.submissionNote}”</p> : null}</div></div><div className="timeline-item"><span className="timeline-dot success" /><div><strong>{po.received - po.returned} units net received</strong><p>{po.received} received · {po.returned} returned · {po.closed} closed without receipt.</p><small>{po.fulfillment}</small></div></div></div></section></div>
+    {mergeOpen ? <MergePurchaseOrderDialog purchaseOrder={po} onClose={() => setMergeOpen(false)} onSaved={(message) => { setMergeOpen(false); onChanged(message); }} /> : null}
   </div>;
+}
+
+function MergePurchaseOrderDialog({ purchaseOrder, onClose, onSaved }: { purchaseOrder: PurchaseOrder; onClose: () => void; onSaved: (message: string) => void }) {
+  const [source, setSource] = useState<LookupOption | null>(null); const [confirmed, setConfirmed] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  useDialogDismiss(onClose, busy);
+  const submit = async (event: FormEvent) => { event.preventDefault(); if (!source || source.id === purchaseOrder.id) return setError("Choose a different draft purchase order."); setBusy(true); setError(""); try { onSaved(await postWorkflow("mergePurchaseOrders", purchaseOrder.id, purchaseOrder.version, { sourcePurchaseOrderId: source.id })); } catch (caught) { setError(caught instanceof Error ? caught.message : "The purchase orders could not be merged."); } finally { setBusy(false); } };
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog" role="dialog" aria-modal="true" aria-label="Merge draft purchase orders"><div className="dialog-header"><div><span className="section-kicker">Surviving order · {purchaseOrder.number}</span><h2>Merge draft purchase orders</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div><form onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<label>Other unsubmitted draft from {purchaseOrder.vendor}<ReferenceSearchSelect kind="purchaseOrders" role="draft" partnerId={purchaseOrder.vendorId} value={source?.id ?? ""} initialOptions={[]} onSelect={setSource} placeholder="Search draft purchase-order number" /></label><div className="next-step-banner"><div><strong>{source ? source.label : "Choose a draft to combine"}</strong><p>Its lines, charges, and live attachments will move to {purchaseOrder.number}. The other number is retained as a canceled audit record. Submitted, received, emailed, delivered, or billed orders cannot be merged.</p></div></div><label className="radio-row"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I understand the other draft will be canceled after its contents are consolidated.</span></label><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button type="submit" className="button danger" disabled={busy || !source || !confirmed}>{busy ? "Merging…" : `Merge into ${purchaseOrder.number}`}</button></div></form></section></div>;
 }
 
 function MetricDisplay({ label, value, tone = "neutral" }: { label: string; value: number | string; tone?: Severity }) {
@@ -1980,13 +2007,20 @@ function CatalogView({ products, onOpen, sort, setSort }: { products: Product[];
   </table></div></section>;
 }
 
-function ProductDetail({ product, movements, onBack, backLabel, onEdit, canManagePictures, viewerEmail, viewerRole }: { product: Product; movements: Movement[]; onBack: () => void; backLabel: string; onEdit?: () => void; canManagePictures: boolean; viewerEmail: string; viewerRole: string }) {
+function ProductDetail({ product, movements, onBack, backLabel, onEdit, canManagePictures, canConsolidate, viewerEmail, viewerRole, onChanged }: { product: Product; movements: Movement[]; onBack: () => void; backLabel: string; onEdit?: () => void; canManagePictures: boolean; canConsolidate: boolean; viewerEmail: string; viewerRole: string; onChanged: (message: string) => void }) {
   const costBasis = product.lastUnitCost ?? product.standardCost;
   const margin = product.sellingPrice > 0 ? `${(((product.sellingPrice - costBasis) / product.sellingPrice) * 100).toFixed(1)}%` : "—";
   const [movementPage, setMovementPage] = useState(1);
   const [movementTotal, setMovementTotal] = useState(0);
   const [productMovements, setProductMovements] = useState<Movement[]>(movements.filter((movement) => movement.product === product.sku));
   const [balances, setBalances] = useState<Array<InventoryLocationBalance & { inventoryStatus: string }>>([]);
+  const [aliases, setAliases] = useState<Array<{ id: string; alias: string; aliasType: string }>>([]);
+  const [defaultLocations, setDefaultLocations] = useState<ProductDefaultLocation[]>(product.defaultLocations);
+  const [addingAlias, setAddingAlias] = useState(false);
+  const [editingBin, setEditingBin] = useState<ProductDefaultLocation | null>(null);
+  const [merging, setMerging] = useState(false);
+  const [masterBusy, setMasterBusy] = useState(false);
+  const [masterError, setMasterError] = useState("");
   const [historyError, setHistoryError] = useState("");
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyRefresh, setHistoryRefresh] = useState(0);
@@ -2002,18 +2036,34 @@ function ProductDetail({ product, movements, onBack, backLabel, onEdit, canManag
       if (!response.ok) throw new Error(text(asRecord(raw.error).message, "Product history could not be loaded."));
       setProductMovements(asRows(raw.movements).map((item, index) => ({ id: text(item.id, `movement-${index}`), time: displayTimestamp(text(item.postedAt)), type: titleCase(text(item.type)), document: `${titleCase(text(item.sourceDocumentType))} · ${text(item.sourceDocumentId)}`, product: product.sku, quantity: number(item.quantity), from: text(item.fromLocationCode, "External"), to: text(item.toLocationCode, "External"), user: text(item.postedBy, "System") })));
       setBalances(asRows(raw.balances).map((item) => ({ productId: product.id, locationId: text(item.locationId), recordedQuantity: number(item.recordedQuantity), reservedQuantity: number(item.reservedQuantity), version: number(item.version), locationCode: text(item.locationCode, "Missing location"), locationName: text(item.locationName, "Referenced location no longer exists"), warehouseName: text(item.warehouseName, "Unreconciled"), inventoryStatus: text(item.inventoryStatus, "orphaned") })));
+      setAliases(asRows(raw.aliases).map((item) => ({ id: text(item.id), alias: text(item.alias), aliasType: text(item.aliasType, "alternate") })));
+      setDefaultLocations(asRows(raw.defaultLocations).map((item) => ({ warehouseId: text(item.warehouseId), warehouseCode: text(item.warehouseCode), warehouseName: text(item.warehouseName), locationId: text(item.locationId) || undefined, locationCode: text(item.locationCode) || undefined, locationName: text(item.locationName) || undefined, version: item.version == null ? undefined : number(item.version) })));
       setMovementTotal(number(asRecord(raw.pagination).total));
     })().catch((caught) => { if (!controller.signal.aborted) setHistoryError(caught instanceof Error ? caught.message : "Product history could not be loaded."); })
       .finally(() => { if (!controller.signal.aborted) setHistoryLoading(false); });
     return () => controller.abort();
   }, [historyRefresh, movementPage, product.id, product.sku]);
+  const changed = (message: string) => { setAddingAlias(false); setEditingBin(null); setMerging(false); setMasterError(""); setHistoryRefresh((current) => current + 1); onChanged(message); };
+  const removeAlias = async (alias: { id: string; alias: string }) => {
+    if (!window.confirm(`Remove “${alias.alias}” as an alternate identifier for ${product.sku}?`)) return;
+    setMasterBusy(true); setMasterError("");
+    const idempotencyKey = crypto.randomUUID();
+    try {
+      const response = await fetch("/api/workflows", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": idempotencyKey }, body: JSON.stringify({ command: "removeProductAlias", entityId: product.id, version: product.productVersion, idempotencyKey, payload: { aliasId: alias.id } }) });
+      const result = await response.json() as { message?: string; error?: string | { message?: string } };
+      if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "The alias could not be removed.");
+      changed(result.message ?? `Alias “${alias.alias}” removed.`);
+    } catch (caught) { setMasterError(caught instanceof Error ? caught.message : "The alias could not be removed."); }
+    finally { setMasterBusy(false); }
+  };
   const movementPages = Math.max(1, Math.ceil(movementTotal / 50));
   const balanceTable = useLocalTableSort(balances, { warehouse: (row) => row.warehouseName, location: (row) => `${row.locationCode} ${row.locationName}`, status: (row) => row.inventoryStatus, onHand: (row) => row.recordedQuantity, reserved: (row) => row.reservedQuantity, available: (row) => row.recordedQuantity - row.reservedQuantity });
   return <div className="object-page">
     <button className="back-button" onClick={onBack}>← Back to {backLabel}</button>
     {historyError ? <div className="exception-banner" role="alert"><span aria-hidden="true">!</span><div><strong>Product detail unavailable</strong><p>{historyError}</p><button className="button secondary" onClick={() => setHistoryRefresh((current) => current + 1)}>Retry</button></div></div> : null}
     <section className="object-header panel product-header"><div className="window-thumb large" aria-hidden="true"><span /><span /><span /><span /></div><div className="object-title"><div><span className="section-kicker">{product.policy}</span><h2>{product.name}</h2><p>{product.specification}</p><code>{product.sku}</code></div><div className="object-total"><span>Selling price</span><strong>{exact.format(product.sellingPrice)}</strong><small>margin {margin}</small></div></div>
-      {onEdit ? <div className="object-actions"><button className="button primary" onClick={onEdit}>Edit product</button></div> : null}</section>
+      <div className="object-actions">{onEdit ? <button className="button primary" onClick={onEdit}>Edit product</button> : null}{canConsolidate ? <><button className="button secondary" onClick={() => setAddingAlias(true)}>Add alias</button><button className="button secondary" onClick={() => setMerging(true)}>Merge duplicate</button></> : null}</div></section>
+    {masterError ? <div className="error-summary" role="alert"><p>{masterError}</p></div> : null}
     <section className="metric-row object-metrics"><MetricDisplay label="On hand" value={product.onHand} /><MetricDisplay label="Usable" value={product.usable} /><MetricDisplay label="Reserved" value={product.reserved} tone="info" /><MetricDisplay label="Available now" value={product.available} tone="success" /><MetricDisplay label="Incoming" value={product.incoming} tone="info" /><MetricDisplay label="Projected" value={product.projected} tone={product.projected < 0 ? "danger" : "neutral"} /></section>
     <ProductPictures product={product} canManage={canManagePictures} viewerEmail={viewerEmail} viewerRole={viewerRole} />
     {/* Cost, price, units and policy were visible in the catalog list and absent from the record
@@ -2039,9 +2089,49 @@ function ProductDetail({ product, movements, onBack, backLabel, onEdit, canManag
         ["Sales unit", product.salesUomCode],
       ]} />
     </div>
+    <div className="detail-columns">
+      <section className="panel"><PanelHeading title="Aliases" detail="Alternate names and part numbers resolve to this item" />
+        {aliases.length ? <ul className="plain-list">{aliases.map((alias) => <li key={alias.id}><span><strong>{alias.alias}</strong><small>{alias.aliasType === "merged_record" ? "Retained from merge" : titleCase(alias.aliasType)}</small></span>{canConsolidate && alias.aliasType !== "merged_record" ? <button type="button" className="row-action" disabled={masterBusy} onClick={() => void removeAlias(alias)}>Remove</button> : null}</li>)}</ul> : <div className="empty-inline">No alternate identifiers have been added.</div>}
+      </section>
+      <section className="panel"><PanelHeading title="Preferred warehouse bins" detail="Receiving defaults by warehouse" />
+        <ul className="plain-list">{defaultLocations.map((item) => <li key={item.warehouseId}><span><strong>{item.warehouseCode} · {item.warehouseName}</strong><small>{item.locationId ? `${item.locationCode} · ${item.locationName}` : "No preferred bin set"}</small></span>{canConsolidate ? <button type="button" className="row-action" onClick={() => setEditingBin(item)}>{item.locationId ? "Change" : "Set bin"}</button> : null}</li>)}</ul>
+      </section>
+    </div>
     <section className="panel"><PanelHeading title="Location balances" /><div className="responsive-table"><table><thead><tr><SortableHeader label="Warehouse" column="warehouse" sort={balanceTable.sort} setSort={balanceTable.setSort} /><SortableHeader label="Location" column="location" sort={balanceTable.sort} setSort={balanceTable.setSort} /><SortableHeader label="Status" column="status" sort={balanceTable.sort} setSort={balanceTable.setSort} /><SortableHeader label="On hand" column="onHand" sort={balanceTable.sort} setSort={balanceTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reserved" column="reserved" sort={balanceTable.sort} setSort={balanceTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Available" column="available" sort={balanceTable.sort} setSort={balanceTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{balanceTable.rows.map((balance) => <tr key={balance.locationId}><td>{balance.warehouseName}</td><td><strong>{balance.locationCode}</strong><small>{balance.locationName}</small></td><td><StatusBadge tone={balance.inventoryStatus === "orphaned" ? "danger" : balance.inventoryStatus === "usable" ? "success" : "warning"}>{titleCase(balance.inventoryStatus)}</StatusBadge></td><td className="numeric">{balance.recordedQuantity}</td><td className="numeric">{balance.reservedQuantity}</td><td className="numeric strong">{balance.recordedQuantity - balance.reservedQuantity}</td></tr>)}</tbody></table></div></section>
     <section className="panel"><PanelHeading title="Movement history" detail={`${movementTotal} posted record${movementTotal === 1 ? "" : "s"}`} />{historyLoading ? <div className="empty-inline">Loading product history…</div> : productMovements.length ? <MovementsTable movements={productMovements} /> : <div className="empty-inline">No movement records exist for this product.</div>}{!historyLoading && movementPages > 1 ? <nav className="snapshot-pagination" aria-label="Product movement pages"><button className="button secondary" disabled={movementPage <= 1} onClick={() => setMovementPage((current) => current - 1)}>Previous</button><span>Page {movementPage} of {movementPages}</span><button className="button secondary" disabled={movementPage >= movementPages} onClick={() => setMovementPage((current) => current + 1)}>Next</button></nav> : null}</section>
+    {addingAlias ? <ProductAliasDialog product={product} onClose={() => setAddingAlias(false)} onSaved={changed} /> : null}
+    {editingBin ? <ProductBinDialog product={product} warehouse={editingBin} onClose={() => setEditingBin(null)} onSaved={changed} /> : null}
+    {merging ? <MergeProductDialog product={product} onClose={() => setMerging(false)} onSaved={changed} /> : null}
   </div>;
+}
+
+async function postWorkflow(command: string, entityId: string, version: number, payload: Record<string, unknown>) {
+  const idempotencyKey = crypto.randomUUID();
+  const response = await fetch("/api/workflows", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": idempotencyKey }, body: JSON.stringify({ command, entityId, version, idempotencyKey, payload }) });
+  const result = await response.json() as { message?: string; error?: string | { message?: string } };
+  if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "The change could not be completed.");
+  return result.message ?? "The change was completed.";
+}
+
+function ProductAliasDialog({ product, onClose, onSaved }: { product: Product; onClose: () => void; onSaved: (message: string) => void }) {
+  const [alias, setAlias] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  useDialogDismiss(onClose, busy);
+  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); setError(""); try { onSaved(await postWorkflow("addProductAlias", product.id, product.productVersion, { alias })); } catch (caught) { setError(caught instanceof Error ? caught.message : "The alias could not be added."); } finally { setBusy(false); } };
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label="Add product alias"><div className="dialog-header"><div><span className="section-kicker">{product.sku}</span><h2>Add product alias</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div><form onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<label>Alternate name or part number<input autoFocus value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="Vendor SKU, legacy number, or common name" required /></label><p className="formula-note">Searches and product pickers will resolve this value to {product.sku}.</p><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button type="submit" className="button primary" disabled={busy || !alias.trim()}>{busy ? "Adding…" : "Add alias"}</button></div></form></section></div>;
+}
+
+function ProductBinDialog({ product, warehouse, onClose, onSaved }: { product: Product; warehouse: ProductDefaultLocation; onClose: () => void; onSaved: (message: string) => void }) {
+  const [locationId, setLocationId] = useState(warehouse.locationId ?? ""); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  useDialogDismiss(onClose, busy);
+  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); setError(""); try { onSaved(await postWorkflow("setProductDefaultLocation", product.id, product.productVersion, { warehouseId: warehouse.warehouseId, locationId })); } catch (caught) { setError(caught instanceof Error ? caught.message : "The preferred bin could not be saved."); } finally { setBusy(false); } };
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label="Set preferred warehouse bin"><div className="dialog-header"><div><span className="section-kicker">{product.sku} · {warehouse.warehouseCode}</span><h2>Set preferred bin</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div><form onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<label>Usable bin in {warehouse.warehouseName}<ReferenceSearchSelect kind="locations" role="bin" warehouseId={warehouse.warehouseId} value={locationId} initialOptions={warehouse.locationId ? [{ id: warehouse.locationId, label: `${warehouse.locationCode} · ${warehouse.locationName}`, detail: warehouse.warehouseName }] : []} onSelect={(option) => setLocationId(option.id)} placeholder="Search bins in this warehouse" /></label><p className="formula-note">Future receipts of this product into {warehouse.warehouseCode} will start with this bin selected.</p><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button type="submit" className="button primary" disabled={busy || !locationId}>{busy ? "Saving…" : "Save preferred bin"}</button></div></form></section></div>;
+}
+
+function MergeProductDialog({ product, onClose, onSaved }: { product: Product; onClose: () => void; onSaved: (message: string) => void }) {
+  const [source, setSource] = useState<LookupOption | null>(null); const [confirmed, setConfirmed] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  useDialogDismiss(onClose, busy);
+  const submit = async (event: FormEvent) => { event.preventDefault(); if (!source || source.id === product.id) return setError("Choose a different duplicate product."); setBusy(true); setError(""); try { onSaved(await postWorkflow("mergeProducts", product.id, product.productVersion, { sourceProductId: source.id })); } catch (caught) { setError(caught instanceof Error ? caught.message : "The products could not be merged."); } finally { setBusy(false); } };
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog" role="dialog" aria-modal="true" aria-label="Merge duplicate product"><div className="dialog-header"><div><span className="section-kicker">Surviving item · {product.sku}</span><h2>Merge duplicate product</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div><form onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<label>Duplicate item to retire<ReferenceSearchSelect kind="products" value={source?.id ?? ""} initialOptions={[]} onSelect={setSource} placeholder="Search SKU, name, manufacturer SKU, or alias" /></label><div className="next-step-banner"><div><strong>{source ? source.label : "Choose the duplicate record"}</strong><p>Its on-hand and reserved balances will be summed into {product.sku}. Orders, costing, and product references move to the surviving item; its old identifiers become aliases.</p></div></div><label className="radio-row"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I understand the duplicate item will be deactivated and this merge cannot be undone.</span></label><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button type="submit" className="button danger" disabled={busy || !source || !confirmed}>{busy ? "Merging…" : `Merge into ${product.sku}`}</button></div></form></section></div>;
 }
 
 function ProductPictures({ product, canManage, viewerEmail, viewerRole }: { product: Product; canManage: boolean; viewerEmail: string; viewerRole: string }) {
@@ -2232,16 +2322,16 @@ function CountsView({ balances, canOperate, onCount, sort, setSort }: { balances
 }
 
 
-function PartnersView({ partners, selectedId, canApprove, canOperate, onOpen, onEdit, sort, setSort }: { partners: Partner[]; selectedId: string | null; canApprove: boolean; canOperate: boolean; onOpen: (id: string | null) => void; onEdit: (partner: Partner) => void } & WorklistSortProps) {
+function PartnersView({ partners, selectedId, canApprove, canOperate, canAdminister, onOpen, onEdit, onChanged, sort, setSort }: { partners: Partner[]; selectedId: string | null; canApprove: boolean; canOperate: boolean; canAdminister: boolean; onOpen: (id: string | null) => void; onEdit: (partner: Partner) => void; onChanged: (message: string) => void } & WorklistSortProps) {
   const selected = partners.find((partner) => partner.id === selectedId);
-  if (selected) return <PartnerDetail partner={selected} canApprove={canApprove} canOperate={canOperate} onBack={() => onOpen(null)} onEdit={() => onEdit(selected)} />;
+  if (selected) return <PartnerDetail partner={selected} canApprove={canApprove} canOperate={canOperate} canAdminister={canAdminister} onBack={() => onOpen(null)} onEdit={() => onEdit(selected)} onChanged={onChanged} />;
   return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Customers and vendors</caption><thead><tr><SortableHeader label="Partner" column="partner" sort={sort} setSort={setSort} /><SortableHeader label="Type" column="type" sort={sort} setSort={setSort} /><SortableHeader label="Contact" column="contact" sort={sort} setSort={setSort} /><SortableHeader label="Address" column="address" sort={sort} setSort={setSort} /><SortableHeader label="Terms" column="terms" sort={sort} setSort={setSort} /><SortableHeader label="Credit control" column="credit" sort={sort} setSort={setSort} defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{partners.map((partner) => <tr key={partner.id}><td><button className="table-link" onClick={() => onOpen(partner.id)}>{partner.name}</button><small>{partner.code}</small></td><td>{titleCase(partner.type)}</td><td>{partner.email || "—"}<small>{partner.phone || ""}</small></td><td>{[partner.addressLine1, partner.city, partner.region, partner.postalCode].filter(Boolean).join(", ") || "Not recorded"}</td><td>{partner.paymentTerms || "—"}</td><td>{partner.creditHold ? <StatusBadge tone="danger">Credit hold</StatusBadge> : partner.creditLimitCents ? formatDocumentMoney(partner.creditLimitCents / 100, partner.currency) : "No limit"}</td><td><button className="row-action" onClick={() => onOpen(partner.id)}>Open</button></td></tr>)}{!partners.length ? <tr><td colSpan={7}><div className="empty-inline">No business partners match this view.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
 type PartnerAddress = { id: string; label: string; contactName?: string; addressLine1: string; addressLine2?: string; city: string; region: string; postalCode: string; country: string; deliveryInstructions?: string; isDefault: boolean; version: number };
 
 /** One account in one place: contacts, credit, ship-to sites, and its open commercial state. */
-function PartnerDetail({ partner, canApprove, canOperate, onBack, onEdit }: { partner: Partner; canApprove: boolean; canOperate: boolean; onBack: () => void; onEdit: () => void }) {
+function PartnerDetail({ partner, canApprove, canOperate, canAdminister, onBack, onEdit, onChanged }: { partner: Partner; canApprove: boolean; canOperate: boolean; canAdminister: boolean; onBack: () => void; onEdit: () => void; onChanged: (message: string) => void }) {
   const [addresses, setAddresses] = useState<PartnerAddress[]>([]);
   const [orders, setOrders] = useState<Array<{ id: string; number: string; detail: string }>>([]);
   const [invoices, setInvoices] = useState<Array<{ id: string; number: string; status: string; invoiceDate: string; dueDate: string; total: number; paid: number; outstanding: number; currency: string }>>([]);
@@ -2249,6 +2339,7 @@ function PartnerDetail({ partner, canApprove, canOperate, onBack, onEdit }: { pa
   const [addingAddress, setAddingAddress] = useState(false);
   const [editingAddress, setEditingAddress] = useState<PartnerAddress | null>(null);
   const [deactivatingAddress, setDeactivatingAddress] = useState<PartnerAddress | null>(null);
+  const [merging, setMerging] = useState(false);
   const [addressMessage, setAddressMessage] = useState("");
   const [detailLoading, setDetailLoading] = useState(true);
   const [detailError, setDetailError] = useState("");
@@ -2328,7 +2419,7 @@ function PartnerDetail({ partner, canApprove, canOperate, onBack, onEdit }: { pa
       {isCustomer ? <div className="object-total"><span>Receivable outstanding</span><strong>{formatDocumentMoney(outstanding, partner.currency)}</strong><small>{creditLimit ? `of ${formatDocumentMoney(creditLimit, partner.currency)} limit` : "No credit limit set"}</small></div> : null}</div>
       {partner.creditHold ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Credit hold</strong><p>New sales orders for this account cannot be confirmed until the hold is released.</p></div></div> : null}
       {isCustomer && !partner.creditHold && creditLimit > 0 && outstanding > creditLimit ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Over credit limit</strong><p>{formatDocumentMoney(outstanding - creditLimit, partner.currency)} above the {formatDocumentMoney(creditLimit, partner.currency)} limit.</p></div></div> : null}
-      <div className="object-actions">{canApprove ? <button className="button primary" onClick={onEdit}>Edit partner</button> : null}{isCustomer && canOperate ? <button className="button secondary" onClick={() => setAddingAddress(true)}>Add ship-to address</button> : null}</div>
+      <div className="object-actions">{canApprove ? <button className="button primary" onClick={onEdit}>Edit partner</button> : null}{isCustomer && canOperate ? <button className="button secondary" onClick={() => setAddingAddress(true)}>Add ship-to address</button> : null}{canAdminister ? <button className="button secondary" onClick={() => setMerging(true)}>Merge duplicate</button> : null}</div>
     </section>
     <div className="detail-columns">
       <section className="panel"><PanelHeading title="Account" /><dl className="definition-list">
@@ -2354,7 +2445,15 @@ function PartnerDetail({ partner, canApprove, canOperate, onBack, onEdit }: { pa
     {addingAddress ? <PartnerAddressDialog partnerId={partner.id} onClose={() => setAddingAddress(false)} onSaved={() => { setAddingAddress(false); setRefreshToken((current) => current + 1); }} /> : null}
     {editingAddress ? <PartnerAddressDialog partnerId={partner.id} address={editingAddress} onClose={() => setEditingAddress(null)} onSaved={() => { setEditingAddress(null); setRefreshToken((current) => current + 1); }} /> : null}
     {deactivatingAddress ? <PartnerAddressDeactivateDialog address={deactivatingAddress} onClose={() => setDeactivatingAddress(null)} onSaved={(message) => { setDeactivatingAddress(null); setAddressMessage(message); setRefreshToken((current) => current + 1); }} /> : null}
+    {merging ? <MergePartnerDialog partner={partner} onClose={() => setMerging(false)} onSaved={(message) => { setMerging(false); onChanged(message); }} /> : null}
   </div>;
+}
+
+function MergePartnerDialog({ partner, onClose, onSaved }: { partner: Partner; onClose: () => void; onSaved: (message: string) => void }) {
+  const [source, setSource] = useState<LookupOption | null>(null); const [confirmed, setConfirmed] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  useDialogDismiss(onClose, busy);
+  const submit = async (event: FormEvent) => { event.preventDefault(); if (!source || source.id === partner.id) return setError("Choose a different duplicate account."); setBusy(true); setError(""); try { onSaved(await postWorkflow("mergeBusinessPartners", partner.id, partner.version, { sourcePartnerId: source.id })); } catch (caught) { setError(caught instanceof Error ? caught.message : "The partner accounts could not be merged."); } finally { setBusy(false); } };
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog" role="dialog" aria-modal="true" aria-label="Merge duplicate partner"><div className="dialog-header"><div><span className="section-kicker">Surviving account · {partner.code}</span><h2>Merge duplicate vendor or customer</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div><form onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<label>Duplicate account to retire<ReferenceSearchSelect kind="partners" role={partner.type === "both" ? undefined : partner.type} value={source?.id ?? ""} initialOptions={[]} onSelect={setSource} placeholder="Search account name, code, or email" /></label><div className="next-step-banner"><div><strong>{source ? source.label : "Choose the duplicate account"}</strong><p>Orders, billing, credits, payments, addresses, and product cost history will move to {partner.code}. If one record is a vendor and the other a customer, the survivor becomes both.</p></div></div><label className="radio-row"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I understand the duplicate account will be deactivated and this merge cannot be undone.</span></label><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button type="submit" className="button danger" disabled={busy || !source || !confirmed}>{busy ? "Merging…" : `Merge into ${partner.code}`}</button></div></form></section></div>;
 }
 
 function PartnerAddressDialog({ partnerId, address, onClose, onSaved }: { partnerId: string; address?: PartnerAddress; onClose: () => void; onSaved: () => void }) {
@@ -2696,11 +2795,16 @@ function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locat
   } : kind === "salesOrderLines" ? {
     id: text(item.id),
     label: `${text(item.orderNumber)} · ${text(item.sku)}`,
-    detail: [text(item.customerName), text(item.productName), titleCase(text(item.fulfillmentRoute))].filter(Boolean).join(" · "),
+    detail: [text(item.customerName), text(item.productName), titleCase(text(item.fulfillmentRoute)), `${number(item.availableToAllocateQuantity)} base units unallocated`].filter(Boolean).join(" · "),
+    availableQuantity: number(item.availableToAllocateQuantity),
   } : kind === "purchaseOrderLines" ? {
     id: text(item.id),
     label: `${text(item.orderNumber)} · ${text(item.sku)}`,
     detail: [text(item.vendorName), text(item.productName)].filter(Boolean).join(" · "),
+  } : kind === "purchaseOrders" ? {
+    id: text(item.id),
+    label: text(item.number, "Purchase order"),
+    detail: [text(item.vendorName), titleCase(text(item.status)), formatDocumentMoney(number(item.totalCents) / 100, text(item.currency, "CAD"))].filter(Boolean).join(" · "),
   } : kind === "products" ? {
     id: text(item.id),
     label: `${text(item.sku)} · ${text(item.name)}`,
@@ -2776,6 +2880,18 @@ function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locat
  * the server still records the confirmed order, shipment, invoice, and (when chosen) payment that
  * the rest of the product needs for returns, traceability, receivables, and audit history.
  */
+const WALK_IN_CUSTOMER_ID = "customer-walk-in";
+const WALK_IN_CUSTOMER: LookupOption = {
+  id: WALK_IN_CUSTOMER_ID,
+  label: "Walk-in Customer",
+  detail: "WALK-IN · Pay now",
+  currency: "CAD",
+  paymentTerms: "Due on receipt",
+  country: "CA",
+  creditHold: false,
+  creditLimitCents: 0,
+};
+
 function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete }: {
   warehouseId: string;
   taxDefaultRateBps: number;
@@ -2785,12 +2901,12 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
   const newLine = (): CounterSaleLine => ({
     id: crypto.randomUUID(), productId: "", quantity: 1, unitAmount: 0, uomId: "", uomCode: "",
     priceSource: "Select a product", discountRate: 0, taxCode: taxDefaultRateBps > 0 ? "GST" : "EXEMPT",
-    taxRate: taxDefaultRateBps / 100, route: "stock", projectReference: "", sourceSalesOrderLineId: "",
+    taxRate: taxDefaultRateBps / 100, route: "stock", projectReference: "", sourceSalesOrderLineId: "", supplyAllocations: [],
     linkedPurchaseOrderLineId: "", factorToBase: 1, trackingPolicy: "quantity", availableQuantity: 0,
     locationId: "", locationLabel: "", locationAvailable: 0, lotId: "", inventoryUnitId: "",
   });
-  const [customerId, setCustomerId] = useState("");
-  const [customer, setCustomer] = useState<LookupOption | null>(null);
+  const [customerId, setCustomerId] = useState(WALK_IN_CUSTOMER_ID);
+  const [customer, setCustomer] = useState<LookupOption | null>(WALK_IN_CUSTOMER);
   const [lines, setLines] = useState<CounterSaleLine[]>(() => [newLine()]);
   const [postingDate, setPostingDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [currency, setCurrency] = useState("CAD");
@@ -2827,6 +2943,7 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
   const chooseCustomer = (option: LookupOption) => {
     setCustomerId(option.id);
     setCustomer(option);
+    if (option.id === WALK_IN_CUSTOMER_ID) setSettlement("pay_now");
     const nextCurrency = option.currency || "CAD";
     const terms = option.paymentTerms || "Due on receipt";
     setCurrency(nextCurrency);
@@ -2896,9 +3013,9 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
   return <form className="counter-sale-workspace" onSubmit={submit}>
     {error ? <div className="error-summary" role="alert"><strong>Counter sale not completed</strong><p>{error}</p></div> : null}
     <section className="panel counter-sale-customer" aria-labelledby="counter-customer-heading">
-      <div className="panel-heading"><div><span className="section-kicker">1 · Customer</span><h2 id="counter-customer-heading">Who is buying?</h2></div><StatusBadge tone={customerId ? "success" : "neutral"}>{customerId ? "Selected" : "Required"}</StatusBadge></div>
+      <div className="panel-heading"><div><span className="section-kicker">1 · Customer</span><h2 id="counter-customer-heading">Who is buying?</h2></div><StatusBadge tone="success">{customerId === WALK_IN_CUSTOMER_ID ? "Walk-in selected" : "Selected"}</StatusBadge></div>
       <div className="command-form form-grid composer-header-fields">
-        <label className="project-field">Customer<ReferenceSearchSelect kind="partners" role="customer" value={customerId} initialOptions={[]} quickCreate="customer" onSelect={chooseCustomer} placeholder="Search customer name, code, or email" /></label>
+        <label className="project-field">Customer<ReferenceSearchSelect kind="partners" role="customer" value={customerId} initialOptions={[WALK_IN_CUSTOMER]} quickCreate="customer" onSelect={chooseCustomer} placeholder="Search customer name, code, or email" /><small>{customerId === WALK_IN_CUSTOMER_ID ? "Selected automatically for a pay-now sale. Search here to use a customer account instead." : "Customer pricing and account terms apply."}</small></label>
         <label>Sale date<input type="date" value={postingDate} onChange={(event) => { const next = event.target.value; setPostingDate(next); setDueDate(dueDateForTerms(next, settlement === "pay_now" ? "Due on receipt" : paymentTerms)); }} required /></label>
         <label>Customer / job reference<input value={projectReference} onChange={(event) => setProjectReference(event.target.value)} placeholder="Optional" /></label>
         <label>Currency<select value={currency} onChange={(event) => { const next = event.target.value; setCurrency(next); setExchangeRate(next === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>
@@ -2944,7 +3061,8 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
     <div className="counter-sale-finish">
       <section className="panel counter-sale-settlement" aria-labelledby="counter-payment-heading">
         <div className="panel-heading"><div><span className="section-kicker">3 · Settlement</span><h2 id="counter-payment-heading">How is this sale being paid?</h2></div></div>
-        <div className="segmented-control" role="group" aria-label="Settlement method"><button type="button" className={settlement === "pay_now" ? "active" : ""} onClick={() => { setSettlement("pay_now"); setDueDate(postingDate); }}>Pay now</button><button type="button" className={settlement === "on_account" ? "active" : ""} onClick={() => { setSettlement("on_account"); setDueDate(dueDateForTerms(postingDate, paymentTerms)); }}>Charge account</button></div>
+        <div className="segmented-control" role="group" aria-label="Settlement method"><button type="button" className={settlement === "pay_now" ? "active" : ""} onClick={() => { setSettlement("pay_now"); setDueDate(postingDate); }}>Pay now</button><button type="button" className={settlement === "on_account" ? "active" : ""} disabled={customerId === WALK_IN_CUSTOMER_ID} title={customerId === WALK_IN_CUSTOMER_ID ? "Select a customer account before charging the sale." : undefined} onClick={() => { setSettlement("on_account"); setDueDate(dueDateForTerms(postingDate, paymentTerms)); }}>Charge account</button></div>
+        {customerId === WALK_IN_CUSTOMER_ID ? <p className="formula-note">Walk-in sales are collected now. Select an account customer above to offer payment terms.</p> : null}
         {settlement === "pay_now" ? <div className="command-form form-grid counter-payment-fields"><label>Payment method<select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}><option value="cash">Cash</option><option value="credit_card">Credit card</option><option value="debit_card">Debit card</option><option value="bank_transfer">Bank transfer</option><option value="cheque">Cheque</option></select></label><label>Receipt / payment reference<input value={paymentReference} onChange={(event) => setPaymentReference(event.target.value)} placeholder="Till receipt, terminal, or cheque no." required /></label></div> : <div className="command-form form-grid counter-payment-fields"><label>Payment terms<select value={paymentTerms} onChange={(event) => { const next = event.target.value; setPaymentTerms(next); setDueDate(dueDateForTerms(postingDate, next)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label>Due date<input type="date" min={postingDate} value={dueDate} onChange={(event) => setDueDate(event.target.value)} required /></label></div>}
         <ImpactPreview lines={[
           { category: "Physical", label: "Usable on-hand", after: `−${lines.reduce((sum, line) => sum + line.quantity * line.factorToBase, 0)} base units`, tone: "warning" },
@@ -2967,7 +3085,7 @@ type ComposerDraftLine = {
   id: string; productId: string; label: string; quantity: number; unitAmount: number;
   uomId: string; uomCode: string; route: string; projectReference: string;
   discountCents: number; taxable: boolean; taxRateBps: number;
-  sourceSalesOrderLineId: string; linkedPurchaseOrderLineId: string;
+  sourceSalesOrderLineId: string; supplyAllocations: Array<{ id: string; salesOrderLineId: string; quantity: number; label: string }>; linkedPurchaseOrderLineId: string;
 };
 type ComposerDraft = {
   number: string; partnerId: string; partnerLabel: string; date: string;
@@ -2994,7 +3112,9 @@ function composerDraft(order: SalesOrder | PurchaseOrder | undefined, isPurchase
         quantity: line.ordered, unitAmount: line.unitCost, uomId: line.orderedUomId ?? "", uomCode: line.orderedUomCode ?? "",
         route: line.fulfillmentRoute ?? "stock", projectReference: "",
         discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps,
-        sourceSalesOrderLineId: line.sourceSalesOrderLineId ?? "", linkedPurchaseOrderLineId: "",
+        sourceSalesOrderLineId: line.sourceSalesOrderLineId ?? "",
+        supplyAllocations: line.supplyAllocations.map((allocation) => ({ id: allocation.id, salesOrderLineId: allocation.salesOrderLineId, quantity: allocation.quantity / (line.uomFactorToBase || 1), label: `${allocation.salesOrderNumber} · ${allocation.customerName}` })),
+        linkedPurchaseOrderLineId: "",
       })),
     };
   }
@@ -3010,7 +3130,7 @@ function composerDraft(order: SalesOrder | PurchaseOrder | undefined, isPurchase
       quantity: line.ordered, unitAmount: line.unitPrice, uomId: line.orderedUomId ?? "", uomCode: line.orderedUomCode ?? "",
       route: line.fulfillmentRoute, projectReference: line.projectReference ?? "",
       discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps,
-      sourceSalesOrderLineId: "", linkedPurchaseOrderLineId: line.linkedPurchaseOrderLineId ?? "",
+      sourceSalesOrderLineId: "", supplyAllocations: [], linkedPurchaseOrderLineId: line.linkedPurchaseOrderLineId ?? "",
     })),
   };
 }
@@ -3038,7 +3158,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
   draft?.lines.forEach((line) => { if (!initialProductOptions.some((option) => option.id === line.productId)) initialProductOptions.push({ id: line.productId, label: line.label, detail: line.projectReference || "Current draft line" }); });
   // Lines start empty: pre-filling an arbitrary catalog product is how the wrong SKU
   // gets ordered when someone tabs past it.
-  const initialLine = (): ComposerLine => ({ id: crypto.randomUUID(), productId: "", quantity: 1, unitAmount: 0, uomId: "", uomCode: "", priceSource: "Select a product", discountRate: 0, taxCode: defaultTaxRateBps > 0 ? "GST" : "Zero", taxRate: defaultTaxRateBps / 100, route: "stock", projectReference: "", sourceSalesOrderLineId: "", linkedPurchaseOrderLineId: "" });
+  const initialLine = (): ComposerLine => ({ id: crypto.randomUUID(), productId: "", quantity: 1, unitAmount: 0, uomId: "", uomCode: "", priceSource: "Select a product", discountRate: 0, taxCode: defaultTaxRateBps > 0 ? "GST" : "Zero", taxRate: defaultTaxRateBps / 100, route: "stock", projectReference: "", sourceSalesOrderLineId: "", supplyAllocations: [], linkedPurchaseOrderLineId: "" });
   const existingLines: ComposerLine[] = (draft?.lines ?? []).map((line) => ({
     id: line.id, productId: line.productId, quantity: line.quantity, unitAmount: line.unitAmount,
     uomId: line.uomId || products.find((product) => product.id === line.productId)?.[isPurchase ? "purchaseUomId" : "salesUomId"] || "",
@@ -3047,7 +3167,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
     discountRate: line.quantity * line.unitAmount > 0 ? line.discountCents / (line.quantity * line.unitAmount) : 0,
     taxCode: line.taxable ? "GST" : "Exempt", taxRate: line.taxRateBps / 100,
     route: line.route.replaceAll("_", "-"), projectReference: line.projectReference || draft?.projectReference || "",
-    sourceSalesOrderLineId: line.sourceSalesOrderLineId, linkedPurchaseOrderLineId: line.linkedPurchaseOrderLineId,
+    sourceSalesOrderLineId: line.sourceSalesOrderLineId, supplyAllocations: line.supplyAllocations, linkedPurchaseOrderLineId: line.linkedPurchaseOrderLineId,
   }));
   // No partner is pre-selected: the first alphabetical account is never a safe guess.
   const [partnerId, setPartnerId] = useState(draft?.partnerId ?? "");
@@ -3148,13 +3268,37 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
   const total = itemSubtotal - discountTotal + freight + fees + deposit + taxTotal;
   const quantity = lines.reduce((sum, line) => sum + line.quantity, 0);
   const updateLine = (id: string, patch: Partial<ComposerLine>) => setLines((current) => current.map((line) => line.id === id ? { ...line, ...patch } : line));
+  const addSupplyAllocation = (lineId: string) => setLines((current) => current.map((line) => {
+    if (line.id !== lineId) return line;
+    const remaining = Math.max(line.quantity - line.supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0), 0);
+    return { ...line, supplyAllocations: [...line.supplyAllocations, { id: crypto.randomUUID(), salesOrderLineId: "", quantity: remaining, label: "" }] };
+  }));
+  const updateSupplyAllocation = (lineId: string, allocationId: string, patch: Partial<ComposerLine["supplyAllocations"][number]>) => setLines((current) => current.map((line) => {
+    if (line.id !== lineId) return line;
+    const supplyAllocations = line.supplyAllocations.map((allocation) => allocation.id === allocationId ? { ...allocation, ...patch } : allocation);
+    return { ...line, supplyAllocations, sourceSalesOrderLineId: supplyAllocations[0]?.salesOrderLineId ?? "" };
+  }));
+  const removeSupplyAllocation = (lineId: string, allocationId: string) => setLines((current) => current.map((line) => {
+    if (line.id !== lineId) return line;
+    const supplyAllocations = line.supplyAllocations.filter((allocation) => allocation.id !== allocationId);
+    return { ...line, supplyAllocations, sourceSalesOrderLineId: supplyAllocations[0]?.salesOrderLineId ?? "" };
+  }));
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError("");
     if (!partnerId) return setError(`Select a ${isPurchase ? "vendor" : "customer"}.`);
     if (!lines.length || lines.some((line) => !line.productId || !line.uomId || line.quantity <= 0 || line.unitAmount < 0)) return setError("Every line needs a product with a configured unit, positive quantity, and valid unit amount.");
-    if (isPurchase && lines.some((line) => line.route !== "stock" && !line.sourceSalesOrderLineId.trim())) return setError("Every special-order or drop-ship purchase line must link to its source sales-order line ID.");
+    if (isPurchase) {
+      for (const [index, line] of lines.entries()) {
+        if (line.route === "stock") continue;
+        if (!line.supplyAllocations.length || line.supplyAllocations.some((allocation) => !allocation.salesOrderLineId.trim() || !Number.isFinite(allocation.quantity) || allocation.quantity <= 0)) return setError(`Line ${index + 1} needs a sales-order demand and positive quantity for every allocation.`);
+        if (new Set(line.supplyAllocations.map((allocation) => allocation.salesOrderLineId)).size !== line.supplyAllocations.length) return setError(`Line ${index + 1} allocates to the same sales-order demand more than once.`);
+        const allocated = line.supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0);
+        if (allocated > line.quantity + 0.000001) return setError(`Line ${index + 1} allocates ${allocated} ${line.uomCode || "units"} from only ${line.quantity} ordered.`);
+        if (line.route === "drop-ship" && line.supplyAllocations.length !== 1) return setError(`Line ${index + 1} is drop ship and must allocate to exactly one sales-order demand.`);
+      }
+    }
     if (!date || !dueDate) return setError("Enter delivery and due dates.");
     if (![freightTaxRate, feeTaxRate].every((rate) => Number.isFinite(rate) && rate >= 0 && rate <= 100)) return setError("Freight and fee tax rates must be between 0% and 100%.");
     if (!isPurchase && (!shipToName.trim() || !shipToAddressLine1.trim() || !shipToCity.trim() || !shipToRegion.trim() || !shipToPostalCode.trim() || !shipToCountry.trim())) return setError("Enter a complete ship-to name and address before saving the sales-order draft.");
@@ -3164,7 +3308,8 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
     try {
       const normalizedLines = lines.map((line) => {
         const product = productOptions[line.productId];
-        return { kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId, unitCostCents: isPurchase ? Math.round(line.unitAmount * 100) : undefined, unitPriceCents: isPurchase ? undefined : Math.round(line.unitAmount * 100), discountCents: Math.round(line.quantity * line.unitAmount * line.discountRate), taxable: line.taxRate > 0, taxCode: line.taxCode, taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: line.route.replaceAll("-", "_"), projectReference: line.projectReference, sourceSalesOrderLineId: isPurchase && line.route !== "stock" ? line.sourceSalesOrderLineId.trim() : undefined, configurationSnapshot: product ? `${product.label} · ${product.detail}` : undefined };
+        const supplyAllocations = isPurchase && line.route !== "stock" ? line.supplyAllocations.map((allocation) => ({ salesOrderLineId: allocation.salesOrderLineId.trim(), quantity: allocation.quantity })) : undefined;
+        return { kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId, unitCostCents: isPurchase ? Math.round(line.unitAmount * 100) : undefined, unitPriceCents: isPurchase ? undefined : Math.round(line.unitAmount * 100), discountCents: Math.round(line.quantity * line.unitAmount * line.discountRate), taxable: line.taxRate > 0, taxCode: line.taxCode, taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: line.route.replaceAll("-", "_"), projectReference: line.projectReference, sourceSalesOrderLineId: supplyAllocations?.[0]?.salesOrderLineId, supplyAllocations, configurationSnapshot: product ? `${product.label} · ${product.detail}` : undefined };
       });
       const chargeLines = [
         freight > 0 ? { kind: "charge", chargeType: "freight", description: "Freight", amountCents: Math.round(freight * 100), direction: "add", taxable: freightTaxRate > 0, refundable: false, taxCode: freightTaxRate > 0 ? "GST" : "Zero", taxRateBps: Math.round(freightTaxRate * 100) } : null,
@@ -3201,9 +3346,22 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
           <label>Discount %<input type="number" min="0" max="100" step="0.1" value={line.discountRate} onChange={(event) => updateLine(line.id, { discountRate: Number(event.target.value) })} /></label>
           <label>Tax code<select value={line.taxCode} onChange={(event) => updateLine(line.id, { taxCode: event.target.value, taxRate: event.target.value === "GST" ? defaultTaxRateBps / 100 : 0 })}><option>GST</option><option>Zero</option><option>Exempt</option></select></label>
           <label>Tax %<input type="number" min="0" value={line.taxRate} onChange={(event) => updateLine(line.id, { taxRate: Number(event.target.value) })} /></label>
-          <label>Fulfillment route<select value={line.route} onChange={(event) => updateLine(line.id, { route: event.target.value as ComposerLine["route"] })}><option value="stock">Stock</option><option value="special-order">Special order</option><option value="drop-ship">Drop ship</option></select></label>
+          <label>Fulfillment route<select value={line.route} onChange={(event) => {
+            const route = event.target.value as ComposerLine["route"];
+            const existing = route === "stock" ? [] : route === "drop-ship" ? line.supplyAllocations.slice(0, 1) : line.supplyAllocations;
+            const supplyAllocations = route !== "stock" && !existing.length ? [{ id: crypto.randomUUID(), salesOrderLineId: "", quantity: line.quantity, label: "" }] : existing;
+            updateLine(line.id, { route, supplyAllocations, sourceSalesOrderLineId: supplyAllocations[0]?.salesOrderLineId ?? "" });
+          }}><option value="stock">Stock</option><option value="special-order">Special order</option><option value="drop-ship">Drop ship</option></select></label>
           <label className="project-field">Customer / project / opening<input value={line.projectReference} onChange={(event) => updateLine(line.id, { projectReference: event.target.value })} placeholder="Optional allocation" /></label>
-          {isPurchase && line.route !== "stock" ? <label className="project-field">Source customer demand<ReferenceSearchSelect kind="salesOrderLines" role={line.route === "drop-ship" ? "drop_ship" : "special_order"} partnerId={initialOrder?.id} value={line.sourceSalesOrderLineId} initialOptions={[]} onSelect={(option) => updateLine(line.id, { sourceSalesOrderLineId: option.id })} placeholder="Search unlinked sales order, customer, or SKU" /></label> : null}
+          {isPurchase && line.route !== "stock" ? <div className="project-field supply-allocation-editor">
+            <div className="supply-allocation-heading"><div><strong>Customer-demand allocations</strong><small>Received usable quantity is reserved to these sales orders automatically, in the order shown.</small></div><button type="button" className="button secondary" disabled={line.route === "drop-ship" || line.supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0) >= line.quantity} onClick={() => addSupplyAllocation(line.id)}>Add allocation</button></div>
+            {line.supplyAllocations.map((allocation, allocationIndex) => <div key={allocation.id} className="supply-allocation-row">
+              <label>Sales-order demand<ReferenceSearchSelect kind="salesOrderLines" role={line.route === "drop-ship" ? "drop_ship" : "special_order"} partnerId={initialOrder?.id} productId={line.productId} value={allocation.salesOrderLineId} initialOptions={allocation.salesOrderLineId ? [{ id: allocation.salesOrderLineId, label: allocation.label || `Saved allocation ${allocationIndex + 1}`, detail: "Current quantity allocation" }] : []} onSelect={(option) => updateSupplyAllocation(line.id, allocation.id, { salesOrderLineId: option.id, label: `${option.label}${option.detail ? ` · ${option.detail}` : ""}` })} placeholder="Search sales order, customer, or SKU" /></label>
+              <label>Allocated quantity ({line.uomCode || "unit"})<input type="number" min="0.000001" max={line.quantity} step="any" value={allocation.quantity} onChange={(event) => updateSupplyAllocation(line.id, allocation.id, { quantity: Number(event.target.value) })} /></label>
+              {line.route !== "drop-ship" ? <button type="button" className="button secondary" onClick={() => removeSupplyAllocation(line.id, allocation.id)}>Remove</button> : null}
+            </div>)}
+            <small>{line.supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0)} of {line.quantity} {line.uomCode || "units"} allocated; any remainder stays general incoming supply.</small>
+          </div> : null}
           {!isPurchase && line.route !== "stock" ? <div className="project-field read-only-label">Save this demand first. Dedicated supply is linked from the purchase-order composer so both sides are recorded atomically.</div> : null}
           {lines.length > 1 && <button type="button" className="remove-composer-line" onClick={() => setLines((current) => current.filter((item) => item.id !== line.id))}>Remove line {index + 1}</button>}
         </fieldset>;
@@ -3285,13 +3443,14 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
   const defaultPostingLocation = warehouseId
     ? (scopedUsable.find((location) => location.locationType === "receiving") ?? (scopedUsable.length === 1 ? scopedUsable[0] : undefined))
     : (usableLocations.length === 1 ? usableLocations[0] : undefined);
-  const [postingLocationId, setPostingLocationId] = useState(command.kind === "immediate-sale" ? "" : defaultPostingLocation?.id ?? "");
+  const preferredLocation = (line?: PurchaseLine) => line?.defaultLocations.find((item) => item.warehouseId === warehouseId)?.locationId;
+  const [postingLocationId, setPostingLocationId] = useState(command.kind === "immediate-sale" ? "" : preferredLocation(initialPoLine) ?? defaultPostingLocation?.id ?? "");
   const [quarantineLocationId, setQuarantineLocationId] = useState(quarantineLocations.length === 1 ? quarantineLocations[0].id : "");
   const [lotNumber, setLotNumber] = useState("");
   const [serialNumber, setSerialNumber] = useState("");
   const [lotId, setLotId] = useState("");
   const [inventoryUnitId, setInventoryUnitId] = useState("");
-  const [receiptLines, setReceiptLines] = useState(() => (po?.lines ?? []).filter((line) => line.open > 0 && line.fulfillmentRoute !== "drop_ship").map((line) => ({ lineId: line.id, lineVersion: line.version, quantity: line.trackingPolicy === "serial" ? Math.min(line.open, 1) : line.open, damagedQuantity: 0, uomId: line.orderedUomId, approvalId: "", lotNumber: "", serialNumber: "" })));
+  const [receiptLines, setReceiptLines] = useState(() => (po?.lines ?? []).filter((line) => line.open > 0 && line.fulfillmentRoute !== "drop_ship").map((line) => ({ lineId: line.id, lineVersion: line.version, quantity: line.trackingPolicy === "serial" ? Math.min(line.open, 1) : line.open, damagedQuantity: 0, locationId: preferredLocation(line) ?? defaultPostingLocation?.id ?? "", uomId: line.orderedUomId, approvalId: "", lotNumber: "", serialNumber: "" })));
   const [overReceiptApprovalId, setOverReceiptApprovalId] = useState("");
   const isBatchReceipt = command.kind === "receive" && receiptLines.length > 1;
   const receiptQuantity = isBatchReceipt ? receiptLines.reduce((sum, line) => sum + Math.max(line.quantity, 0), 0) : quantity;
@@ -3306,7 +3465,7 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
   const countPayload = () => {
     // The batch receipt builds its own payload, so the truck's paperwork has to be attached
     // here too — otherwise the fields above post nothing on a multi-line receipt.
-    if (isBatchReceipt) return { lines: receiptLines.filter((line) => line.quantity > 0), locationId: postingLocationId, quarantineLocationId, postingDate: receiptDate, ...(packingSlipNumber.trim() ? { packingSlipNumber: packingSlipNumber.trim() } : {}) };
+    if (isBatchReceipt) return { lines: receiptLines.filter((line) => line.quantity > 0), warehouseId, quarantineLocationId, postingDate: receiptDate, ...(packingSlipNumber.trim() ? { packingSlipNumber: packingSlipNumber.trim() } : {}) };
     const lineId = ["receive", "close", "reopen", "reverse", "vendor-return"].includes(command.kind)
       ? selectedPoLine?.id
       : ["reserve", "ship", "immediate-sale", "customer-return"].includes(command.kind)
@@ -3317,12 +3476,12 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
     return { quantity, quarantineQuantity: secondaryQuantity, reason, disposition, expectedDate, carrier, serviceLevel, trackingNumber, billOfLadingNumber, locationId, quarantineLocationId, uomId: lineUomId, recordedQuantity: selectedCountBalance?.recordedQuantity, balanceVersion: selectedCountBalance?.version,
       // Goods that arrived on Friday and are keyed on Monday belong to Friday's period, and the
       // vendor's packing slip is what the receipt gets reconciled against.
-      ...(["receive", "immediate-sale"].includes(command.kind) ? { postingDate: receiptDate, ...(command.kind === "immediate-sale" ? { warehouseId } : {}), ...(packingSlipNumber.trim() ? { packingSlipNumber: packingSlipNumber.trim() } : {}) } : {}), ...(lotNumber.trim() ? { lotNumber: lotNumber.trim() } : {}), ...(serialNumber.trim() ? { serialNumber: serialNumber.trim() } : {}), ...(lotId ? { lotId } : {}), ...(inventoryUnitId ? { inventoryUnitId } : {}), ...(overReceiptApprovalId.trim() ? { approvalId: overReceiptApprovalId.trim() } : {}), ...(lineId ? { lineId } : {}) };
+      ...(["receive", "immediate-sale"].includes(command.kind) ? { postingDate: receiptDate, warehouseId, ...(packingSlipNumber.trim() ? { packingSlipNumber: packingSlipNumber.trim() } : {}) } : {}), ...(lotNumber.trim() ? { lotNumber: lotNumber.trim() } : {}), ...(serialNumber.trim() ? { serialNumber: serialNumber.trim() } : {}), ...(lotId ? { lotId } : {}), ...(inventoryUnitId ? { inventoryUnitId } : {}), ...(overReceiptApprovalId.trim() ? { approvalId: overReceiptApprovalId.trim() } : {}), ...(lineId ? { lineId } : {}) };
   };
   const chooseCountLocation = (locationId: string) => { const balance = countBalances.find((item) => item.locationId === locationId); setCountLocationId(locationId); setQuantity(balance?.recordedQuantity ?? 0); setApprovalRequired(false); setCountApproval(null); setApprovedCountPayload(null); setApprovalMessage(""); };
-  const choosePoLine = (lineId: string) => { const line = po?.lines.find((item) => item.id === lineId); setSelectedPoLineId(lineId); setLotNumber(""); setSerialNumber(""); setLotId(""); setInventoryUnitId(""); if (po && line) setQuantity(commandDefaults(command.kind, { ...po, ordered: line.ordered, received: line.received, returned: line.returned, closed: line.closed, open: line.open, lines: [line] }, effectiveSo).quantity); };
+  const choosePoLine = (lineId: string) => { const line = po?.lines.find((item) => item.id === lineId); setSelectedPoLineId(lineId); setLotNumber(""); setSerialNumber(""); setLotId(""); setInventoryUnitId(""); if (po && line) { setPostingLocationId(preferredLocation(line) ?? defaultPostingLocation?.id ?? ""); setQuantity(commandDefaults(command.kind, { ...po, ordered: line.ordered, received: line.received, returned: line.returned, closed: line.closed, open: line.open, lines: [line] }, effectiveSo).quantity); } };
   const chooseSoLine = (lineId: string) => { const line = so?.lines?.find((item) => item.id === lineId); if (!so || !line) return; const factor = line.uomFactorToBase || 1; const availability = calculateSalesAvailability(line.open, line.reserved, line.productAvailable / factor, line.productIncoming / factor); setSelectedSoLineId(lineId); setLotId(""); setInventoryUnitId(""); setQuantity(commandDefaults(command.kind, effectivePo, { ...so, ordered: line.ordered, reserved: line.reserved, shipped: line.shipped, returned: line.returned, open: line.open, availableNow: availability.availableNow, incomingBeforeDate: availability.incomingBeforeDate, shortage: availability.shortage, route: titleCase(line.fulfillmentRoute), lines: [line] }).quantity); };
-  const updateReceiptLine = (lineId: string, patch: Partial<{ quantity: number; damagedQuantity: number; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>) => setReceiptLines((current) => current.map((line) => line.lineId === lineId ? { ...line, ...patch } : line));
+  const updateReceiptLine = (lineId: string, patch: Partial<{ quantity: number; damagedQuantity: number; locationId: string; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>) => setReceiptLines((current) => current.map((line) => line.lineId === lineId ? { ...line, ...patch } : line));
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -3330,7 +3489,8 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
     if (command.kind === "count" && (!selectedCountBalance || !Number.isFinite(selectedCountBalance.version))) return setError("Select a current durable location balance before posting the count.");
     if (command.kind === "count" && quantity < 0) return setError("The counted quantity cannot be negative.");
     if (!isBatchReceipt && command.kind !== "count" && max > 0 && quantity > max) return setError(`Quantity cannot exceed ${max}.`);
-    if ((command.kind === "receive" || command.kind === "vendor-return" && disposition !== "allowance") && !postingLocationId) return setError("Select an active usable inventory location.");
+    if ((!isBatchReceipt && command.kind === "receive" || command.kind === "vendor-return" && disposition !== "allowance") && !postingLocationId) return setError("Select an active usable inventory location.");
+    if (isBatchReceipt && receiptLines.some((line) => line.quantity > 0 && !line.locationId)) return setError("Select a usable destination for every received line.");
     if ((command.kind === "customer-return" && disposition !== "available") || (command.kind === "receive" && (secondaryQuantity > 0 || isBatchReceipt && receiptLines.some((line) => line.damagedQuantity > 0)))) { if (!quarantineLocationId) return setError("Select an active quarantine or damaged inventory location."); }
     if (command.kind === "receive" && secondaryQuantity > quantity) return setError("Quarantine quantity cannot exceed arrived quantity.");
     if (isBatchReceipt && receiptLines.some((line) => line.quantity < 0 || line.damagedQuantity < 0 || line.damagedQuantity > line.quantity)) return setError("Each receipt line needs a non-negative quantity and quarantine cannot exceed arrived quantity.");
@@ -3417,8 +3577,8 @@ type CommandFieldsProps = {
   kind: CommandKind; po?: PurchaseOrder; so?: SalesOrder; purchaseLines: PurchaseLine[]; salesLines: SalesLine[];
   selectedPoLineId: string; selectedSoLineId: string; setSelectedPoLineId: (value: string) => void; setSelectedSoLineId: (value: string) => void;
   quantity: number; secondaryQuantity: number; setQuantity: (value: number) => void; setSecondaryQuantity: (value: number) => void;
-  receiptLines: Array<{ lineId: string; lineVersion: number; quantity: number; damagedQuantity: number; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>;
-  updateReceiptLine: (lineId: string, patch: Partial<{ quantity: number; damagedQuantity: number; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>) => void;
+  receiptLines: Array<{ lineId: string; lineVersion: number; quantity: number; damagedQuantity: number; locationId: string; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>;
+  updateReceiptLine: (lineId: string, patch: Partial<{ quantity: number; damagedQuantity: number; locationId: string; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>) => void;
   lotNumber: string; setLotNumber: (value: string) => void; serialNumber: string; setSerialNumber: (value: string) => void;
   lotId: string; setLotId: (value: string) => void; inventoryUnitId: string; setInventoryUnitId: (value: string) => void;
   overReceiptApprovalId: string; setOverReceiptApprovalId: (value: string) => void;
@@ -3446,7 +3606,7 @@ function CommandFields({ receiptDate, setReceiptDate, packingSlipNumber, setPack
   const receiptPaperworkFields = <><label>Received on<input type="date" max={new Date().toISOString().slice(0, 10)} value={receiptDate} onChange={(event) => setReceiptDate(event.target.value)} /></label><label>Packing slip / delivery note<input value={packingSlipNumber} onChange={(event) => setPackingSlipNumber(event.target.value)} placeholder="Vendor's document number" /></label></>;
   const incomingIdentityFields = purchasePolicy === "lot" ? <label>Received lot number<input value={lotNumber} onChange={(event) => setLotNumber(event.target.value)} placeholder="Required lot number" required /></label> : purchasePolicy === "serial" ? <label>Received serial number<input value={serialNumber} onChange={(event) => setSerialNumber(event.target.value)} placeholder="One serial per receipt posting" required /></label> : null;
   const outgoingIdentityFields = (policy: string, productId?: string, salesLineId?: string, locationId?: string, shipped = false) => policy === "lot" ? <label>Lot identity<ReferenceSearchSelect kind="inventoryLots" role={shipped ? "shipped" : "on_hand"} productId={productId} lineId={salesLineId} locationId={locationId} value={lotId} initialOptions={[]} onSelect={(option) => setLotId(option.id)} placeholder="Search available lots" /></label> : policy === "serial" ? <label>Serial identity<ReferenceSearchSelect kind="inventoryUnits" role={shipped ? "shipped" : "on_hand"} productId={productId} lineId={salesLineId} locationId={locationId} value={inventoryUnitId} initialOptions={[]} onSelect={(option) => setInventoryUnitId(option.id)} placeholder="Search eligible serial numbers" /></label> : null;
-  if (kind === "receive" && receiptLines.length > 1) return <div className="command-form"><div className="line-context"><span>Multi-line truck receipt</span><strong>{receiptLines.length} PO lines on one receipt document</strong></div><div className="form-grid">{receiptPaperworkFields}</div>{usableLocationField}{receiptLines.some((line) => line.damagedQuantity > 0) ? quarantineLocationField : null}<div className="batch-receipt-lines">{receiptLines.map((receiptLine) => { const line = purchaseLines.find((item) => item.id === receiptLine.lineId); const excess = Math.max(receiptLine.quantity - (line?.open ?? 0), 0); return <div className="batch-receipt-line" key={receiptLine.lineId}><div><strong>{line?.sku} · {line?.product}</strong><small>{line?.open} {line?.orderedUomCode ?? "unit"} open</small></div><label>Arrived at dock ({line?.orderedUomCode ?? "unit"})<input type="number" min="0" max={line?.trackingPolicy === "serial" ? 1 : undefined} step={line?.uomFactorToBase === 1 ? "1" : "0.001"} value={receiptLine.quantity} onChange={(event) => updateReceiptLine(receiptLine.lineId, { quantity: Number(event.target.value) })} /></label>{/* Named as a subset: side by side, "Arrived" and "Quarantine" read as two buckets that
+  if (kind === "receive" && receiptLines.length > 1) return <div className="command-form"><div className="line-context"><span>Multi-line truck receipt</span><strong>{receiptLines.length} PO lines on one receipt document</strong></div><div className="form-grid">{receiptPaperworkFields}</div>{receiptLines.some((line) => line.damagedQuantity > 0) ? quarantineLocationField : null}<div className="batch-receipt-lines">{receiptLines.map((receiptLine) => { const line = purchaseLines.find((item) => item.id === receiptLine.lineId); const excess = Math.max(receiptLine.quantity - (line?.open ?? 0), 0); return <div className="batch-receipt-line" key={receiptLine.lineId}><div><strong>{line?.sku} · {line?.product}</strong><small>{line?.open} {line?.orderedUomCode ?? "unit"} open</small></div><label>Preferred bin<ReferenceSearchSelect kind="locations" role="bin" warehouseId={warehouseId} value={receiptLine.locationId} initialOptions={usableLocations.filter((location) => !warehouseId || location.warehouseId === warehouseId).map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => updateReceiptLine(receiptLine.lineId, { locationId: option.id })} placeholder="Search usable bins in this warehouse" /></label><label>Arrived at dock ({line?.orderedUomCode ?? "unit"})<input type="number" min="0" max={line?.trackingPolicy === "serial" ? 1 : undefined} step={line?.uomFactorToBase === 1 ? "1" : "0.001"} value={receiptLine.quantity} onChange={(event) => updateReceiptLine(receiptLine.lineId, { quantity: Number(event.target.value) })} /></label>{/* Named as a subset: side by side, "Arrived" and "Quarantine" read as two buckets that
       add up, so a clerk logging 13 units with 3 damaged keyed 10 and 3 and short-received the line. */}<label>Of which quarantined ({line?.orderedUomCode ?? "unit"})<input type="number" min="0" step={line?.uomFactorToBase === 1 ? "1" : "0.001"} max={receiptLine.quantity} value={receiptLine.damagedQuantity} onChange={(event) => updateReceiptLine(receiptLine.lineId, { damagedQuantity: Number(event.target.value) })} /></label>{line?.trackingPolicy === "lot" ? <label>Lot number<input value={receiptLine.lotNumber} onChange={(event) => updateReceiptLine(receiptLine.lineId, { lotNumber: event.target.value })} placeholder="Required lot number" /></label> : line?.trackingPolicy === "serial" ? <label>Serial number<input value={receiptLine.serialNumber} onChange={(event) => updateReceiptLine(receiptLine.lineId, { serialNumber: event.target.value })} placeholder="Exactly one serial" /></label> : null}{excess > 0 ? <label>Approval ID (if above tolerance)<input value={receiptLine.approvalId} onChange={(event) => updateReceiptLine(receiptLine.lineId, { approvalId: event.target.value })} placeholder={`${excess} excess; paste approved request ID when required`} /></label> : null}</div>; })}</div><p className="formula-note">Lines with zero arrived quantity are skipped. Tracked lines require their lot or serial identity; the server applies the configured over-receipt policy per line.</p></div>;
   if (kind === "receive") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{po?.open ?? 0} {po?.lines[0]?.orderedUomCode ?? "units"} open to receive</strong><small>{po?.lines[0]?.specification}</small></div><div className="form-grid"><label>Arrived at dock ({po?.lines[0]?.orderedUomCode ?? "unit"})<input type="number" min="1" max={purchasePolicy === "serial" ? 1 : undefined} step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Of which quarantined<input type="number" min="0" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={quantity} value={secondaryQuantity} onChange={(e) => setSecondaryQuantity(Number(e.target.value))} /></label>{receiptPaperworkFields}{incomingIdentityFields}{quantity > (po?.open ?? 0) ? <label>Approval ID (if above tolerance)<input value={overReceiptApprovalId} onChange={(event) => setOverReceiptApprovalId(event.target.value)} placeholder="Paste the approved line-scoped request ID" /></label> : null}{usableLocationField}{secondaryQuantity > 0 ? quarantineLocationField : null}</div></div>;
   if (kind === "ship" || kind === "reserve") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{[so?.lines?.[0]?.product ?? so?.customer, so?.project].filter(Boolean).join(" · ")}</span><strong>{kind === "reserve" ? `${so?.availableNow ?? 0} available now` : `${so?.reserved ?? 0} reserved`}</strong><small>{so?.route}</small></div><label>{kind === "reserve" ? "Quantity to reserve" : "Quantity to ship"}<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label>{kind === "ship" ? outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, so?.lines?.[0]?.reservationLocationId) : null}<div className="line-context"><span>{kind === "reserve" ? "Location selection" : "Ship-to address"}</span><strong>{kind === "reserve" ? "Best available usable location is selected at posting" : `${so?.shipToName ?? so?.customer}`}</strong><small>{kind === "reserve" ? "The committed location is recorded on the reservation." : [so?.shipToAddressLine1, so?.shipToCity, so?.shipToRegion, so?.shipToPostalCode, so?.shipToCountry].filter(Boolean).join(", ")}</small></div>{kind === "ship" ? <><label>Carrier<input value={carrier} onChange={(event) => setCarrier(event.target.value)} placeholder="Required carrier" required /></label><label>Service level<input value={serviceLevel} onChange={(event) => setServiceLevel(event.target.value)} placeholder="Ground, LTL, same day…" /></label><label>Tracking number<input value={trackingNumber} onChange={(event) => setTrackingNumber(event.target.value)} placeholder="Tracking or PRO number" /></label><label>Bill of lading<input value={billOfLadingNumber} onChange={(event) => setBillOfLadingNumber(event.target.value)} placeholder="Required when no tracking number" /></label></> : null}</div>;
@@ -3573,6 +3733,12 @@ function normalizeSnapshot(input: unknown): Snapshot {
       dimensions: text(item.dimensions),
       finish: text(item.finish),
       trackingPolicy: text(item.trackingPolicy, "quantity"),
+      aliases: parseJsonRows(item.aliasesJson).map((row) => text(row.alias)).filter(Boolean),
+      defaultLocations: parseJsonRows(item.defaultLocationsJson).map((row) => ({
+        warehouseId: text(row.warehouseId), warehouseCode: text(row.warehouseCode), warehouseName: text(row.warehouseName),
+        locationId: text(row.locationId) || undefined, locationCode: text(row.locationCode) || undefined,
+        locationName: text(row.locationName) || undefined, version: row.version == null ? undefined : number(row.version),
+      })),
     };
   });
 
@@ -3581,14 +3747,29 @@ function normalizeSnapshot(input: unknown): Snapshot {
       const baseOrdered = number(line.orderedQuantity);
       const enteredOrdered = number(line.orderedUomQuantity, baseOrdered);
       const factor = enteredOrdered > 0 ? baseOrdered / enteredOrdered : 1;
+      const supplyAllocations = parseJsonRows(line.supplyAllocationsJson).map((allocation) => ({
+        id: text(allocation.id),
+        salesOrderLineId: text(allocation.salesOrderLineId),
+        quantity: number(allocation.quantity),
+        receivedQuantity: number(allocation.receivedQuantity),
+        status: text(allocation.status, "active"),
+        salesOrderNumber: text(allocation.salesOrderNumber, "Sales order"),
+        customerName: text(allocation.customerName, "Customer"),
+      }));
       return {
       id: text(line.id, `${text(item.id)}-line-${lineIndex}`),
       productId: text(line.productId) || undefined,
       sku: text(line.sku),
       product: text(line.productName, "Unnamed product"),
       specification: configurationText(line.configurationSnapshot) || products.find((product) => product.id === text(line.productId))?.specification || "No configuration recorded",
-      customerRef: text(line.sourceSalesOrderLineId) || undefined,
+      customerRef: supplyAllocations.length ? supplyAllocations.map((allocation) => `${allocation.salesOrderNumber} · ${allocation.customerName}`).join(", ") : text(line.sourceSalesOrderLineId) || undefined,
       sourceSalesOrderLineId: text(line.sourceSalesOrderLineId) || undefined,
+      supplyAllocations,
+      defaultLocations: parseJsonRows(line.defaultLocationsJson).map((row) => ({
+        warehouseId: text(row.warehouseId), warehouseCode: text(row.warehouseCode), warehouseName: text(row.warehouseName),
+        locationId: text(row.locationId) || undefined, locationCode: text(row.locationCode) || undefined,
+        locationName: text(row.locationName) || undefined, version: row.version == null ? undefined : number(row.version),
+      })),
       ordered: enteredOrdered,
       received: number(line.grossReceivedQuantity, number(line.netReceivedQuantity)) / factor,
       returned: number(line.returnedQuantity) / factor,
@@ -3942,6 +4123,12 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asRows(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
+}
+
+function parseJsonRows(value: unknown): Array<Record<string, unknown>> {
+  if (typeof value !== "string") return asRows(value);
+  try { return asRows(JSON.parse(value) as unknown); }
+  catch { return []; }
 }
 
 function text(value: unknown, fallback = "") {

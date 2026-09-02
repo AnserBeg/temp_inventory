@@ -294,6 +294,8 @@ export async function ensureDatabase() {
     ready = (async () => {
       const db = getD1();
       await db.prepare("SELECT source_sales_order_line_id FROM purchase_order_lines LIMIT 0").run();
+      await db.prepare("SELECT allocated_qty,received_qty,status,version FROM supply_allocations LIMIT 0").run();
+      await db.prepare("SELECT supply_allocation_id,receipt_movement_id,reservation_id,reversed_qty FROM supply_allocation_receipts LIMIT 0").run();
       if (demoBootstrapEnabled()) {
         await seedDatabase(db);
         await seedAdvancedDatabase(db);
