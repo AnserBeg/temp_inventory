@@ -41,14 +41,21 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
   const [state, setState] = useState<ConnectionState | null>(null);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  // Every setState here happens after the response arrives, never synchronously inside the
+  // effect that starts the load; errors are handled where they occur rather than by the caller.
   const load = useCallback(async () => {
-    setError("");
-    const response = await fetch("/api/integrations/email", { cache: "no-store" });
-    const body = await response.json() as ConnectionState;
-    if (!response.ok) throw new Error(errorMessage(body, "Email connection status is unavailable."));
-    setState(body);
+    try {
+      const response = await fetch("/api/integrations/email", { cache: "no-store" });
+      const body = await response.json() as ConnectionState;
+      if (!response.ok) throw new Error(errorMessage(body, "Email connection status is unavailable."));
+      setState(body);
+      setError("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Email connection status is unavailable.");
+    }
   }, []);
-  useEffect(() => { void load().catch((caught) => setError(caught instanceof Error ? caught.message : "Email connection status is unavailable.")); }, [load]);
+  // Deferred a tick, as the other loaders are, so no state is set synchronously inside the effect.
+  useEffect(() => { const timer = window.setTimeout(() => void load(), 0); return () => window.clearTimeout(timer); }, [load]);
 
   const connect = async (provider: EmailProvider) => {
     setBusy(provider); setError("");

@@ -224,7 +224,7 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
       continue;
     }
     const productId = requiredText(line.productId, `lines[${index}].productId`);
-    const product = await first<{ name: string; active: number }>("SELECT name, active FROM products WHERE id = ?", productId);
+    const product = await first<{ name: string; active: number; dimensions: string | null; finish: string | null; material: string | null }>("SELECT name, active, dimensions, finish, material FROM products WHERE id = ?", productId);
     if (!product?.active) throw new RecordValidationError("INVALID_PRODUCT", `Line ${index + 1} must reference an active product.`, 404);
     const route = line.fulfillmentRoute ?? "stock";
     if (!(["stock", "special_order", "drop_ship"] as const).includes(route)) {
@@ -305,7 +305,10 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
       taxRateBps,
       fulfillmentRoute: route,
       projectReference: typeof line.projectReference === "string" && line.projectReference.trim() ? line.projectReference.trim() : input.projectReference?.trim() || null,
-      configurationSnapshot: typeof line.configurationSnapshot === "string" && line.configurationSnapshot.trim() ? line.configurationSnapshot : null,
+      // The composer sends the product's physical attributes; when it cannot (the product was not on the
+      // page it had loaded), derive the same text here so an edited draft never loses its configuration.
+      configurationSnapshot: typeof line.configurationSnapshot === "string" && line.configurationSnapshot.trim() ? line.configurationSnapshot.trim()
+        : [product.dimensions, product.finish, product.material].map((value) => typeof value === "string" ? value.trim() : "").filter((value) => value && !/^unspecified$/i.test(value)).join(" · ") || null,
       sourceSalesOrderLineId,supplyAllocations,linkedPurchaseOrderLineId,
     });
   }

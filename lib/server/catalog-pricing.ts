@@ -72,8 +72,12 @@ export async function resolveMarginRule(input: { productId: string; category: st
     WHERE active=1 AND minimum_cost_cents<=? AND (maximum_cost_cents IS NULL OR maximum_cost_cents>?)
       AND (valid_from IS NULL OR valid_from<=?) AND (valid_to IS NULL OR valid_to>=?)
       AND (product_id=? OR (product_id IS NULL AND (category=? OR category IS NULL)))
-    ORDER BY CASE WHEN product_id=? THEN 3 WHEN category=? THEN 2 ELSE 1 END DESC,priority DESC,minimum_cost_cents DESC,id
+    ORDER BY CASE WHEN product_id=? THEN 3 WHEN category=? THEN 2 ELSE 1 END DESC,priority DESC,minimum_cost_cents DESC,
+      CASE WHEN id='margin-default-32' THEN 1 ELSE 0 END,id
     LIMIT 1`, input.costBasisCents, input.costBasisCents, onDate, onDate, input.productId, input.category, input.productId, input.category);
+  // The seeded catch-all only wins when no user-authored rule matches: a global band saved at the
+  // form's default priority ties with it on scope, priority, and minimum cost, and the id tie-break
+  // alone would let the seed silently override the rule the administrator just created.
   return rule ? {
     id: rule.id,
     code: rule.code,
@@ -178,13 +182,24 @@ export async function repriceAutomaticProducts(actor: PricingActor, reason: stri
     FROM products WHERE active=1 AND pricing_mode='automatic' ORDER BY id`);
   const statements: D1PreparedStatement[] = [];
   const when = new Date().toISOString();
+  let repriced = 0;
   for (const product of products) {
     const costBasisCents = Number(product.lastUnitCostCents ?? product.standardCostCents);
     const { rule, suggestedSellingPriceCents } = await suggestedPriceForProduct({ productId: product.id, category: product.category, costBasisCents });
-    if (suggestedSellingPriceCents === product.sellingPriceCents && rule.id === product.appliedMarginRuleId) continue;
+    const priceChanged = suggestedSellingPriceCents !== Number(product.sellingPriceCents);
+    if (!priceChanged && rule.id === product.appliedMarginRuleId) continue;
+    if (!priceChanged) {
+      // Only the winning rule changed. Record it without touching the version: bumping every
+      // automatic product on each matrix save made unrelated concurrent product edits fail with a
+      // spurious VERSION_CONFLICT even though nothing the editor could see had changed.
+      statements.push(getD1().prepare("UPDATE products SET suggested_selling_price_cents=?,applied_margin_rule_id=? WHERE id=? AND pricing_mode='automatic' AND selling_price_cents=?")
+        .bind(suggestedSellingPriceCents, rule.id, product.id, product.sellingPriceCents));
+      continue;
+    }
+    repriced += 1;
     statements.push(
-      getD1().prepare(`UPDATE products SET suggested_selling_price_cents=?,selling_price_cents=?,applied_margin_rule_id=?,pricing_updated_at=?,version=version+1 WHERE id=? AND pricing_mode='automatic'`)
-        .bind(suggestedSellingPriceCents, suggestedSellingPriceCents, rule.id, when, product.id),
+      getD1().prepare(`UPDATE products SET suggested_selling_price_cents=?,selling_price_cents=?,applied_margin_rule_id=?,pricing_updated_at=?,version=version+1 WHERE id=? AND pricing_mode='automatic' AND selling_price_cents=?`)
+        .bind(suggestedSellingPriceCents, suggestedSellingPriceCents, rule.id, when, product.id, product.sellingPriceCents),
       getD1().prepare(`INSERT INTO catalog_price_history
         (id,product_id,event_type,cost_basis_cents,previous_selling_price_cents,suggested_selling_price_cents,effective_selling_price_cents,pricing_mode,margin_rule_id,source_purchase_order_id,reason,created_at,created_by)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
@@ -192,7 +207,7 @@ export async function repriceAutomaticProducts(actor: PricingActor, reason: stri
     );
   }
   if (statements.length) await getD1().batch(statements);
-  return statements.length / 2;
+  return repriced;
 }
 
 export async function prepareCanceledPurchaseCostStatements(input: { claim: CommandClaim; actor: PricingActor; purchaseOrderId: string; effectiveAt: string }) {

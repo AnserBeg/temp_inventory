@@ -5,6 +5,7 @@ import {
   ReactNode,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -13,8 +14,10 @@ import { OperationsWorkspace } from "./components/operations-suite";
 import { EmailConnectionManager, EmailDocumentButton } from "./components/email-documents";
 import { InventoryCountSessions } from "./components/inventory-count-sessions";
 import { actorName } from "./components/format";
+import { localDatePlusDays, localDateString } from "./components/local-date";
+import { NumberField } from "./components/number-field";
 import { useDialogDismiss } from "./components/use-dialog-dismiss";
-import { PAYMENT_TERMS, QuickCreateDialog, RemoteSearchSelect, SearchableSelect, type LookupKind, type QuickCreateKind } from "./components/reference-picker";
+import { PAYMENT_TERMS, PickerPermissionsContext, QuickCreateDialog, RemoteSearchSelect, SearchableSelect, type LookupKind, type QuickCreateKind } from "./components/reference-picker";
 import { calculateSalesAvailability } from "@/lib/domain/sales-availability";
 import { inventoryCountApprovalPayload, workflowSnapshotParts } from "@/lib/domain/workflow-envelope";
 
@@ -475,6 +478,8 @@ type LookupOption = {
   currency?: string; paymentTerms?: string;
   creditHold?: boolean; creditLimitCents?: number;
   availableQuantity?: number; trackingPolicy?: string; inventoryPolicy?: string;
+  /** Catalog attributes, so an order line's configuration snapshot is built from what the product is, not its price hint. */
+  dimensions?: string; finish?: string; material?: string; category?: string;
 };
 
 type CommandKind =
@@ -550,6 +555,9 @@ const documentDate = new Intl.DateTimeFormat("en-CA", {
   day: "numeric",
 });
 
+/** Visible suffix on a required field's label, so a disabled or refused submit is never a mystery. */
+const requiredMark = <span className="required-mark" aria-hidden="true"> *</span>;
+
 function formatDocumentDate(value: string | undefined, fallback = "Not recorded") {
   if (!value) return fallback;
   const date = new Date(`${value.slice(0, 10)}T12:00:00`);
@@ -624,10 +632,30 @@ function DocumentFacts({ title, facts }: { title: string; facts: Array<[string, 
   </section>;
 }
 
+/** Today plus `days`, in the viewer's calendar rather than UTC's. */
 function futureDate(days: number) {
-  const date = new Date();
-  date.setDate(date.getDate() + days);
-  return date.toISOString().slice(0, 10);
+  return localDatePlusDays(days);
+}
+
+/**
+ * A purchase order without an expected date says so. The normaliser used to invent one a week
+ * out, which then showed as a real commitment and, a week later, as "late".
+ */
+function expectedDateLabel(value: string | undefined) {
+  return value ? formatDocumentDate(value) : "Not set";
+}
+
+/**
+ * What stands in for a missing location on a movement. Every external row used to read
+ * "External / Supplier → External / Customer" whatever the movement was, so a customer return
+ * appeared to arrive from a supplier and a scrap posting to ship to a customer.
+ */
+const externalMovementFrom: Record<string, string> = { purchase_receipt: "External / Supplier", customer_return: "External / Customer", shipment_reversal: "External / Customer" };
+const externalMovementTo: Record<string, string> = { sales_shipment: "External / Customer", receipt_reversal: "External / Supplier", vendor_return: "External / Supplier" };
+function movementCounterparty(type: string, side: "from" | "to") {
+  const named = (side === "from" ? externalMovementFrom : externalMovementTo)[type];
+  if (named) return named;
+  return type.includes("scrap") ? "Scrap" : "Adjustment";
 }
 
 function dueDateForTerms(baseDate: string, terms: string) {
@@ -804,7 +832,9 @@ export function InventoryApp() {
     snapshotLoadController.current = controller;
     const requestKey = [view, page, appliedWorklistQuery, worklistStatus, worklistSort, warehouseId].join("|");
     try {
-      const params = new URLSearchParams({ page: String(page), pageSize: "50", scope: view, worklistQuery: appliedWorklistQuery, status: worklistStatus, sort: worklistSort, warehouseId });
+      // asOf is the viewer's own calendar date: "late" is judged against the day they are in,
+      // not against UTC, which is already tomorrow through the working afternoon.
+      const params = new URLSearchParams({ page: String(page), pageSize: "50", scope: view, worklistQuery: appliedWorklistQuery, status: worklistStatus, sort: worklistSort, warehouseId, asOf: localDateString() });
       const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store", signal: controller.signal });
       const data = await response.json() as Record<string, unknown>;
       if (!response.ok) throw new Error(text(asRecord(data.error).message, "Snapshot unavailable"));
@@ -1177,7 +1207,7 @@ export function InventoryApp() {
   };
 
   const fetchCountApproval = async (approvalId: string) => {
-    const response = await fetch("/api/workflows?page=1&pageSize=100", { cache: "no-store" });
+    const response = await fetch(`/api/workflows?page=1&pageSize=100&asOf=${localDateString()}`, { cache: "no-store" });
     const result = await response.json() as { error?: string | { message?: string } };
     if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "Approval status could not be refreshed.");
     return countApprovalFromResponse(result, approvalId);
@@ -1304,6 +1334,7 @@ export function InventoryApp() {
   };
 
   return (
+    <PickerPermissionsContext.Provider value={snapshot.viewer.permissions}>
     <div className="app-shell">
       <a className="skip-link" href="#main-content">Skip to content</a>
       <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`} aria-label="Primary navigation">
@@ -1321,11 +1352,14 @@ export function InventoryApp() {
                   className={`nav-item ${view === item.key && (item.tab ? workspaceTab === item.tab : item.key !== "reports" || workspaceTab !== "pricing") ? "active" : ""}`}
                   onClick={() => navigate(item.key, undefined, item.tab ?? "overview")}
                   aria-current={view === item.key && (item.tab ? workspaceTab === item.tab : item.key !== "reports" || workspaceTab !== "pricing") ? "page" : undefined}
+                  // Named explicitly, with the badge folded in: the glyph is decorative and the
+                  // tree was reading these as unnamed buttons.
+                  aria-label={item.key === "expected-receipts" && snapshot.summary.lateReceipts > 0 ? `${item.label}, ${snapshot.summary.lateReceipts} late` : item.key === "vendor-bills" && snapshot.summary.matchExceptions > 0 ? `${item.label}, exceptions present` : item.label}
                 >
                   <span className="nav-glyph" aria-hidden="true">{item.glyph}</span>
                   <span>{item.label}</span>
-                  {item.key === "expected-receipts" && snapshot.summary.lateReceipts > 0 && <span className="nav-count">{snapshot.summary.lateReceipts}</span>}
-                  {item.key === "vendor-bills" && snapshot.summary.matchExceptions > 0 && <span className="nav-dot" aria-label="Exceptions present" />}
+                  {item.key === "expected-receipts" && snapshot.summary.lateReceipts > 0 && <span className="nav-count" aria-hidden="true">{snapshot.summary.lateReceipts}</span>}
+                  {item.key === "vendor-bills" && snapshot.summary.matchExceptions > 0 && <span className="nav-dot" aria-hidden="true" />}
                 </button>
               ))}
             </div>
@@ -1383,7 +1417,7 @@ export function InventoryApp() {
             <>
               {view === "home" && <Dashboard snapshot={snapshot} navigate={navigate} openPo={setSelectedPoId} />}
               {view === "purchase-orders" && (
-                <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} onCreateOrder={() => setCreateOrder("purchaseOrder")}>
+                <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { changeWorkspaceTab("overview"); setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }}>
                 {selectedPo ? (
                   <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
@@ -1424,10 +1458,10 @@ export function InventoryApp() {
               {view === "customer-returns" && <CustomerReturnsView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onReturn={(so) => setActiveCommand({ kind: "customer-return", entityId: so.id, entityNumber: so.number })} />}
               {view === "stock" && (
                 <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}>
-                  {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="inventory" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} warehouseId={warehouseId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
+                  {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="inventory" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canApprove ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} warehouseId={warehouseId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
                 </OperationsWorkspace>
               )}
-              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="the catalog" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <CatalogView products={snapshot.products} onOpen={setSelectedProductId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />)}
+              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="the catalog" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canApprove ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <CatalogView products={snapshot.products} onOpen={setSelectedProductId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />)}
               {/* Jumping to the order a movement belongs to: navigate first, then select, since
                   navigate clears the current selection. The worklist is searched by the order
                   number so the target is on the page that loads. */}
@@ -1499,6 +1533,7 @@ export function InventoryApp() {
           locations={snapshot.locations}
           countBalances={snapshot.inventoryBalances.filter((item) => item.productId === activeCommand.entityId)}
           warehouseId={warehouseId}
+          canPostFinancial={snapshot.viewer.permissions.canPostFinancial}
           onClose={() => setActiveCommand(null)}
           onSubmit={(payload) => runCommand(activeCommand.kind, activeCommand.entityId, activeCommand.entityNumber, payload)}
           onRequestCountApproval={(payload) => requestCountApproval(activeCommand.entityId, payload)}
@@ -1573,6 +1608,7 @@ export function InventoryApp() {
       {toast && <div className="toast" role="status"><span aria-hidden="true">✓</span>{toast}</div>}
       {mobileNavOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
     </div>
+    </PickerPermissionsContext.Provider>
   );
 }
 
@@ -1647,7 +1683,7 @@ function Dashboard({ snapshot, navigate, openPo }: { snapshot: Snapshot; navigat
               <tr key={po.id}>
                 <td><button className="table-link" onClick={() => { navigate("purchase-orders"); openPo(po.id); }}>{po.number}</button></td>
                 <td>{po.vendor}</td>
-                <td><span className={po.daysLate > 0 ? "text-danger" : ""}>{po.daysLate > 0 ? `${po.daysLate} days late` : formatDate(po.expectedDate)}</span></td>
+                <td><span className={po.daysLate > 0 ? "text-danger" : ""}>{po.daysLate > 0 ? `${po.daysLate} days late` : po.expectedDate ? formatDate(po.expectedDate) : "Not set"}</span></td>
                 <td className="numeric strong">{po.open}</td>
                 <td>{po.customerRef ? <span className="allocation-tag">{po.customerRef}</span> : <span className="muted">Stock replenishment</span>}</td>
                 <td><button className="row-action" onClick={() => { navigate("purchase-orders"); openPo(po.id); }}>Open</button></td>
@@ -1740,6 +1776,10 @@ function useLocalTableSort<T>(rows: T[], accessors: Record<string, (row: T) => u
     return [...rows].sort((left, right) => {
       const leftValue = accessor(left);
       const rightValue = accessor(right);
+      // Blank cells sort last in either direction: an unset date is not earlier than every real one.
+      const leftBlank = leftValue == null || leftValue === "";
+      const rightBlank = rightValue == null || rightValue === "";
+      if (leftBlank !== rightBlank) return leftBlank ? 1 : -1;
       if (typeof leftValue === "number" && typeof rightValue === "number") return (leftValue - rightValue) * direction;
       return String(leftValue ?? "").localeCompare(String(rightValue ?? ""), undefined, { numeric: true, sensitivity: "base" }) * direction;
     });
@@ -1813,7 +1853,7 @@ function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSo
       <td><StatusBadge>{purchaseOrderStage(po)}</StatusBadge></td>
       {/* A late order still has to say which date it missed; "6 days late" alone cannot be
           matched against the vendor's confirmation. */}
-      <td>{po.daysLate > 0 ? <><StatusBadge tone="danger">{po.daysLate} days late</StatusBadge><small>{formatDocumentDate(po.expectedDate)}</small></> : formatDocumentDate(po.expectedDate)}</td>
+      <td>{po.daysLate > 0 ? <><StatusBadge tone="danger">{po.daysLate} days late</StatusBadge><small>{expectedDateLabel(po.expectedDate)}</small></> : expectedDateLabel(po.expectedDate)}</td>
       <td className="numeric">{po.ordered}</td><td className="numeric">{po.received - po.returned}</td><td className="numeric">{po.closed}</td><td className="numeric strong">{po.open}</td>
       <td><StatusBadge>{po.billing}</StatusBadge></td>
       <td className="numeric strong">{formatDocumentMoney(po.total, po.currency, false)}</td>
@@ -1829,7 +1869,8 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
   const [activateError, setActivateError] = useState("");
   const [submitNote, setSubmitNote] = useState("");
   const [mergeOpen, setMergeOpen] = useState(false);
-  const isDraft = po.lifecycle.toLowerCase() === "draft";
+  // A rejected revision is the buyer's to correct and resubmit, so it is edited like a draft.
+  const isDraft = ["draft", "rejected"].includes(po.lifecycle.toLowerCase());
   const overallStage = purchaseOrderStage(po);
   const billingIsNext = overallStage === "Awaiting vendor bill" || overallStage === "Partially billed";
   const fullyReceived = po.received - po.returned >= po.ordered && po.closed === 0;
@@ -1848,7 +1889,7 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
       {billingIsNext ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>{overallStage === "Partially billed" ? "Finish entering the vendor bill" : fullyReceived ? "Receipt complete · vendor bill pending" : "Receiving closed · vendor bill pending"}</strong><p>Record the supplier&apos;s invoice against this PO and its posted receipt. This creates the payable without moving inventory again.</p></div><button className="button primary" type="button" onClick={onOpenVendorBilling}>Open vendor billing</button></div> : null}
       {po.exception && <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Action needed</strong><p>{po.exception}</p></div></div>}
       {activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}
-      {isDraft && canOperate ? <form className="draft-activation" onSubmit={submit}><label>Submission note<input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required /></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button><button className="button secondary" type="button" onClick={() => setMergeOpen(true)}>Merge another draft</button></form> : null}
+      {isDraft && canOperate ? <form className="draft-activation" onSubmit={submit} noValidate><label><span>Submission note{requiredMark}</span><input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required aria-required="true" /><small className="field-hint">{submitNote.trim() ? "" : "Required before the order can be submitted."}</small></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : po.lifecycle.toLowerCase() === "rejected" ? "Resubmit for approval" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button><button className="button secondary" type="button" onClick={() => setMergeOpen(true)}>Merge another draft</button></form> : null}
       {canOperate ? <div className="object-actions">
         {po.lifecycle.toLowerCase() === "approved" && <EmailDocumentButton documentType="purchase_order" documentId={po.id} documentNumber={po.number}>Email purchase order</EmailDocumentButton>}
         {po.lifecycle.toLowerCase() === "approved" && po.open > 0 && <button className="button primary" onClick={() => onCommand("receive")}>Receive remaining</button>}
@@ -1872,7 +1913,7 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
     <div className="detail-columns">
       <DocumentFacts title="Order details" facts={[
         ["Order date", formatDocumentDate(po.orderDate)],
-        ["Expected delivery", formatDocumentDate(po.expectedDate)],
+        ["Expected delivery", expectedDateLabel(po.expectedDate)],
         ["Payment terms", po.paymentTerms ?? "Not recorded"],
         ["Payment due", formatDocumentDate(po.dueDate)],
         ["Currency", po.exchangeRateToBase === 1 ? po.currency : `${po.currency} · rate ${po.exchangeRateToBase} to CAD`],
@@ -1919,7 +1960,14 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   const [confirmNote, setConfirmNote] = useState("");
   const isDraft = so.lifecycle.toLowerCase() === "draft";
   const hasDedicatedSupply = so.lines?.some((line) => Boolean(line.linkedPurchaseOrderLineId)) ?? false;
-  const canImmediateSale = so.lifecycle.toLowerCase() === "confirmed" && (so.lines?.some((line) => line.fulfillmentRoute === "stock" && line.open > line.reserved && line.productAvailable > 0) ?? false);
+  const confirmed = so.lifecycle.toLowerCase() === "confirmed";
+  const canImmediateSale = confirmed && (so.lines?.some((line) => line.fulfillmentRoute === "stock" && line.open > line.reserved && line.productAvailable > 0) ?? false);
+  // Actions that cannot apply are not offered: a fully shipped order showed three live-looking
+  // buttons that did nothing. Whatever remains that is blocked says why.
+  const fulfillmentOpen = confirmed && so.open > 0;
+  const canShip = confirmed && so.reserved > 0;
+  const canReserve = fulfillmentOpen && so.open > so.reserved;
+  const reserveBlocked = canReserve && so.availableNow <= 0;
   const confirm = async (event: FormEvent) => {
     event.preventDefault();
     setActivating(true); setActivateError("");
@@ -1930,7 +1978,7 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   const totals = documentTotals(lines.map((line) => ({ quantity: line.ordered, unitAmount: line.unitPrice, discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps })), so);
   const lineTable = useLocalTableSort(lines, { line: (row) => lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, route: (row) => `${row.fulfillmentRoute} ${row.projectReference ?? ""}`, ordered: (row) => row.ordered, reserved: (row) => row.reserved, shipped: (row) => row.shipped, returned: (row) => row.returned, open: (row) => row.open, unitPrice: (row) => row.unitPrice, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitPrice, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitPrice, row.discountCents) });
   const shipmentTable = useLocalTableSort(so.shipments, { number: (row) => row.number, posted: (row) => row.postedAt, status: (row) => row.status, carrier: (row) => row.carrier, service: (row) => row.serviceLevel, tracking: (row) => row.trackingNumber, billOfLading: (row) => row.billOfLadingNumber });
-  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm}><label>Confirmation note<input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" required /></label><button className="button primary" type="submit" disabled={activating || !confirmNote.trim()}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions"><EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton>{canPostFinancial ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale}>Ship &amp; invoice now</button> : null}<button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip} disabled={so.lifecycle.toLowerCase() !== "confirmed" || so.reserved <= 0}>Post shipment</button><button className="button secondary" onClick={onReserve} disabled={so.lifecycle.toLowerCase() !== "confirmed" || so.open <= so.reserved || so.availableNow <= 0}>Reserve available stock</button></div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
+  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm} noValidate><label><span>Confirmation note{requiredMark}</span><input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" required aria-required="true" /><small className="field-hint">{confirmNote.trim() ? "" : "Required before the order can be confirmed."}</small></label><button className="button primary" type="submit" disabled={activating || !confirmNote.trim()}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions"><EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton>{canPostFinancial && fulfillmentOpen ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale} title={canImmediateSale ? undefined : "No unreserved stock line has usable inventory to ship and invoice now."}>Ship &amp; invoice now</button> : null}{canShip ? <button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip}>Post shipment</button> : null}{canReserve ? <button className="button secondary" onClick={onReserve} disabled={reserveBlocked} title={reserveBlocked ? "No usable stock is available to reserve right now." : undefined}>Reserve available stock</button> : null}{!fulfillmentOpen && !canShip ? <span className="read-only-label">{confirmed ? "Fully shipped: no fulfillment actions remain." : `No fulfillment actions while the order is ${so.lifecycle.toLowerCase()}.`}</span> : null}</div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
     <section className="panel availability-panel"><PanelHeading title="Availability for requested date" detail={`Requested ${formatDate(so.requestedDate)}`} /><div className="availability-grid"><MetricDisplay label="Required" value={so.open} /><MetricDisplay label="Available now" value={so.availableNow} tone="success" /><MetricDisplay label="Incoming before date" value={so.incomingBeforeDate} tone="info" /><MetricDisplay label="Shortage" value={so.shortage} tone={so.shortage > 0 ? "danger" : "neutral"} /></div>{so.linkedPo && <div className="linked-supply"><span className="section-kicker">Linked supply</span><strong>{so.linkedPo}</strong><p>{so.incomingBeforeDate} units expected before the customer&apos;s requested date.</p></div>}</section>
     {/* The lines are the order. Without them this page showed a total for goods it never named,
         so nobody could check what the customer actually bought. */}
@@ -2030,11 +2078,11 @@ function ProductDetail({ product, movements, onBack, backLabel, onEdit, canManag
       await Promise.resolve();
       if (controller.signal.aborted) return;
       setHistoryLoading(true); setHistoryError("");
-      const params = new URLSearchParams({ detail: "product", productId: product.id, page: String(movementPage), pageSize: "50" });
+      const params = new URLSearchParams({ detail: "product", productId: product.id, page: String(movementPage), pageSize: "50", asOf: localDateString() });
       const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store", signal: controller.signal });
       const raw = await response.json() as Record<string, unknown>;
       if (!response.ok) throw new Error(text(asRecord(raw.error).message, "Product history could not be loaded."));
-      setProductMovements(asRows(raw.movements).map((item, index) => ({ id: text(item.id, `movement-${index}`), time: displayTimestamp(text(item.postedAt)), type: titleCase(text(item.type)), document: `${titleCase(text(item.sourceDocumentType))} · ${text(item.sourceDocumentId)}`, product: product.sku, quantity: number(item.quantity), from: text(item.fromLocationCode, "External"), to: text(item.toLocationCode, "External"), user: text(item.postedBy, "System") })));
+      setProductMovements(asRows(raw.movements).map((item, index) => ({ id: text(item.id, `movement-${index}`), time: displayTimestamp(text(item.postedAt)), type: titleCase(text(item.type)), document: `${titleCase(text(item.sourceDocumentType))} · ${text(item.sourceDocumentId)}`, product: product.sku, quantity: number(item.quantity), from: text(item.fromLocationCode) || movementCounterparty(text(item.type), "from"), to: text(item.toLocationCode) || movementCounterparty(text(item.type), "to"), user: text(item.postedBy, "System") })));
       setBalances(asRows(raw.balances).map((item) => ({ productId: product.id, locationId: text(item.locationId), recordedQuantity: number(item.recordedQuantity), reservedQuantity: number(item.reservedQuantity), version: number(item.version), locationCode: text(item.locationCode, "Missing location"), locationName: text(item.locationName, "Referenced location no longer exists"), warehouseName: text(item.warehouseName, "Unreconciled"), inventoryStatus: text(item.inventoryStatus, "orphaned") })));
       setAliases(asRows(raw.aliases).map((item) => ({ id: text(item.id), alias: text(item.alias), aliasType: text(item.aliasType, "alternate") })));
       setDefaultLocations(asRows(raw.defaultLocations).map((item) => ({ warehouseId: text(item.warehouseId), warehouseCode: text(item.warehouseCode), warehouseName: text(item.warehouseName), locationId: text(item.locationId) || undefined, locationCode: text(item.locationCode) || undefined, locationName: text(item.locationName) || undefined, version: item.version == null ? undefined : number(item.version) })));
@@ -2160,8 +2208,9 @@ function ProductPictures({ product, canManage, viewerEmail, viewerRole }: { prod
 
   useEffect(() => {
     const controller = new AbortController();
-    void loadPictures(controller.signal);
-    return () => controller.abort();
+    // Deferred a tick so the load's own "loading" state is not set synchronously inside the effect.
+    const timer = window.setTimeout(() => void loadPictures(controller.signal), 0);
+    return () => { window.clearTimeout(timer); controller.abort(); };
   }, [loadPictures]);
 
   const upload = async (event: FormEvent) => {
@@ -2262,7 +2311,7 @@ function EditProductDialog({ product, onClose, onSaved }: { product: Product; on
   };
   return <div className="modal-overlay" role="presentation"><section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label={`Edit ${product.sku}`}>
     <div className="dialog-header"><h2>Edit {product.sku}</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div>
-    <form onSubmit={submit}>
+    <form onSubmit={submit} noValidate>
       {error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}
       <div className="command-form form-grid">
         <label><span>SKU</span><input value={form.sku} onChange={(event) => set({ sku: event.target.value })} required /></label>
@@ -2274,11 +2323,11 @@ function EditProductDialog({ product, onClose, onSaved }: { product: Product; on
         <label><span>Finish</span><input value={form.finish} onChange={(event) => set({ finish: event.target.value })} required /></label>
         <label><span>Tracking policy</span><select value={form.trackingPolicy} onChange={(event) => set({ trackingPolicy: event.target.value })}><option value="quantity">Quantity</option><option value="lot">Lot</option><option value="serial">Serial</option></select></label>
         <label><span>Inventory policy</span><select value={form.inventoryPolicy} onChange={(event) => set({ inventoryPolicy: event.target.value })}><option value="stocked">Stocked</option><option value="special_order">Special order</option><option value="drop_ship">Drop ship</option></select></label>
-        <label><span>Reorder point ({product.baseUomCode})</span><input type="number" min="0" step="0.001" value={form.reorderPoint} onChange={(event) => set({ reorderPoint: Number(event.target.value) })} /></label>
-        <label><span>Reorder up to ({product.baseUomCode})</span><input type="number" min={form.reorderPoint} step="0.001" value={form.maxStockLevel} onChange={(event) => set({ maxStockLevel: Number(event.target.value) })} /></label>
-        <label><span>Standard cost</span><input type="number" min="0" step="0.01" value={form.standardCost} onChange={(event) => set({ standardCost: Number(event.target.value) })} /></label>
+        <label><span>Reorder point ({product.baseUomCode})</span><NumberField min="0" step="0.001" value={form.reorderPoint} onChange={(reorderPoint) => set({ reorderPoint })} /></label>
+        <label><span>Reorder up to ({product.baseUomCode})</span><NumberField min={form.reorderPoint} step="0.001" value={form.maxStockLevel} onChange={(maxStockLevel) => set({ maxStockLevel })} /></label>
+        <label><span>Standard cost</span><NumberField min="0" step="0.01" value={form.standardCost} onChange={(standardCost) => set({ standardCost })} /></label>
         <label><span>Pricing mode</span><select value={form.pricingMode} onChange={(event) => set({ pricingMode: event.target.value as "automatic" | "manual" })}><option value="automatic">Automatic from margin matrix</option><option value="manual">Manual override</option></select></label>
-        <label><span>Selling price</span><input type="number" min="0" step="0.01" value={form.sellingPrice} onChange={(event) => set({ sellingPrice: Number(event.target.value) })} disabled={form.pricingMode === "automatic"} /><small>{form.pricingMode === "automatic" ? `Will use the current suggestion (${exact.format(product.suggestedSellingPrice)}).` : `Current matrix suggestion: ${exact.format(product.suggestedSellingPrice)}.`}</small></label>
+        <label><span>Selling price</span><NumberField min="0" step="0.01" value={form.sellingPrice} onChange={(sellingPrice) => set({ sellingPrice })} disabled={form.pricingMode === "automatic"} /><small>{form.pricingMode === "automatic" ? `Will use the current suggestion (${exact.format(product.suggestedSellingPrice)}).` : `Current matrix suggestion: ${exact.format(product.suggestedSellingPrice)}.`}</small></label>
         {form.pricingMode === "manual" ? <label className="full"><span>Override reason</span><input value={form.manualPriceReason} onChange={(event) => set({ manualPriceReason: event.target.value })} placeholder="Why this product does not follow the matrix" required /></label> : null}
       </div>
       {/* Units are fixed once a product has movement history, so they are shown rather than edited here. */}
@@ -2311,16 +2360,6 @@ function MovementsTable({ movements, onOpenOrder, sort, setSort }: { movements: 
     <td>{movement.from}</td><td>{movement.to}</td><td title={movement.user}>{actorName(movement.user)}</td>
   </tr>)}{!movements.length ? <tr><td colSpan={9}><div className="empty-inline">No posted movement matches this filter.</div></td></tr> : null}</tbody></table></div>;
 }
-
-function CountsView({ balances, canOperate, onCount, sort, setSort }: { balances: CountBalance[]; canOperate: boolean; onCount: (balance: CountBalance) => void } & WorklistSortProps) {
-  // The hero that used to sit here offered one "Start count" button wired to balances[0] — a
-  // row nobody chose. Counting starts from the row you mean to count.
-  //
-  // Rows now come from a balance-paged query rather than being matched against whichever page
-  // of the catalog happened to be loaded, so every page is a full page of countable locations.
-  return <div className="stack"><section className="panel"><PanelHeading title="Active location balances" detail="Click any column heading to sort" /><div className="responsive-table"><table><caption className="sr-only">Inventory balances available for cycle counting</caption><thead><tr><SortableHeader label="Product" column="product" sort={sort} setSort={setSort} /><SortableHeader label="Warehouse location" column="location" sort={sort} setSort={setSort} /><SortableHeader label="Book quantity" column="recorded" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reserved" column="reserved" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Available" column="available" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{balances.map((balance) => <tr key={`${balance.productId}-${balance.locationId}`}><td><strong>{balance.productName}</strong><small>{balance.sku}</small></td><td><strong>{balance.warehouseName} · {balance.locationCode}</strong><small>{balance.locationName}</small></td><td className="numeric strong">{balance.recordedQuantity}</td><td className="numeric">{balance.reservedQuantity}</td><td className="numeric">{balance.recordedQuantity - balance.reservedQuantity}</td><td>{canOperate ? <button className="button secondary" onClick={() => onCount(balance)}>Count location</button> : <span className="read-only-label">Read-only</span>}</td></tr>)}{!balances.length ? <tr><td colSpan={6}><div className="empty-inline">No location balances are available to count.</div></td></tr> : null}</tbody></table></div></section></div>;
-}
-
 
 function PartnersView({ partners, selectedId, canApprove, canOperate, canAdminister, onOpen, onEdit, onChanged, sort, setSort }: { partners: Partner[]; selectedId: string | null; canApprove: boolean; canOperate: boolean; canAdminister: boolean; onOpen: (id: string | null) => void; onEdit: (partner: Partner) => void; onChanged: (message: string) => void } & WorklistSortProps) {
   const selected = partners.find((partner) => partner.id === selectedId);
@@ -2438,7 +2477,7 @@ function PartnerDetail({ partner, canApprove, canOperate, canAdminister, onBack,
     {isCustomer ? <section className="panel"><PanelHeading title="Invoices" detail={invoices.length ? `${invoices.length} invoice${invoices.length === 1 ? "" : "s"} · ${formatDocumentMoney(outstanding, partner.currency)} outstanding` : undefined} />
       {detailLoading ? <div className="empty-inline">Loading invoices…</div>
         : invoices.length ? <div className="responsive-table"><table><caption className="sr-only">Customer invoices, dates, and settlement</caption><thead><tr><SortableHeader label="Invoice" column="number" sort={invoiceTable.sort} setSort={invoiceTable.setSort} /><SortableHeader label="Invoiced" column="invoiced" sort={invoiceTable.sort} setSort={invoiceTable.setSort} /><SortableHeader label="Due" column="due" sort={invoiceTable.sort} setSort={invoiceTable.setSort} /><SortableHeader label="Status" column="status" sort={invoiceTable.sort} setSort={invoiceTable.setSort} /><SortableHeader label="Total" column="total" sort={invoiceTable.sort} setSort={invoiceTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Paid" column="paid" sort={invoiceTable.sort} setSort={invoiceTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Outstanding" column="outstanding" sort={invoiceTable.sort} setSort={invoiceTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{invoiceTable.rows.map((invoice) => {
-          const overdue = invoice.outstanding > 0 && Boolean(invoice.dueDate) && invoice.dueDate < new Date().toISOString().slice(0, 10);
+          const overdue = invoice.outstanding > 0 && Boolean(invoice.dueDate) && invoice.dueDate < localDateString();
           return <tr key={invoice.id}><td><strong>{invoice.number}</strong></td><td>{formatDocumentDate(invoice.invoiceDate)}</td><td>{formatDocumentDate(invoice.dueDate)}</td><td>{overdue ? <StatusBadge tone="danger">Overdue</StatusBadge> : <StatusBadge>{invoice.status}</StatusBadge>}</td><td className="numeric">{formatDocumentMoney(invoice.total, invoice.currency)}</td><td className="numeric">{formatDocumentMoney(invoice.paid, invoice.currency)}</td><td className="numeric strong">{formatDocumentMoney(invoice.outstanding, invoice.currency)}</td></tr>;
         })}</tbody></table></div>
         : <div className="empty-inline">No invoice has been posted for this customer.</div>}</section> : null}
@@ -2568,7 +2607,7 @@ function PartnerEditor({ partner, onClose, onSaved }: { partner: Partner | "new"
         <label>Province / region<input value={form.region} onChange={(event) => set({ region: event.target.value })} /></label>
         <label>Postal code<input value={form.postalCode} onChange={(event) => set({ postalCode: event.target.value })} /></label>
         <label>Country<input value={form.country} onChange={(event) => set({ country: event.target.value.toUpperCase() })} /></label>
-        <label>Credit limit<input type="number" min="0" step="0.01" value={form.creditLimit} onChange={(event) => set({ creditLimit: Number(event.target.value) })} /></label>
+        <label>Credit limit<NumberField min="0" step="0.01" value={form.creditLimit} onChange={(creditLimit) => set({ creditLimit })} /></label>
         <label className="radio-row"><input type="checkbox" checked={form.creditHold} onChange={(event) => set({ creditHold: event.target.checked })} /><span>Credit hold</span></label>
       </div>
       <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="button primary" disabled={busy}>{busy ? "Saving…" : editing ? "Save changes" : "Create partner"}</button></div>
@@ -2581,7 +2620,7 @@ function PartnerEditor({ partner, onClose, onSaved }: { partner: Partner | "new"
 function VendorBillsView({ bills, sort, setSort }: { bills: Bill[] } & WorklistSortProps) {
   // Exact amounts here: a variance is an exception precisely because it is small, and rounding
   // one to the dollar prints "$0" beside a row that is demanding review.
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDateString();
   return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Vendor bills, matching variance, and settlement</caption><thead><tr><SortableHeader label="Bill" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Vendor invoice" column="vendorInvoice" sort={sort} setSort={setSort} /><SortableHeader label="Vendor" column="vendor" sort={sort} setSort={setSort} /><SortableHeader label="Purchase order" column="purchaseOrder" sort={sort} setSort={setSort} /><SortableHeader label="Invoiced" column="invoiced" sort={sort} setSort={setSort} /><SortableHeader label="Due" column="due" sort={sort} setSort={setSort} /><SortableHeader label="Authorized line value" column="authorized" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Billed line value" column="billed" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Line variance" column="variance" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Bill total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Outstanding" column="outstanding" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Match" column="match" sort={sort} setSort={setSort} /><SortableHeader label="Settlement" column="settlement" sort={sort} setSort={setSort} /></tr></thead><tbody>{bills.map((bill) => {
     const overdue = bill.outstanding > 0 && Boolean(bill.dueDate) && bill.dueDate < today;
     return <tr key={bill.id}>
@@ -2632,7 +2671,7 @@ const reportTabs: Array<{ key: ReportKey; label: string }> = [
  */
 function ManagementReports({ warehouseId, canViewReceivables }: { warehouseId: string; canViewReceivables: boolean }) {
   const [report, setReport] = useState<ReportKey>(canViewReceivables ? "ar-aging" : "open-orders");
-  const [asOf, setAsOf] = useState(new Date().toISOString().slice(0, 10));
+  const [asOf, setAsOf] = useState(localDateString());
   const [statementPartner, setStatementPartner] = useState<{ id: string; label: string }>({ id: "", label: "" });
   const [payload, setPayload] = useState<ReportPayload | null>(null);
   const [loading, setLoading] = useState(false);
@@ -2689,7 +2728,7 @@ function ManagementReports({ warehouseId, canViewReceivables }: { warehouseId: s
     const csv = [headers, ...reportTable.rows.map((row) => headers.map((key) => row[key]))]
       .map((row) => row.map((value) => `"${String(value ?? "").replaceAll('"', '""')}"`).join(",")).join("\n");
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-    const link = document.createElement("a"); link.href = url; link.download = `paneflow-${report}-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url);
+    const link = document.createElement("a"); link.href = url; link.download = `paneflow-${report}-${localDateString()}.csv`; link.click(); URL.revokeObjectURL(url);
   };
 
   return <section className="panel">
@@ -2735,7 +2774,7 @@ function ReportsView({ snapshot, warehouseId }: { snapshot: Snapshot; warehouseI
   const [productPage, setProductPage] = useState(1);
   // The accounting handoff was locked to year-to-date, so the month-end close everybody
   // actually runs could not be exported without editing the URL.
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDateString();
   const [exportFrom, setExportFrom] = useState(`${today.slice(0, 4)}-01-01`);
   const [exportTo, setExportTo] = useState(today);
   const validRange = Boolean(exportFrom && exportTo) && exportFrom <= exportTo;
@@ -2749,7 +2788,7 @@ function ReportsView({ snapshot, warehouseId }: { snapshot: Snapshot; warehouseI
     const rows = [["SKU", "Product", "Usable", "Incoming", "Demand", "Projected"], ...productTable.rows.map((product) => [product.sku, product.name, product.usable, product.incoming, product.demand, product.projected])];
     const csv = rows.map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\n");
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-    const link = document.createElement("a"); link.href = url; link.download = `paneflow-availability-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url);
+    const link = document.createElement("a"); link.href = url; link.download = `paneflow-availability-${localDateString()}.csv`; link.click(); URL.revokeObjectURL(url);
   };
   // The four static cards that used to sit here restated dashboard numbers and did nothing when
   // clicked, so they occupied a screen of a reporting workspace without answering a question.
@@ -2775,7 +2814,7 @@ function WarehouseView({ snapshot, source, canOperate, onReceive, navigate }: { 
   const postingAvailable = source === "server" && canOperate;
   {/* The page shell's top bar already shows the connection state and the last refresh time
       directly above this, so the header repeated both within a few pixels of the originals. */}
-  return <div className="warehouse-shell"><div className="warehouse-header"><div><h2>Warehouse work</h2></div><div className="warehouse-user"><span>{initials(snapshot.viewer.name)}</span><div><strong>{snapshot.viewer.name || "Signing in…"}</strong><small>{snapshot.viewer.role ? titleCase(snapshot.viewer.role) : ""}</small></div></div></div><section className="warehouse-launcher" aria-label="Warehouse work">{tasks.map((task) => <button type="button" key={task.label} onClick={() => navigate(task.view, undefined, task.tab)}><span className="task-glyph" aria-hidden="true">{task.glyph}</span><strong>{task.label}</strong><small>{task.count} work item{task.count === 1 ? "" : "s"}</small></button>)}</section>{next ? <section className="warehouse-next"><div className="step-header"><span>Next receipt</span><StatusBadge tone={next.daysLate > 0 ? "danger" : "info"}>{next.daysLate > 0 ? `${next.daysLate} days late` : formatDate(next.expectedDate)}</StatusBadge></div><h3>{selected ? `Receive ${selected.number}` : "No matching receipt"}</h3><p>{selected ? `${selected.vendor} · ${selected.customerRef ?? "Stock replenishment"}` : "Scan a different purchase order or SKU."}</p><form className="scan-zone" onSubmit={(event) => { event.preventDefault(); if (postingAvailable && selected) onReceive(selected); }}><span aria-hidden="true">▤</span><div><strong>Scan a purchase order or SKU</strong>{scanned && !scanMatch ? <small className="text-danger">No approved open purchase order matches “{scan.trim()}”.</small> : null}</div><input aria-label="Scan purchase order or SKU" placeholder="Scan or type code" autoComplete="off" value={scan} onChange={(event) => setScan(event.target.value)} /></form><button className="warehouse-primary" disabled={!postingAvailable || !selected} onClick={() => { if (selected) onReceive(selected); }}>{postingAvailable ? selected ? `Start receiving ${selected.number}` : "Scan a valid receipt" : "Posting unavailable"}</button></section> : <section className="warehouse-next"><div className="empty-inline">No approved purchase order currently has quantity open to receive.</div></section>}</div>;
+  return <div className="warehouse-shell"><div className="warehouse-header"><div><h2>Warehouse work</h2></div><div className="warehouse-user"><span>{initials(snapshot.viewer.name)}</span><div><strong>{snapshot.viewer.name || "Signing in…"}</strong><small>{snapshot.viewer.role ? titleCase(snapshot.viewer.role) : ""}</small></div></div></div><section className="warehouse-launcher" aria-label="Warehouse work">{tasks.map((task) => <button type="button" key={task.label} onClick={() => navigate(task.view, undefined, task.tab)}><span className="task-glyph" aria-hidden="true">{task.glyph}</span><strong>{task.label}</strong><small>{task.count} work item{task.count === 1 ? "" : "s"}</small></button>)}</section>{next ? <section className="warehouse-next"><div className="step-header"><span>Next receipt</span><StatusBadge tone={next.daysLate > 0 ? "danger" : "info"}>{next.daysLate > 0 ? `${next.daysLate} days late` : next.expectedDate ? formatDate(next.expectedDate) : "No expected date"}</StatusBadge></div><h3>{selected ? `Receive ${selected.number}` : "No matching receipt"}</h3><p>{selected ? `${selected.vendor} · ${selected.customerRef ?? "Stock replenishment"}` : "Scan a different purchase order or SKU."}</p><form className="scan-zone" onSubmit={(event) => { event.preventDefault(); if (postingAvailable && selected) onReceive(selected); }}><span aria-hidden="true">▤</span><div><strong>Scan a purchase order or SKU</strong>{scanned && !scanMatch ? <small className="text-danger">No approved open purchase order matches “{scan.trim()}”.</small> : null}</div><input aria-label="Scan purchase order or SKU" placeholder="Scan or type code" autoComplete="off" value={scan} onChange={(event) => setScan(event.target.value)} /></form><button className="warehouse-primary" disabled={!postingAvailable || !selected} onClick={() => { if (selected) onReceive(selected); }}>{postingAvailable ? selected ? `Start receiving ${selected.number}` : "Scan a valid receipt" : "Posting unavailable"}</button></section> : <section className="warehouse-next"><div className="empty-inline">No approved purchase order currently has quantity open to receive.</div></section>}</div>;
 }
 
 
@@ -2825,6 +2864,10 @@ function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locat
     availableQuantity: number(item.availableQuantity),
     trackingPolicy: text(item.trackingPolicy, "quantity"),
     inventoryPolicy: text(item.inventoryPolicy, "stocked"),
+    dimensions: text(item.dimensions) || undefined,
+    finish: text(item.finish) || undefined,
+    material: text(item.material) || undefined,
+    category: text(item.category) || undefined,
   } : kind === "locations" ? {
     id: text(item.id),
     label: `${text(item.warehouseCode)} · ${text(item.code)} · ${text(item.name)}`,
@@ -2908,17 +2951,19 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
   const [customerId, setCustomerId] = useState(WALK_IN_CUSTOMER_ID);
   const [customer, setCustomer] = useState<LookupOption | null>(WALK_IN_CUSTOMER);
   const [lines, setLines] = useState<CounterSaleLine[]>(() => [newLine()]);
-  const [postingDate, setPostingDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [postingDate, setPostingDate] = useState(() => localDateString());
   const [currency, setCurrency] = useState("CAD");
   const [exchangeRate, setExchangeRate] = useState(1);
   const [settlement, setSettlement] = useState<"pay_now" | "on_account">("pay_now");
   const [paymentTerms, setPaymentTerms] = useState("Due on receipt");
-  const [dueDate, setDueDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [dueDate, setDueDate] = useState(() => localDateString());
   const [paymentMethod, setPaymentMethod] = useState("cash");
   const [paymentReference, setPaymentReference] = useState("");
   const [projectReference, setProjectReference] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  // Set when the server reports the attempt key already belongs to a posted sale.
+  const [alreadyPosted, setAlreadyPosted] = useState(false);
   const attemptKey = useRef("");
 
   const updateLine = (id: string, patch: Partial<CounterSaleLine>) => setLines((current) => current.map((line) => line.id === id ? { ...line, ...patch } : line));
@@ -2994,8 +3039,15 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
           },
         }),
       });
-      const result = await response.json() as { message?: string; error?: string | { message?: string } };
+      const result = await response.json() as { message?: string; error?: string | { code?: string; message?: string } };
       if (!response.ok) {
+        // The key is kept through a conflict: it means an earlier attempt with this key was
+        // already recorded (a network drop after the server posted), and a fresh key on the
+        // third try would post the same sale twice. Any other failure gets a new key.
+        if (typeof result.error === "object" && result.error?.code === "IDEMPOTENCY_CONFLICT") {
+          setAlreadyPosted(true);
+          throw new Error("An earlier attempt at this sale was already recorded by the server. Check Customer invoices before posting it again.");
+        }
         attemptKey.current = "";
         throw new Error(typeof result.error === "string" ? result.error : result.error?.message || "The counter sale could not be completed.");
       }
@@ -3011,7 +3063,7 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
   if (!canPost) return <section className="panel empty-state"><span className="empty-glyph" aria-hidden="true">$</span><h2>Counter-sale posting is restricted</h2><p>This action moves inventory and posts a receivable in one step. A manager or administrator with both inventory and financial posting access must complete it.</p></section>;
 
   return <form className="counter-sale-workspace" onSubmit={submit}>
-    {error ? <div className="error-summary" role="alert"><strong>Counter sale not completed</strong><p>{error}</p></div> : null}
+    {error ? <div className="error-summary" role="alert"><strong>Counter sale not completed</strong><p>{error}</p>{alreadyPosted ? <div className="dialog-actions"><button type="button" className="button secondary" onClick={() => { attemptKey.current = ""; setAlreadyPosted(false); setError(""); setLines([newLine()]); }}>Start a new sale</button></div> : null}</div> : null}
     <section className="panel counter-sale-customer" aria-labelledby="counter-customer-heading">
       <div className="panel-heading"><div><span className="section-kicker">1 · Customer</span><h2 id="counter-customer-heading">Who is buying?</h2></div><StatusBadge tone="success">{customerId === WALK_IN_CUSTOMER_ID ? "Walk-in selected" : "Selected"}</StatusBadge></div>
       <div className="command-form form-grid composer-header-fields">
@@ -3044,7 +3096,8 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
               locationId: "", locationLabel: "", locationAvailable: 0, lotId: "", inventoryUnitId: "" });
             setError("");
           }} placeholder="Search SKU, name, manufacturer code, or dimensions" /><small>{line.productId ? `${line.availableQuantity} available in scope · ${line.priceSource}` : "Price and availability appear with each result."}</small></label>
-          <label>Quantity<input type="number" min="0.001" step="0.001" value={line.quantity} disabled={line.trackingPolicy === "serial"} onChange={(event) => updateLine(line.id, { quantity: Number(event.target.value), locationId: "", locationLabel: "", locationAvailable: 0, lotId: "", inventoryUnitId: "" })} required /></label>
+          {/* The chosen location, lot, and serial survive a quantity change; the free-stock check beside the location flags a shortfall instead. */}
+          <label>Quantity<input type="number" min="0.001" step="0.001" value={line.quantity} disabled={line.trackingPolicy === "serial"} onChange={(event) => updateLine(line.id, { quantity: Number(event.target.value) })} required /></label>
           <label>UOM<input value={line.uomCode || "Base"} readOnly /></label>
           <label>Unit price<input type="number" min="0.01" step="0.01" value={line.unitAmount || ""} onChange={(event) => updateLine(line.id, { unitAmount: Number(event.target.value) })} required /></label>
           <label>Discount %<input type="number" min="0" max="100" step="0.01" value={line.discountRate} onChange={(event) => updateLine(line.id, { discountRate: Number(event.target.value) })} /></label>
@@ -3174,7 +3227,8 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
   // The hold is enforced when the order is confirmed. Carrying it here means a rep learns about
   // it before keying the lines rather than after.
   const [partnerCreditHold, setPartnerCreditHold] = useState(false);
-  const [date, setDate] = useState(draft?.date ?? futureDate(isPurchase ? 14 : 21));
+  // `||` rather than `??`: an order saved without an expected date reopens with the default.
+  const [date, setDate] = useState(draft?.date || futureDate(isPurchase ? 14 : 21));
   const [currency, setCurrency] = useState(draft?.currency ?? "CAD");
   const [exchangeRate, setExchangeRate] = useState(draft?.exchangeRateToBase ?? 1);
   const [terms, setTerms] = useState(draft?.paymentTerms ?? (isPurchase ? "Net 30" : "Net 15"));
@@ -3202,15 +3256,23 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [confirmingDiscard, setConfirmingDiscard] = useState(false);
+  // Validation messages appear once a save has been attempted, then clear field by field.
+  const [attempted, setAttempted] = useState(false);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
+  const errorId = useId();
   useEffect(() => { closeRef.current?.focus(); }, []);
   /**
    * Closing this dialog throws the draft away — nothing is persisted until the order is saved.
    * A composer holding keyed lines therefore asks first, so Escape or a mis-aimed × cannot
-   * silently discard a twelve-line order.
+   * silently discard a twelve-line order. An existing draft compares against what it opened
+   * with, so closing it untouched does not warn about losing changes that were never made.
    */
-  const dirty = Boolean(partnerId) || lines.some((line) => line.productId) || freight > 0 || fees > 0 || deposit > 0;
-  const requestClose = useCallback(() => { if (dirty) setConfirmingDiscard(true); else onClose(); }, [dirty, onClose]);
+  const formSignature = JSON.stringify({ partnerId, date, currency, exchangeRate, terms, dueDate, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, freight, freightTaxRate, fees, feeTaxRate, deposit, lines: lines.map((line) => [line.productId, line.quantity, line.unitAmount, line.uomId, line.discountRate, line.taxCode, line.taxRate, line.route, line.projectReference, line.supplyAllocations.map((allocation) => [allocation.salesOrderLineId, allocation.quantity])]) });
+  const [openedWith] = useState(formSignature);
+  const dirty = editing ? formSignature !== openedWith : Boolean(partnerId) || lines.some((line) => line.productId) || freight > 0 || fees > 0 || deposit > 0;
+  // Not memoized by hand: the dismiss hook reads the latest handler through a ref.
+  const requestClose = () => { if (dirty) setConfirmingDiscard(true); else onClose(); };
   useDialogDismiss(requestClose, submitting);
   useEffect(() => {
     if (!partnerId) return;
@@ -3284,32 +3346,75 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
     return { ...line, supplyAllocations, sourceSalesOrderLineId: supplyAllocations[0]?.salesOrderLineId ?? "" };
   }));
 
+  /**
+   * Every reason the order cannot be saved, re-evaluated on each render so a message clears as
+   * its field is fixed. Native `required` validation only flashed a tooltip on the first empty
+   * field, so "Save sales order draft" appeared to do nothing when a postal code was missing.
+   */
+  const collectProblems = () => {
+    const problems: Array<{ field: string; message: string }> = [];
+    const add = (field: string, message: string) => { if (!problems.some((problem) => problem.field === field)) problems.push({ field, message }); };
+    if (!partnerId) add("partnerId", `Select a ${isPurchase ? "vendor" : "customer"}.`);
+    if (!lines.length) add("lines", "Add at least one product line.");
+    lines.forEach((line, index) => {
+      if (!line.productId) add(`line-${line.id}-product`, `Line ${index + 1}: choose a product.`);
+      else if (!line.uomId) add(`line-${line.id}-product`, `Line ${index + 1}: this product has no configured ${isPurchase ? "purchasing" : "sales"} unit.`);
+      if (!(line.quantity > 0)) add(`line-${line.id}-quantity`, `Line ${index + 1}: enter a positive quantity.`);
+      if (line.unitAmount < 0) add(`line-${line.id}-unitAmount`, `Line ${index + 1}: the unit ${isPurchase ? "cost" : "price"} cannot be negative.`);
+      if (isPurchase && line.route !== "stock") {
+        const allocated = line.supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0);
+        if (!line.supplyAllocations.length || line.supplyAllocations.some((allocation) => !allocation.salesOrderLineId.trim() || !Number.isFinite(allocation.quantity) || allocation.quantity <= 0)) add(`line-${line.id}-allocations`, `Line ${index + 1} needs a sales-order demand and positive quantity for every allocation.`);
+        else if (new Set(line.supplyAllocations.map((allocation) => allocation.salesOrderLineId)).size !== line.supplyAllocations.length) add(`line-${line.id}-allocations`, `Line ${index + 1} allocates to the same sales-order demand more than once.`);
+        else if (allocated > line.quantity + 0.000001) add(`line-${line.id}-allocations`, `Line ${index + 1} allocates ${allocated} ${line.uomCode || "units"} from only ${line.quantity} ordered.`);
+        else if (line.route === "drop-ship" && line.supplyAllocations.length !== 1) add(`line-${line.id}-allocations`, `Line ${index + 1} is drop ship and must allocate to exactly one sales-order demand.`);
+      }
+    });
+    if (!date) add("date", `Enter the ${isPurchase ? "expected" : "requested"} delivery date.`);
+    if (!dueDate) add("dueDate", "Enter the payment due date.");
+    if (currency !== "CAD" && !(exchangeRate > 0)) add("exchangeRate", "Enter a positive exchange rate for the foreign currency.");
+    if (![freightTaxRate, feeTaxRate].every((rate) => Number.isFinite(rate) && rate >= 0 && rate <= 100)) add("freightTaxRate", "Freight and fee tax rates must be between 0% and 100%.");
+    if (!isPurchase) {
+      if (!shipToName.trim()) add("shipToName", "Enter the ship-to recipient.");
+      if (!shipToAddressLine1.trim()) add("shipToAddressLine1", "Enter the first ship-to address line.");
+      if (!shipToCity.trim()) add("shipToCity", "Enter the ship-to city.");
+      if (!shipToRegion.trim()) add("shipToRegion", "Enter the ship-to province or region.");
+      if (!shipToPostalCode.trim()) add("shipToPostalCode", "Enter the ship-to postal code.");
+      if (!shipToCountry.trim()) add("shipToCountry", "Enter the ship-to country.");
+    }
+    if (fastTrack && !approvalReason.trim()) add("approvalReason", "Enter an authorization note before creating and approving this order.");
+    return problems;
+  };
+  const problems = collectProblems();
+  const shownProblems = attempted ? problems : [];
+  const fieldMessage = (field: string) => shownProblems.find((problem) => problem.field === field)?.message;
+  const fieldProps = (field: string) => fieldMessage(field) ? { "aria-invalid": true as const, "aria-describedby": `${errorId}-${field}` } : {};
+  const fieldError = (field: string) => { const message = fieldMessage(field); return message ? <small className="field-error" id={`${errorId}-${field}`}>{message}</small> : null; };
+  const focusField = (field: string) => window.requestAnimationFrame(() => {
+    const target = formRef.current?.querySelector<HTMLElement>(`[data-field="${field}"] input, [data-field="${field}"] select`);
+    target?.scrollIntoView({ block: "center" });
+    target?.focus();
+  });
+  /**
+   * What was ordered, from the product's own attributes. The picker's detail line — price,
+   * availability, cost source — used to be saved here as the line's "configuration".
+   */
+  const configurationSnapshotFor = (productId: string) => {
+    const option = productOptions[productId];
+    const catalog = products.find((product) => product.id === productId);
+    const parts = [option?.dimensions ?? catalog?.dimensions, option?.finish ?? catalog?.finish, option?.material ?? catalog?.material].map((part) => part?.trim() ?? "").filter(Boolean);
+    return parts.length ? parts.join(" · ") : undefined;
+  };
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError("");
-    if (!partnerId) return setError(`Select a ${isPurchase ? "vendor" : "customer"}.`);
-    if (!lines.length || lines.some((line) => !line.productId || !line.uomId || line.quantity <= 0 || line.unitAmount < 0)) return setError("Every line needs a product with a configured unit, positive quantity, and valid unit amount.");
-    if (isPurchase) {
-      for (const [index, line] of lines.entries()) {
-        if (line.route === "stock") continue;
-        if (!line.supplyAllocations.length || line.supplyAllocations.some((allocation) => !allocation.salesOrderLineId.trim() || !Number.isFinite(allocation.quantity) || allocation.quantity <= 0)) return setError(`Line ${index + 1} needs a sales-order demand and positive quantity for every allocation.`);
-        if (new Set(line.supplyAllocations.map((allocation) => allocation.salesOrderLineId)).size !== line.supplyAllocations.length) return setError(`Line ${index + 1} allocates to the same sales-order demand more than once.`);
-        const allocated = line.supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0);
-        if (allocated > line.quantity + 0.000001) return setError(`Line ${index + 1} allocates ${allocated} ${line.uomCode || "units"} from only ${line.quantity} ordered.`);
-        if (line.route === "drop-ship" && line.supplyAllocations.length !== 1) return setError(`Line ${index + 1} is drop ship and must allocate to exactly one sales-order demand.`);
-      }
-    }
-    if (!date || !dueDate) return setError("Enter delivery and due dates.");
-    if (![freightTaxRate, feeTaxRate].every((rate) => Number.isFinite(rate) && rate >= 0 && rate <= 100)) return setError("Freight and fee tax rates must be between 0% and 100%.");
-    if (!isPurchase && (!shipToName.trim() || !shipToAddressLine1.trim() || !shipToCity.trim() || !shipToRegion.trim() || !shipToPostalCode.trim() || !shipToCountry.trim())) return setError("Enter a complete ship-to name and address before saving the sales-order draft.");
-    if (fastTrack && !approvalReason.trim()) return setError("Enter an authorization note before creating and approving this order.");
-    if (currency !== "CAD" && exchangeRate <= 0) return setError("Enter a positive exchange rate for the foreign currency.");
+    setAttempted(true);
+    if (problems.length) { focusField(problems[0].field); return; }
     setSubmitting(true);
     try {
       const normalizedLines = lines.map((line) => {
-        const product = productOptions[line.productId];
         const supplyAllocations = isPurchase && line.route !== "stock" ? line.supplyAllocations.map((allocation) => ({ salesOrderLineId: allocation.salesOrderLineId.trim(), quantity: allocation.quantity })) : undefined;
-        return { kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId, unitCostCents: isPurchase ? Math.round(line.unitAmount * 100) : undefined, unitPriceCents: isPurchase ? undefined : Math.round(line.unitAmount * 100), discountCents: Math.round(line.quantity * line.unitAmount * line.discountRate), taxable: line.taxRate > 0, taxCode: line.taxCode, taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: line.route.replaceAll("-", "_"), projectReference: line.projectReference, sourceSalesOrderLineId: supplyAllocations?.[0]?.salesOrderLineId, supplyAllocations, configurationSnapshot: product ? `${product.label} · ${product.detail}` : undefined };
+        return { kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId, unitCostCents: isPurchase ? Math.round(line.unitAmount * 100) : undefined, unitPriceCents: isPurchase ? undefined : Math.round(line.unitAmount * 100), discountCents: Math.round(line.quantity * line.unitAmount * line.discountRate), taxable: line.taxRate > 0, taxCode: line.taxCode, taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: line.route.replaceAll("-", "_"), projectReference: line.projectReference, sourceSalesOrderLineId: supplyAllocations?.[0]?.salesOrderLineId, supplyAllocations, configurationSnapshot: configurationSnapshotFor(line.productId) };
       });
       const chargeLines = [
         freight > 0 ? { kind: "charge", chargeType: "freight", description: "Freight", amountCents: Math.round(freight * 100), direction: "add", taxable: freightTaxRate > 0, refundable: false, taxCode: freightTaxRate > 0 ? "GST" : "Zero", taxRateBps: Math.round(freightTaxRate * 100) } : null,
@@ -3329,23 +3434,23 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
     { category: "Financial effect", label: "Refundable core / empty deposit", after: `${currency} ${deposit.toFixed(2)}` },
   ];
 
-  return <div className="modal-overlay" role="presentation"><section className="command-dialog create-order-dialog commercial-composer" role="dialog" aria-modal="true" aria-labelledby="create-order-title"><div className="dialog-header"><div><span className="section-kicker">{editing ? draft?.number : "New commercial commitment"}</span><h2 id="create-order-title">{editing ? `Edit ${isPurchase ? "purchase" : "sales"} order draft` : `Create multi-line ${isPurchase ? "purchase order" : "sales order"}`}</h2></div><button ref={closeRef} type="button" className="icon-button" aria-label="Close dialog" onClick={requestClose}>×</button></div><form onSubmit={submit}>
-    {error && <div className="error-summary" role="alert" tabIndex={-1}><strong>Review the order</strong><p>{error}</p></div>}
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog create-order-dialog commercial-composer" role="dialog" aria-modal="true" aria-labelledby="create-order-title"><div className="dialog-header"><div><span className="section-kicker">{editing ? draft?.number : "New commercial commitment"}</span><h2 id="create-order-title">{editing ? `Edit ${isPurchase ? "purchase" : "sales"} order draft` : `Create multi-line ${isPurchase ? "purchase order" : "sales order"}`}</h2></div><button ref={closeRef} type="button" className="icon-button" aria-label="Close dialog" onClick={requestClose}>×</button></div><form ref={formRef} onSubmit={submit} noValidate>
+    {error || shownProblems.length ? <div className="error-summary" role="alert" tabIndex={-1}><strong>Review the order</strong>{error ? <p>{error}</p> : null}{shownProblems.length ? <ul className="error-list">{shownProblems.map((problem) => <li key={problem.field}><button type="button" className="text-button" onClick={() => focusField(problem.field)}>{problem.message}</button></li>)}</ul> : null}</div> : null}
     {!isPurchase && partnerCreditHold ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>This customer is on credit hold</strong><p>The draft can be saved, but it cannot be confirmed until accounting releases the hold.</p></div></div> : null}
-    <div className="command-form form-grid composer-header-fields"><label>{isPurchase ? "Vendor" : "Customer"}<ReferenceSearchSelect kind="partners" role={partnerRole} value={partnerId} initialOptions={initialPartnerOptions} quickCreate={partnerRole} onSelect={(option) => { setPartnerId(option.id); setPartnerCreditHold(option.creditHold === true); const nextCurrency = option.currency || "CAD"; const nextTerms = option.paymentTerms || (isPurchase ? "Net 30" : "Net 15"); setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); if (!isPurchase) { setShipToName(option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); } }} placeholder={`Search ${partnerRole} name, code, or email`} /></label><label>{isPurchase ? "Expected delivery" : "Requested delivery"}<input type="date" value={date} onChange={(event) => { const nextDate = event.target.value; setDate(nextDate); setDueDate(dueDateForTerms(nextDate, terms)); }} /></label><label>Currency<select value={currency} onChange={(event) => { const nextCurrency = event.target.value; setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>{currency !== "CAD" && <label>Exchange rate to CAD<input type="number" min="0.0001" step="0.0001" value={exchangeRate} onChange={(event) => setExchangeRate(Number(event.target.value))} /></label>}<label>Payment terms<select value={terms} onChange={(event) => { const nextTerms = event.target.value; setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label>Due date<input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} /></label></div>
-    {!isPurchase ? <fieldset className="composer-lines"><legend>Ship-to address</legend><div className="command-form form-grid composer-header-fields"><label className="project-field">Saved job site / ship-to<ReferenceSearchSelect kind="partnerAddresses" partnerId={partnerId} value={shipToAddressId} initialOptions={[]} onSelect={(option) => { setShipToAddressId(option.id); setShipToName(option.contactName || option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); if (option.deliveryInstructions) setDeliveryInstructions(option.deliveryInstructions); }} placeholder={partnerId ? "Search this customer's saved addresses" : "Select a customer first"} /></label><label>Recipient<input value={shipToName} onChange={(event) => setShipToName(event.target.value)} required /></label><label>Address line 1<input value={shipToAddressLine1} onChange={(event) => setShipToAddressLine1(event.target.value)} required /></label><label>Address line 2<input value={shipToAddressLine2} onChange={(event) => setShipToAddressLine2(event.target.value)} /></label><label>City<input value={shipToCity} onChange={(event) => setShipToCity(event.target.value)} required /></label><label>Province / region<input value={shipToRegion} onChange={(event) => setShipToRegion(event.target.value)} required /></label><label>Postal code<input value={shipToPostalCode} onChange={(event) => setShipToPostalCode(event.target.value)} required /></label><label>Country<input value={shipToCountry} onChange={(event) => setShipToCountry(event.target.value.toUpperCase())} required /></label><label>Delivery instructions<input value={deliveryInstructions} onChange={(event) => setDeliveryInstructions(event.target.value)} placeholder="Dock, access, or appointment details" /></label></div><div className="composer-address-actions"><button type="button" className="button secondary" disabled={savingAddress || !partnerId || !shipToAddressLine1.trim() || !shipToCity.trim()} onClick={() => void saveShipToAddress()}>{savingAddress ? "Saving…" : "Save to this customer's address book"}</button>{addressNotice ? <span className="read-only-label" role="status">{addressNotice}</span> : null}</div></fieldset> : null}
+    <div className="command-form form-grid composer-header-fields"><label data-field="partnerId"><span>{isPurchase ? "Vendor" : "Customer"}{requiredMark}</span><ReferenceSearchSelect kind="partners" role={partnerRole} value={partnerId} initialOptions={initialPartnerOptions} quickCreate={partnerRole} onSelect={(option) => { setPartnerId(option.id); setPartnerCreditHold(option.creditHold === true); const nextCurrency = option.currency || "CAD"; const nextTerms = option.paymentTerms || (isPurchase ? "Net 30" : "Net 15"); setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); if (!isPurchase) { setShipToName(option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); } }} placeholder={`Search ${partnerRole} name, code, or email`} />{fieldError("partnerId")}</label><label data-field="date"><span>{isPurchase ? "Expected delivery" : "Requested delivery"}{requiredMark}</span><input type="date" value={date} {...fieldProps("date")} onChange={(event) => { const nextDate = event.target.value; setDate(nextDate); setDueDate(dueDateForTerms(nextDate, terms)); }} />{fieldError("date")}</label><label>Currency<select value={currency} onChange={(event) => { const nextCurrency = event.target.value; setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>{currency !== "CAD" && <label data-field="exchangeRate"><span>Exchange rate to CAD{requiredMark}</span><NumberField min="0.0001" step="0.0001" value={exchangeRate} onChange={setExchangeRate} {...fieldProps("exchangeRate")} />{fieldError("exchangeRate")}</label>}<label>Payment terms<select value={terms} onChange={(event) => { const nextTerms = event.target.value; setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label data-field="dueDate"><span>Due date{requiredMark}</span><input type="date" value={dueDate} {...fieldProps("dueDate")} onChange={(event) => setDueDate(event.target.value)} />{fieldError("dueDate")}</label></div>
+    {!isPurchase ? <fieldset className="composer-lines"><legend>Ship-to address</legend><div className="command-form form-grid composer-header-fields"><label className="project-field">Saved job site / ship-to<ReferenceSearchSelect kind="partnerAddresses" partnerId={partnerId} value={shipToAddressId} initialOptions={[]} onSelect={(option) => { setShipToAddressId(option.id); setShipToName(option.contactName || option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); if (option.deliveryInstructions) setDeliveryInstructions(option.deliveryInstructions); }} placeholder={partnerId ? "Search this customer's saved addresses" : "Select a customer first"} /></label><label data-field="shipToName"><span>Recipient{requiredMark}</span><input value={shipToName} onChange={(event) => setShipToName(event.target.value)} required {...fieldProps("shipToName")} />{fieldError("shipToName")}</label><label data-field="shipToAddressLine1"><span>Address line 1{requiredMark}</span><input value={shipToAddressLine1} onChange={(event) => setShipToAddressLine1(event.target.value)} required {...fieldProps("shipToAddressLine1")} />{fieldError("shipToAddressLine1")}</label><label>Address line 2<input value={shipToAddressLine2} onChange={(event) => setShipToAddressLine2(event.target.value)} /></label><label data-field="shipToCity"><span>City{requiredMark}</span><input value={shipToCity} onChange={(event) => setShipToCity(event.target.value)} required {...fieldProps("shipToCity")} />{fieldError("shipToCity")}</label><label data-field="shipToRegion"><span>Province / region{requiredMark}</span><input value={shipToRegion} onChange={(event) => setShipToRegion(event.target.value)} required {...fieldProps("shipToRegion")} />{fieldError("shipToRegion")}</label><label data-field="shipToPostalCode"><span>Postal code{requiredMark}</span><input value={shipToPostalCode} onChange={(event) => setShipToPostalCode(event.target.value)} required {...fieldProps("shipToPostalCode")} />{fieldError("shipToPostalCode")}</label><label data-field="shipToCountry"><span>Country{requiredMark}</span><input value={shipToCountry} onChange={(event) => setShipToCountry(event.target.value.toUpperCase())} required {...fieldProps("shipToCountry")} />{fieldError("shipToCountry")}</label><label>Delivery instructions<input value={deliveryInstructions} onChange={(event) => setDeliveryInstructions(event.target.value)} placeholder="Dock, access, or appointment details" /></label></div><div className="composer-address-actions"><button type="button" className="button secondary" disabled={savingAddress || !partnerId || !shipToAddressLine1.trim() || !shipToCity.trim()} onClick={() => void saveShipToAddress()}>{savingAddress ? "Saving…" : "Save to this customer's address book"}</button>{addressNotice ? <span className="read-only-label" role="status">{addressNotice}</span> : null}</div></fieldset> : null}
     <section className="composer-lines" aria-labelledby="composer-lines-title">
       <div className="composer-section-heading"><div><strong id="composer-lines-title">Product lines</strong></div><button type="button" className="button secondary" onClick={() => setLines((current) => [...current, initialLine()])}>Add product line</button></div>
       {lines.map((line, index) => {
         const selected = productOptions[line.productId];
         return <fieldset key={line.id} className="composer-line">
           <legend>Line {index + 1}</legend>
-          <label className="product-field">Product / configuration<ReferenceSearchSelect kind="products" role={partnerRole} partnerId={partnerId} quantity={line.quantity} warehouseId={warehouseId} currency={currency} exchangeRateToBase={exchangeRate} value={line.productId} initialOptions={line.productId && productOptions[line.productId] ? [productOptions[line.productId]] : []} quickCreate="product" onSelect={(option) => { setProductOptions((current) => ({ ...current, [option.id]: option })); updateLine(line.id, { productId: option.id, ...(option.unitAmount != null ? { unitAmount: option.unitAmount } : {}), uomId: option.uomId ?? "", uomCode: option.uomCode ?? "", priceSource: option.priceSource ?? "Catalog price" }); }} placeholder="Search SKU, name, manufacturer SKU, or dimensions" /><small>{selected?.detail}</small></label>
-          <label>Quantity ({line.uomCode || "unit"})<input type="number" min="1" value={line.quantity} onChange={(event) => updateLine(line.id, { quantity: Number(event.target.value) })} />{line.uomCode ? null : <small>Select a configured product unit</small>}</label>
-          <label>Unit {isPurchase ? "cost" : "price"}<input type="number" min="0" step="0.01" value={line.unitAmount} onChange={(event) => updateLine(line.id, { unitAmount: Number(event.target.value), priceSource: "Manual override" })} /><small>{line.priceSource}</small></label>
-          <label>Discount %<input type="number" min="0" max="100" step="0.1" value={line.discountRate} onChange={(event) => updateLine(line.id, { discountRate: Number(event.target.value) })} /></label>
+          <label className="product-field" data-field={`line-${line.id}-product`}><span>Product / configuration{requiredMark}</span><ReferenceSearchSelect kind="products" role={partnerRole} partnerId={partnerId} quantity={line.quantity} warehouseId={warehouseId} currency={currency} exchangeRateToBase={exchangeRate} value={line.productId} initialOptions={line.productId && productOptions[line.productId] ? [productOptions[line.productId]] : []} quickCreate="product" onSelect={(option) => { setProductOptions((current) => ({ ...current, [option.id]: option })); updateLine(line.id, { productId: option.id, ...(option.unitAmount != null ? { unitAmount: option.unitAmount } : {}), uomId: option.uomId ?? "", uomCode: option.uomCode ?? "", priceSource: option.priceSource ?? "Catalog price" }); }} placeholder="Search SKU, name, manufacturer SKU, or dimensions" /><small>{selected?.detail}</small>{fieldError(`line-${line.id}-product`)}</label>
+          <label data-field={`line-${line.id}-quantity`}><span>Quantity ({line.uomCode || "unit"}){requiredMark}</span><NumberField min="1" value={line.quantity} onChange={(quantity) => updateLine(line.id, { quantity })} {...fieldProps(`line-${line.id}-quantity`)} />{line.uomCode ? null : <small>Select a configured product unit</small>}{fieldError(`line-${line.id}-quantity`)}</label>
+          <label data-field={`line-${line.id}-unitAmount`}>Unit {isPurchase ? "cost" : "price"}<NumberField min="0" step="0.01" value={line.unitAmount} onChange={(unitAmount) => updateLine(line.id, { unitAmount, priceSource: "Manual override" })} {...fieldProps(`line-${line.id}-unitAmount`)} /><small>{line.priceSource}</small>{fieldError(`line-${line.id}-unitAmount`)}</label>
+          <label>Discount %<NumberField min="0" max="100" step="0.1" value={line.discountRate} onChange={(discountRate) => updateLine(line.id, { discountRate })} /></label>
           <label>Tax code<select value={line.taxCode} onChange={(event) => updateLine(line.id, { taxCode: event.target.value, taxRate: event.target.value === "GST" ? defaultTaxRateBps / 100 : 0 })}><option>GST</option><option>Zero</option><option>Exempt</option></select></label>
-          <label>Tax %<input type="number" min="0" value={line.taxRate} onChange={(event) => updateLine(line.id, { taxRate: Number(event.target.value) })} /></label>
+          <label>Tax %<NumberField min="0" value={line.taxRate} onChange={(taxRate) => updateLine(line.id, { taxRate })} /></label>
           <label>Fulfillment route<select value={line.route} onChange={(event) => {
             const route = event.target.value as ComposerLine["route"];
             const existing = route === "stock" ? [] : route === "drop-ship" ? line.supplyAllocations.slice(0, 1) : line.supplyAllocations;
@@ -3353,22 +3458,23 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
             updateLine(line.id, { route, supplyAllocations, sourceSalesOrderLineId: supplyAllocations[0]?.salesOrderLineId ?? "" });
           }}><option value="stock">Stock</option><option value="special-order">Special order</option><option value="drop-ship">Drop ship</option></select></label>
           <label className="project-field">Customer / project / opening<input value={line.projectReference} onChange={(event) => updateLine(line.id, { projectReference: event.target.value })} placeholder="Optional allocation" /></label>
-          {isPurchase && line.route !== "stock" ? <div className="project-field supply-allocation-editor">
+          {isPurchase && line.route !== "stock" ? <div className="project-field supply-allocation-editor" data-field={`line-${line.id}-allocations`}>
             <div className="supply-allocation-heading"><div><strong>Customer-demand allocations</strong><small>Received usable quantity is reserved to these sales orders automatically, in the order shown.</small></div><button type="button" className="button secondary" disabled={line.route === "drop-ship" || line.supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0) >= line.quantity} onClick={() => addSupplyAllocation(line.id)}>Add allocation</button></div>
             {line.supplyAllocations.map((allocation, allocationIndex) => <div key={allocation.id} className="supply-allocation-row">
               <label>Sales-order demand<ReferenceSearchSelect kind="salesOrderLines" role={line.route === "drop-ship" ? "drop_ship" : "special_order"} partnerId={initialOrder?.id} productId={line.productId} value={allocation.salesOrderLineId} initialOptions={allocation.salesOrderLineId ? [{ id: allocation.salesOrderLineId, label: allocation.label || `Saved allocation ${allocationIndex + 1}`, detail: "Current quantity allocation" }] : []} onSelect={(option) => updateSupplyAllocation(line.id, allocation.id, { salesOrderLineId: option.id, label: `${option.label}${option.detail ? ` · ${option.detail}` : ""}` })} placeholder="Search sales order, customer, or SKU" /></label>
-              <label>Allocated quantity ({line.uomCode || "unit"})<input type="number" min="0.000001" max={line.quantity} step="any" value={allocation.quantity} onChange={(event) => updateSupplyAllocation(line.id, allocation.id, { quantity: Number(event.target.value) })} /></label>
+              <label>Allocated quantity ({line.uomCode || "unit"})<NumberField min="0.000001" max={line.quantity} step="any" value={allocation.quantity} onChange={(quantity) => updateSupplyAllocation(line.id, allocation.id, { quantity })} /></label>
               {line.route !== "drop-ship" ? <button type="button" className="button secondary" onClick={() => removeSupplyAllocation(line.id, allocation.id)}>Remove</button> : null}
             </div>)}
             <small>{line.supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0)} of {line.quantity} {line.uomCode || "units"} allocated; any remainder stays general incoming supply.</small>
+            {fieldError(`line-${line.id}-allocations`)}
           </div> : null}
           {!isPurchase && line.route !== "stock" ? <div className="project-field read-only-label">Save this demand first. Dedicated supply is linked from the purchase-order composer so both sides are recorded atomically.</div> : null}
           {lines.length > 1 && <button type="button" className="remove-composer-line" onClick={() => setLines((current) => current.filter((item) => item.id !== line.id))}>Remove line {index + 1}</button>}
         </fieldset>;
       })}
     </section>
-    <div className="composer-bottom-grid"><fieldset className="composer-charges"><legend>Charges, fees, and deposits</legend><label>Freight<input type="number" min="0" step="0.01" value={freight} onChange={(event) => setFreight(Number(event.target.value))} /></label><label>Freight tax %<input type="number" min="0" max="100" step="0.01" value={freightTaxRate} onChange={(event) => setFreightTaxRate(Number(event.target.value))} /></label><label>Other fees<input type="number" min="0" step="0.01" value={fees} onChange={(event) => setFees(Number(event.target.value))} /></label><label>Fee tax %<input type="number" min="0" max="100" step="0.01" value={feeTaxRate} onChange={(event) => setFeeTaxRate(Number(event.target.value))} /></label><label>Refundable core / empty deposit<input type="number" min="0" step="0.01" value={deposit} onChange={(event) => setDeposit(Number(event.target.value))} /></label></fieldset><dl className="composer-totals"><div><dt>Items</dt><dd>{currency} {itemSubtotal.toFixed(2)}</dd></div><div><dt>Discounts</dt><dd>−{currency} {discountTotal.toFixed(2)}</dd></div><div><dt>Freight & fees</dt><dd>{currency} {(freight + fees).toFixed(2)}</dd></div><div><dt>Refundable deposits</dt><dd>{currency} {deposit.toFixed(2)}</dd></div><div><dt>Tax</dt><dd>{currency} {taxTotal.toFixed(2)}</dd></div><div className="total"><dt>{fastTrack ? "Authorized total" : "Draft total"}</dt><dd>{currency} {total.toFixed(2)}</dd></div></dl></div>
-    {canFastTrack && !editing ? <fieldset className="composer-lines"><legend>Authorization path</legend><label><span><input type="checkbox" checked={fastTrack} onChange={(event) => setFastTrack(event.target.checked)} /> Fast-track with my signing authority</span><small>{isPurchase ? "Create this purchase order directly as approved." : "Create this sales order directly as confirmed."} Your identity, note, and timestamp are written to the audit trail.</small></label>{fastTrack ? <label>Authorization note<input value={approvalReason} onChange={(event) => setApprovalReason(event.target.value)} placeholder="Why I am authorizing this commitment" required /></label> : null}</fieldset> : null}
+    <div className="composer-bottom-grid"><fieldset className="composer-charges"><legend>Charges, fees, and deposits</legend><label>Freight<NumberField min="0" step="0.01" value={freight} onChange={setFreight} /></label><label data-field="freightTaxRate">Freight tax %<NumberField min="0" max="100" step="0.01" value={freightTaxRate} onChange={setFreightTaxRate} {...fieldProps("freightTaxRate")} />{fieldError("freightTaxRate")}</label><label>Other fees<NumberField min="0" step="0.01" value={fees} onChange={setFees} /></label><label>Fee tax %<NumberField min="0" max="100" step="0.01" value={feeTaxRate} onChange={setFeeTaxRate} /></label><label>Refundable core / empty deposit<NumberField min="0" step="0.01" value={deposit} onChange={setDeposit} /></label></fieldset><dl className="composer-totals"><div><dt>Items</dt><dd>{currency} {itemSubtotal.toFixed(2)}</dd></div><div><dt>Discounts</dt><dd>−{currency} {discountTotal.toFixed(2)}</dd></div><div><dt>Freight & fees</dt><dd>{currency} {(freight + fees).toFixed(2)}</dd></div><div><dt>Refundable deposits</dt><dd>{currency} {deposit.toFixed(2)}</dd></div><div><dt>Tax</dt><dd>{currency} {taxTotal.toFixed(2)}</dd></div><div className="total"><dt>{fastTrack ? "Authorized total" : "Draft total"}</dt><dd>{currency} {total.toFixed(2)}</dd></div></dl></div>
+    {canFastTrack && !editing ? <fieldset className="composer-lines"><legend>Authorization path</legend><label><span><input type="checkbox" checked={fastTrack} onChange={(event) => setFastTrack(event.target.checked)} /> Fast-track with my signing authority</span><small>{isPurchase ? "Create this purchase order directly as approved." : "Create this sales order directly as confirmed."} Your identity, note, and timestamp are written to the audit trail.</small></label>{fastTrack ? <label data-field="approvalReason"><span>Authorization note{requiredMark}</span><input value={approvalReason} onChange={(event) => setApprovalReason(event.target.value)} placeholder="Why I am authorizing this commitment" required {...fieldProps("approvalReason")} />{fieldError("approvalReason")}</label> : null}</fieldset> : null}
     <ImpactPreview lines={impact} /><div className="dialog-actions">
       {confirmingDiscard
         ? <><span className="discard-warning" role="alert">Nothing here has been saved yet. Discarding loses the lines you keyed.</span><button type="button" className="button secondary" onClick={() => setConfirmingDiscard(false)}>Keep editing</button><button type="button" className="button danger" onClick={onClose}>Discard draft</button></>
@@ -3384,6 +3490,8 @@ type CommandPanelProps = {
   so?: SalesOrder;
   locations: LocationOption[];
   countBalances: InventoryLocationBalance[];
+  /** A vendor-return price allowance posts a financial credit, which needs its own permission. */
+  canPostFinancial?: boolean;
   onClose: () => void;
   onSubmit: (payload: Record<string, unknown>) => Promise<void>;
   onRequestCountApproval: (payload: Record<string, unknown>) => Promise<{ approval: CountApproval; message: string }>;
@@ -3391,7 +3499,7 @@ type CommandPanelProps = {
   onRefreshCountApproval: (approval: CountApproval) => Promise<CountApproval>;
 };
 
-function CommandPanel({ command, warehouseId, po, so, locations, countBalances, onClose, onSubmit, onRequestCountApproval, onApproveCountApproval, onRefreshCountApproval }: CommandPanelProps) {
+function CommandPanel({ command, warehouseId, po, so, locations, countBalances, canPostFinancial = false, onClose, onSubmit, onRequestCountApproval, onApproveCountApproval, onRefreshCountApproval }: CommandPanelProps) {
   const initialPoLine = po?.lines.find((line) => command.kind === "reopen" ? line.closed > 0 : command.kind === "reverse" ? line.latestReceiptReversible > 0 : command.kind === "vendor-return" ? line.received - line.returned > 0 : line.open > 0) ?? po?.lines[0];
   const initialSoLine = so?.lines?.find((line) => command.kind === "ship" ? line.reserved > 0 : command.kind === "immediate-sale" ? line.fulfillmentRoute === "stock" && line.open > line.reserved && line.productAvailable > 0 : command.kind === "customer-return" ? line.shipped - line.returned > 0 : line.open > 0) ?? so?.lines?.[0];
   const [selectedPoLineId, setSelectedPoLineId] = useState(initialPoLine?.id ?? "");
@@ -3418,7 +3526,7 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
   const [disposition, setDisposition] = useState(defaults.disposition);
   const [expectedDate, setExpectedDate] = useState(futureDate(7));
   const [carrier, setCarrier] = useState(command.kind === "immediate-sale" ? "Customer pickup" : "");
-  const [receiptDate, setReceiptDate] = useState(new Date().toISOString().slice(0, 10));
+  const [receiptDate, setReceiptDate] = useState(localDateString());
   const [packingSlipNumber, setPackingSlipNumber] = useState("");
   const [serviceLevel, setServiceLevel] = useState("");
   const [trackingNumber, setTrackingNumber] = useState("");
@@ -3450,7 +3558,15 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
   const [serialNumber, setSerialNumber] = useState("");
   const [lotId, setLotId] = useState("");
   const [inventoryUnitId, setInventoryUnitId] = useState("");
-  const [receiptLines, setReceiptLines] = useState(() => (po?.lines ?? []).filter((line) => line.open > 0 && line.fulfillmentRoute !== "drop_ship").map((line) => ({ lineId: line.id, lineVersion: line.version, quantity: line.trackingPolicy === "serial" ? Math.min(line.open, 1) : line.open, damagedQuantity: 0, locationId: preferredLocation(line) ?? defaultPostingLocation?.id ?? "", uomId: line.orderedUomId, approvalId: "", lotNumber: "", serialNumber: "" })));
+  const fullOpenQuantity = (line: PurchaseLine) => line.trackingPolicy === "serial" ? Math.min(line.open, 1) : line.open;
+  const [receiptLines, setReceiptLines] = useState(() => {
+    const openLines = (po?.lines ?? []).filter((line) => line.open > 0 && line.fulfillmentRoute !== "drop_ship");
+    // One line is received in full by default. A truck with several starts every line at zero
+    // so nothing is received by omission; "Receive all open lines" fills them on request.
+    const startEmpty = openLines.length > 1;
+    return openLines.map((line) => ({ lineId: line.id, lineVersion: line.version, quantity: startEmpty ? 0 : fullOpenQuantity(line), damagedQuantity: 0, locationId: preferredLocation(line) ?? defaultPostingLocation?.id ?? "", uomId: line.orderedUomId, approvalId: "", lotNumber: "", serialNumber: "" }));
+  });
+  const receiveAllOpenLines = () => setReceiptLines((current) => current.map((receiptLine) => { const line = po?.lines.find((item) => item.id === receiptLine.lineId); return line ? { ...receiptLine, quantity: fullOpenQuantity(line) } : receiptLine; }));
   const [overReceiptApprovalId, setOverReceiptApprovalId] = useState("");
   const isBatchReceipt = command.kind === "receive" && receiptLines.length > 1;
   const receiptQuantity = isBatchReceipt ? receiptLines.reduce((sum, line) => sum + Math.max(line.quantity, 0), 0) : quantity;
@@ -3561,10 +3677,10 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
     finally { setSubmitting(false); }
   };
 
-  return <div className="modal-overlay" role="presentation"><section className="command-dialog" role="dialog" aria-modal="true" aria-labelledby="command-title"><div className="dialog-header"><div><span className="section-kicker">{command.entityNumber}</span><h2 id="command-title">{title}</h2></div><button className="icon-button" aria-label="Close dialog" onClick={onClose}>×</button></div><form onSubmit={submit}>
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog" role="dialog" aria-modal="true" aria-labelledby="command-title"><div className="dialog-header"><div><span className="section-kicker">{command.entityNumber}</span><h2 id="command-title">{title}</h2></div><button className="icon-button" aria-label="Close dialog" onClick={onClose}>×</button></div><form onSubmit={submit} noValidate>
     {error && <div className="error-summary" role="alert"><strong>Review the highlighted information</strong><p>{error}</p></div>}
     <fieldset className="command-fields-lock" disabled={command.kind === "count" && Boolean(countApproval)}>
-      <CommandFields receiptDate={receiptDate} setReceiptDate={setReceiptDate} packingSlipNumber={packingSlipNumber} setPackingSlipNumber={setPackingSlipNumber} warehouseId={warehouseId} kind={command.kind} po={effectivePo} so={effectiveSo} purchaseLines={po?.lines ?? []} salesLines={so?.lines ?? []} selectedPoLineId={selectedPoLine?.id ?? ""} selectedSoLineId={selectedSoLine?.id ?? ""} setSelectedPoLineId={choosePoLine} setSelectedSoLineId={chooseSoLine} quantity={quantity} secondaryQuantity={secondaryQuantity} setQuantity={setQuantity} setSecondaryQuantity={setSecondaryQuantity} receiptLines={receiptLines} updateReceiptLine={updateReceiptLine} lotNumber={lotNumber} setLotNumber={setLotNumber} serialNumber={serialNumber} setSerialNumber={setSerialNumber} lotId={lotId} setLotId={setLotId} inventoryUnitId={inventoryUnitId} setInventoryUnitId={setInventoryUnitId} overReceiptApprovalId={overReceiptApprovalId} setOverReceiptApprovalId={setOverReceiptApprovalId} reason={reason} setReason={setReason} disposition={disposition} setDisposition={setDisposition} expectedDate={expectedDate} setExpectedDate={setExpectedDate} carrier={carrier} setCarrier={setCarrier} serviceLevel={serviceLevel} setServiceLevel={setServiceLevel} trackingNumber={trackingNumber} setTrackingNumber={setTrackingNumber} billOfLadingNumber={billOfLadingNumber} setBillOfLadingNumber={setBillOfLadingNumber} max={max} countBalances={countBalances} countLocationId={countLocationId} setCountLocationId={chooseCountLocation} usableLocations={usableLocations} quarantineLocations={quarantineLocations} postingLocationId={postingLocationId} setPostingLocationId={setPostingLocationId} quarantineLocationId={quarantineLocationId} setQuarantineLocationId={setQuarantineLocationId} />
+      <CommandFields receiptDate={receiptDate} setReceiptDate={setReceiptDate} packingSlipNumber={packingSlipNumber} setPackingSlipNumber={setPackingSlipNumber} warehouseId={warehouseId} kind={command.kind} po={effectivePo} so={effectiveSo} purchaseLines={po?.lines ?? []} salesLines={so?.lines ?? []} selectedPoLineId={selectedPoLine?.id ?? ""} selectedSoLineId={selectedSoLine?.id ?? ""} setSelectedPoLineId={choosePoLine} setSelectedSoLineId={chooseSoLine} quantity={quantity} secondaryQuantity={secondaryQuantity} setQuantity={setQuantity} setSecondaryQuantity={setSecondaryQuantity} receiptLines={receiptLines} updateReceiptLine={updateReceiptLine} receiveAllOpenLines={receiveAllOpenLines} canPostFinancial={canPostFinancial} lotNumber={lotNumber} setLotNumber={setLotNumber} serialNumber={serialNumber} setSerialNumber={setSerialNumber} lotId={lotId} setLotId={setLotId} inventoryUnitId={inventoryUnitId} setInventoryUnitId={setInventoryUnitId} overReceiptApprovalId={overReceiptApprovalId} setOverReceiptApprovalId={setOverReceiptApprovalId} reason={reason} setReason={setReason} disposition={disposition} setDisposition={setDisposition} expectedDate={expectedDate} setExpectedDate={setExpectedDate} carrier={carrier} setCarrier={setCarrier} serviceLevel={serviceLevel} setServiceLevel={setServiceLevel} trackingNumber={trackingNumber} setTrackingNumber={setTrackingNumber} billOfLadingNumber={billOfLadingNumber} setBillOfLadingNumber={setBillOfLadingNumber} max={max} countBalances={countBalances} countLocationId={countLocationId} setCountLocationId={chooseCountLocation} usableLocations={usableLocations} quarantineLocations={quarantineLocations} postingLocationId={postingLocationId} setPostingLocationId={setPostingLocationId} quarantineLocationId={quarantineLocationId} setQuarantineLocationId={setQuarantineLocationId} />
     </fieldset>
     {command.kind === "count" && approvalRequired ? <div className={`count-approval-status ${countApproval?.status ?? "required"}`} role="status"><strong>{countApproval ? `Approval ${countApproval.status}` : "Manager approval required"}</strong><p>{approvalMessage}</p>{countApproval ? <small>Request ID: {countApproval.id} · Version {countApproval.version}</small> : null}</div> : null}
     <ImpactPreview lines={impact} />
@@ -3579,6 +3695,7 @@ type CommandFieldsProps = {
   quantity: number; secondaryQuantity: number; setQuantity: (value: number) => void; setSecondaryQuantity: (value: number) => void;
   receiptLines: Array<{ lineId: string; lineVersion: number; quantity: number; damagedQuantity: number; locationId: string; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>;
   updateReceiptLine: (lineId: string, patch: Partial<{ quantity: number; damagedQuantity: number; locationId: string; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>) => void;
+  receiveAllOpenLines: () => void; canPostFinancial: boolean;
   lotNumber: string; setLotNumber: (value: string) => void; serialNumber: string; setSerialNumber: (value: string) => void;
   lotId: string; setLotId: (value: string) => void; inventoryUnitId: string; setInventoryUnitId: (value: string) => void;
   overReceiptApprovalId: string; setOverReceiptApprovalId: (value: string) => void;
@@ -3592,29 +3709,31 @@ type CommandFieldsProps = {
   quarantineLocationId: string; setQuarantineLocationId: (value: string) => void;
 };
 
-function CommandFields({ receiptDate, setReceiptDate, packingSlipNumber, setPackingSlipNumber, warehouseId, kind, po, so, purchaseLines, salesLines, selectedPoLineId, selectedSoLineId, setSelectedPoLineId, setSelectedSoLineId, quantity, secondaryQuantity, setQuantity, setSecondaryQuantity, receiptLines, updateReceiptLine, lotNumber, setLotNumber, serialNumber, setSerialNumber, lotId, setLotId, inventoryUnitId, setInventoryUnitId, overReceiptApprovalId, setOverReceiptApprovalId, reason, setReason, disposition, setDisposition, expectedDate, setExpectedDate, carrier, setCarrier, serviceLevel, setServiceLevel, trackingNumber, setTrackingNumber, billOfLadingNumber, setBillOfLadingNumber, max, countBalances, countLocationId, setCountLocationId, usableLocations, quarantineLocations, postingLocationId, setPostingLocationId, quarantineLocationId, setQuarantineLocationId }: CommandFieldsProps) {
+function CommandFields({ receiptDate, setReceiptDate, packingSlipNumber, setPackingSlipNumber, warehouseId, kind, po, so, purchaseLines, salesLines, selectedPoLineId, selectedSoLineId, setSelectedPoLineId, setSelectedSoLineId, quantity, secondaryQuantity, setQuantity, setSecondaryQuantity, receiptLines, updateReceiptLine, receiveAllOpenLines, canPostFinancial, lotNumber, setLotNumber, serialNumber, setSerialNumber, lotId, setLotId, inventoryUnitId, setInventoryUnitId, overReceiptApprovalId, setOverReceiptApprovalId, reason, setReason, disposition, setDisposition, expectedDate, setExpectedDate, carrier, setCarrier, serviceLevel, setServiceLevel, trackingNumber, setTrackingNumber, billOfLadingNumber, setBillOfLadingNumber, max, countBalances, countLocationId, setCountLocationId, usableLocations, quarantineLocations, postingLocationId, setPostingLocationId, quarantineLocationId, setQuarantineLocationId }: CommandFieldsProps) {
   const eligiblePurchaseLines = purchaseLines.filter((line) => kind === "reverse" ? line.latestReceiptReversible > 0 : true);
   const purchasePolicy = po?.lines[0]?.trackingPolicy ?? "quantity";
   const salesPolicy = so?.lines?.[0]?.trackingPolicy ?? "quantity";
   const purchaseLineSelector = eligiblePurchaseLines.length > 1 ? <SearchableSelect label="Purchase order line" value={selectedPoLineId} setValue={setSelectedPoLineId} options={eligiblePurchaseLines.map((line) => ({ id: line.id, label: `${line.sku} · ${line.product}`, detail: kind === "reverse" ? `${line.latestReceiptReversible} reversible on latest receipt` : `${line.open} open` }))} /> : null;
   const salesLineSelector = salesLines.length > 1 ? <SearchableSelect label="Sales order line" value={selectedSoLineId} setValue={setSelectedSoLineId} options={salesLines.map((line) => ({ id: line.id, label: `${line.sku} · ${line.product}`, detail: kind === "customer-return" ? `${Math.max(line.shipped - line.returned, 0)} returnable` : kind === "ship" ? `${line.reserved} reserved to ship` : kind === "immediate-sale" ? `${Math.max(line.open - line.reserved, 0)} unreserved open` : `${line.open} open` }))} /> : null;
   const usableLocationField = <label>Usable destination<ReferenceSearchSelect kind="locations" role="usable" warehouseId={warehouseId} value={postingLocationId} initialOptions={usableLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} quickCreate="location" onSelect={(option) => setPostingLocationId(option.id)} placeholder="Search every usable location" /></label>;
-  const vendorSourceLocationField = <label>Source inventory location<ReferenceSearchSelect kind="locations" role="usable" warehouseId={warehouseId} value={postingLocationId} initialOptions={usableLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => { setPostingLocationId(option.id); setLotId(""); setInventoryUnitId(""); }} placeholder="Search the location holding the returned stock" /></label>;
+  // "stocked" rather than "usable": goods going back to the vendor are as likely to be sitting
+  // in quarantine or a damaged location as on a usable shelf.
+  const vendorSourceLocationField = <label>Source inventory location<ReferenceSearchSelect kind="locations" role="stocked" warehouseId={warehouseId} value={postingLocationId} initialOptions={[...usableLocations, ...quarantineLocations].filter((location) => !warehouseId || location.warehouseId === warehouseId).map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: `${titleCase(location.inventoryStatus)} inventory` }))} onSelect={(option) => { setPostingLocationId(option.id); setLotId(""); setInventoryUnitId(""); }} placeholder="Search any location holding the returned stock" /></label>;
   const immediateSourceLocationField = <label>Source inventory location {salesPolicy === "quantity" ? <small>(optional)</small> : null}<ReferenceSearchSelect kind="locations" role="usable" warehouseId={warehouseId} value={postingLocationId} initialOptions={usableLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => { setPostingLocationId(option.id); setLotId(""); setInventoryUnitId(""); }} placeholder={salesPolicy === "quantity" ? "Best free-stock location is selected automatically" : "Select the location holding this identity"} /></label>;
   const quarantineLocationField = <label>Quarantine destination<ReferenceSearchSelect kind="locations" role="non_usable" warehouseId={warehouseId} value={quarantineLocationId} initialOptions={quarantineLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: titleCase(location.inventoryStatus) }))} quickCreate="location" onSelect={(option) => setQuarantineLocationId(option.id)} placeholder="Search every quarantine or damaged location" /></label>;
   // Vendor paperwork for a receipt: which day the goods landed, and the slip they came with.
-  const receiptPaperworkFields = <><label>Received on<input type="date" max={new Date().toISOString().slice(0, 10)} value={receiptDate} onChange={(event) => setReceiptDate(event.target.value)} /></label><label>Packing slip / delivery note<input value={packingSlipNumber} onChange={(event) => setPackingSlipNumber(event.target.value)} placeholder="Vendor's document number" /></label></>;
-  const incomingIdentityFields = purchasePolicy === "lot" ? <label>Received lot number<input value={lotNumber} onChange={(event) => setLotNumber(event.target.value)} placeholder="Required lot number" required /></label> : purchasePolicy === "serial" ? <label>Received serial number<input value={serialNumber} onChange={(event) => setSerialNumber(event.target.value)} placeholder="One serial per receipt posting" required /></label> : null;
+  const receiptPaperworkFields = <><label>Received on<input type="date" max={localDateString()} value={receiptDate} onChange={(event) => setReceiptDate(event.target.value)} /></label><label>Packing slip / delivery note<input value={packingSlipNumber} onChange={(event) => setPackingSlipNumber(event.target.value)} placeholder="Vendor's document number" /></label></>;
+  const incomingIdentityFields = purchasePolicy === "lot" ? <label><span>Received lot number{requiredMark}</span><input value={lotNumber} onChange={(event) => setLotNumber(event.target.value)} placeholder="Required lot number" required aria-required="true" /></label> : purchasePolicy === "serial" ? <label><span>Received serial number{requiredMark}</span><input value={serialNumber} onChange={(event) => setSerialNumber(event.target.value)} placeholder="One serial per receipt posting" required aria-required="true" /></label> : null;
   const outgoingIdentityFields = (policy: string, productId?: string, salesLineId?: string, locationId?: string, shipped = false) => policy === "lot" ? <label>Lot identity<ReferenceSearchSelect kind="inventoryLots" role={shipped ? "shipped" : "on_hand"} productId={productId} lineId={salesLineId} locationId={locationId} value={lotId} initialOptions={[]} onSelect={(option) => setLotId(option.id)} placeholder="Search available lots" /></label> : policy === "serial" ? <label>Serial identity<ReferenceSearchSelect kind="inventoryUnits" role={shipped ? "shipped" : "on_hand"} productId={productId} lineId={salesLineId} locationId={locationId} value={inventoryUnitId} initialOptions={[]} onSelect={(option) => setInventoryUnitId(option.id)} placeholder="Search eligible serial numbers" /></label> : null;
-  if (kind === "receive" && receiptLines.length > 1) return <div className="command-form"><div className="line-context"><span>Multi-line truck receipt</span><strong>{receiptLines.length} PO lines on one receipt document</strong></div><div className="form-grid">{receiptPaperworkFields}</div>{receiptLines.some((line) => line.damagedQuantity > 0) ? quarantineLocationField : null}<div className="batch-receipt-lines">{receiptLines.map((receiptLine) => { const line = purchaseLines.find((item) => item.id === receiptLine.lineId); const excess = Math.max(receiptLine.quantity - (line?.open ?? 0), 0); return <div className="batch-receipt-line" key={receiptLine.lineId}><div><strong>{line?.sku} · {line?.product}</strong><small>{line?.open} {line?.orderedUomCode ?? "unit"} open</small></div><label>Preferred bin<ReferenceSearchSelect kind="locations" role="bin" warehouseId={warehouseId} value={receiptLine.locationId} initialOptions={usableLocations.filter((location) => !warehouseId || location.warehouseId === warehouseId).map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => updateReceiptLine(receiptLine.lineId, { locationId: option.id })} placeholder="Search usable bins in this warehouse" /></label><label>Arrived at dock ({line?.orderedUomCode ?? "unit"})<input type="number" min="0" max={line?.trackingPolicy === "serial" ? 1 : undefined} step={line?.uomFactorToBase === 1 ? "1" : "0.001"} value={receiptLine.quantity} onChange={(event) => updateReceiptLine(receiptLine.lineId, { quantity: Number(event.target.value) })} /></label>{/* Named as a subset: side by side, "Arrived" and "Quarantine" read as two buckets that
-      add up, so a clerk logging 13 units with 3 damaged keyed 10 and 3 and short-received the line. */}<label>Of which quarantined ({line?.orderedUomCode ?? "unit"})<input type="number" min="0" step={line?.uomFactorToBase === 1 ? "1" : "0.001"} max={receiptLine.quantity} value={receiptLine.damagedQuantity} onChange={(event) => updateReceiptLine(receiptLine.lineId, { damagedQuantity: Number(event.target.value) })} /></label>{line?.trackingPolicy === "lot" ? <label>Lot number<input value={receiptLine.lotNumber} onChange={(event) => updateReceiptLine(receiptLine.lineId, { lotNumber: event.target.value })} placeholder="Required lot number" /></label> : line?.trackingPolicy === "serial" ? <label>Serial number<input value={receiptLine.serialNumber} onChange={(event) => updateReceiptLine(receiptLine.lineId, { serialNumber: event.target.value })} placeholder="Exactly one serial" /></label> : null}{excess > 0 ? <label>Approval ID (if above tolerance)<input value={receiptLine.approvalId} onChange={(event) => updateReceiptLine(receiptLine.lineId, { approvalId: event.target.value })} placeholder={`${excess} excess; paste approved request ID when required`} /></label> : null}</div>; })}</div><p className="formula-note">Lines with zero arrived quantity are skipped. Tracked lines require their lot or serial identity; the server applies the configured over-receipt policy per line.</p></div>;
-  if (kind === "receive") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{po?.open ?? 0} {po?.lines[0]?.orderedUomCode ?? "units"} open to receive</strong><small>{po?.lines[0]?.specification}</small></div><div className="form-grid"><label>Arrived at dock ({po?.lines[0]?.orderedUomCode ?? "unit"})<input type="number" min="1" max={purchasePolicy === "serial" ? 1 : undefined} step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label><label>Of which quarantined<input type="number" min="0" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={quantity} value={secondaryQuantity} onChange={(e) => setSecondaryQuantity(Number(e.target.value))} /></label>{receiptPaperworkFields}{incomingIdentityFields}{quantity > (po?.open ?? 0) ? <label>Approval ID (if above tolerance)<input value={overReceiptApprovalId} onChange={(event) => setOverReceiptApprovalId(event.target.value)} placeholder="Paste the approved line-scoped request ID" /></label> : null}{usableLocationField}{secondaryQuantity > 0 ? quarantineLocationField : null}</div></div>;
-  if (kind === "ship" || kind === "reserve") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{[so?.lines?.[0]?.product ?? so?.customer, so?.project].filter(Boolean).join(" · ")}</span><strong>{kind === "reserve" ? `${so?.availableNow ?? 0} available now` : `${so?.reserved ?? 0} reserved`}</strong><small>{so?.route}</small></div><label>{kind === "reserve" ? "Quantity to reserve" : "Quantity to ship"}<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label>{kind === "ship" ? outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, so?.lines?.[0]?.reservationLocationId) : null}<div className="line-context"><span>{kind === "reserve" ? "Location selection" : "Ship-to address"}</span><strong>{kind === "reserve" ? "Best available usable location is selected at posting" : `${so?.shipToName ?? so?.customer}`}</strong><small>{kind === "reserve" ? "The committed location is recorded on the reservation." : [so?.shipToAddressLine1, so?.shipToCity, so?.shipToRegion, so?.shipToPostalCode, so?.shipToCountry].filter(Boolean).join(", ")}</small></div>{kind === "ship" ? <><label>Carrier<input value={carrier} onChange={(event) => setCarrier(event.target.value)} placeholder="Required carrier" required /></label><label>Service level<input value={serviceLevel} onChange={(event) => setServiceLevel(event.target.value)} placeholder="Ground, LTL, same day…" /></label><label>Tracking number<input value={trackingNumber} onChange={(event) => setTrackingNumber(event.target.value)} placeholder="Tracking or PRO number" /></label><label>Bill of lading<input value={billOfLadingNumber} onChange={(event) => setBillOfLadingNumber(event.target.value)} placeholder="Required when no tracking number" /></label></> : null}</div>;
-  if (kind === "immediate-sale") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer}</span><strong>{so?.availableNow ?? 0} unreserved units available now</strong><small>No reservation is created. Shipment, COGS, and customer invoice post together.</small></div><label>Quantity sold now<input type="number" min="1" max={max} value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} /></label><label>Sale and invoice date<input type="date" max={new Date().toISOString().slice(0, 10)} value={receiptDate} onChange={(event) => setReceiptDate(event.target.value)} /></label>{immediateSourceLocationField}{outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, postingLocationId)}<div className="line-context"><span>Invoice handoff</span><strong>Posted immediately for {so?.customer}</strong><small>{so?.paymentTerms || "Due on receipt"} · you will be taken to Posted invoices after posting.</small></div><label>Fulfillment method<input value={carrier} onChange={(event) => setCarrier(event.target.value)} placeholder="Customer pickup" /></label><label>Reference (optional)<input value={trackingNumber} onChange={(event) => setTrackingNumber(event.target.value)} placeholder="Receipt, pickup, or delivery reference" /></label></div>;
-  if (kind === "vendor-return") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} {po?.lines[0]?.orderedUomCode ?? "units"} eligible to return</strong><small>Source: {po?.number}</small></div><label>Quantity to return<input type="number" min="1" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label>{disposition !== "allowance" ? <>{vendorSourceLocationField}{outgoingIdentityFields(purchasePolicy, po?.lines[0]?.productId, undefined, postingLocationId)}</> : null}<fieldset><legend>What should happen after the vendor receives these goods?</legend>{[["replacement", "Replace the returned quantity"], ["refund", "Issue a credit; no replacement"], ["repair", "Repair and return the same unit"], ["allowance", "No physical return; issue a price allowance"]].map(([value, label]) => <label className="radio-row" key={value}><input type="radio" name="disposition" value={value} checked={disposition === value} onChange={(e) => setDisposition(e.target.value)} /><span>{label}</span></label>)}</fieldset><SearchableSelect label="Return reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={vendorReturnReasons.map((label) => ({ id: label, label }))} /></div>;
-  if (kind === "customer-return") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer} · {so?.number}</span><strong>{max} {so?.lines?.[0]?.orderedUomCode ?? "units"} eligible to return</strong><small>Physical and financial decisions are reviewed separately.</small></div><label>Quantity received back<input type="number" min="1" step={so?.lines?.[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label>{outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, undefined, true)}<label>Physical disposition<select value={disposition} onChange={(e) => setDisposition(e.target.value)}><option value="quarantine">Receive into quarantine</option><option value="available">Return to available stock</option><option value="damaged">Damaged stock</option></select></label>{disposition === "available" ? usableLocationField : quarantineLocationField}<SearchableSelect label="Return reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={customerReturnReasons.map((label) => ({ id: label, label }))} /></div>;
-  if (kind === "count") { const balance = countBalances.find((item) => item.locationId === countLocationId); return <div className="command-form"><div className="line-context"><span>Cycle count</span><strong>{balance ? `${balance.warehouseName} / ${balance.locationCode}` : "No active location balance"}</strong><small>{balance ? `Book quantity ${balance.recordedQuantity} · ${balance.reservedQuantity} reserved` : "Receive inventory at an active location before counting."}</small></div><SearchableSelect label="Inventory location" value={countLocationId} setValue={setCountLocationId} options={countBalances.map((item) => ({ id: item.locationId, label: `${item.warehouseName} · ${item.locationCode} · ${item.locationName}`, detail: `${item.recordedQuantity} book` }))} /><label>Book quantity<input value={balance?.recordedQuantity ?? ""} readOnly /></label><label>Counted quantity<input type="number" min="0" step="0.0001" value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} required /></label><SearchableSelect label="Variance reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={countVarianceReasons.map((label) => ({ id: label, label }))} /></div>; }
-  return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} eligible</strong><small>{kind === "reopen" ? `${po?.closed} closed without receipt` : kind === "reverse" ? `${po?.lines[0]?.latestReceiptReversible ?? 0} reversible on the latest receipt` : `${po?.open} open to receive`}</small></div><label>{kind === "reopen" ? "Quantity to reopen" : kind === "reverse" ? "Quantity to reverse" : "Quantity to close"}<input type="number" min="1" max={max} value={quantity} onChange={(e) => setQuantity(Number(e.target.value))} /></label>{kind === "reopen" && <label>New expected date<input type="date" value={expectedDate} onChange={(e) => setExpectedDate(e.target.value)} /></label>}{kind === "reverse" && <fieldset><legend>Is the reversed quantity still expected?</legend><label className="radio-row"><input type="radio" name="disposition" value="reopen" checked={disposition === "reopen"} onChange={(e) => setDisposition(e.target.value)} /><span>Yes, reopen it to receive</span></label><label className="radio-row"><input type="radio" name="disposition" value="close" checked={disposition === "close"} onChange={(e) => setDisposition(e.target.value)} /><span>No, close it without receipt</span></label></fieldset>}<SearchableSelect label="Reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={closeReopenReasons.map((label) => ({ id: label, label }))} /></div>;
+  if (kind === "receive" && receiptLines.length > 1) return <div className="command-form"><div className="line-context"><span>Multi-line truck receipt</span><strong>{receiptLines.length} PO lines on one receipt document</strong><small>Every line starts at zero. Key what actually arrived, or fill every line with its open quantity.</small></div><div className="batch-receipt-actions"><button type="button" className="button secondary" onClick={receiveAllOpenLines}>Receive all open lines</button></div><div className="form-grid">{receiptPaperworkFields}</div>{receiptLines.some((line) => line.damagedQuantity > 0) ? quarantineLocationField : null}<div className="batch-receipt-lines">{receiptLines.map((receiptLine) => { const line = purchaseLines.find((item) => item.id === receiptLine.lineId); const excess = Math.max(receiptLine.quantity - (line?.open ?? 0), 0); return <div className="batch-receipt-line" key={receiptLine.lineId}><div><strong>{line?.sku} · {line?.product}</strong><small>{line?.open} {line?.orderedUomCode ?? "unit"} open</small></div><label>Preferred bin<ReferenceSearchSelect kind="locations" role="bin" warehouseId={warehouseId} value={receiptLine.locationId} initialOptions={usableLocations.filter((location) => !warehouseId || location.warehouseId === warehouseId).map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => updateReceiptLine(receiptLine.lineId, { locationId: option.id })} placeholder="Search usable bins in this warehouse" /></label><label>Arrived at dock ({line?.orderedUomCode ?? "unit"})<NumberField min="0" max={line?.trackingPolicy === "serial" ? 1 : undefined} step={line?.uomFactorToBase === 1 ? "1" : "0.001"} value={receiptLine.quantity} onChange={(quantity) => updateReceiptLine(receiptLine.lineId, { quantity })} /></label>{/* Named as a subset: side by side, "Arrived" and "Quarantine" read as two buckets that
+      add up, so a clerk logging 13 units with 3 damaged keyed 10 and 3 and short-received the line. */}<label>Of which quarantined ({line?.orderedUomCode ?? "unit"})<NumberField min="0" step={line?.uomFactorToBase === 1 ? "1" : "0.001"} max={receiptLine.quantity} value={receiptLine.damagedQuantity} onChange={(damagedQuantity) => updateReceiptLine(receiptLine.lineId, { damagedQuantity })} /></label>{line?.trackingPolicy === "lot" ? <label>Lot number<input value={receiptLine.lotNumber} onChange={(event) => updateReceiptLine(receiptLine.lineId, { lotNumber: event.target.value })} placeholder="Required lot number" /></label> : line?.trackingPolicy === "serial" ? <label>Serial number<input value={receiptLine.serialNumber} onChange={(event) => updateReceiptLine(receiptLine.lineId, { serialNumber: event.target.value })} placeholder="Exactly one serial" /></label> : null}{excess > 0 ? <label>Approval ID (if above tolerance)<input value={receiptLine.approvalId} onChange={(event) => updateReceiptLine(receiptLine.lineId, { approvalId: event.target.value })} placeholder={`${excess} excess; paste approved request ID when required`} /></label> : null}</div>; })}</div><p className="formula-note">Lines with zero arrived quantity are skipped. Tracked lines require their lot or serial identity; the server applies the configured over-receipt policy per line.</p></div>;
+  if (kind === "receive") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{po?.open ?? 0} {po?.lines[0]?.orderedUomCode ?? "units"} open to receive</strong><small>{po?.lines[0]?.specification}</small></div><div className="form-grid"><label>Arrived at dock ({po?.lines[0]?.orderedUomCode ?? "unit"})<NumberField min="1" max={purchasePolicy === "serial" ? 1 : undefined} step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} value={quantity} onChange={setQuantity} /></label><label>Of which quarantined<NumberField min="0" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={quantity} value={secondaryQuantity} onChange={setSecondaryQuantity} /></label>{receiptPaperworkFields}{incomingIdentityFields}{quantity > (po?.open ?? 0) ? <label>Approval ID (if above tolerance)<input value={overReceiptApprovalId} onChange={(event) => setOverReceiptApprovalId(event.target.value)} placeholder="Paste the approved line-scoped request ID" /></label> : null}{usableLocationField}{secondaryQuantity > 0 ? quarantineLocationField : null}</div></div>;
+  if (kind === "ship" || kind === "reserve") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{[so?.lines?.[0]?.product ?? so?.customer, so?.project].filter(Boolean).join(" · ")}</span><strong>{kind === "reserve" ? `${so?.availableNow ?? 0} available now` : `${so?.reserved ?? 0} reserved`}</strong><small>{so?.route}</small></div><label>{kind === "reserve" ? "Quantity to reserve" : "Quantity to ship"}<NumberField min="1" max={max} value={quantity} onChange={setQuantity} /></label>{kind === "ship" ? outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, so?.lines?.[0]?.reservationLocationId) : null}<div className="line-context"><span>{kind === "reserve" ? "Location selection" : "Ship-to address"}</span><strong>{kind === "reserve" ? "Best available usable location is selected at posting" : `${so?.shipToName ?? so?.customer}`}</strong><small>{kind === "reserve" ? "The committed location is recorded on the reservation." : [so?.shipToAddressLine1, so?.shipToCity, so?.shipToRegion, so?.shipToPostalCode, so?.shipToCountry].filter(Boolean).join(", ")}</small></div>{kind === "ship" ? <><label><span>Carrier{requiredMark}</span><input value={carrier} onChange={(event) => setCarrier(event.target.value)} placeholder="Required carrier" required aria-required="true" /></label><label>Service level<input value={serviceLevel} onChange={(event) => setServiceLevel(event.target.value)} placeholder="Ground, LTL, same day…" /></label><label>Tracking number<input value={trackingNumber} onChange={(event) => setTrackingNumber(event.target.value)} placeholder="Tracking or PRO number" /></label><label>Bill of lading<input value={billOfLadingNumber} onChange={(event) => setBillOfLadingNumber(event.target.value)} placeholder="Required when no tracking number" /></label></> : null}</div>;
+  if (kind === "immediate-sale") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer}</span><strong>{so?.availableNow ?? 0} unreserved units available now</strong><small>No reservation is created. Shipment, COGS, and customer invoice post together.</small></div><label>Quantity sold now<NumberField min="1" max={max} value={quantity} onChange={setQuantity} /></label><label>Sale and invoice date<input type="date" max={localDateString()} value={receiptDate} onChange={(event) => setReceiptDate(event.target.value)} /></label>{immediateSourceLocationField}{outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, postingLocationId)}<div className="line-context"><span>Invoice handoff</span><strong>Posted immediately for {so?.customer}</strong><small>{so?.paymentTerms || "Due on receipt"} · you will be taken to Posted invoices after posting.</small></div><label>Fulfillment method<input value={carrier} onChange={(event) => setCarrier(event.target.value)} placeholder="Customer pickup" /></label><label>Reference (optional)<input value={trackingNumber} onChange={(event) => setTrackingNumber(event.target.value)} placeholder="Receipt, pickup, or delivery reference" /></label></div>;
+  if (kind === "vendor-return") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} {po?.lines[0]?.orderedUomCode ?? "units"} eligible to return</strong><small>Source: {po?.number}</small></div><label>Quantity to return<NumberField min="1" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={max} value={quantity} onChange={setQuantity} /></label>{disposition !== "allowance" ? <>{vendorSourceLocationField}{outgoingIdentityFields(purchasePolicy, po?.lines[0]?.productId, undefined, postingLocationId)}</> : null}<fieldset><legend>What should happen after the vendor receives these goods?</legend>{[["replacement", "Replace the returned quantity"], ["refund", "Issue a credit; no replacement"], ["repair", "Repair and return the same unit"], ["allowance", "No physical return; issue a price allowance"]].map(([value, label]) => { const financialOnly = value === "allowance" && !canPostFinancial; return <label className={`radio-row ${financialOnly ? "disabled" : ""}`} key={value} title={financialOnly ? "A price allowance posts a vendor credit, which needs financial posting permission." : undefined}><input type="radio" name="disposition" value={value} checked={disposition === value} disabled={financialOnly} onChange={(e) => setDisposition(e.target.value)} /><span>{label}{financialOnly ? <small className="field-hint"> Needs financial posting permission.</small> : null}</span></label>; })}</fieldset><SearchableSelect label="Return reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={vendorReturnReasons.map((label) => ({ id: label, label }))} /></div>;
+  if (kind === "customer-return") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer} · {so?.number}</span><strong>{max} {so?.lines?.[0]?.orderedUomCode ?? "units"} eligible to return</strong><small>Physical and financial decisions are reviewed separately.</small></div><label>Quantity received back<NumberField min="1" step={so?.lines?.[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={max} value={quantity} onChange={setQuantity} /></label>{outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, undefined, true)}<label>Physical disposition<select value={disposition} onChange={(e) => setDisposition(e.target.value)}><option value="quarantine">Receive into quarantine</option><option value="available">Return to available stock</option><option value="damaged">Damaged stock</option></select></label>{disposition === "available" ? usableLocationField : quarantineLocationField}<SearchableSelect label="Return reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={customerReturnReasons.map((label) => ({ id: label, label }))} /></div>;
+  if (kind === "count") { const balance = countBalances.find((item) => item.locationId === countLocationId); return <div className="command-form"><div className="line-context"><span>Cycle count</span><strong>{balance ? `${balance.warehouseName} / ${balance.locationCode}` : "No active location balance"}</strong><small>{balance ? `Book quantity ${balance.recordedQuantity} · ${balance.reservedQuantity} reserved` : "Receive inventory at an active location before counting."}</small></div><SearchableSelect label="Inventory location" value={countLocationId} setValue={setCountLocationId} options={countBalances.map((item) => ({ id: item.locationId, label: `${item.warehouseName} · ${item.locationCode} · ${item.locationName}`, detail: `${item.recordedQuantity} book` }))} /><label>Book quantity<input value={balance?.recordedQuantity ?? ""} readOnly /></label><label><span>Counted quantity{requiredMark}</span><NumberField min="0" step="0.0001" value={quantity} onChange={setQuantity} required /></label><SearchableSelect label="Variance reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={countVarianceReasons.map((label) => ({ id: label, label }))} /></div>; }
+  return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} eligible</strong><small>{kind === "reopen" ? `${po?.closed} closed without receipt` : kind === "reverse" ? `${po?.lines[0]?.latestReceiptReversible ?? 0} reversible on the latest receipt` : `${po?.open} open to receive`}</small></div><label>{kind === "reopen" ? "Quantity to reopen" : kind === "reverse" ? "Quantity to reverse" : "Quantity to close"}<NumberField min="1" max={max} value={quantity} onChange={setQuantity} /></label>{kind === "reopen" && <label>New expected date<input type="date" value={expectedDate} onChange={(e) => setExpectedDate(e.target.value)} /></label>}{kind === "reverse" && <fieldset><legend>Is the reversed quantity still expected?</legend><label className="radio-row"><input type="radio" name="disposition" value="reopen" checked={disposition === "reopen"} onChange={(e) => setDisposition(e.target.value)} /><span>Yes, reopen it to receive</span></label><label className="radio-row"><input type="radio" name="disposition" value="close" checked={disposition === "close"} onChange={(e) => setDisposition(e.target.value)} /><span>No, close it without receipt</span></label></fieldset>}<SearchableSelect label="Reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={closeReopenReasons.map((label) => ({ id: label, label }))} /></div>;
 }
 
 function ImpactPreview({ lines }: { lines: Array<{ category: string; label: string; before?: string | number; after: string | number; tone?: Severity }> }) {
@@ -3694,7 +3813,9 @@ function normalizeSnapshot(input: unknown): Snapshot {
       sku: text(item.sku, "Unidentified product"),
       name: text(item.name, "Unnamed product"),
       specification: [text(item.dimensions), text(item.finish), text(item.material)].filter(Boolean).join(" · ") || "No configuration recorded",
-      policy: titleCase(text(item.trackingPolicy || item.inventoryPolicy, "stock")),
+      // The inventory policy is the one that varies (stocked, special order, drop ship);
+      // leading with the tracking policy printed "Quantity" on nearly every product.
+      policy: [titleCase(text(item.inventoryPolicy, "stocked")), text(item.trackingPolicy, "quantity") === "quantity" ? "" : `${titleCase(text(item.trackingPolicy))} tracked`].filter(Boolean).join(" · "),
       location: number(item.stockedLocationCount) > 1 ? `${text(item.primaryLocationName)} + ${number(item.stockedLocationCount) - 1} more` : text(item.primaryLocationName, "No stocked location"),
       locationCode: text(item.primaryLocationCode, "No stock"),
       onHand: number(item.onHand),
@@ -3792,11 +3913,12 @@ function normalizeSnapshot(input: unknown): Snapshot {
       version: number(line.version, 1),
       };
     });
-    const expectedDate = text(item.expectedDate, futureDate(7));
+    // Empty when the order has none: a fabricated date a week out read as a real promise.
+    const expectedDate = text(item.expectedDate);
     const open = number(item.openToReceiveQuantity);
     const closed = number(item.closedWithoutReceiptQuantity);
     const billingStatus = text(item.billingStatus, "not_billed");
-    const late = expectedDate < new Date().toISOString().slice(0, 10) && open > 0 ? calendarDaysLate(expectedDate) : 0;
+    const late = expectedDate && expectedDate < localDateString() && open > 0 ? calendarDaysLate(expectedDate) : 0;
     return {
       id: text(item.id, `po-${index}`),
       number: text(item.number, "Purchase order"),
@@ -3959,8 +4081,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
     relatedOrderKind: text(item.relatedOrderKind) === "purchase" ? "purchase" as const : text(item.relatedOrderKind) === "sales" ? "sales" as const : undefined,
     product: text(item.sku, text(item.productName)),
     quantity: number(item.quantity),
-    from: text(item.fromLocationCode, "External / Supplier"),
-    to: text(item.toLocationCode, "External / Customer"),
+    from: text(item.fromLocationCode) || movementCounterparty(text(item.type), "from"),
+    to: text(item.toLocationCode) || movementCounterparty(text(item.type), "to"),
     user: text(item.postedBy, "System"),
   }));
 

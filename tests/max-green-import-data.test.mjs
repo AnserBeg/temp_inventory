@@ -4,9 +4,15 @@ import test from "node:test";
 
 const data = JSON.parse(await readFile(new URL("../data/max-green-inventory.json", import.meta.url), "utf8"));
 
+// Every location type the import emits must be one saveLocation accepts, or the imported bins can
+// never be edited once they hold stock (the Outside yard is created as 'yard' with on-hand units).
+const acceptedLocationTypes = ["storage", "yard", "receiving", "shipping", "quarantine", "in_transit", "scrap"];
+
 test("Max Green import preserves the workbook's two physical locations", () => {
   assert.equal(data.company.name, "Max Green");
   assert.deepEqual(data.company.warehouse.locations.map((location) => location.name), ["Inside", "Outside"]);
+  assert.deepEqual(data.company.warehouse.locations.map((location) => location.locationType), ["storage", "yard"]);
+  assert.ok(data.company.warehouse.locations.every((location) => acceptedLocationTypes.includes(location.locationType)));
   assert.equal(data.summary.productCount, 154);
   assert.equal(data.summary.insideUnits, 556);
   assert.equal(data.summary.outsideUnits, 62);

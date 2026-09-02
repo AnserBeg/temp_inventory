@@ -1,7 +1,34 @@
+import path from "node:path";
 import vinext from "vinext";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import hostingConfig from "./.openai/hosting.json";
 import { sites } from "./build/sites-vite-plugin";
+
+/**
+ * Windows-only repair for vinext's self-hosted Google Fonts.
+ *
+ * vinext caches the font CSS with forward-slash absolute paths
+ * (`C:/…/.vinext/fonts/geist-…/geist-….woff2`) and then rewrites that prefix to the served
+ * `/assets/_vinext_fonts/` URL by searching for `path.join(root, ".vinext", "fonts")` — which on
+ * Windows has backslashes, so nothing matches and the browser is handed `file:///C:/…` URLs that
+ * never load. Rewriting the forward-slash form here, after vinext's transform, points the CSS at
+ * the same middleware and build output vinext already serves the files from.
+ */
+function windowsFontUrls(): Plugin {
+  let cacheDir = "";
+  return {
+    name: "paneflow:windows-font-urls",
+    enforce: "post",
+    apply: () => process.platform === "win32",
+    configResolved(config) {
+      cacheDir = path.join(config.root, ".vinext", "fonts").split(path.sep).join("/");
+    },
+    transform(code) {
+      if (!cacheDir || !code.includes(cacheDir)) return null;
+      return { code: code.split(cacheDir).join("/assets/_vinext_fonts"), map: null };
+    },
+  };
+}
 
 const LOCAL_D1_DATABASE_ID =
   "00000000-0000-4000-8000-000000000000";
@@ -50,6 +77,7 @@ export default defineConfig(async () => {
       : undefined,
     plugins: [
       vinext(),
+      windowsFontUrls(),
       sites(),
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },

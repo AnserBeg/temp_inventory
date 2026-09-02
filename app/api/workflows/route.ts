@@ -14,6 +14,7 @@ export async function GET(request: Request) {
       page: Number(url.searchParams.get("page") ?? 1),
       pageSize: Number(url.searchParams.get("pageSize") ?? 50),
       scope: url.searchParams.get("scope") ?? "",
+      asOf: url.searchParams.get("asOf") ?? undefined,
     }), { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     if (error instanceof AuthorizationError) return authorizationResponse(error);

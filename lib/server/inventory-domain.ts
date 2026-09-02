@@ -133,19 +133,43 @@ async function receiptLocation(productId: string, payload: CommandPayload, purpo
   return preferred.id;
 }
 
+/** Strict YYYY-MM-DD calendar-date validation shared by every dated payload field. */
+function validDateText(value: unknown, field: string) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) throw new DomainError("VALIDATION_ERROR", `${field} must use YYYY-MM-DD format.`);
+  const parsed = new Date(`${text}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== text) {
+    throw new DomainError("VALIDATION_ERROR", `${field} must be a valid calendar date.`);
+  }
+  return text;
+}
+
 function postingDateValue(payload: CommandPayload) {
   const value = typeof payload.postingDate === "string" && payload.postingDate.trim()
-    ? payload.postingDate.trim()
+    ? validDateText(payload.postingDate, "postingDate")
     : new Date().toISOString().slice(0, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    throw new DomainError("VALIDATION_ERROR", "postingDate must use YYYY-MM-DD format.");
-  }
-  const parsed = new Date(`${value}T00:00:00.000Z`);
-  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== value) {
-    throw new DomainError("VALIDATION_ERROR", "postingDate must be a valid calendar date.");
+  // A posting date is the business date the goods or money actually moved. The caller's own
+  // calendar day (asOf) plus one day of timezone slack is the latest date that can be true.
+  const callerToday = typeof payload.asOf === "string" && payload.asOf.trim() ? validDateText(payload.asOf, "asOf") : new Date().toISOString().slice(0, 10);
+  const latest = new Date(`${callerToday}T00:00:00.000Z`);
+  latest.setUTCDate(latest.getUTCDate() + 1);
+  if (value > latest.toISOString().slice(0, 10)) {
+    throw new DomainError("POSTING_DATE_IN_FUTURE", `postingDate ${value} is in the future; postings cannot be dated later than ${latest.toISOString().slice(0, 10)}.`);
   }
   return value;
 }
+
+/**
+ * Quantities are stored as REAL with at most three decimals, but SQLite arithmetic on them
+ * drifts (0.3-0.1-0.2 = -2.8e-17), which the non-negative balance triggers reject as a raw
+ * failure. Every balance/layer/reservation mutation rounds to six places and every claim
+ * compares with a one-millionth tolerance so precision-3 products never trip the invariant.
+ */
+const QTY_EPSILON = "0.000001";
+const qtyMinus = (column: string) => `ROUND(${column} - ?, 6)`;
+const qtyPlus = (column: string) => `ROUND(${column} + ?, 6)`;
+const qtyAtLeast = (expression: string) => `${expression} >= ? - ${QTY_EPSILON}`;
+const qtyDrained = (column: string) => `ROUND(${column} - ?, 6) <= ${QTY_EPSILON}`;
 
 function postingTimestamp(payload: CommandPayload) {
   return `${postingDateValue(payload)}${new Date().toISOString().slice(10)}`;
@@ -206,7 +230,7 @@ type OutgoingTracking = {
   claimBindings: Array<string | number>;
 };
 
-async function outgoingTracking(productId: string, locationId: string, quantity: number, payload: CommandPayload): Promise<OutgoingTracking> {
+async function outgoingTracking(productId: string, locationId: string, quantity: number, payload: CommandPayload, inventoryStatus = "usable"): Promise<OutgoingTracking> {
   const product = await first<{ policy: string }>("SELECT tracking_policy AS policy FROM products WHERE id=? AND active=1", productId);
   if (!product || !["quantity", "lot", "serial"].includes(product.policy)) throw new DomainError("TRACKING_CONFIGURATION_ERROR", "The product tracking policy is missing or invalid.", 409);
   const lotId = typeof payload.lotId === "string" && payload.lotId.trim() ? payload.lotId.trim() : null;
@@ -224,10 +248,10 @@ async function outgoingTracking(productId: string, locationId: string, quantity:
     return { policy: "lot", lotId, unitId: null, unitVersion: null, claimSql: ` AND (SELECT COALESCE(SUM(CASE WHEN sm.to_location_id=? THEN ma.quantity WHEN sm.from_location_id=? THEN -ma.quantity ELSE 0 END),0) FROM movement_assignments ma JOIN stock_movements sm ON sm.id=ma.movement_id WHERE sm.product_id=? AND ma.lot_id=?)>=?`, claimBindings: [locationId, locationId, productId, lotId, quantity] };
   }
   if (quantity !== 1 || !unitId) throw new DomainError("SERIAL_ASSIGNMENT_REQUIRED", "Serial-tracked shipments require inventoryUnitId and quantity exactly one.", 409);
-  const unit = await first<{ lotId: string | null; version: number }>("SELECT lot_id AS lotId,version FROM inventory_units WHERE id=? AND product_id=? AND location_id=? AND inventory_status='usable' AND lifecycle_status='on_hand' AND allocated_sales_order_line_id IS NULL", unitId, productId, locationId);
-  if (!unit) throw new DomainError("INVALID_SERIAL_STATE", "The selected serial is not usable, unallocated on-hand stock at the reservation location.", 409);
+  const unit = await first<{ lotId: string | null; version: number }>("SELECT lot_id AS lotId,version FROM inventory_units WHERE id=? AND product_id=? AND location_id=? AND inventory_status=? AND lifecycle_status='on_hand' AND allocated_sales_order_line_id IS NULL", unitId, productId, locationId, inventoryStatus);
+  if (!unit) throw new DomainError("INVALID_SERIAL_STATE", `The selected serial is not ${inventoryStatus}, unallocated on-hand stock at the selected location.`, 409);
   if (lotId && lotId !== unit.lotId) throw new DomainError("SERIAL_LOT_MISMATCH", "The serial does not belong to the selected lot.", 409);
-  return { policy: "serial", lotId: unit.lotId, unitId, unitVersion: unit.version, claimSql: " AND EXISTS (SELECT 1 FROM inventory_units iu WHERE iu.id=? AND iu.product_id=? AND iu.location_id=? AND iu.inventory_status='usable' AND iu.lifecycle_status='on_hand' AND iu.allocated_sales_order_line_id IS NULL AND iu.version=?)", claimBindings: [unitId, productId, locationId, unit.version] };
+  return { policy: "serial", lotId: unit.lotId, unitId, unitVersion: unit.version, claimSql: " AND EXISTS (SELECT 1 FROM inventory_units iu WHERE iu.id=? AND iu.product_id=? AND iu.location_id=? AND iu.inventory_status=? AND iu.lifecycle_status='on_hand' AND iu.allocated_sales_order_line_id IS NULL AND iu.version=?)", claimBindings: [unitId, productId, locationId, inventoryStatus, unit.version] };
 }
 
 /**
@@ -438,21 +462,53 @@ async function historicalShipmentUnitCost(salesOrderLineId: string, productId: s
   return policy.method === "standard" ? policy.standardCostCents : policy.averageCostCents || policy.standardCostCents;
 }
 
+/**
+ * One bound JSON document claims every consumed layer at once. D1 caps a statement at 100
+ * bound parameters, so a FIFO issue across many small layers cannot be claimed with two
+ * placeholders per layer.
+ */
 function layerClaimPredicate(layers: CostLayerAllocation[]) {
-  return layers.map(() => "AND EXISTS (SELECT 1 FROM cost_layers WHERE id = ? AND remaining_qty >= ?)").join(" ");
+  if (!layers.length) return "";
+  return `AND NOT EXISTS (SELECT 1 FROM json_each(?) claimed LEFT JOIN cost_layers cl ON cl.id = json_extract(claimed.value, '$.id')
+    WHERE cl.id IS NULL OR cl.remaining_qty < json_extract(claimed.value, '$.quantity') - ${QTY_EPSILON})`;
 }
 
 function layerClaimBindings(layers: CostLayerAllocation[]) {
-  return layers.flatMap((layer) => [layer.id, layer.quantity]);
+  if (!layers.length) return [] as string[];
+  return [JSON.stringify(layers.map((layer) => ({ id: layer.id, quantity: layer.quantity })))];
 }
 
 function layerConsumptionPrepared(input: InventoryCommand, layers: CostLayerAllocation[]) {
   const marker = commandExistsPrepared(input);
   return layers.map((layer) => commandD1(input).prepare(`UPDATE cost_layers
-    SET remaining_qty = remaining_qty - ?,
-        status = CASE WHEN remaining_qty - ? = 0 THEN 'consumed' ELSE 'open' END
-    WHERE id = ? AND remaining_qty >= ? AND ${marker}`)
+    SET remaining_qty = MAX(${qtyMinus("remaining_qty")}, 0),
+        status = CASE WHEN ${qtyDrained("remaining_qty")} THEN 'consumed' ELSE 'open' END
+    WHERE id = ? AND ${qtyAtLeast("remaining_qty")} AND ${marker}`)
     .bind(layer.quantity, layer.quantity, layer.id, layer.quantity));
+}
+
+/** Open FIFO layers for a product, optionally skipping one layer that is claimed separately. */
+async function openLayersForIssue(productId: string, quantity: number, excludeLayerId: string | null) {
+  const rows = await all<{ id: string; remainingQty: number; unitCostCents: number }>(
+    `SELECT id, remaining_qty AS remainingQty,
+            unit_cost_cents + CASE WHEN received_qty > 0 THEN ROUND(landed_cost_cents / received_qty) ELSE 0 END AS unitCostCents
+       FROM cost_layers
+      WHERE product_id = ? AND remaining_qty > 0 AND (? IS NULL OR id <> ?)
+      ORDER BY received_at, id`,
+    productId, excludeLayerId, excludeLayerId,
+  );
+  let remaining = quantity;
+  let valueCents = 0;
+  const layers: CostLayerAllocation[] = [];
+  for (const row of rows) {
+    if (remaining <= 0) break;
+    const used = roundQuantity(Math.min(remaining, Number(row.remainingQty)));
+    if (used <= 0) continue;
+    layers.push({ id: row.id, quantity: used, unitCostCents: Number(row.unitCostCents) });
+    valueCents += Math.round(used * Number(row.unitCostCents));
+    remaining = roundQuantity(remaining - used);
+  }
+  return { layers, valueCents, shortfall: remaining };
 }
 
 function valueEntryPrepared(
@@ -576,7 +632,9 @@ export const inventoryCommandCapabilities = {
   postImmediateSale: "financialWrite",
   counterSale: "financialWrite",
   postCounterSale: "financialWrite",
-  reverseShipment: "operationalWrite",
+  // Shipment reversal lives only in the workflow dispatcher (advanced-domain), which also
+  // restores lot/serial identity and guards invoiced quantity. The legacy alias here was an
+  // incomplete duplicate and now answers UNKNOWN_COMMAND.
   customerReturn: "operationalWrite",
   postCustomerReturn: "operationalWrite",
   inventoryAdjustment: "operationalWrite",
@@ -795,7 +853,18 @@ async function approvalForOverReceipt(input:InventoryCommand,line:PurchaseLineSt
 
 async function postReceipt(input: InventoryCommand): Promise<CommandResult> {
   const payload = input.payload ?? {};
-  const line = await getPurchaseLine(input.entityId, typeof payload.lineId === "string" ? payload.lineId : undefined);
+  const requestedLineId = typeof payload.lineId === "string" && payload.lineId.trim() ? payload.lineId.trim() : "";
+  const line = await getPurchaseLine(input.entityId, requestedLineId || undefined);
+  if (!requestedLineId) {
+    // The claim is keyed by lineId. Without one the claim silently failed after the RCV number
+    // had already been consumed; resolve a single-line order here and refuse anything else.
+    const lineCount = await first<{ count: number }>("SELECT COUNT(*) AS count FROM purchase_order_lines WHERE purchase_order_id=?", input.entityId);
+    if (Number(lineCount?.count ?? 0) !== 1) throw new DomainError("LINE_REQUIRED", "lineId is required: this purchase order has more than one line, so choose the line being received.", 400, line.lineVersion);
+    payload.lineId = line.id;
+    input.payload = payload;
+  } else if (line.id !== requestedLineId) {
+    throw new DomainError("NOT_FOUND", "Purchase order line was not found on this purchase order.", 404);
+  }
   const enteredQuantity = positive(payload);
   const enteredDamagedQuantity = payload.damagedQuantity == null ? 0 : roundQuantity(asNumber(payload, "damagedQuantity"));
   if (enteredDamagedQuantity < 0 || enteredDamagedQuantity > enteredQuantity) {
@@ -895,7 +964,7 @@ async function postReceipt(input: InventoryCommand): Promise<CommandResult> {
         .bind(usableMovementId, line.productId, usableQuantity, locationId, receiptId, usableLineId, line.id, now, actor, line.unitCostCents, input.idempotencyKey),
       db.prepare(`INSERT INTO inventory_balances (product_id, location_id, on_hand_qty, reserved_qty, version)
                   SELECT ?, ?, ?, 0, 1 WHERE ${exists}
-                  ON CONFLICT(product_id, location_id) DO UPDATE SET on_hand_qty = on_hand_qty + excluded.on_hand_qty, version = version + 1`)
+                  ON CONFLICT(product_id, location_id) DO UPDATE SET on_hand_qty = ROUND(on_hand_qty + excluded.on_hand_qty, 6), version = version + 1`)
         .bind(line.productId, locationId, usableQuantity),
       db.prepare(`INSERT INTO cost_layers
         (id, product_id, receipt_movement_id, received_qty, remaining_qty, unit_cost_cents, landed_cost_cents, received_at, status)
@@ -915,8 +984,8 @@ async function postReceipt(input: InventoryCommand): Promise<CommandResult> {
       db.prepare(`INSERT INTO reservations (id,sales_order_line_id,product_id,location_id,quantity,status,created_at)
         SELECT ?,?,?,?,?, 'active',? WHERE ${exists}`)
         .bind(allocation.reservationId, allocation.salesOrderLineId, line.productId, locationId, allocation.reserveQuantity, now),
-      db.prepare(`UPDATE inventory_balances SET reserved_qty=reserved_qty+?,version=version+1
-        WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${exists}`)
+      db.prepare(`UPDATE inventory_balances SET reserved_qty=${qtyPlus("reserved_qty")},version=version+1
+        WHERE product_id=? AND location_id=? AND ${qtyAtLeast("on_hand_qty-reserved_qty")} AND ${exists}`)
         .bind(allocation.reserveQuantity, line.productId, locationId, allocation.reserveQuantity),
     );
     if (allocation.usableReceiptQuantity > 0 && allocation.usableLineageId) commands.push(db.prepare(`INSERT INTO supply_allocation_receipts
@@ -940,7 +1009,7 @@ async function postReceipt(input: InventoryCommand): Promise<CommandResult> {
         .bind(damagedMovementId, line.productId, damagedQuantity, quarantineLocationId, receiptId, damagedLineId, line.id, now, actor, line.unitCostCents, input.idempotencyKey),
       db.prepare(`INSERT INTO inventory_balances (product_id, location_id, on_hand_qty, reserved_qty, version)
                   SELECT ?, ?, ?, 0, 1 WHERE ${exists}
-                  ON CONFLICT(product_id, location_id) DO UPDATE SET on_hand_qty = on_hand_qty + excluded.on_hand_qty, version = version + 1`)
+                  ON CONFLICT(product_id, location_id) DO UPDATE SET on_hand_qty = ROUND(on_hand_qty + excluded.on_hand_qty, 6), version = version + 1`)
         .bind(line.productId, quarantineLocationId, damagedQuantity),
       db.prepare(`INSERT INTO cost_layers
         (id, product_id, receipt_movement_id, received_qty, remaining_qty, unit_cost_cents, landed_cost_cents, received_at, status)
@@ -1021,8 +1090,15 @@ async function postReceiptBatch(input: InventoryCommand): Promise<CommandResult>
     const supplyAllocations = await planReceiptSupplyAllocations(line.id, usableQuantity, damagedQuantity);
     states.push({ line, lineVersion, quantity, damagedQuantity, usableQuantity, locationId, quarantineLocationId, valuation, tracking, approval, supplyAllocations, payload: linePayload });
   }
-  const duplicateProduct = states.find((state, index) => states.findIndex((candidate) => candidate.line.productId === state.line.productId) !== index);
-  if (duplicateProduct) throw new DomainError("DUPLICATE_PRODUCT_RECEIPT", "A batch receipt cannot contain the same product on multiple PO lines because valuation must advance once per product. Post those duplicate-product lines separately.", 409);
+  // The same SKU on two PO lines is ordinary (two prices, two delivery dates). FIFO and
+  // standard costing value each line independently, so those receipts are safe together.
+  // Only a moving average must advance once per product, and that pair is named so the
+  // receiver knows exactly which lines to split into a second receipt.
+  for (const [index, state] of states.entries()) {
+    const earlier = states.findIndex((candidate, candidateIndex) => candidateIndex < index && candidate.line.productId === state.line.productId);
+    if (earlier === -1 || state.valuation.method !== "average") continue;
+    throw new DomainError("DUPLICATE_PRODUCT_RECEIPT", `Lines ${earlier + 1} and ${index + 1} both receive ${state.line.productId} (PO lines ${states[earlier].line.id} and ${state.line.id}); an average-cost product must advance its valuation once per receipt, so post those lines as separate receipts.`, 409);
+  }
 
   const actor = optionalText(payload, "actor", "Avery Morgan");
   const receiptId = newId("receipt");
@@ -1044,13 +1120,23 @@ async function postReceiptBatch(input: InventoryCommand): Promise<CommandResult>
       availableDelta: roundQuantity(totalUsable - automaticallyReserved),
     },
   };
+  // D1 caps a statement at 100 bound parameters. The per-line preconditions that every receipt
+  // line carries (line version, valuation version, destination bins) are bound as one JSON array
+  // and checked with json_each, so a long truck receipt does not grow the claim by six parameters
+  // per line. Only the conditional predicates (approvals, tracking, supply allocations) still bind
+  // per line.
+  const lineClaimJson = JSON.stringify(states.map((state) => ({
+    lineId: state.line.id, lineVersion: state.lineVersion, productId: state.line.productId, valuationVersion: state.valuation.version,
+    locationId: state.locationId, quarantineLocationId: state.damagedQuantity > 0 ? state.quarantineLocationId : null,
+  })));
+  const lineClaimSql = `AND NOT EXISTS (SELECT 1 FROM json_each(?) lc
+    WHERE NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.id=json_extract(lc.value,'$.lineId') AND pol.purchase_order_id=po.id AND pol.version=json_extract(lc.value,'$.lineVersion'))
+       OR COALESCE((SELECT version FROM valuation_policies WHERE product_id=json_extract(lc.value,'$.productId')),0)<>json_extract(lc.value,'$.valuationVersion')
+       OR NOT EXISTS (SELECT 1 FROM locations WHERE id=json_extract(lc.value,'$.locationId') AND active=1 AND inventory_status='usable')
+       OR (json_extract(lc.value,'$.quarantineLocationId') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM locations WHERE id=json_extract(lc.value,'$.quarantineLocationId') AND active=1 AND inventory_status IN ('quarantine','damaged'))))`;
   const claimSql = states.map((state) => `
-    AND EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.id=? AND pol.purchase_order_id=po.id AND pol.version=?)
-    AND COALESCE((SELECT version FROM valuation_policies WHERE product_id=?),0)=?
     ${state.approval ? "AND EXISTS (SELECT 1 FROM approvals WHERE id=? AND version=? AND status='approved' AND consumed_at IS NULL)" : ""}
     ${state.tracking.claimSql}
-    AND EXISTS (SELECT 1 FROM locations WHERE id=? AND active=1 AND inventory_status='usable')
-    ${state.damagedQuantity > 0 ? "AND EXISTS (SELECT 1 FROM locations WHERE id=? AND active=1 AND inventory_status IN ('quarantine','damaged'))" : ""}
     ${state.supplyAllocations.map(() => "AND EXISTS (SELECT 1 FROM supply_allocations sa JOIN sales_order_lines sol ON sol.id=sa.sales_order_line_id JOIN sales_orders so ON so.id=sol.sales_order_id WHERE sa.id=? AND sa.version=? AND sa.status='active' AND sa.allocated_qty-sa.received_qty>=? AND so.lifecycle_status<>'canceled')").join("\n")}
     ${state.supplyAllocations.filter((allocation) => allocation.reserveQuantity > 0).map(() => `AND EXISTS (SELECT 1 FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id
       WHERE sol.id=? AND so.id=? AND so.version=? AND so.lifecycle_status<>'canceled'
@@ -1058,11 +1144,8 @@ async function postReceiptBatch(input: InventoryCommand): Promise<CommandResult>
           -COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0)
           -COALESCE((SELECT SUM(r.quantity) FROM reservations r WHERE r.sales_order_line_id=sol.id AND r.status='active'),0)>=?)`).join("\n")}`).join("\n");
   const claimBindings = states.flatMap((state) => [
-    state.line.id, state.lineVersion, state.line.productId, state.valuation.version,
     ...(state.approval ? [state.approval.id, state.approval.version] : []),
     ...state.tracking.claimBindings,
-    state.locationId,
-    ...(state.damagedQuantity > 0 ? [state.quarantineLocationId] : []),
     ...state.supplyAllocations.flatMap((allocation) => [allocation.id, allocation.version, allocation.receiptQuantity]),
     ...state.supplyAllocations.filter((allocation) => allocation.reserveQuantity > 0).flatMap((allocation) => [allocation.salesOrderLineId, allocation.salesOrderId, allocation.salesOrderVersion, allocation.reserveQuantity]),
   ]);
@@ -1070,8 +1153,8 @@ async function postReceiptBatch(input: InventoryCommand): Promise<CommandResult>
   const exists = commandExistsPrepared(input);
   const commands: D1PreparedStatement[] = [
     statement(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
-      SELECT ?,?,?,?,?,?,? FROM purchase_orders po WHERE po.id=? AND po.lifecycle_status='approved' ${claimSql}`,
-      input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, now, input.entityId, ...claimBindings),
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders po WHERE po.id=? AND po.lifecycle_status='approved' ${lineClaimSql} ${claimSql}`,
+      input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, now, input.entityId, lineClaimJson, ...claimBindings),
     db.prepare(`INSERT INTO receipts (id,number,purchase_order_id,status,posted_at,packing_slip_number,version) SELECT ?,?,?,'posted',?,?,1 WHERE ${exists}`).bind(receiptId, receiptNumber, input.entityId, now, optionalText(input.payload ?? {}, "packingSlipNumber", "") || null),
     db.prepare(`UPDATE purchase_orders SET version=version+1 WHERE id=? AND ${exists}`).bind(input.entityId),
   ];
@@ -1103,7 +1186,7 @@ async function postReceiptBatch(input: InventoryCommand): Promise<CommandResult>
       db.prepare(`INSERT INTO receipt_lines (id,receipt_id,purchase_order_line_id,product_id,location_id,quantity,condition) SELECT ?,?,?,?,?,?,'usable' WHERE ${exists}`).bind(usableLineId, receiptId, line.id, line.productId, locationId, usableQuantity),
       db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,to_location_id,inventory_status,source_document_type,source_document_id,source_line_id,purchase_order_line_id,posted_at,posted_by,unit_cost_cents,idempotency_key)
         SELECT ?,'purchase_receipt',?,?,?,'usable','receipt',?,?,?,?,?,?,? WHERE ${exists}`).bind(usableMovementId, line.productId, usableQuantity, locationId, receiptId, usableLineId, line.id, now, actor, line.unitCostCents, input.idempotencyKey),
-      db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) SELECT ?,?,?,0,1 WHERE ${exists} ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=on_hand_qty+excluded.on_hand_qty,version=version+1`).bind(line.productId, locationId, usableQuantity),
+      db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) SELECT ?,?,?,0,1 WHERE ${exists} ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=ROUND(on_hand_qty+excluded.on_hand_qty,6),version=version+1`).bind(line.productId, locationId, usableQuantity),
       db.prepare(`INSERT INTO cost_layers (id,product_id,receipt_movement_id,received_qty,remaining_qty,unit_cost_cents,landed_cost_cents,received_at,status) SELECT ?,?,?,?,?,?,0,?,'open' WHERE ${exists}`).bind(newId("layer"), line.productId, usableMovementId, usableQuantity, usableQuantity, line.unitCostCents, now),
       valueEntryPrepared(input, { productId: line.productId, movementId: usableMovementId, entryType: "receipt", quantity: usableQuantity, unitCostCents: valuation.unitCostCents, valueCents: usableValueCents, method: valuation.method, referenceType: "receipt", referenceId: receiptId, postedAt: now, postedBy: actor }),
     );
@@ -1115,7 +1198,7 @@ async function postReceiptBatch(input: InventoryCommand): Promise<CommandResult>
       if (allocation.reserveQuantity > 0 && allocation.reservationId) commands.push(
         db.prepare(`INSERT INTO reservations (id,sales_order_line_id,product_id,location_id,quantity,status,created_at) SELECT ?,?,?,?,?,'active',? WHERE ${exists}`)
           .bind(allocation.reservationId, allocation.salesOrderLineId, line.productId, locationId, allocation.reserveQuantity, now),
-        db.prepare(`UPDATE inventory_balances SET reserved_qty=reserved_qty+?,version=version+1 WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${exists}`)
+        db.prepare(`UPDATE inventory_balances SET reserved_qty=${qtyPlus("reserved_qty")},version=version+1 WHERE product_id=? AND location_id=? AND ${qtyAtLeast("on_hand_qty-reserved_qty")} AND ${exists}`)
           .bind(allocation.reserveQuantity, line.productId, locationId, allocation.reserveQuantity),
       );
       if (allocation.usableReceiptQuantity > 0 && allocation.usableLineageId) commands.push(db.prepare(`INSERT INTO supply_allocation_receipts
@@ -1127,7 +1210,7 @@ async function postReceiptBatch(input: InventoryCommand): Promise<CommandResult>
       db.prepare(`INSERT INTO receipt_lines (id,receipt_id,purchase_order_line_id,product_id,location_id,quantity,condition) SELECT ?,?,?,?,?,?,'damaged' WHERE ${exists}`).bind(damagedLineId, receiptId, line.id, line.productId, quarantineLocationId, damagedQuantity),
       db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,to_location_id,inventory_status,source_document_type,source_document_id,source_line_id,purchase_order_line_id,posted_at,posted_by,unit_cost_cents,idempotency_key)
         SELECT ?,'purchase_receipt',?,?,?,'quarantine','receipt',?,?,?,?,?,?,? WHERE ${exists}`).bind(damagedMovementId, line.productId, damagedQuantity, quarantineLocationId, receiptId, damagedLineId, line.id, now, actor, line.unitCostCents, input.idempotencyKey),
-      db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) SELECT ?,?,?,0,1 WHERE ${exists} ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=on_hand_qty+excluded.on_hand_qty,version=version+1`).bind(line.productId, quarantineLocationId, damagedQuantity),
+      db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) SELECT ?,?,?,0,1 WHERE ${exists} ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=ROUND(on_hand_qty+excluded.on_hand_qty,6),version=version+1`).bind(line.productId, quarantineLocationId, damagedQuantity),
       db.prepare(`INSERT INTO cost_layers (id,product_id,receipt_movement_id,received_qty,remaining_qty,unit_cost_cents,landed_cost_cents,received_at,status) SELECT ?,?,?,?,?,?,0,?,'open' WHERE ${exists}`).bind(newId("layer"), line.productId, damagedMovementId, damagedQuantity, damagedQuantity, line.unitCostCents, now),
       valueEntryPrepared(input, { productId: line.productId, movementId: damagedMovementId, entryType: "receipt", quantity: damagedQuantity, unitCostCents: valuation.unitCostCents, valueCents: damagedValueCents, method: valuation.method, referenceType: "receipt", referenceId: receiptId, postedAt: now, postedBy: actor }),
     );
@@ -1190,7 +1273,7 @@ async function closeRemainder(input: InventoryCommand): Promise<CommandResult> {
 async function reopenRemainder(input: InventoryCommand): Promise<CommandResult> {
   const payload = input.payload ?? {};
   const reason = requiredText(payload, "reason");
-  const expectedDate = requiredText(payload, "expectedDate");
+  const expectedDate = validDateText(requiredText(payload, "expectedDate"), "expectedDate");
   const line = await getPurchaseLine(input.entityId, typeof payload.lineId === "string" ? payload.lineId : undefined);
   const quantity = (await normalizedQuantity({ productId: line.productId, quantity: positive(payload), uomId: typeof payload.uomId === "string" ? payload.uomId : null, usage: "purchase", field: "quantity" })).baseQuantity;
   if (line.lifecycleStatus !== "approved") throw new DomainError("INVALID_STATE", "Only approved purchase-order commitments can be reopened.", 409, line.version);
@@ -1228,24 +1311,39 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
   );
   if (!receipt) throw new DomainError("NOT_FOUND", "Receipt was not found.", 404);
   if (receipt.version !== input.version) throw new DomainError("VERSION_CONFLICT", "The receipt changed. Refresh before reversing it.", 409, receipt.version);
-  const source = await first<{ movementId: string; receiptLineId: string; poLineId: string; productId: string; locationId: string; inventoryStatus: string; unitCostCents: number; remainingQty: number }>(
+  // A split receipt posts one movement per condition (usable bin, quarantine bin). The caller
+  // may target the movement by inventoryStatus and/or receiptLineId; otherwise the movement
+  // with the most physically reversible stock is chosen, which is what the snapshot advertises.
+  const requestedStatus = typeof payload.inventoryStatus === "string" && payload.inventoryStatus.trim() ? payload.inventoryStatus.trim().toLowerCase() : null;
+  if (requestedStatus && !["usable", "quarantine", "damaged"].includes(requestedStatus)) throw new DomainError("VALIDATION_ERROR", "inventoryStatus must be usable, quarantine, or damaged.");
+  const requestedReceiptLineId = typeof payload.receiptLineId === "string" && payload.receiptLineId.trim() ? payload.receiptLineId.trim() : null;
+  const requestedLineId = typeof payload.lineId === "string" && payload.lineId.trim() ? payload.lineId.trim() : null;
+  const source = await first<{ movementId: string; receiptLineId: string; poLineId: string; productId: string; locationId: string; inventoryStatus: string; unitCostCents: number; remainingQty: number; availableQty: number }>(
     `SELECT sm.id AS movementId, sm.source_line_id AS receiptLineId, sm.purchase_order_line_id AS poLineId,
             sm.product_id AS productId, sm.to_location_id AS locationId, sm.inventory_status AS inventoryStatus,
             sm.unit_cost_cents AS unitCostCents,
-            sm.quantity + COALESCE(SUM(rev.quantity), 0) AS remainingQty
+            sm.quantity + COALESCE(SUM(rev.quantity), 0) AS remainingQty,
+            COALESCE((SELECT ib.on_hand_qty - ib.reserved_qty FROM inventory_balances ib
+                       WHERE ib.product_id = sm.product_id AND ib.location_id = sm.to_location_id), 0)
+            + COALESCE((SELECT SUM(MIN(r.quantity, sar.quantity - sar.reversed_qty)) FROM supply_allocation_receipts sar
+                         JOIN reservations r ON r.id = sar.reservation_id AND r.status = 'active'
+                        WHERE sar.receipt_movement_id = sm.id), 0) AS availableQty
        FROM stock_movements sm
        LEFT JOIN stock_movements rev ON rev.reversal_of_movement_id = sm.id AND rev.movement_type = 'receipt_reversal'
       WHERE sm.source_document_type = 'receipt' AND sm.source_document_id = ?
         AND (? IS NULL OR sm.source_line_id = ? OR sm.purchase_order_line_id = ?)
-      GROUP BY sm.id HAVING remainingQty > 0 ORDER BY remainingQty DESC, sm.id LIMIT 1`,
+        AND (? IS NULL OR sm.inventory_status = ? OR EXISTS (SELECT 1 FROM locations l WHERE l.id = sm.to_location_id AND l.inventory_status = ?))
+        AND (? IS NULL OR sm.source_line_id = ?)
+      GROUP BY sm.id HAVING remainingQty > 0
+      ORDER BY MIN(remainingQty, availableQty) DESC, remainingQty DESC, sm.id LIMIT 1`,
     input.entityId,
-    typeof payload.lineId === "string" ? payload.lineId : null,
-    typeof payload.lineId === "string" ? payload.lineId : null,
-    typeof payload.lineId === "string" ? payload.lineId : null
+    requestedLineId, requestedLineId, requestedLineId,
+    requestedStatus, requestedStatus, requestedStatus,
+    requestedReceiptLineId, requestedReceiptLineId,
   );
-  if (!source) throw new DomainError("NOT_REVERSIBLE", "This receipt has no remaining quantity to reverse.", 409, receipt.version);
+  if (!source) throw new DomainError("NOT_REVERSIBLE", requestedStatus || requestedReceiptLineId ? "No remaining receipt quantity matches the requested inventory status or receipt line." : "This receipt has no remaining quantity to reverse.", 409, receipt.version);
   const quantity = (await normalizedQuantity({ productId: source.productId, quantity: enteredQuantity, uomId: typeof payload.uomId === "string" ? payload.uomId : null, usage: "purchase", field: "quantity" })).baseQuantity;
-  if (quantity > source.remainingQty) throw new DomainError("INVALID_QUANTITY", `Only ${source.remainingQty} units remain reversible.`, 409, receipt.version);
+  if (quantity > source.remainingQty) throw new DomainError("INVALID_QUANTITY", `Only ${source.remainingQty} units remain reversible${requestedStatus ? ` in ${requestedStatus} condition` : ""}.`, 409, receipt.version);
   const allocationReceiptRows = await all<{
     id: string; allocationId: string; allocationVersion: number; quantity: number; reversedQty: number;
     reservationId: string | null; reservationQuantity: number; reservationStatus: string | null;
@@ -1301,8 +1399,17 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
        WHERE sm.id = ?
        ORDER BY cl.id LIMIT 1`, source.movementId);
   if (!layer) throw new DomainError("VALUATION_LINEAGE_MISSING", "The original receipt cost layer is missing; reversal is blocked to protect valuation integrity.", 409);
-  if (quantity > layer.remainingQty) {
-    throw new DomainError("RECEIPT_LAYER_CONSUMED", `Only ${layer.remainingQty} units remain in this receipt's original cost layer; other receipts cannot fund its reversal.`, 409);
+  // Units physically on the shelf can always come back off it. When FIFO already spent this
+  // receipt's own layer on a shipment elsewhere, the remainder is funded from the product's
+  // other open layers and the cost difference is posted as a variance, so the value ledger
+  // and the layer ledger move by the same amount.
+  const ownLayerQuantity = roundQuantity(Math.min(quantity, Math.max(Number(layer.remainingQty), 0)));
+  const otherLayerQuantity = roundQuantity(quantity - ownLayerQuantity);
+  const otherLayers = otherLayerQuantity > 0
+    ? await openLayersForIssue(source.productId, otherLayerQuantity, layer.id)
+    : { layers: [] as CostLayerAllocation[], valueCents: 0, shortfall: 0 };
+  if (otherLayers.shortfall > 0) {
+    throw new DomainError("RECEIPT_LAYER_CONSUMED", `Only ${layer.remainingQty} units remain in this receipt's original cost layer and the product's other open layers cannot fund the remaining ${otherLayers.shortfall}; reverse a smaller quantity.`, 409);
   }
   const blockingBill = await first<{ number: string; status: string; matchStatus: string }>(`SELECT vb.number,vb.status,vb.match_status AS matchStatus
       FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id
@@ -1322,10 +1429,17 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
   const consumedByOtherPostingsQty = roundQuantity(layer.receivedQty - layer.remainingQty - layer.priorReversedQty);
   const consumedByOtherPostingsValueCents = Math.round(totalLayerValueCents * consumedByOtherPostingsQty / layer.receivedQty);
   const remainingLayerValueCents = totalLayerValueCents - consumedByOtherPostingsValueCents - layer.priorReversedValueCents;
-  const valueCents = quantity === layer.remainingQty
-    ? remainingLayerValueCents
-    : Math.round(totalLayerValueCents * quantity / layer.receivedQty);
+  // The reversal itself is always valued at the original receipt cost (including landed cost).
+  const ownLayerValueCents = ownLayerQuantity <= 0 ? 0
+    : ownLayerQuantity === layer.remainingQty ? remainingLayerValueCents
+    : Math.round(totalLayerValueCents * ownLayerQuantity / layer.receivedQty);
+  const otherAtReceiptCostCents = Math.round(totalLayerValueCents * otherLayerQuantity / layer.receivedQty);
+  const valueCents = ownLayerValueCents + otherAtReceiptCostCents;
   if (valueCents < 0) throw new DomainError("VALUATION_LINEAGE_INVALID", "The original receipt layer has inconsistent reversal value history.", 409);
+  // What the layer ledger actually gives up, and the balancing variance between that and the
+  // receipt-cost reversal entry. Reversal + variance always equals the layer value removed.
+  const layerValueRemovedCents = ownLayerValueCents + otherLayers.valueCents;
+  const costVarianceCents = otherAtReceiptCostCents - otherLayers.valueCents;
   const unitCostCents = quantity > 0 ? Math.round(valueCents / quantity) : 0;
   const costMethod = (["fifo", "average", "standard"].includes(layer.costMethod) ? layer.costMethod : "fifo") as ValuationMethod;
   const policy = await valuationPolicy(source.productId);
@@ -1336,14 +1450,14 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
   const totalOnHandQty = Number(totalBalance?.onHandQty ?? 0);
   const nextAverageCostCents = policy.method === "average"
     ? totalOnHandQty - quantity > 0
-      ? Math.max(0, Math.round(((totalOnHandQty * policy.averageCostCents) - valueCents) / (totalOnHandQty - quantity)))
+      ? Math.max(0, Math.round(((totalOnHandQty * policy.averageCostCents) - layerValueRemovedCents) / (totalOnHandQty - quantity)))
       : 0
     : policy.averageCostCents;
   const actor = optionalText(payload, "actor", "Avery Morgan");
   const movementId = newId("movement");
   const result: CommandResult = {
     message: `${quantity} unit${quantity === 1 ? "" : "s"} reversed from the posted receipt.`,
-    impact: { physical: `${quantity} units removed from on-hand inventory.`, commercial: `${disposition === "reopen" ? `Open incoming increased by ${quantity}.` : `${quantity} units were closed without replacement supply.`}${automaticallyReleased ? ` ${automaticallyReleased} linked reservation units were released.` : ""}`, financial: `Inventory value decreased by ${valueCents} cents from the original receipt layer, including landed cost; AP compatibility was verified before posting.`, onHandDelta: -quantity, incomingDelta: disposition === "reopen" ? quantity : 0, reservedDelta: -automaticallyReleased, availableDelta: roundQuantity(-quantity + automaticallyReleased) },
+    impact: { physical: `${quantity} units removed from ${source.inventoryStatus} on-hand inventory.`, commercial: `${disposition === "reopen" ? `Open incoming increased by ${quantity}.` : `${quantity} units were closed without replacement supply.`}${automaticallyReleased ? ` ${automaticallyReleased} linked reservation units were released.` : ""}`, financial: `Inventory value decreased by ${layerValueRemovedCents} cents (${valueCents} cents at the original receipt cost including landed cost${costVarianceCents ? `, ${costVarianceCents > 0 ? "plus" : "less"} a ${Math.abs(costVarianceCents)} cent cost variance because ${otherLayerQuantity} units were funded from other cost layers` : ""}); AP compatibility was verified before posting.`, onHandDelta: -quantity, incomingDelta: disposition === "reopen" ? quantity : 0, reservedDelta: -automaticallyReleased, availableDelta: roundQuantity(-quantity + automaticallyReleased) },
   };
   const exists = commandExistsPrepared(input);
   const db = commandD1(input);
@@ -1360,13 +1474,14 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
     .map((reversal) => [reversal.salesOrderId, reversal.salesOrderVersion])).entries()].flatMap(([salesOrderId, salesOrderVersion]) => [salesOrderId, salesOrderVersion]);
   const commands: D1PreparedStatement[] = [
     logPrepared(input, result, "receipts",
-      `AND EXISTS (SELECT 1 FROM inventory_balances WHERE product_id = ? AND location_id = ? AND on_hand_qty - reserved_qty + ? >= ?)
-       AND EXISTS (SELECT 1 FROM cost_layers WHERE id = ? AND receipt_movement_id = ? AND remaining_qty >= ?)
+      `AND EXISTS (SELECT 1 FROM inventory_balances WHERE product_id = ? AND location_id = ? AND on_hand_qty - reserved_qty + ? >= ? - ${QTY_EPSILON})
+       AND EXISTS (SELECT 1 FROM cost_layers WHERE id = ? AND receipt_movement_id = ? AND remaining_qty >= ? - ${QTY_EPSILON})
+       ${layerClaimPredicate(otherLayers.layers)}
        AND NOT EXISTS (SELECT 1 FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=? AND vb.status<>'void' AND (vb.match_status='matched' OR vb.status IN ('approved','partially_paid','paid')))
        AND (SELECT COALESCE(SUM(on_hand_qty), 0) FROM inventory_balances WHERE product_id = ?) = ?
         AND COALESCE((SELECT version FROM valuation_policies WHERE product_id = ?), 0) = ?${tracking.claimSql}
         ${tracking.policy === "quantity" ? "" : "AND COALESCE((SELECT SUM(ma.quantity) FROM movement_assignments ma WHERE ma.movement_id=? AND ((? IS NOT NULL AND ma.lot_id=?) OR (? IS NOT NULL AND ma.inventory_unit_id=?))),0)-COALESCE((SELECT SUM(ra.quantity) FROM stock_movements rev JOIN movement_assignments ra ON ra.movement_id=rev.id WHERE rev.reversal_of_movement_id=? AND rev.movement_type='receipt_reversal' AND ((? IS NOT NULL AND ra.lot_id=?) OR (? IS NOT NULL AND ra.inventory_unit_id=?))),0)>=?"}${allocationReversalClaimSql}${reservationReleaseClaimSql}${salesOrderReleaseClaimSql}`,
-      [source.productId, source.locationId, automaticallyReleased, quantity, layer.id, source.movementId, quantity, source.poLineId,
+      [source.productId, source.locationId, automaticallyReleased, quantity, layer.id, source.movementId, ownLayerQuantity, ...layerClaimBindings(otherLayers.layers), source.poLineId,
         source.productId, totalOnHandQty, source.productId, policy.version, ...tracking.claimBindings,
         ...(tracking.policy === "quantity" ? [] : [source.movementId, tracking.lotId, tracking.lotId, tracking.unitId, tracking.unitId, source.movementId, tracking.lotId, tracking.lotId, tracking.unitId, tracking.unitId, quantity]),
         ...allocationReversals.flatMap((reversal) => [reversal.id, reversal.reverseQuantity, reversal.allocationId, reversal.allocationVersion, reversal.reverseQuantity]),
@@ -1384,11 +1499,11 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
     ...(disposition === "close" ? [db.prepare(`UPDATE purchase_order_lines SET closed_qty=closed_qty+? WHERE id=? AND ${exists}`).bind(quantity, source.poLineId)] : []),
     ...allocationReversals.flatMap((reversal) => [
       ...(reversal.releaseQuantity > 0 && reversal.reservationId ? [
-        db.prepare(`UPDATE reservations SET quantity=quantity-?,status=CASE WHEN quantity-?<=0 THEN 'released' ELSE 'active' END
-          WHERE id=? AND status='active' AND quantity>=? AND ${exists}`)
+        db.prepare(`UPDATE reservations SET quantity=MAX(${qtyMinus("quantity")},0),status=CASE WHEN ${qtyDrained("quantity")} THEN 'released' ELSE 'active' END
+          WHERE id=? AND status='active' AND ${qtyAtLeast("quantity")} AND ${exists}`)
           .bind(reversal.releaseQuantity, reversal.releaseQuantity, reversal.reservationId, reversal.releaseQuantity),
-        db.prepare(`UPDATE inventory_balances SET reserved_qty=reserved_qty-?,version=version+1
-          WHERE product_id=? AND location_id=? AND reserved_qty>=? AND ${exists}`)
+        db.prepare(`UPDATE inventory_balances SET reserved_qty=MAX(${qtyMinus("reserved_qty")},0),version=version+1
+          WHERE product_id=? AND location_id=? AND ${qtyAtLeast("reserved_qty")} AND ${exists}`)
           .bind(reversal.releaseQuantity, source.productId, source.locationId, reversal.releaseQuantity),
       ] : []),
       db.prepare(`UPDATE supply_allocation_receipts SET reversed_qty=reversed_qty+?
@@ -1401,8 +1516,8 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
     ...[...new Map(allocationReversals.filter((reversal) => reversal.releaseQuantity > 0)
       .map((reversal) => [reversal.salesOrderId, reversal.salesOrderVersion])).entries()].map(([salesOrderId, salesOrderVersion]) =>
       db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${exists}`).bind(salesOrderId, salesOrderVersion)),
-    db.prepare(`UPDATE inventory_balances SET on_hand_qty = on_hand_qty - ?, version = version + 1
-                WHERE product_id = ? AND location_id = ? AND on_hand_qty - reserved_qty >= ? AND ${exists}`).bind(quantity, source.productId, source.locationId, quantity),
+    db.prepare(`UPDATE inventory_balances SET on_hand_qty = ${qtyMinus("on_hand_qty")}, version = version + 1
+                WHERE product_id = ? AND location_id = ? AND ${qtyAtLeast("on_hand_qty - reserved_qty")} AND ${exists}`).bind(quantity, source.productId, source.locationId, quantity),
     db.prepare(`INSERT INTO stock_movements
       (id, movement_type, product_id, quantity, from_location_id, inventory_status, source_document_type,
        source_document_id, source_line_id, purchase_order_line_id, reversal_of_movement_id,
@@ -1412,17 +1527,23 @@ async function reverseReceipt(input: InventoryCommand): Promise<CommandResult> {
     valueEntryPrepared(input, { productId: source.productId, movementId, entryType: "receipt_reversal",
       quantity: -quantity, unitCostCents, valueCents: -valueCents,
       method: costMethod, referenceType: "receipt", referenceId: input.entityId, postedAt: now, postedBy: actor }),
-    db.prepare(`UPDATE cost_layers
-      SET remaining_qty = remaining_qty - ?, status = CASE WHEN remaining_qty - ? = 0 THEN 'consumed' ELSE 'open' END
-      WHERE id = ? AND receipt_movement_id = ? AND remaining_qty >= ? AND ${exists}`)
-      .bind(quantity, quantity, layer.id, source.movementId, quantity),
+    ...(costVarianceCents !== 0 ? [valueEntryPrepared(input, { productId: source.productId, movementId, entryType: "cost_variance",
+      quantity: 0, unitCostCents: 0, valueCents: costVarianceCents,
+      method: costMethod, referenceType: "receipt", referenceId: input.entityId, postedAt: now, postedBy: actor })] : []),
+    ...(ownLayerQuantity > 0 ? [db.prepare(`UPDATE cost_layers
+      SET remaining_qty = MAX(${qtyMinus("remaining_qty")}, 0), status = CASE WHEN ${qtyDrained("remaining_qty")} THEN 'consumed' ELSE 'open' END
+      WHERE id = ? AND receipt_movement_id = ? AND ${qtyAtLeast("remaining_qty")} AND ${exists}`)
+      .bind(ownLayerQuantity, ownLayerQuantity, layer.id, source.movementId, ownLayerQuantity)] : []),
+    ...layerConsumptionPrepared(input, otherLayers.layers),
     auditPrepared(input, "receipt", input.entityId, "receipt_reversed", result.message,
-      { reason, disposition, quantity, movementId, sourceMovementId: source.movementId, costLayerId: layer.id,
+      { reason, disposition, quantity, movementId, sourceMovementId: source.movementId, costLayerId: layer.id, inventoryStatus: source.inventoryStatus,
         baseCostCents: Math.round(quantity * layer.unitCostCents), landedCostIncludedCents: valueCents - Math.round(quantity * layer.unitCostCents),
-        inventoryValueCents: -valueCents, costMethod, automaticallyReleased, apIntegrityChecked: true }, now),
+        inventoryValueCents: -layerValueRemovedCents, receiptCostValueCents: -valueCents, costVarianceCents,
+        otherLayerQuantity, otherLayerIds: otherLayers.layers.map((other) => other.id),
+        costMethod, automaticallyReleased, apIntegrityChecked: true }, now),
     outboxPrepared(input, "inventory.receipt_reversed", "receipt", input.entityId,
-      { movementId, sourceMovementId: source.movementId, costLayerId: layer.id, productId: source.productId,
-        disposition, quantity, automaticallyReleased, inventoryValueCents: -valueCents }, now),
+      { movementId, sourceMovementId: source.movementId, costLayerId: layer.id, productId: source.productId, inventoryStatus: source.inventoryStatus,
+        disposition, quantity, automaticallyReleased, inventoryValueCents: -layerValueRemovedCents, costVarianceCents }, now),
   ];
   if (policy.method === "average") {
     commands.push(db.prepare(`UPDATE valuation_policies
@@ -1448,10 +1569,15 @@ async function postVendorReturn(input: InventoryCommand): Promise<CommandResult>
   if (line.version !== input.version) throw new DomainError("VERSION_CONFLICT", "The purchase order changed. Refresh before posting the vendor return.", 409, line.version);
   if (quantity > line.netReceivedQty) throw new DomainError("INVALID_QUANTITY", `Only ${line.netReceivedQty} net received units can be returned.`, 409, line.version);
   const locationId = requiredText(payload, "locationId");
-  await requireActiveLocation(locationId, ["usable"], "vendor-return inventory");
+  // Damaged receipts sit in quarantine or damaged bins, and those are exactly the units that go
+  // back to the vendor, so every stock-holding status except in-transit is a valid source.
+  const location = await requireActiveLocation(locationId, ["usable", "quarantine", "damaged"], "vendor-return inventory");
+  const inventoryStatus = location.inventoryStatus;
+  // Serial units record quarantine and damaged stock alike as 'quarantine'.
+  const unitStatus = inventoryStatus === "usable" ? "usable" : "quarantine";
   const balance = await first<{ onHandQty: number; reservedQty: number }>("SELECT on_hand_qty AS onHandQty, reserved_qty AS reservedQty FROM inventory_balances WHERE product_id = ? AND location_id = ?", line.productId, locationId);
-  if (!balance || balance.onHandQty - balance.reservedQty < quantity) throw new DomainError("INSUFFICIENT_STOCK", "Not enough unreserved stock exists at the selected location.", 409, line.version);
-  const tracking = await outgoingTracking(line.productId, locationId, quantity, payload);
+  if (!balance || balance.onHandQty - balance.reservedQty + 0.000001 < quantity) throw new DomainError("INSUFFICIENT_STOCK", "Not enough unreserved stock exists at the selected location.", 409, line.version);
+  const tracking = await outgoingTracking(line.productId, locationId, quantity, payload, unitStatus);
   const valuation = await valuationForIssue(line.productId, quantity);
   const actor = optionalText(payload, "actor", "Avery Morgan");
   const returnId = newId("vendor-return");
@@ -1461,7 +1587,7 @@ async function postVendorReturn(input: InventoryCommand): Promise<CommandResult>
   const result: CommandResult = {
     message: `${returnNumber} posted for ${quantity} unit${quantity === 1 ? "" : "s"}.`,
     impact: {
-      physical: `${quantity} units removed from on-hand inventory.`,
+      physical: `${quantity} units removed from ${inventoryStatus} on-hand inventory at ${location.code}.`,
       commercial: disposition === "repair" ? `${quantity} units are open to receive back after repair.` : replacementExpected ? `${quantity} units are open to receive as replacement.` : `${quantity} units marked not expected; no replacement incoming.`,
       financial: `${replacementExpected ? "No credit assumed; replacement or repaired stock is expected." : "Vendor credit is expected but not yet posted."} Inventory value decreased by ${valuation.valueCents} cents.`,
       onHandDelta: -quantity,
@@ -1474,14 +1600,15 @@ async function postVendorReturn(input: InventoryCommand): Promise<CommandResult>
   const db = commandD1(input);
   const commands: D1PreparedStatement[] = [
     logPrepared(input, result, "purchase_orders",
-      `AND EXISTS (SELECT 1 FROM inventory_balances WHERE product_id = ? AND location_id = ? AND on_hand_qty - reserved_qty >= ?) ${layerClaimPredicate(valuation.layers)}${tracking.claimSql}`,
-      [line.productId, locationId, quantity, ...layerClaimBindings(valuation.layers), ...tracking.claimBindings]),
+      `AND EXISTS (SELECT 1 FROM inventory_balances WHERE product_id = ? AND location_id = ? AND ${qtyAtLeast("on_hand_qty - reserved_qty")})
+       AND EXISTS (SELECT 1 FROM locations WHERE id = ? AND active = 1 AND inventory_status = ?) ${layerClaimPredicate(valuation.layers)}${tracking.claimSql}`,
+      [line.productId, locationId, quantity, locationId, inventoryStatus, ...layerClaimBindings(valuation.layers), ...tracking.claimBindings]),
     db.prepare(`UPDATE purchase_orders SET version = version + 1 WHERE id = ? AND version = ? AND ${exists}`).bind(input.entityId, input.version),
   ];
   if (!replacementExpected) commands.push(db.prepare(`UPDATE purchase_order_lines SET closed_qty = closed_qty + ? WHERE id = ? AND ${exists}`).bind(quantity, line.id));
   commands.push(
-    db.prepare(`UPDATE inventory_balances SET on_hand_qty = on_hand_qty - ?, version = version + 1
-                WHERE product_id = ? AND location_id = ? AND on_hand_qty - reserved_qty >= ? AND ${exists}`).bind(quantity, line.productId, locationId, quantity),
+    db.prepare(`UPDATE inventory_balances SET on_hand_qty = ${qtyMinus("on_hand_qty")}, version = version + 1
+                WHERE product_id = ? AND location_id = ? AND ${qtyAtLeast("on_hand_qty - reserved_qty")} AND ${exists}`).bind(quantity, line.productId, locationId, quantity),
     db.prepare(`INSERT INTO vendor_returns
       (id, number, purchase_order_id, purchase_order_line_id, product_id, location_id, quantity, disposition, posted_at)
       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${exists}`)
@@ -1489,8 +1616,8 @@ async function postVendorReturn(input: InventoryCommand): Promise<CommandResult>
     db.prepare(`INSERT INTO stock_movements
       (id, movement_type, product_id, quantity, from_location_id, inventory_status, source_document_type,
        source_document_id, purchase_order_line_id, posted_at, posted_by, unit_cost_cents, idempotency_key)
-      SELECT ?, 'vendor_return', ?, ?, ?, 'usable', 'vendor_return', ?, ?, ?, ?, ?, ? WHERE ${exists}`)
-      .bind(movementId, line.productId, -quantity, locationId, returnId, line.id, now, actor, valuation.unitCostCents, input.idempotencyKey),
+      SELECT ?, 'vendor_return', ?, ?, ?, ?, 'vendor_return', ?, ?, ?, ?, ?, ? WHERE ${exists}`)
+      .bind(movementId, line.productId, -quantity, locationId, inventoryStatus, returnId, line.id, now, actor, valuation.unitCostCents, input.idempotencyKey),
     valueEntryPrepared(input, { productId: line.productId, movementId, entryType: "vendor_return",
       quantity: -quantity, unitCostCents: valuation.unitCostCents, valueCents: -valuation.valueCents,
       method: valuation.method, referenceType: "vendor_return", referenceId: returnId, postedAt: now, postedBy: actor }),
@@ -1519,9 +1646,12 @@ async function postPriceOnlyCredit(input: InventoryCommand): Promise<CommandResu
   if (order.version !== input.version) {
     throw new DomainError("VERSION_CONFLICT", "The purchase order changed. Refresh before recording the price allowance.", 409, order.version);
   }
-  const amountLabel = amountCents > 0
-    ? new Intl.NumberFormat("en-CA", { style: "currency", currency: order.currency }).format(amountCents / 100)
-    : "An unvalued allowance";
+  const formatAmount = () => {
+    // A malformed currency code on the order must not turn an allowance into a 500.
+    try { return new Intl.NumberFormat("en-CA", { style: "currency", currency: order.currency }).format(amountCents / 100); }
+    catch { return `${(amountCents / 100).toFixed(2)} ${order.currency}`; }
+  };
+  const amountLabel = amountCents > 0 ? formatAmount() : "An unvalued allowance";
   const result: CommandResult = {
     message: `${amountLabel} price-only vendor allowance recorded.`,
     impact: {
@@ -1589,38 +1719,69 @@ async function reserveSale(input: InventoryCommand): Promise<CommandResult> {
   if (line.version !== input.version) throw new DomainError("VERSION_CONFLICT", "The sales order changed. Refresh before reserving stock.", 409, line.version);
   const openToReserve = roundQuantity(line.orderedQty - line.canceledQty - line.shippedQty - line.reservedQty);
   if (quantity > openToReserve) throw new DomainError("INVALID_QUANTITY", `Only ${Math.max(openToReserve, 0)} units remain to reserve.`, 409, line.version);
-  const requestedLocation = typeof payload.locationId === "string" ? payload.locationId : null;
-  const balance = await first<{ locationId: string; onHandQty: number; reservedQty: number }>(
-    `SELECT ib.location_id AS locationId, ib.on_hand_qty AS onHandQty, ib.reserved_qty AS reservedQty
+  const requestedLocation = typeof payload.locationId === "string" && payload.locationId.trim() ? payload.locationId.trim() : null;
+  const requestedWarehouse = typeof payload.warehouseId === "string" && payload.warehouseId.trim() ? payload.warehouseId.trim() : null;
+  // The worklist shows product-wide availability, so a reservation without a location spreads
+  // the demand across usable bins (largest available first, one reservation row per bin) and
+  // only fails when the whole product cannot cover it. A named location keeps the old rule:
+  // that one bin must hold the entire quantity.
+  const balances = await all<{ locationId: string; availableQty: number }>(
+    `SELECT ib.location_id AS locationId, ib.on_hand_qty - ib.reserved_qty AS availableQty
        FROM inventory_balances ib JOIN locations l ON l.id = ib.location_id
-      WHERE ib.product_id = ? AND l.inventory_status = 'usable' AND (? IS NULL OR ib.location_id = ?)
-        AND ib.on_hand_qty - ib.reserved_qty >= ? ORDER BY ib.on_hand_qty - ib.reserved_qty DESC LIMIT 1`,
-    line.productId, requestedLocation, requestedLocation, quantity
+      WHERE ib.product_id = ? AND l.active = 1 AND l.inventory_status = 'usable'
+        AND (? IS NULL OR ib.location_id = ?) AND (? IS NULL OR l.warehouse_id = ?)
+        AND ib.on_hand_qty - ib.reserved_qty > ${QTY_EPSILON}
+      ORDER BY ib.on_hand_qty - ib.reserved_qty DESC, ib.location_id`,
+    line.productId, requestedLocation, requestedLocation, requestedWarehouse, requestedWarehouse,
   );
-  if (!balance) throw new DomainError("INSUFFICIENT_AVAILABILITY", "There is not enough usable, unreserved stock at the selected location.", 409, line.version);
-  const reservationId = newId("reservation");
+  const allocations: Array<{ locationId: string; quantity: number; reservationId: string }> = [];
+  let remaining = quantity;
+  for (const balance of balances) {
+    if (remaining <= 0) break;
+    const available = roundQuantity(Number(balance.availableQty));
+    const allocated = requestedLocation ? (available + 0.000001 >= quantity ? quantity : 0) : roundQuantity(Math.min(available, remaining));
+    if (allocated <= 0) continue;
+    allocations.push({ locationId: balance.locationId, quantity: allocated, reservationId: newId("reservation") });
+    remaining = roundQuantity(remaining - allocated);
+  }
+  if (remaining > 0 || !allocations.length) {
+    throw new DomainError("INSUFFICIENT_AVAILABILITY", requestedLocation
+      ? "There is not enough usable, unreserved stock at the selected location."
+      : `Only ${roundQuantity(quantity - remaining)} of ${quantity} units are usable and unreserved${requestedWarehouse ? " in the selected warehouse" : ""}.`, 409, line.version);
+  }
   const now = new Date().toISOString();
+  const spread = allocations.length === 1 ? "" : ` across ${allocations.length} locations`;
   const result: CommandResult = {
-    message: `${quantity} unit${quantity === 1 ? "" : "s"} reserved for this sales order.`,
-    impact: { physical: "On-hand inventory is unchanged.", commercial: `${quantity} units allocated to customer demand.`, financial: "No invoice was created.", onHandDelta: 0, incomingDelta: 0, reservedDelta: quantity, availableDelta: -quantity },
+    message: `${quantity} unit${quantity === 1 ? "" : "s"} reserved for this sales order${spread}.`,
+    impact: { physical: "On-hand inventory is unchanged.", commercial: `${quantity} units allocated to customer demand${spread}.`, financial: "No invoice was created.", onHandDelta: 0, incomingDelta: 0, reservedDelta: quantity, availableDelta: -quantity },
   };
   const exists = commandExistsPrepared(input);
   const db = commandD1(input);
+  const primary = allocations[0];
+  const claimedBalances = JSON.stringify(allocations.map((allocation) => ({ locationId: allocation.locationId, quantity: allocation.quantity })));
   await db.batch([
+    // One JSON document claims every bin at once, so the claim stays within D1's parameter cap
+    // however many bins the product is spread across.
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
                 SELECT ?, ?, ?, ?, ?, ?, ? FROM sales_orders so
                  WHERE so.id = ? AND so.version = ?
-                   AND EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id = ? AND ib.location_id = ? AND ib.on_hand_qty - ib.reserved_qty >= ?)`)
-      .bind(input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, now, input.entityId, input.version, line.productId, balance.locationId, quantity),
-    db.prepare(`INSERT INTO reservations (id, sales_order_line_id, product_id, location_id, quantity, status, created_at)
-                SELECT ?, ?, ?, ?, ?, 'active', ? WHERE ${exists}`).bind(reservationId, line.id, line.productId, balance.locationId, quantity, now),
-    db.prepare(`UPDATE inventory_balances SET reserved_qty = reserved_qty + ?, version = version + 1
-                WHERE product_id = ? AND location_id = ? AND ${exists}`).bind(quantity, line.productId, balance.locationId),
+                   AND NOT EXISTS (SELECT 1 FROM json_each(?) claimed
+                     LEFT JOIN inventory_balances ib ON ib.product_id = ? AND ib.location_id = json_extract(claimed.value, '$.locationId')
+                     LEFT JOIN locations l ON l.id = ib.location_id
+                     WHERE ib.location_id IS NULL OR l.active <> 1 OR l.inventory_status <> 'usable'
+                        OR ib.on_hand_qty - ib.reserved_qty < json_extract(claimed.value, '$.quantity') - ${QTY_EPSILON})`)
+      .bind(input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, now, input.entityId, input.version, claimedBalances, line.productId),
+    ...allocations.flatMap((allocation) => [
+      db.prepare(`INSERT INTO reservations (id, sales_order_line_id, product_id, location_id, quantity, status, created_at)
+                  SELECT ?, ?, ?, ?, ?, 'active', ? WHERE ${exists}`).bind(allocation.reservationId, line.id, line.productId, allocation.locationId, allocation.quantity, now),
+      db.prepare(`UPDATE inventory_balances SET reserved_qty = ${qtyPlus("reserved_qty")}, version = version + 1
+                  WHERE product_id = ? AND location_id = ? AND ${qtyAtLeast("on_hand_qty - reserved_qty")} AND ${exists}`).bind(allocation.quantity, line.productId, allocation.locationId, allocation.quantity),
+    ]),
     db.prepare(`UPDATE sales_orders SET version = version + 1 WHERE id = ? AND version = ? AND ${exists}`).bind(input.entityId, input.version),
     auditPrepared(input, "sales_order", input.entityId, "stock_reserved", result.message,
-      { quantity, locationId: balance.locationId, reservationId }, now),
-    outboxPrepared(input, "sales_order.stock_reserved", "reservation", reservationId,
-      { salesOrderId: input.entityId, productId: line.productId, quantity, locationId: balance.locationId }, now),
+      { quantity, locationId: allocations.length === 1 ? primary.locationId : null, reservationId: allocations.length === 1 ? primary.reservationId : null, allocations }, now),
+    outboxPrepared(input, "sales_order.stock_reserved", "reservation", primary.reservationId,
+      { salesOrderId: input.entityId, productId: line.productId, quantity, locationId: allocations.length === 1 ? primary.locationId : null, allocations }, now),
   ]);
   return requireLogged(input, "Availability or the sales order changed before stock could be reserved.");
 }
@@ -1647,13 +1808,23 @@ async function shipSale(input: InventoryCommand): Promise<CommandResult> {
       ORDER BY created_at, id`, line.id
   );
   let remaining = quantity;
-  const allocations = activeReservations.flatMap((reservation) => {
+  const reservationDraws = activeReservations.flatMap((reservation) => {
     if (remaining <= 0) return [];
     const allocated = roundQuantity(Math.min(reservation.quantity, remaining));
     remaining = roundQuantity(remaining - allocated);
     return allocated > 0 ? [{ ...reservation, allocated }] : [];
   });
   if (remaining > 0) throw new DomainError("NOT_RESERVED", "Reserve the requested quantity before posting shipment.", 409, line.version);
+  // Two reservation rows in the same bin are one physical pick. Merge them by location before
+  // the tracked-product check so a lot or serial shipment is not refused as "split-location".
+  const allocationsByLocation = new Map<string, { locationId: string; allocated: number; reservations: Array<{ id: string; allocated: number }> }>();
+  for (const draw of reservationDraws) {
+    const merged = allocationsByLocation.get(draw.locationId) ?? { locationId: draw.locationId, allocated: 0, reservations: [] };
+    merged.allocated = roundQuantity(merged.allocated + draw.allocated);
+    merged.reservations.push({ id: draw.id, allocated: draw.allocated });
+    allocationsByLocation.set(draw.locationId, merged);
+  }
+  const allocations = [...allocationsByLocation.values()];
   const trackingPolicy = await first<{ policy: string }>("SELECT tracking_policy AS policy FROM products WHERE id=?", line.productId);
   if (allocations.length > 1 && trackingPolicy?.policy !== "quantity") {
     throw new DomainError("TRACKING_SELECTION_REQUIRED", "Split-location shipments for lot- or serial-tracked products require separate tracked shipment commands.", 409, line.version);
@@ -1675,10 +1846,13 @@ async function shipSale(input: InventoryCommand): Promise<CommandResult> {
   };
   const exists = commandExistsPrepared(input);
   const db = commandD1(input);
-  const reservationClaims = trackedAllocations.map(() => `EXISTS (SELECT 1 FROM reservations r WHERE r.id = ? AND r.status = 'active' AND r.quantity >= ?)
-    AND EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id = ? AND ib.location_id = ? AND ib.on_hand_qty >= ? AND ib.reserved_qty >= ?)`).join(" AND ");
+  const reservationClaims = trackedAllocations.flatMap((allocation) => [
+    ...allocation.reservations.map(() => `EXISTS (SELECT 1 FROM reservations r WHERE r.id = ? AND r.status = 'active' AND ${qtyAtLeast("r.quantity")})`),
+    `EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id = ? AND ib.location_id = ? AND ${qtyAtLeast("ib.on_hand_qty")} AND ${qtyAtLeast("ib.reserved_qty")})`,
+  ]).join(" AND ");
   const reservationClaimBindings = trackedAllocations.flatMap((allocation) => [
-    allocation.id, allocation.allocated, line.productId, allocation.locationId, allocation.allocated, allocation.allocated,
+    ...allocation.reservations.flatMap((reservation) => [reservation.id, reservation.allocated]),
+    line.productId, allocation.locationId, allocation.allocated, allocation.allocated,
   ]);
   const trackingClaimSql = trackedAllocations.map((allocation) => allocation.tracking.claimSql).join("");
   const trackingClaimBindings = trackedAllocations.flatMap((allocation) => allocation.tracking.claimBindings);
@@ -1704,9 +1878,9 @@ async function shipSale(input: InventoryCommand): Promise<CommandResult> {
       : Math.round(valuation.valueCents * allocation.allocated / quantity);
     allocatedValue += valueCents;
     commands.push(
-      db.prepare(`UPDATE reservations SET quantity = quantity - ?, status = CASE WHEN quantity - ? = 0 THEN 'consumed' ELSE 'active' END
-                  WHERE id = ? AND ${exists}`).bind(allocation.allocated, allocation.allocated, allocation.id),
-      db.prepare(`UPDATE inventory_balances SET on_hand_qty = on_hand_qty - ?, reserved_qty = reserved_qty - ?, version = version + 1
+      ...allocation.reservations.map((reservation) => db.prepare(`UPDATE reservations SET quantity = MAX(${qtyMinus("quantity")}, 0), status = CASE WHEN ${qtyDrained("quantity")} THEN 'consumed' ELSE 'active' END
+                  WHERE id = ? AND ${exists}`).bind(reservation.allocated, reservation.allocated, reservation.id)),
+      db.prepare(`UPDATE inventory_balances SET on_hand_qty = ${qtyMinus("on_hand_qty")}, reserved_qty = ${qtyMinus("reserved_qty")}, version = version + 1
                   WHERE product_id = ? AND location_id = ? AND ${exists}`).bind(allocation.allocated, allocation.allocated, line.productId, allocation.locationId),
       db.prepare(`INSERT INTO shipment_lines (id, shipment_id, sales_order_line_id, product_id, location_id, quantity)
                   SELECT ?, ?, ?, ?, ?, ? WHERE ${exists}`).bind(allocation.shipmentLineId, shipmentId, line.id, line.productId, allocation.locationId, allocation.allocated),
@@ -1935,7 +2109,7 @@ async function postCounterSale(input: InventoryCommand): Promise<CommandResult> 
   };
 
   const stockClaims = [...stockGroups.values()].map(() => ` AND EXISTS (SELECT 1 FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id
-    WHERE ib.product_id=? AND ib.location_id=? AND l.active=1 AND l.inventory_status='usable' AND ib.on_hand_qty-ib.reserved_qty>=?)`).join("");
+    WHERE ib.product_id=? AND ib.location_id=? AND l.active=1 AND l.inventory_status='usable' AND ${qtyAtLeast("ib.on_hand_qty-ib.reserved_qty")})`).join("");
   const stockClaimBindings = [...stockGroups.values()].flatMap((stock) => [stock.productId, stock.locationId, stock.quantity]);
   const lotClaims = [...lotGroups.values()].map(() => ` AND (SELECT COALESCE(SUM(CASE WHEN sm.to_location_id=? THEN ma.quantity WHEN sm.from_location_id=? THEN -ma.quantity ELSE 0 END),0)
     FROM movement_assignments ma JOIN stock_movements sm ON sm.id=ma.movement_id WHERE sm.product_id=? AND ma.lot_id=?)>=?`).join("");
@@ -2011,8 +2185,8 @@ async function postCounterSale(input: InventoryCommand): Promise<CommandResult> 
         AND allocated_sales_order_line_id IS NULL AND version=? AND ${exists}`)
       .bind(line.tracking.unitId, line.productId, line.locationId, line.tracking.unitVersion));
   });
-  for (const stock of stockGroups.values()) statements.push(db.prepare(`UPDATE inventory_balances SET on_hand_qty=on_hand_qty-?,version=version+1
-    WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${exists}`)
+  for (const stock of stockGroups.values()) statements.push(db.prepare(`UPDATE inventory_balances SET on_hand_qty=${qtyMinus("on_hand_qty")},version=version+1
+    WHERE product_id=? AND location_id=? AND ${qtyAtLeast("on_hand_qty-reserved_qty")} AND ${exists}`)
     .bind(stock.quantity, stock.productId, stock.locationId, stock.quantity));
   statements.push(...layerConsumptionPrepared(input, allLayers));
   for (const documentType of ["sales_order", "customer_invoice"] as const) {
@@ -2045,6 +2219,41 @@ async function postCounterSale(input: InventoryCommand): Promise<CommandResult> 
   await db.batch(statements);
   return requireLogged(input, "Customer credit, inventory, lot/serial identity, or valuation changed before the counter sale could post.");
 }
+
+type CustomerCreditState = { id: string; name: string; currency: string; paymentTerms: string | null; creditLimitCents: number; creditHold: number; outstandingBaseCents: number };
+
+/** The customer's live credit position: hold flag, limit, and open receivables in base CAD. */
+async function customerCreditState(customerId: string) {
+  return first<CustomerCreditState>(`SELECT bp.id,bp.name,bp.currency,bp.payment_terms AS paymentTerms,
+      bp.credit_limit_cents AS creditLimitCents,bp.credit_hold AS creditHold,
+      COALESCE((SELECT SUM(MAX(ci.base_total_cents-ROUND(ci.paid_cents*ci.exchange_rate_to_base)-
+        COALESCE((SELECT SUM(cc.base_amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0),0))
+        FROM customer_invoices ci WHERE ci.customer_id=bp.id AND ci.status<>'void'),0) AS outstandingBaseCents
+      FROM business_partners bp WHERE bp.id=? AND bp.partner_type IN ('customer','both') AND bp.active=1`, customerId);
+}
+
+/**
+ * The same account rules the counter sale applies before charging on account: no credit hold,
+ * the document currency must match a credit-controlled customer's limit currency, and the new
+ * receivable plus open receivables must fit under the limit.
+ */
+function assertCustomerCreditAllows(customer: CustomerCreditState, sale: { currency: string; exchangeRateToBase: number; totalCents: number; context: string }) {
+  if (Boolean(customer.creditHold)) throw new DomainError("CREDIT_HOLD", `This customer is on credit hold. Remove the hold before posting this ${sale.context} on account.`, 409);
+  if (customer.creditLimitCents > 0 && sale.currency !== customer.currency) {
+    throw new DomainError("CREDIT_CURRENCY_MISMATCH", `This customer's credit limit is denominated in ${customer.currency}; use that currency for a credit-controlled ${sale.context}.`, 409);
+  }
+  const outstandingCreditCents = Math.round(customer.outstandingBaseCents / sale.exchangeRateToBase);
+  if (customer.creditLimitCents > 0 && outstandingCreditCents + sale.totalCents > customer.creditLimitCents) {
+    const exceededBy = (outstandingCreditCents + sale.totalCents - customer.creditLimitCents) / 100;
+    throw new DomainError("CREDIT_LIMIT_EXCEEDED", `This ${sale.context} would exceed the customer's credit limit by ${exceededBy.toFixed(2)} ${customer.currency}.`, 409);
+  }
+}
+
+/** Claim fragment re-checking the credit rules atomically; binds [currency, exchangeRateToBase, totalCents]. Expects alias bp. */
+const customerCreditClaimSql = ` AND bp.credit_hold=0 AND (bp.credit_limit_cents=0 OR (bp.currency=? AND
+    ROUND(COALESCE((SELECT SUM(MAX(ci.base_total_cents-ROUND(ci.paid_cents*ci.exchange_rate_to_base)-
+      COALESCE((SELECT SUM(cc.base_amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0),0))
+      FROM customer_invoices ci WHERE ci.customer_id=bp.id AND ci.status<>'void'),0)/?)+?<=bp.credit_limit_cents))`;
 
 /**
  * Counter and immediate sales are one business event: goods leave usable stock and the customer
@@ -2117,6 +2326,11 @@ async function postImmediateSale(input: InventoryCommand): Promise<CommandResult
   const total = subtotal + tax;
   if (subtotal < 0 || total < 0) throw new DomainError("INVALID_DOCUMENT_TOTAL", "Order charges and discounts cannot make the invoice subtotal or total negative.");
   const baseTotal = Math.round(total * source.exchange);
+  // An immediate sale posts a receivable on account, so it is subject to exactly the customer
+  // checks a counter sale applies before charging the account.
+  const customer = await customerCreditState(source.customerId);
+  if (!customer) throw new DomainError("INVALID_CUSTOMER", "The customer on this sales order is inactive or not a customer account; reactivate it before posting an immediate sale.", 409, line.version);
+  assertCustomerCreditAllows(customer, { currency: source.currency, exchangeRateToBase: source.exchange, totalCents: total, context: "immediate sale" });
   const appliedTaxRates = [...new Set((source.taxable && source.taxRate > 0 ? [source.taxRate] : []).concat(orderCharges.filter((charge) => charge.taxable).map((charge) => charge.taxRate)))];
   const headerTaxRate = appliedTaxRates.length === 1 ? appliedTaxRates[0] : 0;
   const headerTaxCode = appliedTaxRates.length > 1 ? "MIXED" : appliedTaxRates.length === 1 ? "GST" : null;
@@ -2148,14 +2362,15 @@ async function postImmediateSale(input: InventoryCommand): Promise<CommandResult
   const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM sales_orders so WHERE so.id=? AND so.version=? AND so.lifecycle_status='confirmed'
+        AND EXISTS (SELECT 1 FROM business_partners bp WHERE bp.id=so.customer_id AND bp.partner_type IN ('customer','both') AND bp.active=1${customerCreditClaimSql})
         AND EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.id=? AND sol.sales_order_id=so.id AND sol.fulfillment_route='stock'
           AND sol.ordered_qty-sol.canceled_qty
             -COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0)
             -COALESCE((SELECT SUM(r.quantity) FROM reservations r WHERE r.sales_order_line_id=sol.id AND r.status='active'),0)>=?)
-        AND EXISTS (SELECT 1 FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id WHERE ib.product_id=? AND ib.location_id=? AND l.active=1 AND l.inventory_status='usable' AND ib.on_hand_qty-ib.reserved_qty>=?)
+        AND EXISTS (SELECT 1 FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id WHERE ib.product_id=? AND ib.location_id=? AND l.active=1 AND l.inventory_status='usable' AND ${qtyAtLeast("ib.on_hand_qty-ib.reserved_qty")})
         ${layerClaimPredicate(valuation.layers)}${tracking.claimSql}`)
       .bind(input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, now,
-        input.entityId, input.version, line.id, quantity, line.productId, balance.locationId, quantity,
+        input.entityId, input.version, source.currency, source.exchange, total, line.id, quantity, line.productId, balance.locationId, quantity,
         ...layerClaimBindings(valuation.layers), ...tracking.claimBindings),
     db.prepare(`INSERT INTO shipments
       (id,number,sales_order_id,status,carrier,service_level,tracking_number,bill_of_lading_number,
@@ -2166,8 +2381,8 @@ async function postImmediateSale(input: InventoryCommand): Promise<CommandResult
         line.shipToPostalCode, line.shipToCountry, now),
     db.prepare(`INSERT INTO shipment_lines (id,shipment_id,sales_order_line_id,product_id,location_id,quantity)
       SELECT ?,?,?,?,?,? WHERE ${exists}`).bind(shipmentLineId, shipmentId, line.id, line.productId, balance.locationId, quantity),
-    db.prepare(`UPDATE inventory_balances SET on_hand_qty=on_hand_qty-?,version=version+1
-      WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${exists}`)
+    db.prepare(`UPDATE inventory_balances SET on_hand_qty=${qtyMinus("on_hand_qty")},version=version+1
+      WHERE product_id=? AND location_id=? AND ${qtyAtLeast("on_hand_qty-reserved_qty")} AND ${exists}`)
       .bind(quantity, line.productId, balance.locationId, quantity),
     db.prepare(`INSERT INTO stock_movements
       (id,movement_type,product_id,quantity,from_location_id,inventory_status,source_document_type,
@@ -2221,134 +2436,6 @@ async function postImmediateSale(input: InventoryCommand): Promise<CommandResult
   return requireLogged(input, "Inventory, pricing, or the sales order changed before the immediate sale could post.");
 }
 
-async function reverseShipment(input: InventoryCommand): Promise<CommandResult> {
-  const payload = input.payload ?? {};
-  const quantity = positive(payload);
-  const reason = requiredText(payload, "reason");
-  const lineId = typeof payload.lineId === "string" ? payload.lineId : null;
-  const source = await first<{
-    shipmentId: string;
-    shipmentVersion: number;
-    shipmentStatus: string;
-    salesOrderId: string;
-    salesOrderVersion: number;
-    salesOrderStatus: string;
-    salesOrderLineId: string;
-    productId: string;
-    locationId: string;
-    inventoryStatus: string;
-    movementId: string;
-    originalQuantity: number;
-    remainingQuantity: number;
-    shippedLineQuantity: number;
-    invoicedQuantity: number;
-  }>(`SELECT sh.id AS shipmentId, sh.version AS shipmentVersion, sh.status AS shipmentStatus,
-             so.id AS salesOrderId, so.version AS salesOrderVersion, so.lifecycle_status AS salesOrderStatus,
-             sl.sales_order_line_id AS salesOrderLineId, sl.product_id AS productId, sl.location_id AS locationId,
-             sm.inventory_status AS inventoryStatus, sm.id AS movementId, sl.quantity AS originalQuantity,
-             sl.quantity - COALESCE((SELECT SUM(rev.quantity) FROM stock_movements rev
-               WHERE rev.reversal_of_movement_id = sm.id AND rev.movement_type = 'shipment_reversal'), 0) AS remainingQuantity,
-             COALESCE((SELECT SUM(CASE WHEN sm2.movement_type = 'sales_shipment' THEN -sm2.quantity
-                                      WHEN sm2.movement_type = 'shipment_reversal' THEN -sm2.quantity ELSE 0 END)
-                         FROM stock_movements sm2 WHERE sm2.sales_order_line_id = sl.sales_order_line_id), 0) AS shippedLineQuantity,
-             COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil
-                         WHERE cil.sales_order_line_id = sl.sales_order_line_id), 0) AS invoicedQuantity
-        FROM shipments sh
-        JOIN sales_orders so ON so.id = sh.sales_order_id
-        JOIN shipment_lines sl ON sl.shipment_id = sh.id
-        JOIN stock_movements sm ON sm.source_document_type = 'shipment' AND sm.source_document_id = sh.id
-          AND sm.source_line_id = sl.id AND sm.movement_type = 'sales_shipment'
-       WHERE sh.id = ? AND (? IS NULL OR sl.id = ?)
-       ORDER BY sl.id LIMIT 1`, input.entityId, lineId, lineId);
-  if (!source) throw new DomainError("NOT_FOUND", "Shipment or shipment line was not found.", 404);
-  if (source.shipmentVersion !== input.version) throw new DomainError("VERSION_CONFLICT", "The shipment changed. Refresh before reversing it.", 409, source.shipmentVersion);
-  if (source.salesOrderStatus !== "confirmed") throw new DomainError("INVALID_STATE", "Only shipments for confirmed sales orders can be reversed.", 409);
-  if (quantity > source.remainingQuantity) throw new DomainError("INVALID_QUANTITY", `Only ${source.remainingQuantity} units remain reversible.`, 409);
-  if (source.shippedLineQuantity - quantity < source.invoicedQuantity) {
-    throw new DomainError("INVOICED_SHIPMENT", "Issue or reverse the related customer invoice before reversing this shipped quantity.", 409);
-  }
-  const historical = await first<{ quantity: number; valueCents: number; restoredValueCents: number; unitCostCents: number; method: string }>(
-    `SELECT COALESCE(SUM(-quantity), 0) AS quantity, COALESCE(SUM(-value_cents), 0) AS valueCents,
-            COALESCE((SELECT SUM(reversal_value.value_cents)
-                        FROM inventory_value_entries reversal_value
-                        JOIN stock_movements reversal_movement ON reversal_movement.id = reversal_value.movement_id
-                       WHERE reversal_movement.reversal_of_movement_id = ?
-                         AND reversal_movement.movement_type = 'shipment_reversal'), 0) AS restoredValueCents,
-            MAX(unit_cost_cents) AS unitCostCents, MAX(cost_method) AS method
-       FROM inventory_value_entries WHERE movement_id = ? AND quantity < 0`, source.movementId, source.movementId);
-  const historicalQuantity = Number(historical?.quantity ?? 0);
-  if (historicalQuantity <= 0) throw new DomainError("VALUATION_HISTORY_MISSING", "The shipment has no immutable value entry to reverse.", 409);
-  const unitCostCents = Math.round(Number(historical?.valueCents ?? 0) / historicalQuantity);
-  const valueCents = quantity === source.remainingQuantity
-    ? Number(historical?.valueCents ?? 0) - Number(historical?.restoredValueCents ?? 0)
-    : Math.round(quantity * unitCostCents);
-  const method = (historical?.method ?? "fifo") as ValuationMethod;
-  const currentPolicy = await valuationPolicy(source.productId);
-  const total = await first<{ onHandQty: number }>("SELECT COALESCE(SUM(on_hand_qty), 0) AS onHandQty FROM inventory_balances WHERE product_id = ?", source.productId);
-  const nextAverageCostCents = Math.round(((Number(total?.onHandQty ?? 0) * currentPolicy.averageCostCents) + valueCents) / (Number(total?.onHandQty ?? 0) + quantity));
-  const actor = optionalText(payload, "actor", "Avery Morgan");
-  const movementId = newId("movement");
-  const now = postingTimestamp(payload);
-  const result: CommandResult = {
-    message: `${quantity} unit${quantity === 1 ? "" : "s"} reversed from the posted shipment.`,
-    impact: { physical: `${quantity} units restored to on-hand inventory.`, commercial: `${quantity} units reopened to ship and were not automatically re-reserved.`, financial: `COGS was reversed by ${valueCents} cents; invoices remain separate.`, onHandDelta: quantity, incomingDelta: 0, reservedDelta: 0, availableDelta: quantity },
-  };
-  const exists = commandExistsPrepared(input);
-  const db = commandD1(input);
-  const commands: D1PreparedStatement[] = [db.prepare(`INSERT OR IGNORE INTO command_log
-      (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
-    SELECT ?, ?, ?, ?, ?, ?, ? FROM shipments sh
-     WHERE sh.id = ? AND sh.version = ?
-       AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id = ? AND so.version = ? AND so.lifecycle_status = 'confirmed')
-       AND EXISTS (SELECT 1 FROM stock_movements original
-         WHERE original.id = ? AND -original.quantity - COALESCE((SELECT SUM(rev.quantity) FROM stock_movements rev
-           WHERE rev.reversal_of_movement_id = original.id AND rev.movement_type = 'shipment_reversal'), 0) >= ?)
-       AND COALESCE((SELECT SUM(CASE WHEN sm.movement_type = 'sales_shipment' THEN -sm.quantity
-                                    WHEN sm.movement_type = 'shipment_reversal' THEN -sm.quantity ELSE 0 END)
-                       FROM stock_movements sm WHERE sm.sales_order_line_id = ?), 0) - ?
-           >= COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil WHERE cil.sales_order_line_id = ?), 0)
-       AND COALESCE((SELECT version FROM valuation_policies WHERE product_id = ?), 0) = ?`)
-    .bind(input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null,
-      input.claimToken ?? null, now, input.entityId, input.version, source.salesOrderId, source.salesOrderVersion,
-      source.movementId, quantity, source.salesOrderLineId, quantity, source.salesOrderLineId,
-      source.productId, currentPolicy.version)];
-  commands.push(
-    db.prepare(`UPDATE shipments SET version = version + 1,
-      status = CASE WHEN ? = ? THEN 'reversed' ELSE 'partially_reversed' END
-      WHERE id = ? AND version = ? AND ${exists}`)
-      .bind(quantity, source.remainingQuantity, input.entityId, input.version),
-    db.prepare(`UPDATE sales_orders SET version = version + 1 WHERE id = ? AND version = ? AND ${exists}`)
-      .bind(source.salesOrderId, source.salesOrderVersion),
-    db.prepare(`INSERT INTO inventory_balances (product_id, location_id, on_hand_qty, reserved_qty, version)
-      SELECT ?, ?, ?, 0, 1 WHERE ${exists}
-      ON CONFLICT(product_id, location_id) DO UPDATE SET on_hand_qty = on_hand_qty + excluded.on_hand_qty, version = version + 1`)
-      .bind(source.productId, source.locationId, quantity),
-    db.prepare(`INSERT INTO stock_movements
-      (id, movement_type, product_id, quantity, to_location_id, inventory_status, source_document_type,
-       source_document_id, sales_order_line_id, reversal_of_movement_id, posted_at, posted_by, unit_cost_cents, idempotency_key)
-      SELECT ?, 'shipment_reversal', ?, ?, ?, ?, 'shipment_reversal', ?, ?, ?, ?, ?, ?, ? WHERE ${exists}`)
-      .bind(movementId, source.productId, quantity, source.locationId, source.inventoryStatus, input.entityId,
-        source.salesOrderLineId, source.movementId, now, actor, unitCostCents, input.idempotencyKey),
-    db.prepare(`INSERT INTO cost_layers
-      (id, product_id, receipt_movement_id, received_qty, remaining_qty, unit_cost_cents, landed_cost_cents, received_at, status)
-      SELECT ?, ?, ?, ?, ?, ?, 0, ?, 'open' WHERE ${exists}`)
-      .bind(newId("layer"), source.productId, movementId, quantity, quantity, unitCostCents, now),
-    valueEntryPrepared(input, { productId: source.productId, movementId, entryType: "shipment_reversal", quantity,
-      unitCostCents, valueCents, method, referenceType: "shipment", referenceId: input.entityId, postedAt: now, postedBy: actor }),
-    auditPrepared(input, "shipment", input.entityId, "shipment_reversed", result.message,
-      { reason, quantity, movementId, originalMovementId: source.movementId, cogsReversedCents: valueCents, costMethod: method }, now),
-    outboxPrepared(input, "inventory.shipment_reversed", "shipment", input.entityId,
-      { salesOrderId: source.salesOrderId, productId: source.productId, quantity, cogsReversedCents: valueCents }, now)
-  );
-  if (currentPolicy.method === "average") {
-    commands.push(db.prepare(`UPDATE valuation_policies SET average_cost_cents = ?, version = version + 1, updated_at = ?, updated_by = ?
-      WHERE product_id = ? AND version = ? AND method = 'average' AND ${exists}`)
-      .bind(nextAverageCostCents, now, actor, source.productId, currentPolicy.version));
-  }
-  await db.batch(commands);
-  return requireLogged(input, "The shipment or sales order changed before the reversal could post.");
-}
-
 async function postCustomerReturn(input: InventoryCommand): Promise<CommandResult> {
   const payload = input.payload ?? {};
   const reason = requiredText(payload, "reason");
@@ -2390,7 +2477,7 @@ async function postCustomerReturn(input: InventoryCommand): Promise<CommandResul
       .bind(returnId, returnNumber, input.entityId, line.id, line.productId, locationId, quantity, condition, now),
     db.prepare(`INSERT INTO inventory_balances (product_id, location_id, on_hand_qty, reserved_qty, version)
                 SELECT ?, ?, ?, 0, 1 WHERE ${exists}
-                ON CONFLICT(product_id, location_id) DO UPDATE SET on_hand_qty = on_hand_qty + excluded.on_hand_qty, version = version + 1`)
+                ON CONFLICT(product_id, location_id) DO UPDATE SET on_hand_qty = ROUND(on_hand_qty + excluded.on_hand_qty, 6), version = version + 1`)
       .bind(line.productId, locationId, quantity),
     db.prepare(`INSERT INTO stock_movements
       (id, movement_type, product_id, quantity, to_location_id, inventory_status, source_document_type,
@@ -2426,16 +2513,32 @@ async function postInventoryAdjustment(input: InventoryCommand): Promise<Command
   const countedQuantity = (await normalizedBaseQuantity(input.entityId, asNumber(payload, "countedQuantity"), "countedQuantity", true)).baseQuantity;
   const reason = requiredText(payload, "reason");
   const openingBalance = normalizeCommand(input.command) === "postopeningbalance";
-  const balance = await first<{ onHandQty: number; reservedQty: number; version: number }>(
+  const existingBalance = await first<{ onHandQty: number; reservedQty: number; version: number }>(
     "SELECT on_hand_qty AS onHandQty, reserved_qty AS reservedQty, version FROM inventory_balances WHERE product_id = ? AND location_id = ?",
     input.entityId, locationId
   );
-  if (!balance) throw new DomainError("NOT_FOUND", "No inventory balance exists for this product and location.", 404);
+  // A first count or opening balance for a product/location pair has no balance row yet. Create
+  // it (0 on hand, 0 reserved, version 1) inside the same batch instead of refusing the posting.
+  const creatingBalance = !existingBalance;
+  const product = await first<{ inventoryPolicy: string; trackingPolicy: string }>("SELECT inventory_policy AS inventoryPolicy, tracking_policy AS trackingPolicy FROM products WHERE id = ? AND active = 1", input.entityId);
+  if (!product) throw new DomainError("NOT_FOUND", "Product was not found or is inactive.", 404);
+  if (creatingBalance) {
+    if (!["stocked", "special_order"].includes(product.inventoryPolicy)) throw new DomainError("NOT_STOCKED", `This product's inventory policy is ${product.inventoryPolicy}; only stocked products can hold a counted balance.`, 409);
+    if (input.version !== 1) throw new DomainError("VERSION_CONFLICT", "No inventory balance exists yet for this product and location; post the count at version 1.", 409, 1);
+  }
+  const balance = existingBalance ?? { onHandQty: 0, reservedQty: 0, version: 1 };
   if (balance.version !== input.version) throw new DomainError("VERSION_CONFLICT", "The inventory balance changed. Refresh before posting the count.", 409, balance.version);
   if (countedQuantity < balance.reservedQty) throw new DomainError("RESERVATION_CONFLICT", `Counted quantity cannot be below ${balance.reservedQty} actively reserved units.`, 409, balance.version);
   if (openingBalance && (balance.onHandQty !== 0 || balance.reservedQty !== 0)) throw new DomainError("OPENING_BALANCE_EXISTS", "Opening inventory can only be posted to an empty, unreserved product/location balance.", 409, balance.version);
   const location = await requireActiveLocation(locationId, ["usable", "quarantine", "damaged", "return_pending", "in_transit"], openingBalance ? "opening inventory" : "inventory count");
   const delta = roundQuantity(countedQuantity - balance.onHandQty);
+  // Lot- and serial-tracked stock is identified unit by unit. A quantity-only count would put
+  // anonymous units on hand that nothing can ship, so the identity ledger has to be corrected
+  // through registration or scrap of the specific lot or serial instead.
+  if (delta !== 0 && product.trackingPolicy !== "quantity") {
+    const identity = product.trackingPolicy === "lot" ? "lot" : "serial number";
+    throw new DomainError("TRACKED_PRODUCT_COUNT", `This product is ${product.trackingPolicy}-tracked, so a count cannot ${delta > 0 ? "add" : "remove"} ${Math.abs(delta)} anonymous unit${Math.abs(delta) === 1 ? "" : "s"}. Register the specific ${identity} (registerInventoryIdentity) or scrap it (scrapInventory) so the balance and the identity ledger agree.`, 409, balance.version);
+  }
   const lossValuation = delta < 0 ? await valuationForIssue(input.entityId, Math.abs(delta)) : null;
   const policy = delta > 0 ? await valuationPolicy(input.entityId) : null;
   const gainActualUnitCostCents = delta > 0
@@ -2463,7 +2566,7 @@ async function postInventoryAdjustment(input: InventoryCommand): Promise<Command
   };
   const exists = commandExistsPrepared(input);
   const db = commandD1(input);
-  let claimPredicate = "AND on_hand_qty >= reserved_qty";
+  let claimPredicate = creatingBalance ? "" : "AND on_hand_qty >= reserved_qty";
   const claimBindings: Array<string | number> = [];
   if (lossValuation) {
     claimPredicate += ` ${layerClaimPredicate(lossValuation.layers)}`;
@@ -2478,7 +2581,18 @@ async function postInventoryAdjustment(input: InventoryCommand): Promise<Command
     claimBindings.push(approval.id, approval.version);
   }
   const commands: D1PreparedStatement[] = [
-    logPrepared(input, result, "inventory_balances", claimPredicate, claimBindings),
+    creatingBalance
+      // No balance row exists to claim against, so the claim is anchored on the active product
+      // and location and on the row still being absent when the batch runs.
+      ? statement(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
+          SELECT ?, ?, ?, ?, ?, ?, ? FROM products p WHERE p.id = ? AND p.active = 1
+            AND EXISTS (SELECT 1 FROM locations l WHERE l.id = ? AND l.active = 1)
+            AND NOT EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.product_id = ? AND ib.location_id = ?) ${claimPredicate}`,
+          input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, new Date().toISOString(),
+          input.entityId, locationId, input.entityId, locationId, ...claimBindings)
+      : logPrepared(input, result, "inventory_balances", claimPredicate, claimBindings),
+    ...(creatingBalance ? [db.prepare(`INSERT OR IGNORE INTO inventory_balances (product_id, location_id, on_hand_qty, reserved_qty, version)
+        SELECT ?, ?, 0, 0, 1 WHERE ${exists}`).bind(input.entityId, locationId)] : []),
     db.prepare(`UPDATE inventory_balances SET on_hand_qty = ?, version = version + 1
                 WHERE product_id = ? AND location_id = ? AND version = ? AND ? >= reserved_qty AND ${exists}`)
       .bind(countedQuantity, input.entityId, locationId, input.version, countedQuantity),
@@ -2552,11 +2666,11 @@ export async function executeInventoryCommand(input: InventoryCommand): Promise<
   if (prior) return prior;
   const normalizedCommand = normalizeCommand(input.command);
   const postingDate = postingDateValue(input.payload ?? {});
-  if (["receive", "postreceipt", "postreceiptbatch", "reversereceipt", "vendorreturn", "postvendorreturn", "ship", "shipsale", "postshipment", "immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale", "reverseshipment", "customerreturn", "postcustomerreturn", "inventoryadjustment", "postinventoryadjustment", "postopeningbalance"].includes(normalizedCommand)) {
+  if (["receive", "postreceipt", "postreceiptbatch", "reversereceipt", "vendorreturn", "postvendorreturn", "ship", "shipsale", "postshipment", "immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale", "customerreturn", "postcustomerreturn", "inventoryadjustment", "postinventoryadjustment", "postopeningbalance"].includes(normalizedCommand)) {
     await assertPeriodOpen("inventory", postingDate);
   }
   if (["receive", "postreceipt", "postreceiptbatch", "reversereceipt", "vendorreturn", "postvendorreturn", "priceonlycredit", "vendorpriceallowance"].includes(normalizedCommand)) await assertPeriodOpen("purchasing", postingDate);
-  if (["ship", "shipsale", "postshipment", "immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale", "reverseshipment", "customerreturn", "postcustomerreturn"].includes(normalizedCommand)) await assertPeriodOpen("sales", postingDate);
+  if (["ship", "shipsale", "postshipment", "immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale", "customerreturn", "postcustomerreturn"].includes(normalizedCommand)) await assertPeriodOpen("sales", postingDate);
   if (["priceonlycredit", "vendorpriceallowance", "immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale"].includes(normalizedCommand)) await assertPeriodOpen("accounting", postingDate);
   switch (normalizedCommand) {
     case "receive":
@@ -2581,7 +2695,6 @@ export async function executeInventoryCommand(input: InventoryCommand): Promise<
     case "postimmediatesale": return postImmediateSale(input);
     case "countersale":
     case "postcountersale": return postCounterSale(input);
-    case "reverseshipment": return reverseShipment(input);
     case "customerreturn":
     case "postcustomerreturn": return postCustomerReturn(input);
     case "inventoryadjustment":
@@ -2591,7 +2704,11 @@ export async function executeInventoryCommand(input: InventoryCommand): Promise<
   }
 }
 
-export type SnapshotPage = { page?: number; pageSize?: number; search?: string; scope?: string; status?: string; sort?: string; warehouseId?: string };
+export type SnapshotPage = {
+  page?: number; pageSize?: number; search?: string; scope?: string; status?: string; sort?: string; warehouseId?: string;
+  /** The viewer's local calendar date (YYYY-MM-DD). "Late" and every other "today" comparison use it instead of UTC now. */
+  asOf?: string;
+};
 
 export function normalizeSnapshotPage(input: SnapshotPage = {}) {
   const page = Number.isInteger(input.page) && Number(input.page) > 0 ? Number(input.page) : 1;
@@ -2612,6 +2729,77 @@ export const salesOpenLines = (order: string) => `EXISTS (SELECT 1 FROM sales_or
   AND sl.ordered_qty-sl.canceled_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity
     WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sl.id),0)>0)`;
 
+/**
+ * The default ("priority") worklist order for orders: still-open approved/confirmed documents
+ * first, then by date and number. The worklist page query and the global search's page
+ * calculation must use exactly this expression or search lands on the wrong page. Callers pass
+ * the SQL for the order's open quantity, since each query derives it from different CTEs.
+ */
+export const purchaseOrderPriorityOrder = (order: string, openQuantity: string) =>
+  `CASE WHEN ${order}.lifecycle_status='approved' AND ${openQuantity} > 0 THEN 0 ELSE 1 END,${order}.expected_date,${order}.number`;
+export const salesOrderPriorityOrder = (order: string, openQuantity: string) =>
+  `CASE WHEN ${order}.lifecycle_status='draft' THEN 0
+              WHEN ${order}.lifecycle_status='confirmed' AND ${openQuantity} > 0 THEN 0
+              ELSE 1 END,${order}.requested_date,${order}.number`;
+/** Open-quantity expressions for queries that have no line CTEs to draw on. */
+export const purchaseOpenQuantity = (order: string) => `(SELECT COALESCE(SUM(pl.ordered_qty-pl.closed_qty-COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pl.id),0)),0)
+  FROM purchase_order_lines pl WHERE pl.purchase_order_id=${order}.id)`;
+export const salesOpenQuantity = (order: string) => `(SELECT COALESCE(SUM(sl.ordered_qty-sl.canceled_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity
+    WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sl.id),0)),0)
+  FROM sales_order_lines sl WHERE sl.sales_order_id=${order}.id)`;
+
+/**
+ * Stock movements store the internal id of whatever document created them. These fragments
+ * resolve that id to the number an operator can look up, for every source_document_type the
+ * server writes, and resolve the related order even for reversal rows (which carry the
+ * original document's id) so the worklist can both display and search by those numbers.
+ */
+const movementDocumentNumber = (sm: string) => `CASE ${sm}.source_document_type
+        WHEN 'receipt' THEN (SELECT r.number FROM receipts r WHERE r.id=${sm}.source_document_id)
+        WHEN 'receipt_reversal' THEN (SELECT r.number FROM receipts r WHERE r.id=${sm}.source_document_id)
+        WHEN 'shipment' THEN (SELECT s.number FROM shipments s WHERE s.id=${sm}.source_document_id)
+        WHEN 'shipment_reversal' THEN (SELECT s.number FROM shipments s WHERE s.id=${sm}.source_document_id)
+        WHEN 'vendor_return' THEN (SELECT vr.number FROM vendor_returns vr WHERE vr.id=${sm}.source_document_id)
+        WHEN 'customer_return' THEN (SELECT cr.number FROM customer_returns cr WHERE cr.id=${sm}.source_document_id)
+        WHEN 'inventory_count' THEN (SELECT ic.number FROM inventory_counts ic WHERE ic.id=${sm}.source_document_id)
+        WHEN 'opening_balance' THEN COALESCE((SELECT ic.number FROM inventory_counts ic WHERE ic.id=${sm}.source_document_id),${sm}.source_document_id)
+        WHEN 'inventory_transfer' THEN (SELECT it.number FROM inventory_transfers it WHERE it.id=${sm}.source_document_id)
+        WHEN 'drop_ship_delivery' THEN (SELECT d.number FROM drop_ship_deliveries d WHERE d.id=${sm}.source_document_id)
+        WHEN 'drop_ship' THEN (SELECT d.number FROM drop_ship_deliveries d WHERE d.id=${sm}.source_document_id)
+      END`;
+const movementPurchaseLineId = (sm: string) => `COALESCE(${sm}.purchase_order_line_id,(SELECT o.purchase_order_line_id FROM stock_movements o WHERE o.id=${sm}.reversal_of_movement_id))`;
+const movementSalesLineId = (sm: string) => `COALESCE(${sm}.sales_order_line_id,(SELECT o.sales_order_line_id FROM stock_movements o WHERE o.id=${sm}.reversal_of_movement_id))`;
+const movementPurchaseOrderId = (sm: string) => `COALESCE((SELECT pl.purchase_order_id FROM purchase_order_lines pl WHERE pl.id=${movementPurchaseLineId(sm)}),
+        CASE WHEN ${sm}.source_document_type IN ('receipt','receipt_reversal') THEN (SELECT r.purchase_order_id FROM receipts r WHERE r.id=${sm}.source_document_id)
+             WHEN ${sm}.source_document_type='vendor_return' THEN (SELECT vr.purchase_order_id FROM vendor_returns vr WHERE vr.id=${sm}.source_document_id) END)`;
+const movementSalesOrderId = (sm: string) => `COALESCE((SELECT sl.sales_order_id FROM sales_order_lines sl WHERE sl.id=${movementSalesLineId(sm)}),
+        CASE WHEN ${sm}.source_document_type IN ('shipment','shipment_reversal') THEN (SELECT s.sales_order_id FROM shipments s WHERE s.id=${sm}.source_document_id)
+             WHEN ${sm}.source_document_type='customer_return' THEN (SELECT cr.sales_order_id FROM customer_returns cr WHERE cr.id=${sm}.source_document_id) END)`;
+const movementRelatedOrderId = (sm: string) => `COALESCE(${movementPurchaseOrderId(sm)},${movementSalesOrderId(sm)})`;
+const movementRelatedOrderNumber = (sm: string) => `COALESCE((SELECT po.number FROM purchase_orders po WHERE po.id=${movementPurchaseOrderId(sm)}),
+        (SELECT so.number FROM sales_orders so WHERE so.id=${movementSalesOrderId(sm)}))`;
+const movementRelatedOrderKind = (sm: string) => `CASE WHEN ${movementPurchaseOrderId(sm)} IS NOT NULL THEN 'purchase' WHEN ${movementSalesOrderId(sm)} IS NOT NULL THEN 'sales' END`;
+
+/**
+ * Per-movement reversible quantity for the latest receipt on a PO line: what is physically
+ * still on hand from that movement (net of prior reversals, capped by the bin's unreserved
+ * stock). Cost-layer remainder is deliberately not a cap any more; a consumed layer is funded
+ * from other layers with a variance at reversal time.
+ */
+const latestReceiptMovementFilter = (line: string) => `receipt_movement.purchase_order_line_id=${line}.id AND receipt_movement.movement_type='purchase_receipt'
+          AND receipt_movement.source_document_type='receipt'
+          AND receipt_movement.source_document_id=(SELECT latest_receipt.id FROM receipts latest_receipt
+            WHERE latest_receipt.purchase_order_id=${line}.purchase_order_id ORDER BY latest_receipt.posted_at DESC,latest_receipt.id DESC LIMIT 1)`;
+const receiptMovementRemaining = `receipt_movement.quantity + COALESCE((SELECT SUM(reversal.quantity)
+        FROM stock_movements reversal WHERE reversal.reversal_of_movement_id=receipt_movement.id AND reversal.movement_type='receipt_reversal'),0)`;
+// Unreserved stock in the receipt's bin plus the reservation quantity the reversal itself can
+// release through the receipt's supply-allocation lineage (auto-reserved special orders).
+const receiptMovementAvailable = `COALESCE((SELECT MAX(balance.on_hand_qty-balance.reserved_qty) FROM inventory_balances balance
+          WHERE balance.product_id=receipt_movement.product_id AND balance.location_id=receipt_movement.to_location_id),0)
+        + COALESCE((SELECT SUM(MIN(r.quantity,sar.quantity-sar.reversed_qty)) FROM supply_allocation_receipts sar
+          JOIN reservations r ON r.id=sar.reservation_id AND r.status='active' WHERE sar.receipt_movement_id=receipt_movement.id),0)`;
+const receiptMovementReversible = `MAX(MIN(${receiptMovementRemaining},${receiptMovementAvailable}),0)`;
+
 export async function getInventorySnapshot(input: SnapshotPage = {}) {
   await ensureDatabase();
   const { page, pageSize, offset } = normalizeSnapshotPage(input);
@@ -2622,6 +2810,12 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
   const childLimit = Math.min(pageSize * 20, 1000);
   const term = input.search?.trim() ?? "";
   const like = `%${term.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+  // The viewer's local calendar date. It is admitted only as a strict YYYY-MM-DD calendar date,
+  // so it can be spliced as a literal into the binding-free worklist fragments; anything else
+  // falls back to the database clock (UTC today).
+  const requestedAsOf = typeof input.asOf === "string" ? input.asOf.trim() : "";
+  const asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf) && new Date(`${requestedAsOf}T00:00:00.000Z`).toISOString().slice(0, 10) === requestedAsOf ? requestedAsOf : "";
+  const todaySql = asOfDate ? `'${asOfDate}'` : "date(" + "'now')";
   const status = input.status?.trim() ?? "";
   const scope = input.scope?.trim() ?? "";
   const sort = input.sort?.trim() ?? "priority";
@@ -2665,7 +2859,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
    */
   const purchaseWorklistFilter = (order: string) =>
     requestedPurchaseStatus === "open" ? ` AND ${order}.lifecycle_status='approved' AND ${purchaseOpenLines(order)}`
-      : requestedPurchaseStatus === "late" ? ` AND ${order}.lifecycle_status='approved' AND ${order}.expected_date<date('now') AND ${purchaseOpenLines(order)}`
+      : requestedPurchaseStatus === "late" ? ` AND ${order}.lifecycle_status='approved' AND ${order}.expected_date<${todaySql} AND ${purchaseOpenLines(order)}`
       : ["closed", "fully_received", "closed_short"].includes(requestedPurchaseStatus) ? ` AND ${purchaseCompletionFilter(order, requestedPurchaseStatus as "closed" | "fully_received" | "closed_short")}`
       : requestedPurchaseStatus === "returnable" ? ` AND EXISTS (SELECT 1 FROM purchase_order_lines pl JOIN stock_movements sm ON sm.purchase_order_line_id=pl.id WHERE pl.purchase_order_id=${order}.id AND sm.movement_type='purchase_receipt')`
       : "";
@@ -2737,9 +2931,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       : sort === "name" ? `${partner}.name,${order}.number`
       : scope === "fulfillment" ? `CASE WHEN COALESCE(${reserved}.reserved_qty,0) > COALESCE(${movements}.shipped_qty,0) THEN 0 ELSE 1 END,${order}.requested_date,${order}.number`
       : scope === "customer-returns" ? `CASE WHEN COALESCE(${movements}.shipped_qty,0) > 0 THEN 0 ELSE 1 END,${order}.requested_date DESC,${order}.number`
-      : `CASE WHEN ${order}.lifecycle_status='draft' THEN 0
-              WHEN ${order}.lifecycle_status='confirmed' AND COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.canceled_qty,0)-COALESCE(${movements}.shipped_qty,0) > 0 THEN 0
-              ELSE 1 END,${order}.requested_date,${order}.number`;
+      : salesOrderPriorityOrder(order, `COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.canceled_qty,0)-COALESCE(${movements}.shipped_qty,0)`);
   };
 
   const productOrder = (product: string, balance: string, incoming: string, demand: string, baseUom: string) => {
@@ -2797,7 +2989,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
    */
   const purchaseOrderOrder = (order: string, partner: string, totals: string, movements: string) =>
     requestedColumnSort ? columnOrder({
-      exception: `CASE WHEN ${order}.lifecycle_status='approved' AND ${order}.expected_date<date('now') AND COALESCE(${totals}.ordered_qty,0)-COALESCE(${movements}.net_received_qty,0)-COALESCE(${totals}.closed_qty,0)>0 THEN 1 ELSE 0 END`,
+      exception: `CASE WHEN ${order}.lifecycle_status='approved' AND ${order}.expected_date<${todaySql} AND COALESCE(${totals}.ordered_qty,0)-COALESCE(${movements}.net_received_qty,0)-COALESCE(${totals}.closed_qty,0)>0 THEN 1 ELSE 0 END`,
       number: `${order}.number COLLATE NOCASE`,
       vendor: `${partner}.name COLLATE NOCASE`,
       status: `CASE
@@ -2818,7 +3010,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       : sort === "newest" ? `${order}.created_at DESC,${order}.number`
       : sort === "name" ? `${partner}.name,${order}.number`
       : scope === "vendor-returns" ? `CASE WHEN COALESCE(${movements}.net_received_qty,0) > 0 THEN 0 ELSE 1 END,${order}.expected_date DESC,${order}.number`
-      : `CASE WHEN ${order}.lifecycle_status='approved' AND COALESCE(${totals}.ordered_qty,0)-COALESCE(${movements}.net_received_qty,0)-COALESCE(${totals}.closed_qty,0) > 0 THEN 0 ELSE 1 END,${order}.expected_date,${order}.number`;
+      : purchaseOrderPriorityOrder(order, `COALESCE(${totals}.ordered_qty,0)-COALESCE(${movements}.net_received_qty,0)-COALESCE(${totals}.closed_qty,0)`);
 
   /**
    * Only the datasets the requested view actually renders are queried. Each of these reads
@@ -3118,25 +3310,14 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       p.id AS productId, p.sku, p.name AS productName,
       -- The raw source id is an internal identifier (receipt-9705cb96-…). Resolve it to the
       -- document number an operator can actually look up, plus the order it belongs to.
-      CASE sm.source_document_type
-        WHEN 'receipt' THEN (SELECT r.number FROM receipts r WHERE r.id=sm.source_document_id)
-        WHEN 'shipment' THEN (SELECT s.number FROM shipments s WHERE s.id=sm.source_document_id)
-        WHEN 'inventory_count' THEN (SELECT ic.number FROM inventory_counts ic WHERE ic.id=sm.source_document_id)
-        WHEN 'inventory_transfer' THEN (SELECT it.number FROM inventory_transfers it WHERE it.id=sm.source_document_id)
-      END AS sourceDocumentNumber,
-      CASE
-        WHEN sm.purchase_order_line_id IS NOT NULL THEN (SELECT po.number FROM purchase_order_lines pl JOIN purchase_orders po ON po.id=pl.purchase_order_id WHERE pl.id=sm.purchase_order_line_id)
-        WHEN sm.sales_order_line_id IS NOT NULL THEN (SELECT so.number FROM sales_order_lines sl JOIN sales_orders so ON so.id=sl.sales_order_id WHERE sl.id=sm.sales_order_line_id)
-      END AS relatedOrderNumber,
-      CASE
-        WHEN sm.purchase_order_line_id IS NOT NULL THEN (SELECT pl.purchase_order_id FROM purchase_order_lines pl WHERE pl.id=sm.purchase_order_line_id)
-        WHEN sm.sales_order_line_id IS NOT NULL THEN (SELECT sl.sales_order_id FROM sales_order_lines sl WHERE sl.id=sm.sales_order_line_id)
-      END AS relatedOrderId,
-      CASE WHEN sm.purchase_order_line_id IS NOT NULL THEN 'purchase' WHEN sm.sales_order_line_id IS NOT NULL THEN 'sales' END AS relatedOrderKind,
+      ${movementDocumentNumber("sm")} AS sourceDocumentNumber,
+      ${movementRelatedOrderNumber("sm")} AS relatedOrderNumber,
+      ${movementRelatedOrderId("sm")} AS relatedOrderId,
+      ${movementRelatedOrderKind("sm")} AS relatedOrderKind,
       fl.code AS fromLocationCode, tl.code AS toLocationCode
       FROM stock_movements sm JOIN products p ON p.id=sm.product_id
       LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id
-      WHERE (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(sm.source_document_id,'') LIKE ? ESCAPE '\\' OR COALESCE(fl.code,'') LIKE ? ESCAPE '\\' OR COALESCE(tl.code,'') LIKE ? ESCAPE '\\' OR sm.posted_by LIKE ? ESCAPE '\\')
+      WHERE (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(sm.source_document_id,'') LIKE ? ESCAPE '\\' OR COALESCE(${movementDocumentNumber("sm")},'') LIKE ? ESCAPE '\\' OR COALESCE(${movementRelatedOrderNumber("sm")},'') LIKE ? ESCAPE '\\' OR COALESCE(fl.code,'') LIKE ? ESCAPE '\\' OR COALESCE(tl.code,'') LIKE ? ESCAPE '\\' OR sm.posted_by LIKE ? ESCAPE '\\')
         AND (?='' OR sm.movement_type=?)
        ORDER BY ${requestedColumnSort ? columnOrder({
          posted: "sm.posted_at",
@@ -3148,7 +3329,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
          from: "fl.code COLLATE NOCASE",
          to: "tl.code COLLATE NOCASE",
          actor: "sm.posted_by COLLATE NOCASE",
-       }, "sm.posted_at DESC,sm.id DESC", "sm.id") : sort === "oldest" ? "sm.posted_at,sm.id" : "sm.posted_at DESC,sm.id DESC"}`, term, like, like, like, like, like, like, movementStatus, movementStatus)) : Promise.resolve([]),
+       }, "sm.posted_at DESC,sm.id DESC", "sm.id") : sort === "oldest" ? "sm.posted_at,sm.id" : "sm.posted_at DESC,sm.id DESC"}`, term, like, like, like, like, like, like, like, like, movementStatus, movementStatus)) : Promise.resolve([]),
     needs("bills") ? (pageAll<Record<string, unknown>>(`SELECT vb.id, vb.number, vb.status, vb.match_status AS matchStatus,
       vb.total_cents AS totalCents, vb.due_date AS dueDate, vb.currency, vb.version,
       -- Line values exclude tax, so the register previously never showed the amount actually
@@ -3276,7 +3457,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       (SELECT COALESCE(SUM(open_qty),0) FROM so_line_state WHERE lifecycle_status='confirmed') AS openDemand,
       (SELECT COUNT(DISTINCT purchase_order_id) FROM po_line_state WHERE lifecycle_status='approved' AND open_qty>0) AS openPurchaseOrders,
       (SELECT COALESCE(SUM(open_qty),0) FROM po_line_state WHERE lifecycle_status='approved') AS openReceiptUnits,
-      (SELECT COUNT(DISTINCT purchase_order_id) FROM po_line_state WHERE lifecycle_status='approved' AND expected_date<date('now') AND open_qty>0) AS latePurchaseOrders,
+      (SELECT COUNT(DISTINCT purchase_order_id) FROM po_line_state WHERE lifecycle_status='approved' AND expected_date<${todaySql} AND open_qty>0) AS latePurchaseOrders,
       (SELECT COUNT(*) FROM purchase_orders WHERE lifecycle_status='pending_approval') AS pendingApprovals,
       (SELECT COUNT(DISTINCT sales_order_id) FROM so_line_state WHERE lifecycle_status='confirmed' AND open_qty>0) AS openSalesOrders,
       (SELECT COUNT(DISTINCT sps.sales_order_id) FROM so_product_supply sps
@@ -3322,16 +3503,14 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       COALESCE(SUM(sm.quantity),0) AS netReceivedQuantity,
       COALESCE(SUM(CASE WHEN sm.movement_type='purchase_receipt' THEN sm.quantity ELSE 0 END),0) AS grossReceivedQuantity,
       COALESCE(SUM(CASE WHEN sm.movement_type='vendor_return' THEN -sm.quantity WHEN sm.movement_type='receipt_reversal' THEN -sm.quantity ELSE 0 END),0) AS returnedQuantity,
-      COALESCE((SELECT MAX(MIN(receipt_movement.quantity + COALESCE((SELECT SUM(reversal.quantity)
-        FROM stock_movements reversal WHERE reversal.reversal_of_movement_id=receipt_movement.id AND reversal.movement_type='receipt_reversal'),0),
-        COALESCE((SELECT MAX(layer.remaining_qty) FROM cost_layers layer WHERE layer.receipt_movement_id=receipt_movement.id),0),
-        COALESCE((SELECT MAX(balance.on_hand_qty-balance.reserved_qty) FROM inventory_balances balance
-          WHERE balance.product_id=receipt_movement.product_id AND balance.location_id=receipt_movement.to_location_id),0)))
-        FROM stock_movements receipt_movement
-        WHERE receipt_movement.purchase_order_line_id=pol.id AND receipt_movement.movement_type='purchase_receipt'
-          AND receipt_movement.source_document_type='receipt'
-          AND receipt_movement.source_document_id=(SELECT latest_receipt.id FROM receipts latest_receipt
-            WHERE latest_receipt.purchase_order_id=pol.purchase_order_id ORDER BY latest_receipt.posted_at DESC,latest_receipt.id DESC LIMIT 1)),0) AS latestReceiptReversibleQuantity,
+      COALESCE((SELECT MAX(${receiptMovementReversible}) FROM stock_movements receipt_movement WHERE ${latestReceiptMovementFilter("pol")}),0) AS latestReceiptReversibleQuantity,
+      -- One entry per condition the latest receipt was split into, so a caller can reverse the
+      -- quarantined part by inventoryStatus/receiptLineId instead of only the largest movement.
+      COALESCE((SELECT json_group_array(json_object(
+        'movementId',receipt_movement.id,'receiptLineId',receipt_movement.source_line_id,'inventoryStatus',receipt_movement.inventory_status,
+        'locationId',receipt_movement.to_location_id,'locationCode',(SELECT l.code FROM locations l WHERE l.id=receipt_movement.to_location_id),
+        'remainingQuantity',${receiptMovementRemaining},'reversibleQuantity',${receiptMovementReversible}))
+        FROM stock_movements receipt_movement WHERE ${latestReceiptMovementFilter("pol")} AND ${receiptMovementRemaining}>0),'[]') AS latestReceiptReversibleJson,
       MAX(pol.ordered_qty-pol.closed_qty-COALESCE(SUM(sm.quantity),0),0) AS openToReceiveQuantity,
       pol.unit_cost_cents AS unitCostCents,pol.configuration_snapshot AS configurationSnapshot,
       pol.discount_cents AS discountCents,pol.taxable,pol.tax_code AS taxCode,pol.tax_rate_bps AS taxRateBps,
@@ -3351,8 +3530,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
           WHERE sa.purchase_order_line_id=pol.id AND sa.status='active'),'[]') AS supplyAllocationsJson
       FROM purchase_order_lines pol JOIN products p ON p.id=pol.product_id LEFT JOIN units_of_measure ou ON ou.id=pol.ordered_uom_id
       LEFT JOIN stock_movements sm ON sm.purchase_order_line_id=pol.id
-      WHERE pol.purchase_order_id IN (${purchaseOrderIds.map(() => "?").join(",")})
-      GROUP BY pol.id ORDER BY pol.id LIMIT ?`, ...purchaseOrderIds, childLimit) : purchaseLineRows,
+      WHERE pol.purchase_order_id IN (SELECT value FROM json_each(?))
+      GROUP BY pol.id ORDER BY pol.id LIMIT ?`, JSON.stringify(purchaseOrderIds), childLimit) : purchaseLineRows,
     needs("salesLines") && salesOrderIds.length ? all<Record<string, unknown>>(`WITH product_available AS MATERIALIZED (
       SELECT ib.product_id,SUM(ib.on_hand_qty-ib.reserved_qty) available_qty
         FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id
@@ -3390,8 +3569,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       JOIN products p ON p.id=sol.product_id LEFT JOIN units_of_measure ou ON ou.id=sol.ordered_uom_id
       LEFT JOIN stock_movements sm ON sm.sales_order_line_id=sol.id
       LEFT JOIN product_available pa ON pa.product_id=sol.product_id
-      WHERE sol.sales_order_id IN (${salesOrderIds.map(() => "?").join(",")})
-      GROUP BY sol.id ORDER BY sol.id LIMIT ?`, ...salesOrderIds, childLimit) : salesLineRows,
+      WHERE sol.sales_order_id IN (SELECT value FROM json_each(?))
+      GROUP BY sol.id ORDER BY sol.id LIMIT ?`, JSON.stringify(salesOrderIds), childLimit) : salesLineRows,
   ]);
 
   // Balance rows must follow the product ids chosen by the fully sorted product page. Repeating
@@ -3405,8 +3584,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id
       JOIN warehouses w ON w.id=l.warehouse_id
       WHERE l.active=1 AND w.active=1 AND (?='' OR w.id=?)
-        AND ib.product_id IN (${visibleProductIds.map(() => "?").join(",")})
-      ORDER BY w.code,l.code,ib.product_id`, warehouseScope, warehouseScope, ...visibleProductIds) : inventoryBalanceRows;
+        AND ib.product_id IN (SELECT value FROM json_each(?))
+      ORDER BY w.code,l.code,ib.product_id`, warehouseScope, warehouseScope, JSON.stringify(visibleProductIds)) : inventoryBalanceRows;
 
   const linesByPo = new Map<string, Array<Record<string, unknown>>>();
   purchaseLines.forEach((line) => {
@@ -3445,7 +3624,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
     else if (["sales-orders", "fulfillment", "customer-returns", "customer-invoices"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id WHERE (?='' OR so.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(so.project_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR so.lifecycle_status=?)${salesWorklistFilter("so")}`, term, like, like, like, salesStatus, salesStatus);
     else if (scope === "counts") total = await first<{ count: number }>(`SELECT COUNT(*) AS count ${countBalanceFrom}`, ...countBalanceBindings);
     else if (["stock", "products"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM products p WHERE p.active=1 AND (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(p.manufacturer_sku,'') LIKE ? ESCAPE '\\' OR p.dimensions LIKE ? ESCAPE '\\' OR p.material LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM product_aliases pa WHERE pa.product_id=p.id AND pa.alias LIKE ? ESCAPE '\\')) AND (?='' OR p.inventory_policy=? OR p.tracking_policy=?)`, term, like, like, like, like, like, like, productStatus, productStatus, productStatus);
-    else if (scope === "movements") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM stock_movements sm JOIN products p ON p.id=sm.product_id LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id WHERE (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(sm.source_document_id,'') LIKE ? ESCAPE '\\' OR COALESCE(fl.code,'') LIKE ? ESCAPE '\\' OR COALESCE(tl.code,'') LIKE ? ESCAPE '\\' OR sm.posted_by LIKE ? ESCAPE '\\') AND (?='' OR sm.movement_type=?)`, term, like, like, like, like, like, like, movementStatus, movementStatus);
+    else if (scope === "movements") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM stock_movements sm JOIN products p ON p.id=sm.product_id LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id WHERE (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(sm.source_document_id,'') LIKE ? ESCAPE '\\' OR COALESCE(${movementDocumentNumber("sm")},'') LIKE ? ESCAPE '\\' OR COALESCE(${movementRelatedOrderNumber("sm")},'') LIKE ? ESCAPE '\\' OR COALESCE(fl.code,'') LIKE ? ESCAPE '\\' OR COALESCE(tl.code,'') LIKE ? ESCAPE '\\' OR sm.posted_by LIKE ? ESCAPE '\\') AND (?='' OR sm.movement_type=?)`, term, like, like, like, like, like, like, like, like, movementStatus, movementStatus);
     else if (scope === "partners") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM business_partners WHERE active=1 AND (?='' OR code LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR COALESCE(email,'') LIKE ? ESCAPE '\\' OR COALESCE(city,'') LIKE ? ESCAPE '\\' OR COALESCE(postal_code,'') LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM master_record_merges mr WHERE mr.entity_type='business_partner' AND mr.target_id=business_partners.id AND mr.source_label LIKE ? ESCAPE '\\')) AND (?='' OR partner_type=? OR partner_type='both')`, term, like, like, like, like, like, like, status, status);
     else if (scope === "vendor-bills") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id WHERE (?='' OR vb.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.number,'') LIKE ? ESCAPE '\\' OR vb.vendor_invoice_number LIKE ? ESCAPE '\\') AND (?='' OR vb.status=? OR vb.match_status=?)${billWorklistFilter('vb')}`, term, like, like, like, like, billStatus, billStatus, billStatus);
     filteredTotal = total ? Number(total.count) : null;
@@ -3496,12 +3675,12 @@ export async function searchInventoryRecords(search: string, limit = 20, pageSiz
   const like = `%${term.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
   const [purchaseOrders, salesOrders, products, partners] = await Promise.all([
     all<Record<string, unknown>>(`WITH ranked AS (SELECT po.id,po.number,bp.name AS vendorName,po.project_reference AS projectReference,
-      CAST((ROW_NUMBER() OVER (ORDER BY po.expected_date,po.number,po.id)-1)/? AS INTEGER)+1 AS page
+      CAST((ROW_NUMBER() OVER (ORDER BY ${purchaseOrderPriorityOrder("po", purchaseOpenQuantity("po"))},po.id)-1)/? AS INTEGER)+1 AS page
       FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id)
       SELECT * FROM ranked WHERE number LIKE ? ESCAPE '\\' OR vendorName LIKE ? ESCAPE '\\' OR COALESCE(projectReference,'') LIKE ? ESCAPE '\\'
       ORDER BY page,number LIMIT ?`, boundedPageSize, like, like, like, boundedLimit),
     all<Record<string, unknown>>(`WITH ranked AS (SELECT so.id,so.number,bp.name AS customerName,so.project_reference AS projectReference,
-      CAST((ROW_NUMBER() OVER (ORDER BY so.requested_date,so.number,so.id)-1)/? AS INTEGER)+1 AS page
+      CAST((ROW_NUMBER() OVER (ORDER BY ${salesOrderPriorityOrder("so", salesOpenQuantity("so"))},so.id)-1)/? AS INTEGER)+1 AS page
       FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id)
       SELECT * FROM ranked WHERE number LIKE ? ESCAPE '\\' OR customerName LIKE ? ESCAPE '\\' OR COALESCE(projectReference,'') LIKE ? ESCAPE '\\'
       ORDER BY page,number LIMIT ?`, boundedPageSize, like, like, like, boundedLimit),
@@ -3614,7 +3793,7 @@ export async function searchInventoryReferences(kind: ReferenceLookup, search = 
         address_line_1 AS addressLine1,address_line_2 AS addressLine2,city,region,postal_code AS postalCode,country,
         delivery_instructions AS deliveryInstructions,is_default AS isDefault,version
       FROM partner_addresses WHERE active=1 AND (?='' OR partner_id=?)
-        AND (?='' OR label LIKE ? ESCAPE '\' OR address_line_1 LIKE ? ESCAPE '\' OR city LIKE ? ESCAPE '\')
+        AND (?='' OR label LIKE ? ESCAPE '\\' OR address_line_1 LIKE ? ESCAPE '\\' OR city LIKE ? ESCAPE '\\')
       ORDER BY is_default DESC,label LIMIT ? OFFSET ?`, partnerId ?? "", partnerId ?? "", term, like, like, like, boundedLimit, boundedOffset) };
   }
   if (kind === "warehouses") {
@@ -3780,6 +3959,10 @@ export async function searchInventoryReferences(kind: ReferenceLookup, search = 
     return { items: await effectivePricesForProducts({ products: items, usage: role === "vendor" ? "purchase" : "sales", partnerId, quantity, currency, exchangeRateToBase }) };
   }
   if (kind === "locations") {
+    // "stocked" lists every active bin that physically holds stock a person can pull from — usable,
+    // quarantine, and damaged — but never in-transit locations. Vendor returns of damaged
+    // receipts source from quarantine, so the picker cannot be usable-only.
+    const stockedOnly = role === "stocked";
     const inventoryStatus = role === "bin" ? "usable" : ["usable", "quarantine", "damaged", "in_transit", "return_pending", "non_usable"].includes(role ?? "") ? role! : "";
     const scopedProduct = productId?.trim() ?? "";
     const items = await all<Record<string, unknown>>(`SELECT l.id,l.code,l.name,l.location_type AS locationType,l.inventory_status AS inventoryStatus,
@@ -3787,11 +3970,12 @@ export async function searchInventoryReferences(kind: ReferenceLookup, search = 
       COALESCE((SELECT ib.on_hand_qty-ib.reserved_qty FROM inventory_balances ib WHERE ib.product_id=? AND ib.location_id=l.id),0) AS availableQuantity
       FROM locations l JOIN warehouses w ON w.id=l.warehouse_id
       WHERE l.active=1 AND w.active=1 AND (?='' OR (?='non_usable' AND l.inventory_status IN ('quarantine','damaged')) OR l.inventory_status=?)
+        AND (?=0 OR (l.inventory_status IN ('usable','quarantine','damaged') AND l.location_type<>'in_transit'))
         AND (?<>'bin' OR l.warehouse_id=?)
         AND (?='' OR COALESCE((SELECT ib.on_hand_qty-ib.reserved_qty FROM inventory_balances ib WHERE ib.product_id=? AND ib.location_id=l.id),0)>0)
         AND (?='' OR l.code LIKE ? ESCAPE '\\' OR l.name LIKE ? ESCAPE '\\' OR w.code LIKE ? ESCAPE '\\' OR w.name LIKE ? ESCAPE '\\')
       ORDER BY CASE WHEN ?<>'' AND l.warehouse_id=? THEN 0 ELSE 1 END,w.code,l.code,l.id LIMIT ?`,
-      scopedProduct, inventoryStatus, inventoryStatus, inventoryStatus, role ?? "", scopedWarehouse, scopedProduct, scopedProduct,
+      scopedProduct, inventoryStatus, inventoryStatus, inventoryStatus, stockedOnly ? 1 : 0, role ?? "", scopedWarehouse, scopedProduct, scopedProduct,
       term, like, like, like, like, scopedWarehouse, scopedWarehouse, boundedLimit);
     return { items };
   }

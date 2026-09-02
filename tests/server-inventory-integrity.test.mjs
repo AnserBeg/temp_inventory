@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const domain = readFileSync(new URL("../lib/server/inventory-domain.ts", import.meta.url), "utf8");
+const advanced = readFileSync(new URL("../lib/server/advanced-domain.ts", import.meta.url), "utf8");
 const schema = readFileSync(new URL("../db/schema.ts", import.meta.url), "utf8");
 const migration = readFileSync(new URL("../drizzle/0007_slow_thor_girl.sql", import.meta.url), "utf8");
 
@@ -13,7 +14,13 @@ test("all outbound legacy postings couple stock, layers, and immutable value ent
   assert.match(domain, /entryType: openingBalance \? "opening_balance" : delta > 0 \? "inventory_adjustment_gain" : "inventory_adjustment_loss"/);
   assert.match(domain, /layerClaimPredicate\(valuation\.layers\)/);
   assert.match(domain, /layerConsumptionPrepared\(input, valuation\.layers\)/);
-  assert.match(domain, /on_hand_qty - reserved_qty >= \?/);
+  // Balance claims compare with a one-millionth tolerance and mutations round to six places so
+  // precision-3 products cannot drift into the non-negative triggers (0.3-0.1-0.2 = -2.8e-17).
+  assert.match(domain, /qtyAtLeast\("on_hand_qty - reserved_qty"\)/);
+  assert.match(domain, /const qtyMinus = \(column: string\) => `ROUND\(\$\{column\} - \?, 6\)`/);
+  assert.match(domain, /const qtyAtLeast = \(expression: string\) => `\$\{expression\} >= \? - \$\{QTY_EPSILON\}`/);
+  assert.doesNotMatch(domain, /SET on_hand_qty = on_hand_qty - \?/);
+  assert.doesNotMatch(domain, /SET on_hand_qty=on_hand_qty-\?/);
 });
 
 test("receipt reversal consumes only its original receipt layer and exact landed value", () => {
@@ -25,7 +32,12 @@ test("receipt reversal consumes only its original receipt layer and exact landed
   assert.match(reversal, /JOIN cost_layers cl ON cl\.receipt_movement_id = sm\.id/);
   assert.match(reversal, /receipt_movement_id = \? AND remaining_qty >= \?/);
   assert.match(reversal, /totalLayerValueCents = Math\.round\(layer\.receivedQty \* layer\.unitCostCents\) \+ layer\.landedCostCents/);
-  assert.match(reversal, /quantity === layer\.remainingQty/);
+  assert.match(reversal, /ownLayerQuantity === layer\.remainingQty/);
+  // A consumed receipt layer no longer blocks the reversal: the remainder is funded from the
+  // product's other open layers and the difference is posted as a balancing cost variance.
+  assert.match(reversal, /openLayersForIssue\(source\.productId, otherLayerQuantity, layer\.id\)/);
+  assert.match(reversal, /entryType: "cost_variance"/);
+  assert.match(reversal, /costVarianceCents = otherAtReceiptCostCents - otherLayers\.valueCents/);
   assert.match(reversal, /RECEIPT_LAYER_CONSUMED/);
   assert.match(reversal, /RECEIPT_REVERSAL_AP_CONFLICT/);
   assert.match(reversal, /vb\.match_status='matched'/);
@@ -35,8 +47,13 @@ test("receipt reversal consumes only its original receipt layer and exact landed
 
 test("shipment fulfillment is net of explicit reversals", () => {
   assert.match(domain, /sm\.movement_type = 'shipment_reversal' THEN -sm\.quantity/);
-  assert.match(domain, /case "reverseshipment": return reverseShipment\(input\)/);
-  assert.match(domain, /INVOICED_SHIPMENT/);
+  // Shipment reversal has exactly one implementation: the workflow dispatcher, which also
+  // restores lot/serial identity. The legacy /api/commands alias was an incomplete duplicate.
+  assert.doesNotMatch(domain, /case "reverseshipment"/);
+  assert.doesNotMatch(domain, /async function reverseShipment/);
+  assert.doesNotMatch(domain, /reverseShipment: "operationalWrite"/);
+  assert.match(advanced, /case "reverseshipment": return reverseShipment\(command\)/);
+  assert.match(advanced, /INVOICED_SHIPMENT/);
 });
 
 test("count approvals are scoped and single-use", () => {
@@ -53,10 +70,10 @@ test("physical postings emit both audit and transactional outbox records", () =>
     "inventory.receipt_reversed",
     "inventory.vendor_return_posted",
     "inventory.shipment_posted",
-    "inventory.shipment_reversed",
     "inventory.customer_return_received",
     "inventory.count_posted",
   ]) assert.match(domain, new RegExp(event.replaceAll(".", "\\.")));
+  assert.match(advanced, /outboxStatement\(command, "shipment\.reversed"/);
   assert.match(domain, /actor_id, actor_email/);
 });
 

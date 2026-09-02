@@ -590,6 +590,17 @@ input[type="checkbox"] { width: 17px; height: 17px; min-height: 0; padding: 0; b
 .error-summary { margin-bottom: 14px; padding: 10px 12px; border: 1px solid #e2b6b1; border-left: 3px solid var(--danger); border-radius: 6px; background: var(--danger-soft); color: #78342e; }
 .error-summary strong { font-size: 12px; }
 .error-summary p { margin: 2px 0 0; font-size: 12px; }
+/* Every missing field, each a link to the field itself. */
+.error-summary .error-list { margin: 4px 0 0; padding-left: 18px; font-size: 12px; }
+.error-summary .error-list li { margin: 2px 0; }
+.error-summary .error-list .text-button { padding: 0; color: inherit; font-size: 12px; text-decoration: underline; }
+.required-mark { color: var(--danger); font-weight: 700; }
+.field-error { display: block; margin-top: 3px; color: #78342e; font-size: 11px; font-weight: 600; }
+.field-hint { display: block; margin-top: 3px; color: var(--ink-soft); font-size: 11px; font-weight: 500; }
+.field-hint:empty { display: none; }
+input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--danger); box-shadow: 0 0 0 2px var(--danger-soft); }
+.batch-receipt-actions { display: flex; justify-content: flex-end; }
+.radio-row.disabled { opacity: .6; cursor: not-allowed; }
 .command-fields-lock { min-width: 0; margin: 0; padding: 0; border: 0; }
 .command-fields-lock:disabled { opacity: .72; }
 .count-approval-status { display: grid; gap: 3px; margin-top: 14px; padding: 11px 12px; border: 1px solid #d8c69a; border-left: 3px solid var(--warning); border-radius: 6px; background: #fff8e7; color: #59491f; }

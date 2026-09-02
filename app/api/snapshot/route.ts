@@ -39,6 +39,9 @@ export async function GET(request: Request) {
         headers: { "Cache-Control": "no-store" },
       });
     }
+    // The viewer's local calendar date. "Late" is judged against it rather than UTC now, so an
+    // order due today does not turn late at 5 p.m. Mountain time. Anything malformed is ignored.
+    const asOf = url.searchParams.get("asOf")?.trim() ?? "";
     const snapshot = await getInventorySnapshot({
       page: Number(url.searchParams.get("page") ?? 1),
       pageSize: Number(url.searchParams.get("pageSize") ?? 50),
@@ -47,6 +50,7 @@ export async function GET(request: Request) {
       status: url.searchParams.get("status") ?? "",
       sort: url.searchParams.get("sort") ?? "priority",
       warehouseId: url.searchParams.get("warehouseId") ?? "",
+      asOf: /^\d{4}-\d{2}-\d{2}$/.test(asOf) ? asOf : undefined,
     });
     // Every write is attributed to this actor, so the shell should be able to say who it is
     // and what they are allowed to do rather than showing a placeholder avatar.

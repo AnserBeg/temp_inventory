@@ -388,7 +388,16 @@ async function updateSalesOrderDraft(command: WorkflowCommand) {
     if (error instanceof RecordValidationError) throw new WorkflowError(error.code, error.message, error.status);
     throw error;
   }
-  const baseTotalCents = Math.round(prepared.totalCents * exchangeRateToBase);
+  // Charges the composer does not manage (added with addDocumentCharge) survive a line edit and
+  // keep counting toward the order total; only composer-owned kinds are rebuilt from the payload.
+  const composerChargeKinds = [...new Set(["freight", "fee", "handling_fee", "returnable_deposit", ...prepared.charges.map((charge) => charge.chargeType)])];
+  const retainedCharges = (await all<{ chargeType: string; amount: number; direction: string; taxAmount: number }>(
+    "SELECT charge_type AS chargeType,amount_cents AS amount,direction,tax_amount_cents AS taxAmount FROM document_charges WHERE document_type='sales_order' AND document_id=?", id,
+  )).filter((charge) => !composerChargeKinds.includes(charge.chargeType));
+  const retainedChargeCents = retainedCharges.reduce((sum, charge) => sum + (charge.direction === "subtract" ? -1 : 1) * (Number(charge.amount) + Math.abs(Number(charge.taxAmount))), 0);
+  const totalCents = prepared.totalCents + retainedChargeCents;
+  if (totalCents < 0) throw new WorkflowError("INVALID_DOCUMENT_TOTAL", "Order charges and discounts cannot make the sales-order total negative.");
+  const baseTotalCents = Math.round(totalCents * exchangeRateToBase);
   const result: WorkflowResult = {
     recordId: id,
     message: `${current.number} draft updated with ${prepared.items.length} item line${prepared.items.length === 1 ? "" : "s"}.`,
@@ -407,8 +416,8 @@ async function updateSalesOrderDraft(command: WorkflowCommand) {
       .bind(...claimValues(command, result, id), id, version),
     db.prepare(`UPDATE sales_orders SET customer_id=?,requested_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,ship_to_name=?,ship_to_address_line_1=?,ship_to_address_line_2=?,ship_to_city=?,ship_to_region=?,ship_to_postal_code=?,ship_to_country=?,delivery_instructions=?,version=version+1
       WHERE id=? AND version=? AND lifecycle_status='draft' AND ${marker(command)}`)
-      .bind(customerId, requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, prepared.totalCents, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, id, version),
-    db.prepare(`DELETE FROM document_charges WHERE document_type='sales_order' AND document_id=? AND ${marker(command)}`).bind(id),
+      .bind(customerId, requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, id, version),
+    db.prepare(`DELETE FROM document_charges WHERE document_type='sales_order' AND document_id=? AND charge_type IN (SELECT value FROM json_each(?)) AND ${marker(command)}`).bind(id, JSON.stringify(composerChargeKinds)),
     db.prepare(`DELETE FROM sales_order_lines WHERE sales_order_id=? AND ${marker(command)}`).bind(id),
   ];
   for (const line of prepared.items) statements.push(db.prepare(`INSERT INTO sales_order_lines
@@ -420,8 +429,8 @@ async function updateSalesOrderDraft(command: WorkflowCommand) {
     SELECT ?,'sales_order',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
     .bind(newId("charge"), id, charge.chargeType, charge.description, charge.amountCents, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRateBps, charge.taxable ? Math.round(charge.amountCents * charge.taxRateBps / 10_000) : 0, when));
   statements.push(
-    auditStatement(command, "sales_order", id, "draft_updated", result.message, { customerId, requestedDate, itemCount: prepared.items.length, totalCents: prepared.totalCents, currency }, when),
-    outboxStatement(command, "sales_order.draft_updated", "sales_order", id, { itemCount: prepared.items.length, totalCents: prepared.totalCents }, when),
+    auditStatement(command, "sales_order", id, "draft_updated", result.message, { customerId, requestedDate, itemCount: prepared.items.length, totalCents, retainedChargeCount: retainedCharges.length, currency }, when),
+    outboxStatement(command, "sales_order.draft_updated", "sales_order", id, { itemCount: prepared.items.length, totalCents }, when),
   );
   await db.batch(statements);
   return finish(command);
@@ -437,7 +446,10 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
   );
   if (!current) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
   if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before editing the draft.", 409, current.version);
-  if (current.status !== "draft") throw new WorkflowError("INVALID_STATE", "Only draft purchase orders can be edited.", 409, current.version);
+  // A rejected order is edited like a draft: the rejected revision stays on file and the edit
+  // becomes the next revision, so resubmission carries the reviewer's history forward.
+  if (current.status !== "draft" && current.status !== "rejected") throw new WorkflowError("INVALID_STATE", "Only draft or rejected purchase orders can be edited.", 409, current.version);
+  const reopeningRejected = current.status === "rejected";
 
   const vendorId = textValue(payload, "vendorId");
   if (!await first("SELECT id FROM business_partners WHERE id=? AND partner_type IN ('vendor','both') AND active=1", vendorId)) {
@@ -457,10 +469,22 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
     if (error instanceof RecordValidationError) throw new WorkflowError(error.code, error.message, error.status);
     throw error;
   }
-  const baseTotalCents = Math.round(prepared.totalCents * exchangeRateToBase);
+  // The composer only ever owns freight, fee, and refundable-deposit charges (plus whatever kinds it
+  // is sending now). Charges of other kinds were added deliberately with addDocumentCharge and must
+  // survive a line edit and still count toward the order total.
+  const composerChargeKinds = [...new Set(["freight", "fee", "handling_fee", "returnable_deposit", ...prepared.charges.map((charge) => charge.chargeType)])];
+  const retainedCharges = (await all<{ chargeType: string; amount: number; direction: string; taxAmount: number }>(
+    "SELECT charge_type AS chargeType,amount_cents AS amount,direction,tax_amount_cents AS taxAmount FROM document_charges WHERE document_type='purchase_order' AND document_id=?", id,
+  )).filter((charge) => !composerChargeKinds.includes(charge.chargeType));
+  const retainedChargeCents = retainedCharges.reduce((sum, charge) => sum + (charge.direction === "subtract" ? -1 : 1) * (Number(charge.amount) + Math.abs(Number(charge.taxAmount))), 0);
+  const totalCents = prepared.totalCents + retainedChargeCents;
+  if (totalCents < 0) throw new WorkflowError("INVALID_DOCUMENT_TOTAL", "Order charges and discounts cannot make the purchase-order total negative.");
+  const baseTotalCents = Math.round(totalCents * exchangeRateToBase);
+  const revisionHead = reopeningRejected ? await first<{ revision: number }>("SELECT COALESCE(MAX(revision_number),0) AS revision FROM purchase_order_revisions WHERE purchase_order_id=?", id) : null;
+  const revisionNumber = reopeningRejected ? Math.max(current.revision, Number(revisionHead?.revision ?? 0)) + 1 : current.revision;
   const result: WorkflowResult = {
     recordId: id,
-    message: `${current.number} draft updated with ${prepared.items.length} item line${prepared.items.length === 1 ? "" : "s"}.`,
+    message: `${current.number} draft updated with ${prepared.items.length} item line${prepared.items.length === 1 ? "" : "s"}${reopeningRejected ? ` as revision ${revisionNumber}` : ""}.`,
     impact: { physical: "No stock movement.", commercial: "Draft supply remains inactive until approval.", financial: "Draft pricing changed; no payable was created.", onHandDelta: 0 },
   };
   const db = commandD1(command);
@@ -479,15 +503,16 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
   const allocationClaimValues = [...allocationDemand].flatMap(([salesOrderLineId, allocation]) => [salesOrderLineId, allocation.productId, allocation.route, id, allocation.quantity]);
   const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
-      SELECT ?,?,?,?,?,?,? FROM purchase_orders po WHERE po.id=? AND po.version=? AND po.lifecycle_status='draft'
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders po WHERE po.id=? AND po.version=? AND po.lifecycle_status=?
       AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.purchase_order_id=po.id)
-      AND NOT EXISTS (SELECT 1 FROM vendor_bills vb WHERE vb.purchase_order_id=po.id AND vb.status<>'void')${allocationClaims}`)
-      .bind(...claimValues(command, result, id), id, version, ...allocationClaimValues),
-    db.prepare(`UPDATE purchase_orders SET vendor_id=?,expected_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,version=version+1
-      WHERE id=? AND version=? AND lifecycle_status='draft' AND ${marker(command)}`)
-      .bind(vendorId, expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, prepared.totalCents, projectReference, id, version),
+      AND NOT EXISTS (SELECT 1 FROM vendor_bills vb WHERE vb.purchase_order_id=po.id AND vb.status<>'void')
+      AND NOT EXISTS (SELECT 1 FROM purchase_order_revisions rev WHERE rev.purchase_order_id=po.id AND rev.revision_number=? AND rev.lifecycle_status<>?)${allocationClaims}`)
+      .bind(...claimValues(command, result, id), id, version, current.status, revisionNumber, current.status, ...allocationClaimValues),
+    db.prepare(`UPDATE purchase_orders SET vendor_id=?,expected_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,lifecycle_status='draft',revision_number=?,version=version+1
+      WHERE id=? AND version=? AND lifecycle_status=? AND ${marker(command)}`)
+      .bind(vendorId, expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, projectReference, revisionNumber, id, version, current.status),
     db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=NULL WHERE linked_purchase_order_line_id IN (SELECT id FROM purchase_order_lines WHERE purchase_order_id=?) AND ${marker(command)}`).bind(id),
-    db.prepare(`DELETE FROM document_charges WHERE document_type='purchase_order' AND document_id=? AND ${marker(command)}`).bind(id),
+    db.prepare(`DELETE FROM document_charges WHERE document_type='purchase_order' AND document_id=? AND charge_type IN (SELECT value FROM json_each(?)) AND ${marker(command)}`).bind(id, JSON.stringify(composerChargeKinds)),
     db.prepare(`DELETE FROM purchase_order_lines WHERE purchase_order_id=? AND ${marker(command)}`).bind(id),
   ];
   for (const line of prepared.items) {
@@ -509,12 +534,17 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
     (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at)
     SELECT ?,'purchase_order',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
     .bind(newId("charge"), id, charge.chargeType, charge.description, charge.amountCents, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRateBps, charge.taxable ? Math.round(charge.amountCents * charge.taxRateBps / 10_000) : 0, when));
+  const revisionSnapshot = JSON.stringify({ number: current.number, vendorId, expectedDate, items: prepared.items, charges: prepared.charges, retainedCharges, totalCents, currency, exchangeRateToBase, previousRevision: reopeningRejected ? current.revision : null });
   statements.push(
-    db.prepare(`UPDATE purchase_order_revisions SET snapshot_json=?,reason='Draft edited',created_by=?,created_at=?
-      WHERE purchase_order_id=? AND revision_number=? AND lifecycle_status='draft' AND ${marker(command)}`)
-      .bind(JSON.stringify({ number: current.number, vendorId, expectedDate, items: prepared.items, charges: prepared.charges, totalCents: prepared.totalCents, currency, exchangeRateToBase }), command.actor.label, when, id, current.revision),
-    auditStatement(command, "purchase_order", id, "draft_updated", result.message, { vendorId, expectedDate, itemCount: prepared.items.length, totalCents: prepared.totalCents, currency }, when),
-    outboxStatement(command, "purchase_order.draft_updated", "purchase_order", id, { itemCount: prepared.items.length, totalCents: prepared.totalCents }, when),
+    reopeningRejected
+      ? db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
+          SELECT ?,?,?,'draft',?,'Draft edited after rejection',?,? WHERE ${marker(command)}`)
+        .bind(newId("revision"), id, revisionNumber, revisionSnapshot, command.actor.label, when)
+      : db.prepare(`UPDATE purchase_order_revisions SET snapshot_json=?,reason='Draft edited',created_by=?,created_at=?
+          WHERE purchase_order_id=? AND revision_number=? AND lifecycle_status='draft' AND ${marker(command)}`)
+        .bind(revisionSnapshot, command.actor.label, when, id, current.revision),
+    auditStatement(command, "purchase_order", id, "draft_updated", result.message, { vendorId, expectedDate, itemCount: prepared.items.length, totalCents, retainedChargeCount: retainedCharges.length, currency, previousStatus: current.status, revisionNumber }, when),
+    outboxStatement(command, "purchase_order.draft_updated", "purchase_order", id, { itemCount: prepared.items.length, totalCents, previousStatus: current.status, revisionNumber }, when),
   );
   await db.batch(statements);
   return finish(command);
@@ -608,7 +638,7 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
   );
   if (!approval) throw new WorkflowError("APPROVAL_STATE_MISSING", "The pending purchase-order approval record is missing.", 409);
   const amendmentDecision = approval.requestType === "purchase_order_amendment";
-  let restoration: { revision: number; total: number; baseTotal: number; lines: Array<{ id: string; ordered: number; unitCost: number }> } | null = null;
+  let restoration: { revision: number; total: number; baseTotal: number; lines: Array<{ id: string; ordered: number; unitCost: number; orderedUomQty: number | null; orderedUomUnitCost: number | null }> } | null = null;
   if (amendmentDecision && decision === "rejected") {
     const revision = await first<{ snapshotJson: string }>(
       "SELECT snapshot_json AS snapshotJson FROM purchase_order_revisions WHERE purchase_order_id=? AND revision_number=? AND lifecycle_status='pending_approval'",
@@ -622,11 +652,14 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
     const previousBaseTotal = Number(previous?.order?.baseTotalCents);
     const previousLines = Array.isArray(previous?.lines) ? previous.lines.map((line) => ({
       id: String(line.id ?? ""), ordered: Number(line.ordered), unitCost: Number(line.unitCost),
+      orderedUomQty: line.orderedUomQty == null ? null : Number(line.orderedUomQty),
+      orderedUomUnitCost: line.orderedUomUnitCost == null ? null : Number(line.orderedUomUnitCost),
     })) : [];
     if (!Number.isSafeInteger(previousRevision) || previousRevision < 1 || !Number.isSafeInteger(previousTotal)
         || previousTotal < 0 || !Number.isSafeInteger(previousBaseTotal) || previousBaseTotal < 0
         || !previousLines.length || previousLines.some((line) => !line.id || !Number.isFinite(line.ordered)
-          || line.ordered <= 0 || !Number.isSafeInteger(line.unitCost) || line.unitCost < 0)) {
+          || line.ordered <= 0 || !Number.isFinite(line.unitCost) || line.unitCost < 0
+          || (line.orderedUomQty != null && !(line.orderedUomQty > 0)) || (line.orderedUomUnitCost != null && !(line.orderedUomUnitCost >= 0)))) {
       throw new WorkflowError("REVISION_RESTORE_MISSING", "The prior approved purchase-order snapshot cannot be restored safely; approval decision was blocked.", 409);
     }
     restoration = { revision: previousRevision, total: previousTotal, baseTotal: previousBaseTotal, lines: previousLines };
@@ -665,8 +698,8 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
   ];
   if (restoration) {
     for (const line of restoration.lines) {
-      statements.push(db.prepare(`UPDATE purchase_order_lines SET ordered_qty=?,unit_cost_cents=? WHERE id=? AND purchase_order_id=? AND ${marker(command)}`)
-        .bind(line.ordered, line.unitCost, line.id, id));
+      statements.push(db.prepare(`UPDATE purchase_order_lines SET ordered_qty=?,unit_cost_cents=?,ordered_uom_qty=COALESCE(?,ordered_uom_qty),ordered_uom_unit_cost_cents=COALESCE(?,ordered_uom_unit_cost_cents) WHERE id=? AND purchase_order_id=? AND ${marker(command)}`)
+        .bind(line.ordered, line.unitCost, line.orderedUomQty, line.orderedUomUnitCost, line.id, id));
     }
   }
   statements.push(...pricingStatements);
@@ -693,22 +726,38 @@ async function amendPurchaseOrder(command: WorkflowCommand) {
   if (order.status !== "approved") throw new WorkflowError("INVALID_STATE", "Only approved purchase orders can be amended.", 409);
   const changeIds = changes.map((change) => textValue(change, "lineId"));
   if (new Set(changeIds).size !== changeIds.length) throw new WorkflowError("DUPLICATE_DOCUMENT_LINE", "Each purchase-order line may be amended only once.");
-  const existingLines = await all<{ id: string; productId: string; ordered: number; closed: number; unitCost: number; configuration: string | null; route: string; sourceSalesLineId: string | null; discountCents: number; taxable: number; taxRateBps: number; retained: number; allocated: number }>(`SELECT pol.id,pol.product_id AS productId,pol.ordered_qty AS ordered,pol.closed_qty AS closed,pol.unit_cost_cents AS unitCost,pol.configuration_snapshot AS configuration,pol.fulfillment_route AS route,pol.source_sales_order_line_id AS sourceSalesLineId,pol.discount_cents AS discountCents,pol.taxable,pol.tax_rate_bps AS taxRateBps,
+  const existingLines = await all<{ id: string; productId: string; ordered: number; closed: number; unitCost: number; orderedUomId: string | null; orderedUomQty: number | null; orderedUomUnitCost: number | null; configuration: string | null; route: string; sourceSalesLineId: string | null; discountCents: number; taxable: number; taxRateBps: number; retained: number; allocated: number }>(`SELECT pol.id,pol.product_id AS productId,pol.ordered_qty AS ordered,pol.closed_qty AS closed,pol.unit_cost_cents AS unitCost,
+      pol.ordered_uom_id AS orderedUomId,pol.ordered_uom_qty AS orderedUomQty,pol.ordered_uom_unit_cost_cents AS orderedUomUnitCost,
+      pol.configuration_snapshot AS configuration,pol.fulfillment_route AS route,pol.source_sales_order_line_id AS sourceSalesLineId,pol.discount_cents AS discountCents,pol.taxable,pol.tax_rate_bps AS taxRateBps,
       CASE WHEN pol.fulfillment_route='drop_ship'
         THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
         ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END AS retained,
       COALESCE((SELECT SUM(sa.allocated_qty) FROM supply_allocations sa WHERE sa.purchase_order_line_id=pol.id AND sa.status='active'),0) AS allocated
     FROM purchase_order_lines pol WHERE pol.purchase_order_id=? ORDER BY pol.id`, id);
   if (changeIds.some((lineId) => !existingLines.some((line) => line.id === lineId))) throw new WorkflowError("INVALID_PO_LINE", "Every amendment line must belong to this purchase order.", 409);
-  const amendedLines = existingLines.map((line) => {
+  const amendedLines: typeof existingLines = [];
+  for (const line of existingLines) {
     const change = changes.find((row) => row.lineId === line.id);
-    if (!change) return line;
-    const ordered = roundQuantity(numberValue(change, "orderedQuantity"));
-    const unitCost = change.unitCostCents == null ? line.unitCost : numberValue(change, "unitCostCents", { integer: true });
+    if (!change) { amendedLines.push(line); continue; }
+    // Amended quantities and unit costs are entered in the line's ordered UOM, exactly as the draft
+    // was, and go through the same conversion and precision validation as every other entry point.
+    const enteredQuantity = numberValue(change, "orderedQuantity");
+    let normalizedQuantity: Awaited<ReturnType<typeof normalizeProductQuantity>>;
+    try {
+      normalizedQuantity = await normalizeProductQuantity({ productId: line.productId, quantity: enteredQuantity, uomId: line.orderedUomId, usage: line.orderedUomId ? "purchase" : "base", field: "orderedQuantity" });
+    } catch (error) {
+      if (error instanceof ProductQuantityError) throw new WorkflowError(error.code, error.message, error.status);
+      throw error;
+    }
+    const ordered = normalizedQuantity.baseQuantity;
+    const enteredUnitCost = change.unitCostCents == null
+      ? (line.orderedUomUnitCost ?? Math.round(line.unitCost * normalizedQuantity.factorToBase))
+      : numberValue(change, "unitCostCents", { integer: true });
+    const unitCost = enteredUnitCost / normalizedQuantity.factorToBase;
     const amendmentFloor = roundQuantity(Math.max(line.retained + line.closed, line.allocated + line.closed));
     if (ordered < amendmentFloor) throw new WorkflowError("BELOW_RETAINED_OR_CLOSED", `Line ${line.id} cannot be amended below ${amendmentFloor}: ${line.retained} retained plus ${line.closed} closed.`, 409);
-    return { ...line, ordered, unitCost };
-  });
+    amendedLines.push({ ...line, ordered, unitCost, orderedUomQty: enteredQuantity, orderedUomUnitCost: enteredUnitCost });
+  }
   const charges = await all<{ chargeType: string; description: string; amount: number; direction: string; taxable: number; refundable: number; taxCode: string | null; taxRate: number; taxAmount: number }>("SELECT charge_type AS chargeType,description,amount_cents AS amount,direction,taxable,refundable,tax_code AS taxCode,tax_rate_bps AS taxRate,tax_amount_cents AS taxAmount FROM document_charges WHERE document_type='purchase_order' AND document_id=? ORDER BY created_at,id", id);
   const itemSubtotal = amendedLines.reduce((sum, line) => {
     const net = Math.max(Math.round(line.ordered * line.unitCost) - line.discountCents, 0);
@@ -733,7 +782,8 @@ async function amendPurchaseOrder(command: WorkflowCommand) {
   for (const change of changes) {
     const lineId = textValue(change, "lineId");
     const amended = amendedLines.find((line) => line.id === lineId)!;
-    statements.push(db.prepare(`UPDATE purchase_order_lines SET ordered_qty=?,unit_cost_cents=? WHERE id=? AND purchase_order_id=? AND ${marker(command)}`).bind(amended.ordered, amended.unitCost, lineId, id));
+    statements.push(db.prepare(`UPDATE purchase_order_lines SET ordered_qty=?,unit_cost_cents=?,ordered_uom_qty=?,ordered_uom_unit_cost_cents=? WHERE id=? AND purchase_order_id=? AND ${marker(command)}`)
+      .bind(amended.ordered, amended.unitCost, amended.orderedUomQty, amended.orderedUomUnitCost, lineId, id));
   }
   const previous = {
     order: { id, number: order.number, vendorId: order.vendorId, lifecycleStatus: "approved", revisionNumber: order.revision,
@@ -873,6 +923,7 @@ async function moveInventory(command: WorkflowCommand, movementType: "internal_t
   const productId = command.entityId ?? textValue(payload, "productId");
   const fromLocationId = textValue(payload, "fromLocationId");
   const requestedTo = textValue(payload, "toLocationId");
+  if (fromLocationId === requestedTo) throw new WorkflowError("SAME_LOCATION", "Source and destination locations must differ.");
   const quantity = await baseQuantity(productId, numberValue(payload, "quantity"));
   const reason = textValue(payload, "reason");
   const postingDate = dateValue(payload, "postingDate", today());
@@ -1389,7 +1440,7 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
   const requestedLineIds = requestedLines.map((line) => textValue(line, "purchaseOrderLineId"));
   if (new Set(requestedLineIds).size !== requestedLineIds.length) throw new WorkflowError("DUPLICATE_DOCUMENT_LINE", "Each purchase-order line may appear only once on a vendor bill.");
   const tolerances = await setting<{ quantity: number; unitPriceCents: number; totalCents: number; allowedChargeKinds: string[] }>("matching.tolerances", { quantity: 0, unitPriceCents: 0, totalCents: 0, allowedChargeKinds: [] });
-  const normalized: Array<{ poLineId: string; productId: string; quantity: number; unitCost: number; poCost: number; lineTotal: number; status: string; details: unknown }> = [];
+  const normalized: Array<{ poLineId: string; productId: string; quantity: number; unitCost: number; poCost: number; lineTotal: number; status: string; aheadOfReceipt: boolean; details: unknown }> = [];
   const exceptions: Array<Record<string, unknown>> = [];
   for (const [index, line] of requestedLines.entries()) {
     const poLineId = requestedLineIds[index];
@@ -1405,11 +1456,17 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
     const lineExceptions: Array<Record<string, unknown>> = [];
     const remainingReceived = roundQuantity(poLine.received - poLine.billed);
     const remainingOrdered = roundQuantity(poLine.ordered - poLine.billed);
-    if (quantity > remainingReceived + tolerances.quantity) lineExceptions.push({ code: "BILLED_ABOVE_RECEIVED", severity: "blocking", variance: roundQuantity(quantity - remainingReceived) });
-    if (quantity > remainingOrdered + tolerances.quantity) lineExceptions.push({ code: "BILLED_ABOVE_ORDERED", severity: "blocking", variance: roundQuantity(quantity - remainingOrdered) });
+    // Billing more than the vendor was asked to supply is a hard stop that needs a PO amendment.
+    // Billing ahead of the goods is ordinary invoice-before-receipt: the bill posts on hold with the
+    // exception recorded and the hold is released once the receipt exists.
+    if (quantity > remainingOrdered + tolerances.quantity) {
+      throw new WorkflowError("BILLED_ABOVE_ORDERED", `Bill line ${index + 1} bills ${quantity} against ${remainingOrdered} unbilled ordered unit${remainingOrdered === 1 ? "" : "s"}${tolerances.quantity ? ` (tolerance ${tolerances.quantity})` : ""}. Amend the purchase order before billing above it.`, 409);
+    }
+    const aheadOfReceipt = quantity > remainingReceived + tolerances.quantity;
+    if (aheadOfReceipt) lineExceptions.push({ code: "BILL_BEFORE_RECEIPT", severity: "blocking", variance: roundQuantity(quantity - remainingReceived) });
     if (Math.abs(unitCost - poLine.poCost) > tolerances.unitPriceCents) lineExceptions.push({ code: "UNIT_PRICE_VARIANCE", severity: "approval", varianceCents: unitCost - poLine.poCost });
     exceptions.push(...lineExceptions.map((item) => ({ ...item, lineId: poLineId })));
-    normalized.push({ poLineId, productId: poLine.productId, quantity, unitCost, poCost: poLine.poCost, lineTotal: Math.round(quantity * unitCost), status: lineExceptions.length ? "exception" : "matched", details: { exceptions: lineExceptions, ordered: poLine.ordered, netReceived: poLine.received, previouslyBilled: poLine.billed, remainingReceived, poUnitCostCents: poLine.poCost } });
+    normalized.push({ poLineId, productId: poLine.productId, quantity, unitCost, poCost: poLine.poCost, lineTotal: Math.round(quantity * unitCost), status: lineExceptions.length ? "exception" : "matched", aheadOfReceipt, details: { exceptions: lineExceptions, ordered: poLine.ordered, netReceived: poLine.received, previouslyBilled: poLine.billed, remainingReceived, poUnitCostCents: poLine.poCost } });
   }
   const charges = (Array.isArray(payload.charges) ? payload.charges as Array<Record<string, unknown>> : []).map(normalizeChargePayload);
   for (const charge of charges) if (!tolerances.allowedChargeKinds.includes(charge.chargeType)) exceptions.push({ code: "UNEXPECTED_CHARGE", severity: "approval", kind: charge.chargeType });
@@ -1434,13 +1491,15 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
     ? `${number} posted and approved by its author${exceptions.length ? ` with ${exceptions.length} authorized three-way-match exception${exceptions.length === 1 ? "" : "s"}` : " after a successful three-way match"}.`
     : hold ? `${number} posted on hold with ${exceptions.length} three-way-match exception${exceptions.length === 1 ? "" : "s"}.` : `${number} posted and matched to PO and cumulative receipts.`, impact: { physical: "No stock movement.", financial: `Payable ${total} ${currency} cents recorded${hold ? " on hold" : fastTrack ? " and author-approved" : ""}.`, matchStatus, exceptions, onHandDelta: 0 }, recordId: billId };
   const db = commandD1(command); const when = new Date().toISOString();
-  const lineClaims = normalized.map(() => `EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.id=? AND pol.purchase_order_id=?
-    AND pol.ordered_qty-COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)+?>=?
+  // The claim re-checks exactly what the hold decision relied on: ordered quantity is always a hard
+  // bound; received quantity only guards lines the decision treated as covered by a receipt.
+  const lineClaims = normalized.map((line) => `EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.id=? AND pol.purchase_order_id=?
+    AND pol.ordered_qty-COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)+?>=?${line.aheadOfReceipt ? "" : `
     AND (CASE WHEN pol.fulfillment_route='drop_ship'
       THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
       ELSE COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0) END)
-      -COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)+?>=?)`).join(" AND ");
-  const lineClaimBindings = normalized.flatMap((line) => [line.poLineId, purchaseOrderId, tolerances.quantity, line.quantity, tolerances.quantity, line.quantity]);
+      -COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)+?>=?`})`).join(" AND ");
+  const lineClaimBindings = normalized.flatMap((line) => [line.poLineId, purchaseOrderId, tolerances.quantity, line.quantity, ...(line.aheadOfReceipt ? [] : [tolerances.quantity, line.quantity])]);
   const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='approved'
@@ -1476,14 +1535,30 @@ async function approveVendorBill(command: WorkflowCommand) {
   const id = textValue({ entityId: command.entityId }, "entityId");
   const reason = textValue(command.payload ?? {}, "reason");
   const version = command.version ?? 0;
-  const bill = await first<{ version: number; status: string }>("SELECT version,status FROM vendor_bills WHERE id=?", id);
+  const bill = await first<{ version: number; status: string; holdReason: string | null }>("SELECT version,status,hold_reason AS holdReason FROM vendor_bills WHERE id=?", id);
   if (!bill) throw new WorkflowError("NOT_FOUND", "Vendor bill not found.", 404);
   if (bill.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Vendor bill changed.", 409, bill.version);
   if (bill.status !== "on_hold") throw new WorkflowError("INVALID_STATE", "Only held bills require approval.", 409);
+  // An invoice-before-goods hold is blocking, not discretionary: it clears only once cumulative
+  // receipts (net of every other live bill) cover each billed line within the quantity tolerance.
+  let holdExceptions: Array<Record<string, unknown>> = [];
+  try { const parsed = JSON.parse(bill.holdReason ?? "[]") as unknown; holdExceptions = Array.isArray(parsed) ? parsed as Array<Record<string, unknown>> : []; } catch { holdExceptions = []; }
+  const awaitingReceipt = holdExceptions.some((exception) => exception.code === "BILL_BEFORE_RECEIPT" || exception.code === "BILLED_ABOVE_RECEIVED");
+  const tolerances = awaitingReceipt ? await setting<{ quantity: number }>("matching.tolerances", { quantity: 0 }) : { quantity: 0 };
+  const unreceivedLineSql = `EXISTS (SELECT 1 FROM vendor_bill_lines vbl JOIN purchase_order_lines pol ON pol.id=vbl.purchase_order_line_id
+    WHERE vbl.vendor_bill_id=vendor_bills.id AND vbl.quantity>(CASE WHEN pol.fulfillment_route='drop_ship'
+        THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
+        ELSE COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0) END)
+      -COALESCE((SELECT SUM(other.quantity) FROM vendor_bill_lines other JOIN vendor_bills ob ON ob.id=other.vendor_bill_id
+        WHERE other.purchase_order_line_id=pol.id AND ob.status<>'void' AND ob.id<>vendor_bills.id),0)+?)`;
+  if (awaitingReceipt && await first(`SELECT 1 AS unreceived FROM vendor_bills WHERE id=? AND ${unreceivedLineSql}`, id, tolerances.quantity)) {
+    throw new WorkflowError("RECEIPT_REQUIRED", "This bill was posted before the goods arrived. Receive the purchase order (or void the bill) before releasing the hold.", 409, bill.version);
+  }
   const result: WorkflowResult = { message: "Vendor bill hold approved; payable released without moving inventory.", impact: { physical: "No stock movement.", financial: "Payable released.", onHandDelta: 0 }, recordId: id };
   const db = commandD1(command); const when = new Date().toISOString();
   await db.batch([
-    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM vendor_bills WHERE id=? AND version=? AND status='on_hold'`).bind(...claimValues(command, result, id), id, version),
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM vendor_bills WHERE id=? AND version=? AND status='on_hold'${awaitingReceipt ? ` AND NOT ${unreceivedLineSql}` : ""}`)
+      .bind(...claimValues(command, result, id), id, version, ...(awaitingReceipt ? [tolerances.quantity] : [])),
     db.prepare(`UPDATE vendor_bills SET status='approved',match_status='approved_variance',hold_reason=NULL,approved_at=?,approved_by=?,version=version+1 WHERE id=? AND version=? AND status='on_hold' AND ${marker(command)}`).bind(when, command.actor.label, id, version),
     db.prepare(`UPDATE approvals SET status='approved',decided_by=?,decision_reason=?,decided_at=?,consumed_at=?,consumed_by=?,consumed_entity_id=?,version=version+1 WHERE entity_type='vendor_bill' AND entity_id=? AND request_type='vendor_bill_match_exception' AND status='pending' AND ${marker(command)}`).bind(command.actor.label, reason, when, when, command.actor.label, id, id),
     auditStatement(command, "vendor_bill", id, "vendor_bill_approved", result.message, { reason }, when),
@@ -1526,6 +1601,9 @@ async function allocateLandedCost(command: WorkflowCommand) {
       COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='vendor_bill' AND dc.document_id=vb.id AND dc.refundable=0 AND dc.charge_type IN ('freight','fuel_surcharge','handling','customs','brokerage')),0) AS eligibleCharges
     FROM vendor_bills vb WHERE vb.id=?`, sourceDocumentId);
   if (!source) throw new WorkflowError("NOT_FOUND", "Landed-cost source vendor bill was not found.", 404);
+  if (await first("SELECT id FROM landed_cost_allocations WHERE source_document_type=? AND source_document_id=?", sourceDocumentType, sourceDocumentId)) {
+    throw new WorkflowError("LANDED_COST_ALREADY_ALLOCATED", "This vendor bill's landed cost has already been allocated; each source document can be allocated once.", 409);
+  }
   if (!["approved", "partially_paid", "paid"].includes(source.status)) throw new WorkflowError("INVALID_STATE", "The landed-cost source vendor bill must be approved and off hold.", 409);
   if (!source.purchaseOrderId) throw new WorkflowError("LANDED_COST_SOURCE_UNRELATED", "The source vendor bill must be linked to a purchase order.", 409);
   const eligibleBaseCents = Math.round(source.eligibleCharges * source.exchange);
@@ -1537,10 +1615,11 @@ async function allocateLandedCost(command: WorkflowCommand) {
   if (!layerIds.length) throw new WorkflowError("VALIDATION_ERROR", "costLayerIds is required.");
   const uniqueLayerIds = lineIdsUnique(layerIds);
   if (uniqueLayerIds.length !== layerIds.length) throw new WorkflowError("DUPLICATE_COST_LAYER", "Each cost layer may appear only once in an allocation.");
-  const placeholders = layerIds.map(() => "?").join(",");
+  // D1 caps a statement at 100 bound parameters, so the selected layers travel as one JSON value.
+  const layerIdsJson = JSON.stringify(layerIds);
   const fetched = await all<{ id: string; productId: string; received: number; remaining: number; unitCost: number; purchaseOrderId: string | null }>(`SELECT cl.id,cl.product_id AS productId,cl.received_qty AS received,cl.remaining_qty AS remaining,cl.unit_cost_cents AS unitCost,pol.purchase_order_id AS purchaseOrderId
     FROM cost_layers cl JOIN stock_movements sm ON sm.id=cl.receipt_movement_id LEFT JOIN purchase_order_lines pol ON pol.id=sm.purchase_order_line_id
-    WHERE cl.id IN (${placeholders})`, ...layerIds);
+    WHERE cl.id IN (SELECT value FROM json_each(?))`, layerIdsJson);
   if (fetched.length !== layerIds.length) throw new WorkflowError("NOT_FOUND", "One or more cost layers were not found.", 404);
   const byId = new Map(fetched.map((layer) => [layer.id, layer]));
   const layers = layerIds.map((id) => byId.get(id)!);
@@ -1565,8 +1644,8 @@ async function allocateLandedCost(command: WorkflowCommand) {
       SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM landed_cost_allocations WHERE source_document_type=? AND source_document_id=?)
         AND EXISTS (SELECT 1 FROM vendor_bills vb WHERE vb.id=? AND vb.status IN ('approved','partially_paid','paid') AND vb.purchase_order_id=?
           AND ROUND(COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='vendor_bill' AND dc.document_id=vb.id AND dc.refundable=0 AND dc.charge_type IN ('freight','fuel_surcharge','handling','customs','brokerage')),0)*vb.exchange_rate_to_base)>=?)
-        AND (SELECT COUNT(*) FROM cost_layers cl JOIN stock_movements sm ON sm.id=cl.receipt_movement_id JOIN purchase_order_lines pol ON pol.id=sm.purchase_order_line_id WHERE cl.id IN (${placeholders}) AND cl.remaining_qty=cl.received_qty AND cl.remaining_qty>0 AND pol.purchase_order_id=?)=?`)
-      .bind(...claimValues(command, result, id), sourceDocumentType, sourceDocumentId, sourceDocumentId, source.purchaseOrderId, amount, ...layerIds, source.purchaseOrderId, layerIds.length),
+        AND (SELECT COUNT(*) FROM cost_layers cl JOIN stock_movements sm ON sm.id=cl.receipt_movement_id JOIN purchase_order_lines pol ON pol.id=sm.purchase_order_line_id WHERE cl.id IN (SELECT value FROM json_each(?)) AND cl.remaining_qty=cl.received_qty AND cl.remaining_qty>0 AND pol.purchase_order_id=?)=?`)
+      .bind(...claimValues(command, result, id), sourceDocumentType, sourceDocumentId, sourceDocumentId, source.purchaseOrderId, amount, layerIdsJson, source.purchaseOrderId, layerIds.length),
     db.prepare(`INSERT INTO landed_cost_allocations (id,number,source_document_type,source_document_id,amount_cents,allocation_basis,posted_at,posted_by) SELECT ?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(id, number, sourceDocumentType, sourceDocumentId, amount, basis, postedAt, command.actor.label),
   ];
   shares.forEach((share) => {
@@ -1712,7 +1791,7 @@ async function savePartnerAddress(command: WorkflowCommand) {
   const payload = command.payload ?? {};
   const creating = normalize(command.command).startsWith("create");
   const id = creating ? newId("partner-address") : textValue({ entityId: command.entityId }, "entityId");
-  const partnerId = textValue(payload, "partnerId");
+  const requestedPartnerId = optionalText(payload, "partnerId");
   const label = textValue(payload, "label");
   const addressLine1 = textValue(payload, "addressLine1");
   const city = textValue(payload, "city");
@@ -1723,11 +1802,16 @@ async function savePartnerAddress(command: WorkflowCommand) {
   const contactName = optionalText(payload, "contactName");
   const deliveryInstructions = optionalText(payload, "deliveryInstructions");
   const isDefault = payload.isDefault === true;
+  const version = command.version ?? 0;
+  const current = creating ? null : await first<{ version: number; partnerId: string }>("SELECT version,partner_id AS partnerId FROM partner_addresses WHERE id=?", id);
+  if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Ship-to address not found.", 404);
+  // An address belongs to the partner it was created under. The single-default rule is scoped to
+  // that partner, never to whichever partnerId the request happened to carry.
+  if (creating && !requestedPartnerId) throw new WorkflowError("VALIDATION_ERROR", "partnerId is required.");
+  if (current && requestedPartnerId && requestedPartnerId !== current.partnerId) throw new WorkflowError("VALIDATION_ERROR", "A ship-to address cannot be moved to another partner; create it under that partner instead.");
+  const partnerId = current?.partnerId ?? requestedPartnerId!;
   const partner = await first("SELECT id FROM business_partners WHERE id=? AND active=1", partnerId);
   if (!partner) throw new WorkflowError("NOT_FOUND", "Select an active business partner.", 404);
-  const version = command.version ?? 0;
-  const current = creating ? null : await first<{ version: number }>("SELECT version FROM partner_addresses WHERE id=?", id);
-  if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Ship-to address not found.", 404);
   if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Ship-to address changed.", 409, current.version);
   if (await first("SELECT id FROM partner_addresses WHERE partner_id=? AND label=? AND id<>?", partnerId, label, id)) throw new WorkflowError("DUPLICATE_PARTNER_ADDRESS", "This partner already has an address with that label.", 409);
   const result: WorkflowResult = { message: `${label} ${creating ? "added" : "updated"}.`, impact: { physical: "No inventory posting.", onHandDelta: 0 }, recordId: id };
@@ -2674,6 +2758,9 @@ async function saveWarehouse(command: WorkflowCommand) {
   return finish(command);
 }
 
+/** Location types that hold stock the same way: a bin and an outdoor yard are both storage. */
+const storageClassLocationTypes = ["storage", "yard"];
+
 async function saveLocation(command: WorkflowCommand) {
   const payload = command.payload ?? {};
   const creating = normalize(command.command).startsWith("create");
@@ -2684,7 +2771,7 @@ async function saveLocation(command: WorkflowCommand) {
   const status = textValue(payload, "inventoryStatus", "usable");
   const warehouseId = textValue(payload, "warehouseId");
   const parent = optionalText(payload, "parentLocationId");
-  if (!["storage", "receiving", "shipping", "quarantine", "in_transit", "scrap"].includes(locationType)
+  if (!storageClassLocationTypes.includes(locationType) && !["receiving", "shipping", "quarantine", "in_transit", "scrap"].includes(locationType)
       || !["usable", "quarantine", "damaged", "in_transit", "return_pending"].includes(status)) {
     throw new WorkflowError("VALIDATION_ERROR", "Invalid locationType or inventoryStatus.");
   }
@@ -2711,7 +2798,11 @@ async function saveLocation(command: WorkflowCommand) {
   if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Location not found.", 404);
   if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Location changed.", 409, current.version);
   if (await first("SELECT id FROM locations WHERE code=? AND id<>?", code, id)) throw new WorkflowError("DUPLICATE_LOCATION_CODE", `Location code ${code} already exists.`, 409);
-  const stockSensitiveChange = current != null && (current.locationType !== locationType || current.status !== status
+  // Reclassifying between storage-class types (a bin becoming a yard) does not move stock; every
+  // other type, status, warehouse, or activation change does and therefore needs an empty location.
+  const typeChanged = current != null && current.locationType !== locationType
+    && !(storageClassLocationTypes.includes(current.locationType) && storageClassLocationTypes.includes(locationType));
+  const stockSensitiveChange = current != null && (typeChanged || current.status !== status
     || current.warehouseId !== warehouseId || (current.active === 1 && !active));
   if (stockSensitiveChange) {
     const balance = await first<{ onHand: number; reserved: number }>(
@@ -3232,9 +3323,14 @@ async function createCustomerInvoiceV2(command:WorkflowCommand){
   lines.forEach((row) => statements.push(db.prepare(`INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,quantity,unit_price_cents,line_total_cents) SELECT ?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("invoice-line"), id, row.id, row.productId, row.quantity, row.unitPrice, row.total)));
   orderCharges.forEach((row) => statements.push(db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,'customer_invoice',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("charge"), id, row.chargeType, row.description, row.amount, row.direction, row.taxable, row.refundable, row.taxCode, row.taxRate, Math.abs(row.taxAmount), when)));
   statements.push(
+    // "invoiced" means nothing is left to bill: every open ordered unit (or, on a canceled order,
+    // every shipped unit) is invoiced. Fully invoicing what has shipped so far while lines remain
+    // unshipped is only partial.
     db.prepare(`UPDATE sales_orders SET billing_status=CASE WHEN NOT EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.sales_order_id=sales_orders.id AND
-      (CASE WHEN sol.fulfillment_route='drop_ship' THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)
-        ELSE COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0) END)
+      (CASE WHEN sales_orders.lifecycle_status='canceled' THEN
+        (CASE WHEN sol.fulfillment_route='drop_ship' THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)
+          ELSE COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0) END)
+        ELSE sol.ordered_qty-sol.canceled_qty END)
       >COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sol.id AND ci.status<>'void'),0)) THEN 'invoiced' ELSE 'partially_invoiced' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(salesOrderId, order.version),
     auditStatement(command, "customer_invoice", id, "customer_invoice_posted", result.message, { salesOrderId, total, base, charges: orderCharges.length, lines: lines.map(({ id: salesOrderLineId, quantity, discount }) => ({ salesOrderLineId, quantity, discount })) }, when),
     outboxStatement(command, "customer_invoice.posted", "customer_invoice", id, { total, base }, when)
