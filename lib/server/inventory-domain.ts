@@ -2889,8 +2889,17 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
         WHERE own_sol.sales_order_id=${order}.id AND own_sol.product_id=demand.product_id AND own_sa.status='active'
           AND own_po.lifecycle_status='approved' AND own_po.expected_date<=${order}.requested_date),0)
   )`;
+  const invoiceableSalesLines = (order: string) => `EXISTS (SELECT 1 FROM sales_order_lines invoiceable_line
+    WHERE invoiceable_line.sales_order_id=${order}.id
+      AND (CASE WHEN invoiceable_line.fulfillment_route='drop_ship'
+        THEN COALESCE((SELECT SUM(delivery.quantity-delivery.reversed_qty) FROM drop_ship_deliveries delivery WHERE delivery.sales_order_line_id=invoiceable_line.id),0)
+        ELSE COALESCE((SELECT SUM(CASE WHEN movement.movement_type='sales_shipment' THEN -movement.quantity WHEN movement.movement_type='shipment_reversal' THEN -movement.quantity ELSE 0 END) FROM stock_movements movement WHERE movement.sales_order_line_id=invoiceable_line.id),0) END)
+      > COALESCE((SELECT SUM(invoice_line.quantity) FROM customer_invoice_lines invoice_line JOIN customer_invoices invoice ON invoice.id=invoice_line.customer_invoice_id WHERE invoice_line.sales_order_line_id=invoiceable_line.id AND invoice.status<>'void'),0))`;
   const salesWorklistFilter = (order: string) =>
-    requestedSalesStatus === "open" ? ` AND ${order}.lifecycle_status='confirmed' AND ${salesOpenLines(order)}`
+    // Customer billing's overview is an action queue, not sales-order history. Keeping fully
+    // invoiced counter sales here made a zero-quantity row look like work that still needed posting.
+    scope === "customer-invoices" ? ` AND ${invoiceableSalesLines(order)}`
+      : requestedSalesStatus === "open" ? ` AND ${order}.lifecycle_status='confirmed' AND ${salesOpenLines(order)}`
       // Active reservation quantities are decremented as shipments post, so any positive
       // remainder is ready to ship. Comparing that remainder with cumulative shipped units
       // hid the last part of a partially shipped reservation.
@@ -3618,7 +3627,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       SELECT sm.to_location_id,0,0,COUNT(*) FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.to_location_id WHERE sm.to_location_id IS NOT NULL AND l.id IS NULL GROUP BY sm.to_location_id
     ) SELECT locationId,SUM(balanceUnits) AS balanceUnits,SUM(balanceRows) AS balanceRows,SUM(movementRows) AS movementRows FROM referenced GROUP BY locationId ORDER BY locationId`);
   let filteredTotal: number | null = null;
-  if (term || status) {
+  if (term || status || scope === "customer-invoices") {
     let total: { count: number } | null = null;
     if (["purchase-orders", "expected-receipts", "vendor-returns"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id WHERE (?='' OR po.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.project_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR po.lifecycle_status=?)${purchaseWorklistFilter("po")}`, term, like, like, like, purchaseStatus, purchaseStatus);
     else if (["sales-orders", "fulfillment", "customer-returns", "customer-invoices"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id WHERE (?='' OR so.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(so.project_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR so.lifecycle_status=?)${salesWorklistFilter("so")}`, term, like, like, like, salesStatus, salesStatus);

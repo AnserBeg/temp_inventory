@@ -968,6 +968,13 @@ test("counter sale creates its hidden order, shipment, invoice, and full payment
   assert.equal(db.sqlite.prepare("SELECT remaining_qty FROM cost_layers WHERE id='layer-counter'").get().remaining_qty, 2);
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM reservations WHERE sales_order_line_id IN (SELECT id FROM sales_order_lines WHERE sales_order_id=?)").get(result.salesOrderId).count, 0);
 
+  const readyToInvoice = await inventoryDomain.getInventorySnapshot({ scope: "customer-invoices", search: result.salesOrderNumber, page: 1, pageSize: 10 });
+  assert.deepEqual(readyToInvoice.salesOrders, [], "a fully invoiced counter sale must not remain in the readiness queue");
+  assert.equal(readyToInvoice.pagination.filteredTotal, 0);
+  const accountant = { id: "accountant", email: "accountant@example.com", name: "Accountant", role: "accounting", label: "Accountant <accountant@example.com>", localDevelopment: false };
+  const postedInvoices = await advancedDomain.getAdvancedSnapshot(accountant, { scope: "customer-billing", page: 1, pageSize: 100 });
+  assert.equal(postedInvoices.customerInvoices.find((invoice) => invoice.id === result.invoiceId)?.status, "paid", "paid counter-sale invoices remain in the posted register");
+
   const repeated = await inventoryDomain.executeInventoryCommand(command);
   assert.equal(repeated.invoiceId, result.invoiceId);
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM customer_invoices WHERE sales_order_id=?").get(result.salesOrderId).count, 1);

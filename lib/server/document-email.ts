@@ -235,7 +235,7 @@ function printableDescription(value: string | null) {
   } catch { return value; }
 }
 
-function renderDocumentPdf(document: LoadedDocument, senderEmail: string) {
+function renderDocumentPdf(document: LoadedDocument, senderEmail?: string) {
   const { header } = document;
   const rows: PdfRow[] = [
     { text: "PANEFLOW OPERATIONS", size: 11, bold: true },
@@ -275,9 +275,21 @@ function renderDocumentPdf(document: LoadedDocument, senderEmail: string) {
   if (header.taxCents != null) rows.push({ text: `Tax: ${money(Number(header.taxCents), header.currency)}`, bold: true });
   rows.push(
     { text: `TOTAL: ${money(Number(header.totalCents), header.currency)}`, size: 14, bold: true, gapAfter: 10 },
-    { text: `Sent from ${senderEmail} through PaneFlow on ${new Date().toISOString().slice(0, 10)}.` },
+    { text: senderEmail
+      ? `Sent from ${senderEmail} through PaneFlow on ${new Date().toISOString().slice(0, 10)}.`
+      : `Generated from PaneFlow on ${new Date().toISOString().slice(0, 10)}.` },
   );
   return buildPdf(rows);
+}
+
+/** Build the same authoritative PDF used for email without requiring a mailbox connection. */
+export async function getDocumentPdf(type: EmailDocumentType, id: string) {
+  const document = await loadDocument(type, id);
+  return {
+    documentNumber: document.header.number,
+    fileName: `${safeFilePart(document.header.number)}.pdf`,
+    body: renderDocumentPdf(document),
+  };
 }
 
 function escapeHtml(value: string) {
@@ -334,4 +346,3 @@ export async function sendDocumentEmail(actor: ActorIdentity, input: { documentT
     throw error;
   }
 }
-

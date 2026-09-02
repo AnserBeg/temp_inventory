@@ -100,6 +100,10 @@ test("authoritative previews default to partner email and reject unapproved docu
   assert.equal(po.fileName, "PO-EMAIL.pdf");
   const invoice = await documentEmail.getDocumentEmailPreview("customer_invoice", "email-invoice");
   assert.equal(invoice.defaultRecipient, "customer@example.test");
+  await run("UPDATE customer_invoices SET status='paid',paid_cents=total_cents WHERE id='email-invoice'");
+  const printable = await documentEmail.getDocumentPdf("customer_invoice", "email-invoice");
+  assert.equal(printable.fileName, "INV-EMAIL.pdf");
+  assert.match(Buffer.from(printable.body).subarray(0, 12).toString("ascii"), /^%PDF-1\.4/);
   await run("UPDATE purchase_orders SET lifecycle_status='draft' WHERE id='email-po'");
   await assert.rejects(documentEmail.getDocumentEmailPreview("purchase_order", "email-po"), /Only an approved purchase order/);
   await run("UPDATE purchase_orders SET lifecycle_status='approved' WHERE id='email-po'");

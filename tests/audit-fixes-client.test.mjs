@@ -165,3 +165,9 @@ test("counter sale keeps its idempotency key through a conflict (review item 7)"
   // A quantity change no longer discards the chosen location, lot, and serial.
   assert.match(sources.app, /onChange=\{\(event\) => updateLine\(line\.id, \{ quantity: Number\(event\.target\.value\) \}\)\} required \/><\/label>/);
 });
+
+test("posted customer invoices expose their printable document", () => {
+  assert.match(sources.suite, /recordHref=\{\(record\) => `\/api\/documents\/pdf\?documentType=customer_invoice&documentId=\$\{encodeURIComponent\(record\.id\)\}`\}/);
+  assert.match(sources.suite, /title=\{`Open \$\{record\.number\} PDF`\}/);
+  assert.match(sources.suite, /Paid invoices remain here as completed records\./);
+});
