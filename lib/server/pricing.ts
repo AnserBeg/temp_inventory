@@ -3,7 +3,7 @@ import { normalizeProductQuantity, ProductQuantityError, type ProductQuantityUsa
 
 export type EffectivePrice = {
   unitAmountCents: number;
-  source: "contract" | "catalog" | "standard_cost";
+  source: "contract" | "catalog" | "last_unit_cost" | "standard_cost";
   sourceLabel: string;
   priceListId: string | null;
   priceListCode: string | null;
@@ -16,6 +16,8 @@ export type EffectivePrice = {
 type ProductPrice = {
   sku: string;
   standardCostCents: number;
+  lastUnitCostCents: number | null;
+  lastUnitCostSourcePoNumber: string | null;
   sellingPriceCents: number;
   purchaseUomId: string;
   salesUomId: string;
@@ -38,9 +40,11 @@ export async function resolveEffectivePrice(input: {
   currency?: string | null;
   exchangeRateToBase?: number | null;
 }): Promise<EffectivePrice> {
-  const product = await first<ProductPrice>(`SELECT sku,standard_cost_cents AS standardCostCents,
-      selling_price_cents AS sellingPriceCents,purchase_uom_id AS purchaseUomId,sales_uom_id AS salesUomId
-    FROM products WHERE id=? AND active=1`, input.productId);
+  const product = await first<ProductPrice>(`SELECT p.sku,p.standard_cost_cents AS standardCostCents,
+      p.last_unit_cost_cents AS lastUnitCostCents,po.number AS lastUnitCostSourcePoNumber,
+      p.selling_price_cents AS sellingPriceCents,p.purchase_uom_id AS purchaseUomId,p.sales_uom_id AS salesUomId
+    FROM products p LEFT JOIN purchase_orders po ON po.id=p.last_unit_cost_source_po_id
+    WHERE p.id=? AND p.active=1`, input.productId);
   if (!product) throw new ProductQuantityError("INVALID_PRODUCT", "Pricing requires an active product.", 404);
   const enteredQuantity = input.quantity && input.quantity > 0 ? input.quantity : 1;
   const quantity = await normalizeProductQuantity({ productId: input.productId, quantity: enteredQuantity, uomId: input.uomId, usage: input.usage, field: "price quantity" });
@@ -66,13 +70,16 @@ export async function resolveEffectivePrice(input: {
       uomCode: quantity.fromUomCode, factorToBase: quantity.factorToBase, currency: contract.currency,
     };
   }
-  const baseAmount = input.usage === "purchase" ? Number(product.standardCostCents) : Number(product.sellingPriceCents);
+  const hasLastUnitCost = input.usage === "purchase" && product.lastUnitCostCents != null;
+  const baseAmount = input.usage === "purchase" ? Number(product.lastUnitCostCents ?? product.standardCostCents) : Number(product.sellingPriceCents);
   const exchange = currency === "CAD" ? 1 : Number(input.exchangeRateToBase);
   if (!Number.isFinite(exchange) || exchange <= 0) throw new ProductQuantityError("EXCHANGE_RATE_REQUIRED", `Enter a positive ${currency}-to-CAD exchange rate before using catalog pricing.`);
   return {
     unitAmountCents: Math.round(baseAmount * quantity.factorToBase / exchange),
-    source: input.usage === "purchase" ? "standard_cost" : "catalog",
-    sourceLabel: input.usage === "purchase" ? "Catalog standard cost" : "Catalog selling price",
+    source: input.usage === "purchase" ? hasLastUnitCost ? "last_unit_cost" : "standard_cost" : "catalog",
+    sourceLabel: input.usage === "purchase"
+      ? hasLastUnitCost ? `Last unit cost${product.lastUnitCostSourcePoNumber ? ` · ${product.lastUnitCostSourcePoNumber}` : ""}` : "Catalog standard cost fallback"
+      : "Catalog selling price",
     priceListId: null,
     priceListCode: null,
     uomId: quantity.fromUomId,

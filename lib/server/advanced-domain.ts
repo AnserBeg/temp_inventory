@@ -4,6 +4,7 @@ import { createOrderRecord, prepareOrderDraft, RecordValidationError, type Creat
 import { getInventorySnapshot, normalizeSnapshotPage, type SnapshotPage } from "./inventory-domain";
 import { assertPeriodOpen } from "./policy";
 import { normalizeProductQuantity, ProductQuantityError, validateBaseProductQuantity } from "./product-quantities";
+import { prepareCanceledPurchaseCostStatements, prepareExistingApprovedPurchaseCostStatements, repriceAutomaticProducts, suggestedPriceForProduct } from "./catalog-pricing";
 
 const unpagedAll = all;
 
@@ -104,6 +105,10 @@ export const workflowCapabilities = {
   createPriceListEntry: "administer",
   updatePriceListEntry: "administer",
   deactivatePriceListEntry: "administer",
+  createMarginRule: "administer",
+  updateMarginRule: "administer",
+  deactivateMarginRule: "administer",
+  updateProductPricing: "approve",
   createWarehouse: "approve",
   updateWarehouse: "approve",
   deactivateWarehouse: "approve",
@@ -519,6 +524,9 @@ async function cancelPurchaseOrder(command: WorkflowCommand) {
   };
   const db = commandD1(command);
   const when = new Date().toISOString();
+  const pricingStatements = current.status === "approved"
+    ? await prepareCanceledPurchaseCostStatements({ claim: command, actor: command.actor, purchaseOrderId: id, effectiveAt: when })
+    : [];
   await db.batch([
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM purchase_orders po WHERE po.id=? AND po.version=? AND po.lifecycle_status IN ('draft','rejected','pending_approval','approved')
@@ -532,6 +540,7 @@ async function cancelPurchaseOrder(command: WorkflowCommand) {
     db.prepare(`UPDATE purchase_order_revisions SET lifecycle_status='canceled' WHERE purchase_order_id=? AND revision_number=? AND ${marker(command)}`).bind(id, current.revision),
     db.prepare(`UPDATE approvals SET status='rejected',decided_by=?,decision_reason=?,decided_at=?,version=version+1
       WHERE entity_type='purchase_order' AND entity_id=? AND status='pending' AND ${marker(command)}`).bind(command.actor.label, `Purchase order canceled: ${reason}`, when, id),
+    ...pricingStatements,
     auditStatement(command, "purchase_order", id, "purchase_order_canceled", result.message, { reason, previousStatus: current.status, revision: current.revision }, when),
     outboxStatement(command, "purchase_order.canceled", "purchase_order", id, { reason, previousStatus: current.status }, when),
   ]);
@@ -610,6 +619,15 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
       : "Purchase order rejected; no purchasing commitment or inventory movement was created.";
   const result: WorkflowResult = { message, impact: { physical: "No stock movement.", commercial: restoration ? "Prior approved incoming commitment restored." : decision === "approved" ? "Incoming forecast activated." : "Commitment remains inactive.", financial: "No vendor bill created.", onHandDelta: 0 }, recordId: id };
   const db = commandD1(command); const when = new Date().toISOString();
+  const pricingStatements = decision === "approved"
+    ? await prepareExistingApprovedPurchaseCostStatements({
+        claim: command,
+        actor: command.actor,
+        purchaseOrderId: id,
+        effectiveAt: when,
+        eventType: amendmentDecision ? "purchase_order_amendment_approved" : "purchase_order_approved",
+      })
+    : [];
   const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='pending_approval'
@@ -630,6 +648,7 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
         .bind(line.ordered, line.unitCost, line.id, id));
     }
   }
+  statements.push(...pricingStatements);
   statements.push(
     auditStatement(command, "purchase_order", id, restoration ? "amendment_rejected_restored" : decision, message,
       { reason, approvalId: approval.id, requestType: approval.requestType, proposalRevision: current.revision, restoredRevision: restoration?.revision ?? null }, when),
@@ -1834,10 +1853,10 @@ async function saveProduct(command: WorkflowCommand) {
   const policy = textValue(payload, "inventoryPolicy", "stocked");
   if (!["quantity", "lot", "serial"].includes(tracking) || !["stocked", "special_order", "drop_ship"].includes(policy)) throw new WorkflowError("VALIDATION_ERROR", "Invalid trackingPolicy or inventoryPolicy.");
   const standard = numberValue(payload, "standardCostCents", { positive: false, integer: true });
-  const price = numberValue(payload, "sellingPriceCents", { positive: false, integer: true });
+  const enteredPrice = numberValue(payload, "sellingPriceCents", { positive: false, integer: true });
   const reorder = payload.reorderPoint == null ? 0 : numberValue(payload, "reorderPoint", { positive: false });
   const maxStock = payload.maxStockLevel == null ? reorder : numberValue(payload, "maxStockLevel", { positive: false });
-  if (standard < 0 || price < 0 || reorder < 0 || maxStock < 0) throw new WorkflowError("VALIDATION_ERROR", "Costs and replenishment levels cannot be negative.");
+  if (standard < 0 || enteredPrice < 0 || reorder < 0 || maxStock < 0) throw new WorkflowError("VALIDATION_ERROR", "Costs and replenishment levels cannot be negative.");
   if (policy === "stocked" && maxStock < reorder) throw new WorkflowError("VALIDATION_ERROR", "The reorder-up-to maximum must be at least the reorder point.");
 
   const baseUomId = optionalText(payload, "baseUomId");
@@ -1852,10 +1871,18 @@ async function saveProduct(command: WorkflowCommand) {
   if (tracking === "serial" && base.precision !== 0) throw new WorkflowError("SERIAL_UOM_PRECISION", "Serial-tracked products require a whole-unit base UOM.", 409);
 
   const version = command.version ?? 0;
-  const current = creating ? null : await first<{ version: number; trackingPolicy: string; baseUomId: string | null }>("SELECT version,tracking_policy AS trackingPolicy,base_uom_id AS baseUomId FROM products WHERE id=?", id);
+  const current = creating ? null : await first<{ version: number; trackingPolicy: string; baseUomId: string | null; category: string; lastUnitCostCents: number | null; sellingPriceCents: number; pricingMode: string; manualPriceReason: string | null }>(
+    "SELECT version,tracking_policy AS trackingPolicy,base_uom_id AS baseUomId,category,last_unit_cost_cents AS lastUnitCostCents,selling_price_cents AS sellingPriceCents,pricing_mode AS pricingMode,manual_price_reason AS manualPriceReason FROM products WHERE id=?", id);
   if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Product not found.", 404);
   if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Product changed.", 409, current.version);
   if (await first("SELECT id FROM products WHERE sku=? AND id<>?", sku, id)) throw new WorkflowError("DUPLICATE_PRODUCT_SKU", `SKU ${sku} already exists.`, 409);
+  const requestedPricingMode = optionalText(payload, "pricingMode") ?? current?.pricingMode ?? "manual";
+  if (!["automatic", "manual"].includes(requestedPricingMode)) throw new WorkflowError("VALIDATION_ERROR", "pricingMode must be automatic or manual.");
+  const pricingMode = requestedPricingMode as "automatic" | "manual";
+  const costBasisCents = Number(current?.lastUnitCostCents ?? standard);
+  const pricing = await suggestedPriceForProduct({ productId: id, category: textValue(payload, "category"), costBasisCents });
+  const price = pricingMode === "automatic" ? pricing.suggestedSellingPriceCents : enteredPrice;
+  const manualPriceReason = pricingMode === "manual" ? optionalText(payload, "manualPriceReason") ?? current?.manualPriceReason ?? (creating ? "Initial catalog price" : "Manual product maintenance") : null;
   const changesImmutableInventoryIdentity = Boolean(current && (current.trackingPolicy !== tracking || current.baseUomId !== baseUomId));
   if (changesImmutableInventoryIdentity) {
     const history = await first<{ count: number }>(`SELECT
@@ -1880,10 +1907,10 @@ async function saveProduct(command: WorkflowCommand) {
     : db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
         SELECT ?,?,?,?,?,?,? FROM products WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM products WHERE sku=? AND id<>?) ${immutableHistoryGuard}`)
       .bind(...claimValues(command, result, id), id, version, sku, id, ...(changesImmutableInventoryIdentity ? [id, id, id, id] : []));
-  const values = [sku, optionalText(payload, "manufacturerSku"), name, textValue(payload, "category"), textValue(payload, "material"), textValue(payload, "dimensions"), textValue(payload, "finish"), tracking, policy, standard, price, reorder, maxStock, baseUomId, purchaseUomId, salesUomId, active ? 1 : 0] as const;
+  const values = [sku, optionalText(payload, "manufacturerSku"), name, textValue(payload, "category"), textValue(payload, "material"), textValue(payload, "dimensions"), textValue(payload, "finish"), tracking, policy, standard, price, pricing.suggestedSellingPriceCents, pricingMode, pricing.rule.id, manualPriceReason, when, reorder, maxStock, baseUomId, purchaseUomId, salesUomId, active ? 1 : 0] as const;
   const write = creating
-    ? db.prepare(`INSERT INTO products (id,sku,manufacturer_sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,max_stock_level,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(id, ...values, when)
-    : db.prepare(`UPDATE products SET sku=?,manufacturer_sku=?,name=?,category=?,material=?,dimensions=?,finish=?,tracking_policy=?,inventory_policy=?,standard_cost_cents=?,selling_price_cents=?,reorder_point=?,max_stock_level=?,base_uom_id=?,purchase_uom_id=?,sales_uom_id=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(...values, id, version);
+    ? db.prepare(`INSERT INTO products (id,sku,manufacturer_sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,suggested_selling_price_cents,pricing_mode,applied_margin_rule_id,manual_price_reason,pricing_updated_at,reorder_point,max_stock_level,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(id, ...values, when)
+    : db.prepare(`UPDATE products SET sku=?,manufacturer_sku=?,name=?,category=?,material=?,dimensions=?,finish=?,tracking_policy=?,inventory_policy=?,standard_cost_cents=?,selling_price_cents=?,suggested_selling_price_cents=?,pricing_mode=?,applied_margin_rule_id=?,manual_price_reason=?,pricing_updated_at=?,reorder_point=?,max_stock_level=?,base_uom_id=?,purchase_uom_id=?,sales_uom_id=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(...values, id, version);
   const statements: D1PreparedStatement[] = [claim, write];
   if (creating) {
     const configuredMethod = await setting<string>("valuation.defaultMethod", "fifo");
@@ -1891,8 +1918,131 @@ async function saveProduct(command: WorkflowCommand) {
     statements.push(db.prepare(`INSERT INTO valuation_policies (product_id,method,standard_cost_cents,average_cost_cents,version,updated_at,updated_by)
       SELECT ?,?,?,?,1,?,? WHERE ${marker(command)}`).bind(id, method, standard, standard, when, command.actor.label));
   }
-  statements.push(auditStatement(command, "product", id, creating ? "created" : "updated", result.message, { sku, tracking, policy, reorderPoint: reorder, maxStockLevel: maxStock, baseUomId, purchaseUomId, salesUomId, active }, when), outboxStatement(command, creating ? "master.product_created" : "master.product_updated", "product", id, { sku, active }, when));
+  statements.push(
+    db.prepare(`INSERT INTO catalog_price_history
+      (id,product_id,event_type,cost_basis_cents,previous_selling_price_cents,suggested_selling_price_cents,effective_selling_price_cents,pricing_mode,margin_rule_id,source_purchase_order_id,reason,created_at,created_by)
+      SELECT ?,?,?,?,?,?,?,?,?,NULL,?,?,? WHERE ${marker(command)}`)
+      .bind(newId("catalog-price"), id, creating ? "product_created" : "product_master_updated", costBasisCents, current?.sellingPriceCents ?? price, pricing.suggestedSellingPriceCents, price, pricingMode, pricing.rule.id, manualPriceReason, when, command.actor.label),
+    auditStatement(command, "product", id, creating ? "created" : "updated", result.message, { sku, tracking, policy, reorderPoint: reorder, maxStockLevel: maxStock, baseUomId, purchaseUomId, salesUomId, active, pricingMode, suggestedSellingPriceCents: pricing.suggestedSellingPriceCents, sellingPriceCents: price }, when),
+    outboxStatement(command, creating ? "master.product_created" : "master.product_updated", "product", id, { sku, active, pricingMode, sellingPriceCents: price }, when),
+  );
   await db.batch(statements);
+  return finish(command);
+}
+
+async function saveMarginRule(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const creating = normalize(command.command).startsWith("create");
+  const id = creating ? newId("margin-rule") : textValue({ entityId: command.entityId }, "entityId");
+  const code = textValue(payload, "code").toUpperCase();
+  const name = textValue(payload, "name");
+  const productId = optionalText(payload, "productId");
+  const category = optionalText(payload, "category");
+  if (productId && category) throw new WorkflowError("VALIDATION_ERROR", "A margin rule can target either one product or one category, not both.");
+  if (productId && !await first("SELECT id FROM products WHERE id=? AND active=1", productId)) throw new WorkflowError("INVALID_PRODUCT", "Select an active product for the margin rule.", 409);
+  const minimumCostCents = payload.minimumCostCents == null ? 0 : numberValue(payload, "minimumCostCents", { positive: false, integer: true });
+  const maximumCostCents = payload.maximumCostCents == null || payload.maximumCostCents === "" ? null : numberValue(payload, "maximumCostCents", { integer: true });
+  const targetMarginBps = numberValue(payload, "targetMarginBps", { positive: false, integer: true });
+  const minimumGrossProfitCents = payload.minimumGrossProfitCents == null ? 0 : numberValue(payload, "minimumGrossProfitCents", { positive: false, integer: true });
+  const roundingIncrementCents = payload.roundingIncrementCents == null ? 100 : numberValue(payload, "roundingIncrementCents", { integer: true });
+  const priority = payload.priority == null ? 0 : numberValue(payload, "priority", { positive: false, integer: true });
+  if (minimumCostCents < 0 || (maximumCostCents != null && maximumCostCents <= minimumCostCents)) throw new WorkflowError("INVALID_COST_RANGE", "Maximum cost must be greater than minimum cost.");
+  if (targetMarginBps < 0 || targetMarginBps >= 10_000) throw new WorkflowError("INVALID_MARGIN", "Target gross margin must be at least 0% and less than 100%.");
+  if (minimumGrossProfitCents < 0) throw new WorkflowError("VALIDATION_ERROR", "Minimum gross profit cannot be negative.");
+  const validFrom = optionalDateValue(payload, "validFrom");
+  const validTo = optionalDateValue(payload, "validTo");
+  if (validFrom && validTo && validFrom > validTo) throw new WorkflowError("VALIDATION_ERROR", "Valid-to date must be on or after valid-from.");
+  const version = command.version ?? 0;
+  const current = creating ? null : await first<{ version: number; active: number }>("SELECT version,active FROM margin_rules WHERE id=?", id);
+  if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Margin rule was not found.", 404);
+  if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Margin rule changed; refresh before saving.", 409, current.version);
+  if (await first("SELECT id FROM margin_rules WHERE code=? AND id<>?", code, id)) throw new WorkflowError("DUPLICATE_MARGIN_RULE", `Margin rule ${code} already exists.`, 409);
+  const high = 9_007_199_254_740_000;
+  const overlap = await first(`SELECT id FROM margin_rules WHERE active=1 AND id<>?
+    AND COALESCE(product_id,'')=COALESCE(?,'') AND COALESCE(category,'')=COALESCE(?,'')
+    AND minimum_cost_cents<? AND ?<COALESCE(maximum_cost_cents,?)
+    AND (valid_to IS NULL OR ? IS NULL OR valid_to>=?) AND (? IS NULL OR valid_from IS NULL OR valid_from<=?)
+    LIMIT 1`, id, productId, category, maximumCostCents ?? high, minimumCostCents, high, validFrom, validFrom, validTo, validTo);
+  if (overlap) throw new WorkflowError("OVERLAPPING_MARGIN_RULE", "This cost band overlaps another active rule in the same product/category scope.", 409);
+  const result: WorkflowResult = { message: `${code} ${creating ? "created" : "updated"}; automatic catalog items were recalculated.`, impact: { physical: "No inventory posting.", commercial: "Automatic catalog prices may change; manual and contract prices remain unchanged.", onHandDelta: 0 }, recordId: id };
+  const db = commandD1(command); const when = new Date().toISOString();
+  const claim = creating
+    ? db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+        SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM margin_rules WHERE code=?)`).bind(...claimValues(command, result, id), code)
+    : db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+        SELECT ?,?,?,?,?,?,? FROM margin_rules WHERE id=? AND version=?`).bind(...claimValues(command, result, id), id, version);
+  const write = creating
+    ? db.prepare(`INSERT INTO margin_rules
+        (id,code,name,product_id,category,minimum_cost_cents,maximum_cost_cents,target_margin_bps,minimum_gross_profit_cents,rounding_increment_cents,priority,valid_from,valid_to,active,version,created_at,updated_at)
+        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,?,? WHERE ${marker(command)}`)
+      .bind(id, code, name, productId, category, minimumCostCents, maximumCostCents, targetMarginBps, minimumGrossProfitCents, roundingIncrementCents, priority, validFrom, validTo, when, when)
+    : db.prepare(`UPDATE margin_rules SET code=?,name=?,product_id=?,category=?,minimum_cost_cents=?,maximum_cost_cents=?,target_margin_bps=?,
+        minimum_gross_profit_cents=?,rounding_increment_cents=?,priority=?,valid_from=?,valid_to=?,active=1,version=version+1,updated_at=?
+        WHERE id=? AND version=? AND ${marker(command)}`)
+      .bind(code, name, productId, category, minimumCostCents, maximumCostCents, targetMarginBps, minimumGrossProfitCents, roundingIncrementCents, priority, validFrom, validTo, when, id, version);
+  await db.batch([
+    claim, write,
+    auditStatement(command, "margin_rule", id, creating ? "created" : "updated", result.message, { code, productId, category, minimumCostCents, maximumCostCents, targetMarginBps, minimumGrossProfitCents, roundingIncrementCents, priority, validFrom, validTo }, when),
+    outboxStatement(command, creating ? "pricing.margin_rule_created" : "pricing.margin_rule_updated", "margin_rule", id, { code }, when),
+  ]);
+  await repriceAutomaticProducts(command.actor, `${code} ${creating ? "created" : "updated"}`);
+  return finish(command);
+}
+
+async function deactivateMarginRule(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const reason = textValue(command.payload ?? {}, "reason");
+  const version = command.version ?? 0;
+  const current = await first<{ code: string; version: number; active: number }>("SELECT code,version,active FROM margin_rules WHERE id=?", id);
+  if (!current) throw new WorkflowError("NOT_FOUND", "Margin rule was not found.", 404);
+  if (!current.active) throw new WorkflowError("INACTIVE_MARGIN_RULE", "Margin rule is already inactive.", 409, current.version);
+  if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Margin rule changed; refresh before deactivating.", 409, current.version);
+  const result: WorkflowResult = { message: `${current.code} deactivated; automatic catalog items were recalculated.`, impact: { physical: "No inventory posting.", commercial: "The next eligible margin rule now applies.", onHandDelta: 0 }, recordId: id };
+  const db = commandD1(command); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM margin_rules WHERE id=? AND version=? AND active=1`).bind(...claimValues(command, result, id), id, version),
+    db.prepare(`UPDATE margin_rules SET active=0,version=version+1,updated_at=? WHERE id=? AND version=? AND active=1 AND ${marker(command)}`).bind(when, id, version),
+    auditStatement(command, "margin_rule", id, "deactivated", result.message, { reason }, when),
+    outboxStatement(command, "pricing.margin_rule_deactivated", "margin_rule", id, { reason }, when),
+  ]);
+  await repriceAutomaticProducts(command.actor, `${current.code} deactivated: ${reason}`);
+  return finish(command);
+}
+
+async function updateProductPricing(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const payload = command.payload ?? {};
+  const pricingMode = textValue(payload, "pricingMode") as "automatic" | "manual";
+  if (!["automatic", "manual"].includes(pricingMode)) throw new WorkflowError("VALIDATION_ERROR", "pricingMode must be automatic or manual.");
+  const reason = textValue(payload, "reason");
+  const version = command.version ?? 0;
+  const product = await first<{ sku: string; category: string; standardCostCents: number; lastUnitCostCents: number | null; sellingPriceCents: number; version: number }>(
+    `SELECT sku,category,standard_cost_cents AS standardCostCents,last_unit_cost_cents AS lastUnitCostCents,
+      selling_price_cents AS sellingPriceCents,version FROM products WHERE id=? AND active=1`, id);
+  if (!product) throw new WorkflowError("NOT_FOUND", "Active product was not found.", 404);
+  if (product.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Product changed; refresh before changing pricing.", 409, product.version);
+  const costBasisCents = Number(product.lastUnitCostCents ?? product.standardCostCents);
+  const { rule, suggestedSellingPriceCents } = await suggestedPriceForProduct({ productId: id, category: product.category, costBasisCents });
+  const sellingPriceCents = pricingMode === "automatic"
+    ? suggestedSellingPriceCents
+    : numberValue(payload, "sellingPriceCents", { positive: false, integer: true });
+  if (sellingPriceCents < 0) throw new WorkflowError("VALIDATION_ERROR", "Selling price cannot be negative.");
+  const result: WorkflowResult = { message: `${product.sku} set to ${pricingMode} pricing at ${(sellingPriceCents / 100).toFixed(2)} CAD.`, impact: { physical: "No inventory posting.", commercial: pricingMode === "automatic" ? "Future catalog-priced sales lines use the margin matrix." : "Future catalog-priced sales lines use the manual price.", onHandDelta: 0 }, recordId: id };
+  const db = commandD1(command); const when = new Date().toISOString();
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM products WHERE id=? AND version=? AND active=1`).bind(...claimValues(command, result, id), id, version),
+    db.prepare(`UPDATE products SET pricing_mode=?,selling_price_cents=?,suggested_selling_price_cents=?,applied_margin_rule_id=?,manual_price_reason=?,pricing_updated_at=?,version=version+1
+      WHERE id=? AND version=? AND active=1 AND ${marker(command)}`)
+      .bind(pricingMode, sellingPriceCents, suggestedSellingPriceCents, rule.id, pricingMode === "manual" ? reason : null, when, id, version),
+    db.prepare(`INSERT INTO catalog_price_history
+      (id,product_id,event_type,cost_basis_cents,previous_selling_price_cents,suggested_selling_price_cents,effective_selling_price_cents,pricing_mode,margin_rule_id,source_purchase_order_id,reason,created_at,created_by)
+      SELECT ?,?,'pricing_mode_changed',?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
+      .bind(newId("catalog-price"), id, costBasisCents, product.sellingPriceCents, suggestedSellingPriceCents, sellingPriceCents, pricingMode, rule.id, null, reason, when, command.actor.label),
+    auditStatement(command, "product", id, "pricing_mode_changed", result.message, { costBasisCents, suggestedSellingPriceCents, sellingPriceCents, pricingMode, marginRuleId: rule.id, reason }, when),
+    outboxStatement(command, "pricing.product_mode_changed", "product", id, { sellingPriceCents, suggestedSellingPriceCents, pricingMode, marginRuleId: rule.id }, when),
+  ]);
   return finish(command);
 }
 
@@ -2709,13 +2859,27 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
   scopedAll<Record<string,unknown>>(["customer-billing"],"SELECT cc.*,bp.name AS customerName FROM customer_credits cc JOIN business_partners bp ON bp.id=cc.customer_id ORDER BY cc.posted_at DESC"),
   scopedAll<Record<string,unknown>>(["vendor-billing","customer-billing"],"SELECT * FROM payments ORDER BY posted_at DESC"),scopedAll<Record<string,unknown>>(["vendor-billing","customer-billing"],"SELECT * FROM document_charges ORDER BY created_at DESC"),scopedAll<Record<string,unknown>>(["inventory","controls"],"SELECT id,code,name,asset_class AS assetClass,unit_deposit_cents AS unitDepositCents,active,version FROM returnable_asset_types ORDER BY name"),
   scopedAll<Record<string,unknown>>(["inventory"],"SELECT ro.*,bp.name AS partnerName,rat.code AS assetCode,rat.name AS assetName,ro.issued_qty-ro.returned_qty-ro.forfeited_qty AS outstandingQuantity,MAX(ro.deposit_charged_cents-ro.deposit_refunded_cents-COALESCE((SELECT SUM(re.amount_cents) FROM returnable_events re WHERE re.obligation_id=ro.id AND re.event_type='forfeit'),0),0) AS depositBalanceCents,MAX(MIN(ro.deposit_charged_cents,CASE WHEN ro.issued_qty>0 THEN ROUND(ro.returned_qty*ro.deposit_charged_cents/ro.issued_qty) ELSE 0 END)-ro.deposit_refunded_cents,0) AS refundableDepositCents FROM returnable_obligations ro JOIN business_partners bp ON bp.id=ro.partner_id JOIN returnable_asset_types rat ON rat.id=ro.asset_type_id ORDER BY ro.created_at DESC"),
-  scopedAll<Record<string,unknown>>(["inventory"],"SELECT * FROM returnable_events ORDER BY posted_at DESC"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT vp.*,p.sku,p.name AS productName FROM valuation_policies vp JOIN products p ON p.id=vp.product_id ORDER BY p.name"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT cl.*,p.sku,p.name AS productName FROM cost_layers cl JOIN products p ON p.id=cl.product_id WHERE cl.remaining_qty>0 ORDER BY cl.received_at DESC"),scopedAll<Record<string,unknown>>([],"SELECT ive.*,p.sku,p.name AS productName FROM inventory_value_entries ive JOIN products p ON p.id=ive.product_id ORDER BY ive.posted_at DESC"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT lca.*,COALESCE(SUM(lcal.allocated_cents),0) AS allocatedCents FROM landed_cost_allocations lca LEFT JOIN landed_cost_allocation_lines lcal ON lcal.allocation_id=lca.id GROUP BY lca.id ORDER BY lca.posted_at DESC"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,event_type AS eventType,aggregate_type AS aggregateType,aggregate_id AS aggregateId,status,attempts,available_at AS availableAt,last_error AS lastError,created_at AS createdAt,processed_at AS processedAt FROM outbox_events ORDER BY created_at DESC"),scopedAll<Record<string,unknown>>(["purchasing","controls"],"SELECT id,document_type AS documentType,document_id AS documentId,file_name AS fileName,content_type AS contentType,size_bytes AS sizeBytes,category,owner_id AS ownerId,owner_email AS ownerEmail,uploaded_at AS uploadedAt,version FROM attachments WHERE deleted_at IS NULL ORDER BY uploaded_at DESC"),scopedAll<Record<string,unknown>>(["controls"],"SELECT user_id AS userId,email,full_name AS fullName,role,active,version FROM app_users ORDER BY full_name"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,code,name,dimension,precision,active FROM units_of_measure ORDER BY code"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,product_id AS productId,from_uom_id AS fromUomId,to_uom_id AS toUomId,numerator,denominator,rounding_mode AS roundingMode FROM uom_conversions ORDER BY id"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,code,name,partner_type AS partnerType,email,phone,payment_terms AS paymentTerms,currency,active,version FROM business_partners ORDER BY code"),scopedAll<Record<string,unknown>>(["inventory","controls"],"SELECT id,sku,manufacturer_sku AS manufacturerSku,name,category,material,dimensions,finish,tracking_policy AS trackingPolicy,inventory_policy AS inventoryPolicy,standard_cost_cents AS standardCostCents,selling_price_cents AS sellingPriceCents,reorder_point AS reorderPoint,max_stock_level AS maxStockLevel,base_uom_id AS baseUomId,purchase_uom_id AS purchaseUomId,sales_uom_id AS salesUomId,active,version FROM products ORDER BY sku")
+  scopedAll<Record<string,unknown>>(["inventory"],"SELECT * FROM returnable_events ORDER BY posted_at DESC"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT vp.*,p.sku,p.name AS productName FROM valuation_policies vp JOIN products p ON p.id=vp.product_id ORDER BY p.name"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT cl.*,p.sku,p.name AS productName FROM cost_layers cl JOIN products p ON p.id=cl.product_id WHERE cl.remaining_qty>0 ORDER BY cl.received_at DESC"),scopedAll<Record<string,unknown>>([],"SELECT ive.*,p.sku,p.name AS productName FROM inventory_value_entries ive JOIN products p ON p.id=ive.product_id ORDER BY ive.posted_at DESC"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT lca.*,COALESCE(SUM(lcal.allocated_cents),0) AS allocatedCents FROM landed_cost_allocations lca LEFT JOIN landed_cost_allocation_lines lcal ON lcal.allocation_id=lca.id GROUP BY lca.id ORDER BY lca.posted_at DESC"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,event_type AS eventType,aggregate_type AS aggregateType,aggregate_id AS aggregateId,status,attempts,available_at AS availableAt,last_error AS lastError,created_at AS createdAt,processed_at AS processedAt FROM outbox_events ORDER BY created_at DESC"),scopedAll<Record<string,unknown>>(["purchasing","controls"],"SELECT id,document_type AS documentType,document_id AS documentId,file_name AS fileName,content_type AS contentType,size_bytes AS sizeBytes,category,owner_id AS ownerId,owner_email AS ownerEmail,uploaded_at AS uploadedAt,version FROM attachments WHERE deleted_at IS NULL ORDER BY uploaded_at DESC"),scopedAll<Record<string,unknown>>(["controls"],"SELECT user_id AS userId,email,full_name AS fullName,role,active,version FROM app_users ORDER BY full_name"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,code,name,dimension,precision,active FROM units_of_measure ORDER BY code"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,product_id AS productId,from_uom_id AS fromUomId,to_uom_id AS toUomId,numerator,denominator,rounding_mode AS roundingMode FROM uom_conversions ORDER BY id"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,code,name,partner_type AS partnerType,email,phone,payment_terms AS paymentTerms,currency,active,version FROM business_partners ORDER BY code"),scopedAll<Record<string,unknown>>(["inventory","controls"],`SELECT p.id,p.sku,p.manufacturer_sku AS manufacturerSku,p.name,p.category,p.material,p.dimensions,p.finish,p.tracking_policy AS trackingPolicy,p.inventory_policy AS inventoryPolicy,
+    p.standard_cost_cents AS standardCostCents,p.last_unit_cost_cents AS lastUnitCostCents,p.last_unit_cost_source_po_id AS lastUnitCostSourcePoId,p.last_unit_cost_source_po_line_id AS lastUnitCostSourcePoLineId,
+    p.last_unit_cost_vendor_id AS lastUnitCostVendorId,p.last_unit_cost_at AS lastUnitCostAt,source_po.number AS lastUnitCostSourcePoNumber,source_vendor.name AS lastUnitCostVendorName,
+    p.selling_price_cents AS sellingPriceCents,p.suggested_selling_price_cents AS suggestedSellingPriceCents,p.pricing_mode AS pricingMode,p.applied_margin_rule_id AS appliedMarginRuleId,
+    mr.code AS appliedMarginRuleCode,p.manual_price_reason AS manualPriceReason,p.pricing_updated_at AS pricingUpdatedAt,p.reorder_point AS reorderPoint,p.max_stock_level AS maxStockLevel,
+    p.base_uom_id AS baseUomId,p.purchase_uom_id AS purchaseUomId,p.sales_uom_id AS salesUomId,p.active,p.version
+    FROM products p LEFT JOIN purchase_orders source_po ON source_po.id=p.last_unit_cost_source_po_id LEFT JOIN business_partners source_vendor ON source_vendor.id=p.last_unit_cost_vendor_id
+    LEFT JOIN margin_rules mr ON mr.id=p.applied_margin_rule_id ORDER BY p.sku`)
 ]);
   const [priceLists, priceListAssignments, priceListEntries] = await Promise.all([
     scopedAll<Record<string, unknown>>(["controls"],`SELECT id,code,name,currency,priority,valid_from AS validFrom,valid_to AS validTo,active,version,updated_at AS updatedAt FROM price_lists ORDER BY active DESC,priority DESC,code`),
     scopedAll<Record<string, unknown>>(["controls"],`SELECT pla.id,pla.price_list_id AS priceListId,pl.code AS priceListCode,pla.partner_id AS partnerId,bp.name AS partnerName,pla.priority,pla.valid_from AS validFrom,pla.valid_to AS validTo,pla.active,pla.version FROM price_list_assignments pla JOIN price_lists pl ON pl.id=pla.price_list_id JOIN business_partners bp ON bp.id=pla.partner_id ORDER BY pla.active DESC,pl.code,bp.name`),
     scopedAll<Record<string, unknown>>(["controls"],`SELECT ple.id,ple.price_list_id AS priceListId,pl.code AS priceListCode,pl.currency,ple.product_id AS productId,p.sku,p.name AS productName,ple.uom_id AS uomId,u.code AS uomCode,ple.minimum_quantity AS minimumQuantity,ple.unit_price_cents AS unitPriceCents,ple.valid_from AS validFrom,ple.valid_to AS validTo,ple.active,ple.version FROM price_list_entries ple JOIN price_lists pl ON pl.id=ple.price_list_id JOIN products p ON p.id=ple.product_id JOIN units_of_measure u ON u.id=ple.uom_id ORDER BY pl.code,p.sku,ple.minimum_quantity DESC`),
   ]);
+  const marginRules = include("controls") ? await unpagedAll<Record<string, unknown>>(`SELECT mr.id,mr.code,mr.name,mr.product_id AS productId,p.sku,
+      mr.category,mr.minimum_cost_cents AS minimumCostCents,mr.maximum_cost_cents AS maximumCostCents,mr.target_margin_bps AS targetMarginBps,
+      mr.minimum_gross_profit_cents AS minimumGrossProfitCents,mr.rounding_increment_cents AS roundingIncrementCents,mr.priority,
+      mr.valid_from AS validFrom,mr.valid_to AS validTo,mr.active,mr.version,mr.updated_at AS updatedAt
+    FROM margin_rules mr LEFT JOIN products p ON p.id=mr.product_id
+    ORDER BY mr.active DESC,CASE WHEN mr.product_id IS NOT NULL THEN 3 WHEN mr.category IS NOT NULL THEN 2 ELSE 1 END DESC,mr.priority DESC,mr.minimum_cost_cents,mr.code
+    LIMIT ? OFFSET ?`, pageSize, offset) : [];
   const partnerMasterData = include("controls") ? await unpagedAll<Record<string,unknown>>(`SELECT id,code,name,partner_type AS partnerType,email,phone,
     address_line_1 AS addressLine1,address_line_2 AS addressLine2,city,region,postal_code AS postalCode,country,
     payment_terms AS paymentTerms,currency,credit_limit_cents AS creditLimitCents,credit_hold AS creditHold,active,version
@@ -2816,6 +2980,7 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
     priceLists: include("controls") && isAdmin ? priceLists : [],
     priceListAssignments: include("controls") && isAdmin ? priceListAssignments : [],
     priceListEntries: include("controls") && isAdmin ? priceListEntries : [],
+    marginRules: include("controls") && isAdmin ? marginRules : [],
     auditEvents,
     currentUser: actor ? {id:actor.id,email:actor.email,name:actor.name,role:actor.role} : null,
     permissions,summary,pagination:{page,pageSize}
@@ -2894,6 +3059,9 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
     case "deactivatepricelistassignment": return deactivatePriceListAssignment(command);
     case "createpricelistentry": case "updatepricelistentry": return savePriceListEntry(command);
     case "deactivatepricelistentry": return deactivatePriceListEntry(command);
+    case "createmarginrule": case "updatemarginrule": return saveMarginRule(command);
+    case "deactivatemarginrule": return deactivateMarginRule(command);
+    case "updateproductpricing": return updateProductPricing(command);
     case "createwarehouse": case "updatewarehouse": return saveWarehouse(command);
     case "deactivatewarehouse": return deactivateMaster(command,"warehouses","warehouse");
     case "createlocation": case "updatelocation": return saveLocation(command);

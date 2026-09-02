@@ -12,7 +12,7 @@ export async function POST(request: Request) {
     requireCapability(actor, capability);
     // Immediate sale crosses two ledgers. Accounting-only users cannot move stock and
     // operators cannot post receivables; managers/administrators carry both grants.
-    if (["immediatesale", "shipandinvoice", "postimmediatesale"].includes((input.command ?? "").trim().toLowerCase().replaceAll(/[_\s-]/g, ""))) {
+    if (["immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale"].includes((input.command ?? "").trim().toLowerCase().replaceAll(/[_\s-]/g, ""))) {
       requireCapability(actor, "operationalWrite");
       requireCapability(actor, "financialWrite");
     }

@@ -87,6 +87,7 @@ export type WorkflowState = {
   valuationPolicies: WorkflowRecord[];
   users: WorkflowRecord[];
   outbox: WorkflowRecord[];
+  marginRules: WorkflowRecord[];
   priceLists: SelectOption[];
   priceAssignments: WorkflowRecord[];
   priceEntries: WorkflowRecord[];
@@ -169,7 +170,7 @@ async function loadWorkflowState(workspace: OperationsWorkspaceKind) {
 
 function emptyWorkflowState(): WorkflowState {
   return {
-    purchaseOrders: [], revisions: [], transfers: [], traceUnits: [], reservations: [], shipments: [], dropShipDeliveries: [], vendorBills: [], customerInvoices: [], valuations: [], assets: [], approvals: [], policies: [], periodLocks: [], valuationPolicies: [], users: [], outbox: [], priceLists: [], priceAssignments: [], priceEntries: [], uomConversions: [], orphanedLocations: [], audit: [], attachments: [],
+    purchaseOrders: [], revisions: [], transfers: [], traceUnits: [], reservations: [], shipments: [], dropShipDeliveries: [], vendorBills: [], customerInvoices: [], valuations: [], assets: [], approvals: [], policies: [], periodLocks: [], valuationPolicies: [], users: [], outbox: [], marginRules: [], priceLists: [], priceAssignments: [], priceEntries: [], uomConversions: [], orphanedLocations: [], audit: [], attachments: [],
     currentUser: { id: "unavailable", name: "Permission context unavailable", role: "No authenticated role", permissions: [] },
     permissions: {},
     options: emptyWorkflowOptions(),
@@ -186,7 +187,7 @@ const tabs: Record<OperationsWorkspaceKind, Array<{ key: string; label: string }
   // themselves live on the other tab. Labelling the first one "Invoices" sent anyone looking
   // for an invoice to the tab that has none, so each label now names what the tab shows.
   "customer-billing": [{ key: "overview", label: "Ready to invoice" }, { key: "billing-actions", label: "Posted invoices" }],
-  controls: [{ key: "overview", label: "Reports" }, { key: "approvals", label: "Approvals" }, { key: "audit", label: "Audit timeline" }, { key: "policies", label: "System policies" }, { key: "periods-access", label: "Periods & access" }, { key: "integrations", label: "Integrations" }, { key: "reconciliation", label: "Reconciliation" }, { key: "pricing", label: "Customer pricing" }, { key: "units", label: "Units & conversions" }, { key: "master-data", label: "Master data" }],
+  controls: [{ key: "overview", label: "Reports" }, { key: "approvals", label: "Approvals" }, { key: "audit", label: "Audit timeline" }, { key: "policies", label: "System policies" }, { key: "periods-access", label: "Periods & access" }, { key: "integrations", label: "Integrations" }, { key: "reconciliation", label: "Reconciliation" }, { key: "pricing", label: "Pricing" }, { key: "units", label: "Units & conversions" }, { key: "master-data", label: "Master data" }],
 };
 
 /** Create actions offered above a workspace's main list, alongside the records they add to. */
@@ -534,6 +535,64 @@ function UnitsPanel({ state, refresh }: { state: WorkflowState; refresh: () => P
   </div>;
 }
 
+function MarginMatrixPanel({ state, refresh }: { state: WorkflowState; refresh: () => Promise<void> }) {
+  const [mode, setMode] = useState<"create" | "update" | "deactivate">("create");
+  const [selectedId, setSelectedId] = useState("");
+  const [code, setCode] = useState(""); const [name, setName] = useState("");
+  const [scope, setScope] = useState<"global" | "category" | "product">("global"); const [category, setCategory] = useState(""); const [productId, setProductId] = useState("");
+  const [minimumCost, setMinimumCost] = useState(0); const [maximumCost, setMaximumCost] = useState(0); const [openEnded, setOpenEnded] = useState(true);
+  const [targetMargin, setTargetMargin] = useState(32); const [minimumProfit, setMinimumProfit] = useState(0); const [roundingIncrement, setRoundingIncrement] = useState(1); const [priority, setPriority] = useState(0);
+  const [validFrom, setValidFrom] = useState(""); const [validTo, setValidTo] = useState(""); const [reason, setReason] = useState(""); const [message, setMessage] = useState(""); const [busy, setBusy] = useState(false);
+  const selected = state.marginRules.find((rule) => rule.id === selectedId);
+  const activeRules = state.marginRules.filter((rule) => rule.status === "Active");
+  const chooseRule = (id: string) => {
+    setSelectedId(id); const rule = state.marginRules.find((candidate) => candidate.id === id); const row = rule?.data ?? {};
+    if (!rule) return;
+    setCode(String(row.code ?? "")); setName(String(row.name ?? "")); setMinimumCost(Number(row.minimumCostCents ?? 0) / 100);
+    setOpenEnded(row.maximumCostCents == null); setMaximumCost(Number(row.maximumCostCents ?? 0) / 100); setTargetMargin(Number(row.targetMarginBps ?? 0) / 100);
+    setMinimumProfit(Number(row.minimumGrossProfitCents ?? 0) / 100); setRoundingIncrement(Number(row.roundingIncrementCents ?? 100) / 100); setPriority(Number(row.priority ?? 0));
+    setValidFrom(String(row.validFrom ?? "")); setValidTo(String(row.validTo ?? "")); setProductId(String(row.productId ?? "")); setCategory(String(row.category ?? ""));
+    setScope(row.productId ? "product" : row.category ? "category" : "global"); setReason("");
+  };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault(); const idempotencyKey = crypto.randomUUID(); setBusy(true); setMessage("");
+    const command = mode === "create" ? "createMarginRule" : mode === "update" ? "updateMarginRule" : "deactivateMarginRule";
+    const payload = mode === "deactivate" ? { reason } : {
+      code, name, productId: scope === "product" ? productId : null, category: scope === "category" ? category.trim() : null,
+      minimumCostCents: Math.round(minimumCost * 100), maximumCostCents: openEnded ? null : Math.round(maximumCost * 100), targetMarginBps: Math.round(targetMargin * 100),
+      minimumGrossProfitCents: Math.round(minimumProfit * 100), roundingIncrementCents: Math.round(roundingIncrement * 100), priority, validFrom: validFrom || null, validTo: validTo || null,
+    };
+    try {
+      const response = await fetch("/api/workflows", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": idempotencyKey }, body: JSON.stringify({ command, idempotencyKey, entityId: mode === "create" ? undefined : selected?.id, version: mode === "create" ? undefined : selected?.version, payload }) });
+      const result = await response.json() as { message?: string; error?: { message?: string } };
+      if (!response.ok) throw new Error(result.error?.message ?? "Margin rule change failed.");
+      setMessage(result.message ?? "Margin matrix saved."); if (mode === "create") { setCode(""); setName(""); } await refresh();
+    } catch (caught) { setMessage(caught instanceof Error ? caught.message : "Margin rule change failed."); }
+    finally { setBusy(false); }
+  };
+  const invalidRange = !openEnded && maximumCost <= minimumCost;
+  return <Section title="Automatic margin matrix" detail="Suggested catalog prices use gross margin: price = cost ÷ (1 − margin), rounded up. Product rules win over category rules, which win over global rules.">
+    <div className="workflow-action-grid"><form className="master-data-form" onSubmit={submit}>
+      <h3>{mode === "create" ? "Create margin rule" : mode === "update" ? "Edit margin rule" : "Deactivate margin rule"}</h3>
+      <label><span>Action</span><select value={mode} onChange={(event) => { setMode(event.target.value as typeof mode); setSelectedId(""); }}><option value="create">Create</option><option value="update">Edit</option><option value="deactivate">Deactivate</option></select></label>
+      {mode !== "create" ? <label><span>Rule</span><select value={selectedId} onChange={(event) => chooseRule(event.target.value)} required><option value="">Select a rule</option>{(mode === "deactivate" ? activeRules : state.marginRules).map((rule) => <option key={rule.id} value={rule.id}>{rule.number} · {rule.status}</option>)}</select></label> : null}
+      {mode === "deactivate" ? <label className="full"><span>Reason</span><input value={reason} onChange={(event) => setReason(event.target.value)} required /></label> : <>
+        <label><span>Code</span><input value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="HARDWARE-LOW" required /></label><label><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} required /></label>
+        <label><span>Scope</span><select value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="global">All products</option><option value="category">Category</option><option value="product">One product</option></select></label>
+        {scope === "category" ? <label><span>Category</span><input value={category} onChange={(event) => setCategory(event.target.value)} required /></label> : null}{scope === "product" ? <RemoteProductField value={productId} initialOptions={state.options.products} setValue={setProductId} label="Product" /> : null}
+        <label><span>Minimum cost (CAD)</span><input type="number" min="0" step="0.01" value={minimumCost} onChange={(event) => setMinimumCost(Number(event.target.value))} required /></label>
+        <label><span><input type="checkbox" checked={openEnded} onChange={(event) => setOpenEnded(event.target.checked)} /> No maximum cost</span>{!openEnded ? <input type="number" min={minimumCost + 0.01} step="0.01" value={maximumCost} onChange={(event) => setMaximumCost(Number(event.target.value))} required /> : null}</label>
+        <label><span>Target gross margin (%)</span><input type="number" min="0" max="99.99" step="0.01" value={targetMargin} onChange={(event) => setTargetMargin(Number(event.target.value))} required /></label><label><span>Minimum gross profit (CAD)</span><input type="number" min="0" step="0.01" value={minimumProfit} onChange={(event) => setMinimumProfit(Number(event.target.value))} /></label>
+        <label><span>Round price up to (CAD)</span><input type="number" min="0.01" step="0.01" value={roundingIncrement} onChange={(event) => setRoundingIncrement(Number(event.target.value))} required /></label><label><span>Priority</span><input type="number" step="1" value={priority} onChange={(event) => setPriority(Number(event.target.value))} /></label>
+        <label><span>Valid from (optional)</span><input type="date" value={validFrom} onChange={(event) => setValidFrom(event.target.value)} /></label><label><span>Valid to (optional)</span><input type="date" value={validTo} onChange={(event) => setValidTo(event.target.value)} /></label>
+      </>}
+      <button className="workflow-action primary" disabled={!state.permissions.canAdminister || busy || (mode !== "create" && !selected) || (mode === "deactivate" && !reason.trim()) || (mode !== "deactivate" && (!code.trim() || !name.trim() || invalidRange || targetMargin < 0 || targetMargin >= 100 || roundingIncrement <= 0 || (scope === "category" && !category.trim()) || (scope === "product" && !productId)))}>{busy ? "Saving…" : mode === "create" ? "Create rule" : mode === "update" ? "Save rule" : "Deactivate rule"}</button>
+    </form></div>
+    {message ? <p role="status" className="workflow-banner">{message}</p> : null}
+    <RecordTable records={state.marginRules} columns={["number", "party", "reference", "detail", "status"]} />
+  </Section>;
+}
+
 function PriceListsPanel({ state, refresh }: { state: WorkflowState; refresh: () => Promise<void> }) {
   const [listMode, setListMode] = useState<"create" | "update">("create"); const [code, setCode] = useState(""); const [name, setName] = useState(""); const [listCurrency, setListCurrency] = useState("CAD"); const [priority, setPriority] = useState(0); const [listValidFrom, setListValidFrom] = useState(""); const [listValidTo, setListValidTo] = useState("");
   const [priceListId, setPriceListId] = useState(state.options.priceLists[0]?.id ?? ""); const [priceListSelection, setPriceListSelection] = useState<SelectOption>();
@@ -570,6 +629,7 @@ function PriceListsPanel({ state, refresh }: { state: WorkflowState; refresh: ()
   const submitEntry = (event: FormEvent) => { event.preventDefault(); const payload = entryMode === "deactivate" ? { reason: entryReason } : { priceListId: selectedPriceListId, productId: selectedProductId, uomId: selectedUomId, minimumQuantity, unitPriceCents: Math.round(unitPrice * 100), validFrom: entryValidFrom || null, validTo: entryValidTo || null }; const command = entryMode === "create" ? "createPriceListEntry" : entryMode === "update" ? "updatePriceListEntry" : "deactivatePriceListEntry"; void post(command, payload, entryMode === "create" ? undefined : entrySelection); };
   const deactivateList = (event: FormEvent) => { event.preventDefault(); if (selectedPriceList) void post("deactivatePriceList", { reason: listDeactivationReason }, selectedPriceList); };
   return <div className="workflow-stack">
+    <MarginMatrixPanel state={state} refresh={refresh} />
     <Section title="Customer price lists">
       <div className="workflow-action-grid">
         <form className="master-data-form" onSubmit={submitList}><h3>{listMode === "create" ? "Create price list" : "Edit price list"}</h3><label><span>Action</span><select value={listMode} onChange={(event) => setListMode(event.target.value as "create" | "update")}><option value="create">Create</option><option value="update">Edit</option></select></label>{listMode === "update" ? <LookupField kind="priceLists" label="Price list to edit" value={selectedPriceListId} setValue={setPriceListId} onSelect={chooseList} initialOptions={state.options.priceLists} /> : null}<label><span>Code</span><input value={code} onChange={(event) => setCode(event.target.value)} required /></label><label><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} required /></label><label><span>Currency</span><select value={listCurrency} onChange={(event) => setListCurrency(event.target.value)}><option>CAD</option><option>USD</option><option>EUR</option></select></label><label><span>Priority</span><input type="number" value={priority} onChange={(event) => setPriority(Number(event.target.value))} /></label><label><span>Valid from (optional)</span><input type="date" value={listValidFrom} onChange={(event) => setListValidFrom(event.target.value)} /></label><label><span>Valid to (optional)</span><input type="date" value={listValidTo} onChange={(event) => setListValidTo(event.target.value)} /></label><button className="workflow-action primary" disabled={!canAdminister || busy || (listMode === "update" && !selectedPriceList) || Boolean(listValidFrom && listValidTo && listValidFrom > listValidTo)}>{listMode === "create" ? "Create list" : "Save list changes"}</button></form>
@@ -1443,6 +1503,11 @@ function normalizeLiveWorkflowState(input: unknown, snapshotInput?: unknown): Wo
   const valuationPolicyRecords: WorkflowRecord[] = rows(raw.valuationPolicies).map((row) => ({ id: text(row, "product_id", "productId"), number: `${text(row, "sku")} · ${text(row, "productName")}`, status: human(row.method), amount: number(row, "standard_cost_cents", "standardCostCents") / 100, detail: `Average ${money0(number(row, "average_cost_cents", "averageCostCents"))}`, version: number(row, "version") || undefined, data: row }));
   const userRecords: WorkflowRecord[] = rows(raw.users).map((row) => ({ id: text(row, "userId"), number: text(row, "fullName", "email"), party: text(row, "email"), status: number(row, "active") ? "Active" : "Disabled", detail: human(row.role), version: number(row, "version") || undefined, data: row }));
   const outboxRecords: WorkflowRecord[] = rows(raw.outbox).map((row) => { const lastError = text(row, "lastError"); return { id: text(row, "id"), number: text(row, "eventType"), party: human(row.aggregateType), reference: text(row, "aggregateId"), status: human(row.status), detail: `${number(row, "attempts")} attempt(s) · available ${text(row, "availableAt")}${lastError ? ` · Last error: ${lastError}` : ""}`, data: row }; });
+  const marginRuleRecords: WorkflowRecord[] = rows(raw.marginRules).map((row) => {
+    const scope = text(row, "sku") ? `Product ${text(row, "sku")}` : text(row, "category") ? `Category ${text(row, "category")}` : "All products";
+    const maximum = row.maximumCostCents == null ? "and up" : `to ${formatWorkflowMoney(number(row, "maximumCostCents") / 100)}`;
+    return { id: text(row, "id"), number: `${text(row, "code")} · ${text(row, "name")}`, status: number(row, "active") ? "Active" : "Inactive", party: `${scope} · ${(number(row, "targetMarginBps") / 100).toFixed(2)}% margin`, reference: `${formatWorkflowMoney(number(row, "minimumCostCents") / 100)} ${maximum}`, detail: `Minimum profit ${formatWorkflowMoney(number(row, "minimumGrossProfitCents") / 100)} · round to ${formatWorkflowMoney(number(row, "roundingIncrementCents") / 100)}`, version: number(row, "version") || undefined, data: row };
+  });
   const priceListOptions = rows(raw.priceLists).filter((row) => number(row, "active") !== 0).map((row) => makeOption(row, ["code", "name"], text(row, "currency")));
   const priceAssignmentRecords: WorkflowRecord[] = rows(raw.priceListAssignments).map((row) => ({ id: text(row, "id"), number: text(row, "priceListCode"), status: number(row, "active") ? "Active" : "Inactive", party: text(row, "partnerName"), reference: `Priority ${number(row, "priority")}`, version: number(row, "version") || undefined, data: row }));
   const priceEntryRecords: WorkflowRecord[] = rows(raw.priceListEntries).map((row) => ({ id: text(row, "id"), number: `${text(row, "priceListCode")} · ${text(row, "sku")}`, status: number(row, "active") ? "Active" : "Inactive", party: `${text(row, "productName")} · ${text(row, "uomCode")}`, quantity: number(row, "minimumQuantity"), amount: number(row, "unitPriceCents") / 100, currency: text(row, "currency") || "CAD", version: number(row, "version") || undefined, data: row }));
@@ -1453,7 +1518,7 @@ function normalizeLiveWorkflowState(input: unknown, snapshotInput?: unknown): Wo
   const attachmentRecords: AttachmentRecord[] = rows(raw.attachments).map((row) => ({ id: text(row, "id"), fileName: text(row, "fileName"), type: text(row, "category", "contentType"), document: `${text(row, "documentType")} · ${text(row, "documentId")}`, status: "Stored", uploadedBy: text(row, "ownerEmail", "ownerId"), time: text(row, "uploadedAt"), href: `/api/attachments/${encodeURIComponent(text(row, "id"))}`, ownerId: text(row, "ownerId"), documentType: text(row, "documentType"), documentId: text(row, "documentId") }));
   const salesOrderLines = salesOrders.flatMap((order) => rows(order.lines).map((line) => ({ id: text(line, "id"), label: `${text(order, "number")} · ${text(line, "sku", "productName")}${text(line, "fulfillmentRoute") ? ` · ${human(line.fulfillmentRoute)}` : ""}`, detail: text(line, "productId"), version: number(order, "version") || undefined, status: text(line, "fulfillmentRoute"), data: { ...line, salesOrderId: text(order, "id"), salesOrderVersion: number(order, "version") } })));
   const purchaseOrderLines = purchaseOrders.flatMap((order) => rows(order.lines).map((line) => ({ id: text(line, "id"), label: `${text(order, "number")} · ${text(line, "sku", "productName")}`, detail: text(order, "id"), version: number(order, "version") || undefined, data: { ...line, purchaseOrderId: text(order, "id"), purchaseOrderVersion: number(order, "version"), currency: text(order, "currency") || "CAD", exchangeRateToBase: number(order, "exchangeRateToBase", "exchange_rate_to_base") || 1, paymentTerms: text(order, "paymentTerms", "payment_terms") || "Net 30", dueDate: text(order, "dueDate", "due_date") || today } })));
-  return { purchaseOrders: poRecords, revisions: revisionRecords, transfers: transferRecords, traceUnits: traceRecords, reservations: reservationRecords, shipments: shipmentRecords, dropShipDeliveries: dropShipRecords, vendorBills: vendorBillRecords, customerInvoices: invoiceRecords, valuations: valuationRecords, assets: assetRecords, approvals: approvalRecords, policies: policyRecords, periodLocks: periodLockRecords, valuationPolicies: valuationPolicyRecords, users: userRecords, outbox: outboxRecords, priceLists: priceListOptions, priceAssignments: priceAssignmentRecords, priceEntries: priceEntryRecords, uomConversions: uomConversionRecords, orphanedLocations: orphanedLocationRecords, audit: auditRecords, attachments: attachmentRecords, currentUser: actor ? { id: text(actor, "id"), name: text(actor, "name", "email"), role: human(actor.role), permissions: permissionLabels } : empty.currentUser, permissions,
+  return { purchaseOrders: poRecords, revisions: revisionRecords, transfers: transferRecords, traceUnits: traceRecords, reservations: reservationRecords, shipments: shipmentRecords, dropShipDeliveries: dropShipRecords, vendorBills: vendorBillRecords, customerInvoices: invoiceRecords, valuations: valuationRecords, assets: assetRecords, approvals: approvalRecords, policies: policyRecords, periodLocks: periodLockRecords, valuationPolicies: valuationPolicyRecords, users: userRecords, outbox: outboxRecords, marginRules: marginRuleRecords, priceLists: priceListOptions, priceAssignments: priceAssignmentRecords, priceEntries: priceEntryRecords, uomConversions: uomConversionRecords, orphanedLocations: orphanedLocationRecords, audit: auditRecords, attachments: attachmentRecords, currentUser: actor ? { id: text(actor, "id"), name: text(actor, "name", "email"), role: human(actor.role), permissions: permissionLabels } : empty.currentUser, permissions,
     totals: {
       inventoryValueCents: number(summaryTotals, "inventoryValueCents"),
       landedCostAllocatedCents: number(summaryTotals, "landedCostAllocatedCents"),

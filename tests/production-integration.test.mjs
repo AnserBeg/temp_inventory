@@ -14,6 +14,7 @@ let outboxModule;
 let auth;
 let exportsModule;
 let reportsModule;
+let countSessions;
 
 async function applyMigrations() {
   const directory = new URL("../drizzle/", import.meta.url);
@@ -40,6 +41,7 @@ before(async () => {
   auth = await import("../lib/server/auth.ts");
   exportsModule = await import("../lib/server/exports.ts");
   reportsModule = await import("../lib/server/reports.ts");
+  countSessions = await import("../lib/server/inventory-count-sessions.ts");
 });
 
 after(() => db.close());
@@ -607,7 +609,7 @@ test("catalog and contract pricing honor the order currency", async () => {
   assert.equal(usdSales.items.find((item) => item.id === "prod-a").effectiveCurrency, "USD");
   const usdPurchasing = await inventoryDomain.searchInventoryReferences("products", "SKU-A", 20, "vendor", undefined, 1, undefined, "USD", 1.25);
   assert.equal(usdPurchasing.items.find((item) => item.id === "prod-a").effectiveUnitAmountCents, 80);
-  assert.equal(usdPurchasing.items.find((item) => item.id === "prod-a").priceSource, "Catalog standard cost");
+  assert.equal(usdPurchasing.items.find((item) => item.id === "prod-a").priceSource, "Catalog standard cost fallback");
   await assert.rejects(inventoryDomain.searchInventoryReferences("products", "SKU-A", 20, "vendor", undefined, 1, undefined, "EUR", 0), (error) => error?.code === "EXCHANGE_RATE_REQUIRED");
 });
 
@@ -802,6 +804,57 @@ test("immediate sale ships free stock and posts the customer invoice atomically 
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM command_log WHERE idempotency_key='post-immediate-sale-short'").get().count, 0);
 });
 
+test("counter sale creates its hidden order, shipment, invoice, and full payment in one posting", async () => {
+  await run("INSERT OR IGNORE INTO warehouses (id,code,name,timezone,active,version) VALUES ('wh-test','TEST','Test warehouse','UTC',1,1)");
+  await run("INSERT OR IGNORE INTO locations (id,code,name,location_type,inventory_status,warehouse_id,active,version) VALUES ('loc-a','A','A','storage','usable','wh-test',1,1)");
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('prod-counter','SKU-COUNTER','Counter sale product','test','test','test','test','quantity','stocked',400,1000,0,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
+  await run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('prod-counter','loc-a',5,0,1)");
+  await run("INSERT INTO valuation_policies (product_id,method,standard_cost_cents,average_cost_cents,version,updated_at,updated_by) VALUES ('prod-counter','fifo',400,400,1,'2026-08-01','Tester')");
+  await run("INSERT INTO cost_layers (id,product_id,received_qty,remaining_qty,unit_cost_cents,landed_cost_cents,received_at,status) VALUES ('layer-counter','prod-counter',5,5,400,0,'2026-08-01','open')");
+  await run("INSERT INTO business_partners (id,code,name,partner_type,payment_terms,currency,credit_limit_cents,credit_hold,active,version,created_at) VALUES ('customer-counter','CUST-COUNTER','Walk-in Customer','customer','Net 30','CAD',100000,0,1,1,'2026-08-01')");
+
+  const command = { command: "postCounterSale", entityId: "counter-sale-request-1", version: 1, idempotencyKey: "post-counter-sale", payload: {
+    customerId: "customer-counter", postingDate: "2026-08-25", settlement: "pay_now", currency: "CAD", exchangeRateToBase: 1,
+    paymentMethod: "cash", paymentReference: "TILL-0042", actor: "Tester", actorId: "tester", actorEmail: "tester@example.com",
+    lines: [
+      { kind: "item", productId: "prod-counter", quantity: 1, uomId: "uom-each", unitPriceCents: 1000, discountCents: 0, taxable: true, taxCode: "GST", taxRateBps: 500, fulfillmentRoute: "stock", locationId: "loc-a" },
+      { kind: "item", productId: "prod-counter", quantity: 2, uomId: "uom-each", unitPriceCents: 1000, discountCents: 200, taxable: true, taxCode: "GST", taxRateBps: 500, fulfillmentRoute: "stock", locationId: "loc-a" },
+    ],
+  } };
+  const result = await inventoryDomain.executeInventoryCommand(command);
+  assert.ok(result.salesOrderId);
+  assert.ok(result.shipmentId);
+  assert.ok(result.invoiceId);
+  assert.ok(result.paymentId);
+  assert.match(result.message, new RegExp(`${result.invoiceNumber} paid.*${result.salesOrderNumber}`));
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT lifecycle_status,billing_status,total_cents,version FROM sales_orders WHERE id=?").get(result.salesOrderId) }, { lifecycle_status: "confirmed", billing_status: "invoiced", total_cents: 2940, version: 1 });
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM sales_order_lines WHERE sales_order_id=?").get(result.salesOrderId).count, 2);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT status,paid_cents,subtotal_cents,tax_cents,total_cents,payment_terms FROM customer_invoices WHERE id=?").get(result.invoiceId) }, { status: "paid", paid_cents: 2940, subtotal_cents: 2800, tax_cents: 140, total_cents: 2940, payment_terms: "Due on receipt" });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT direction,amount_cents,method,reference FROM payments WHERE id=?").get(result.paymentId) }, { direction: "inbound", amount_cents: 2940, method: "cash", reference: "TILL-0042" });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT on_hand_qty,reserved_qty FROM inventory_balances WHERE product_id='prod-counter' AND location_id='loc-a'").get() }, { on_hand_qty: 2, reserved_qty: 0 });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT COUNT(*) AS lines,COALESCE(SUM(quantity),0) AS quantity FROM shipment_lines WHERE shipment_id=?").get(result.shipmentId) }, { lines: 2, quantity: 3 });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT COALESCE(SUM(quantity),0) AS quantity,COALESCE(SUM(value_cents),0) AS value FROM inventory_value_entries WHERE reference_id=?").get(result.shipmentId) }, { quantity: -3, value: -1200 });
+  assert.equal(db.sqlite.prepare("SELECT remaining_qty FROM cost_layers WHERE id='layer-counter'").get().remaining_qty, 2);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM reservations WHERE sales_order_line_id IN (SELECT id FROM sales_order_lines WHERE sales_order_id=?)").get(result.salesOrderId).count, 0);
+
+  const repeated = await inventoryDomain.executeInventoryCommand(command);
+  assert.equal(repeated.invoiceId, result.invoiceId);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM customer_invoices WHERE sales_order_id=?").get(result.salesOrderId).count, 1);
+
+  const accountSale = await inventoryDomain.executeInventoryCommand({ ...command, entityId: "counter-sale-request-account", idempotencyKey: "post-counter-sale-account", payload: {
+    ...command.payload, settlement: "on_account", paymentMethod: undefined, paymentReference: undefined, paymentTerms: "Net 30", dueDate: "2026-09-24",
+    lines: [{ ...command.payload.lines[0], quantity: 1 }],
+  } });
+  assert.equal(accountSale.paymentId, undefined);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT status,paid_cents,payment_terms,due_date FROM customer_invoices WHERE id=?").get(accountSale.invoiceId) }, { status: "posted", paid_cents: 0, payment_terms: "Net 30", due_date: "2026-09-24" });
+  assert.equal(db.sqlite.prepare("SELECT on_hand_qty FROM inventory_balances WHERE product_id='prod-counter' AND location_id='loc-a'").get().on_hand_qty, 1);
+
+  await assert.rejects(inventoryDomain.executeInventoryCommand({ ...command, entityId: "counter-sale-request-short", idempotencyKey: "post-counter-sale-short", payload: { ...command.payload, lines: [
+    { ...command.payload.lines[0], quantity: 2 }, { ...command.payload.lines[1], quantity: 1, discountCents: 0 },
+  ] } }), (error) => error?.code === "INSUFFICIENT_AVAILABILITY");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM command_log WHERE idempotency_key='post-counter-sale-short'").get().count, 0);
+});
+
 test("accounting exports reject base-total plugs and emit tax from the tax component", async () => {
   await run("INSERT INTO business_partners (id,code,name,partner_type,currency,active,version,created_at) VALUES ('vendor-a','VEND-A','Vendor A','vendor','USD',1,1,'2026-08-01')");
   await run("INSERT INTO vendor_bills (id,number,vendor_invoice_number,vendor_id,status,match_status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,version) VALUES ('bill-fx','VB-FX','V-FX','vendor-a','posted','matched','2026-08-02','2026-09-01',10000,500,10500,0,'USD',1.5,16000,1)");
@@ -956,4 +1009,69 @@ test("the dashboard special-order watchlist searches beyond the first catalog pa
   const home = await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 50, scope: "home" });
   assert.equal(home.products.some((row) => row.id === "prod-dashboard-special"), true);
   assert.equal(home.products.every((row) => ["special_order", "drop_ship"].includes(String(row.inventoryPolicy))), true);
+});
+
+test("inventory count sessions save, review, approve, post, and preserve their audit lineage", async () => {
+  const operator = { id: "count-operator", email: "counter@example.com", name: "Counter", role: "operator", label: "Counter <counter@example.com>", localDevelopment: false };
+  const manager = { id: "count-manager", email: "manager@example.com", name: "Manager", role: "manager", label: "Manager <manager@example.com>", localDevelopment: false };
+  await run("INSERT INTO warehouses (id,code,name,timezone,active,version) VALUES ('warehouse-count-test','COUNT','Count Test Warehouse','America/Edmonton',1,1)");
+  await run("INSERT INTO locations (id,code,name,location_type,inventory_status,warehouse_id,active,version) VALUES ('location-count-test','COUNT-A-01','Count aisle','storage','usable','warehouse-count-test',1,1)");
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('product-count-test','COUNT-SKU','Count session product','test','test','test','test','quantity','stocked',200000,250000,0,'uom-each','uom-each','uom-each',1,1,'2026-09-01')");
+  await run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('product-count-test','location-count-test',2,0,1)");
+  await run("INSERT INTO valuation_policies (product_id,method,standard_cost_cents,average_cost_cents,version,updated_at,updated_by) VALUES ('product-count-test','standard',200000,200000,1,'2026-09-01','Tester')");
+
+  const created = await countSessions.createCountSession(operator, { countType: "correction", warehouseId: "warehouse-count-test", effectiveDate: "2026-09-02", blindCount: false, idempotencyKey: "count-session-create-test" });
+  await countSessions.addCountLine(operator, { sessionId: created.session.id, productId: "product-count-test", locationId: "location-count-test" });
+  let workspace = await countSessions.getCountSessionWorkspace({ sessionId: created.session.id });
+  const line = workspace.lines[0];
+  await countSessions.saveCountLine(operator, { sessionId: created.session.id, lineId: line.id, version: line.version, countedQuantity: 3, reason: "Found in adjacent bay" });
+  await countSessions.submitCountSession(operator, { sessionId: created.session.id });
+
+  const firstPost = await countSessions.postCountSession(operator, { sessionId: created.session.id, postingDate: "2026-09-02" });
+  assert.equal(firstPost.finished, false);
+  assert.equal(firstPost.blocked[0].code, "APPROVAL_REQUIRED");
+  workspace = await countSessions.getCountSessionWorkspace({ sessionId: created.session.id });
+  assert.equal(workspace.lines[0].status, "needs_approval");
+
+  await countSessions.requestCountLineApproval(operator, { sessionId: created.session.id, lineId: line.id, idempotencyKey: "count-session-approval-request-test" });
+  await countSessions.approveCountLine(manager, { sessionId: created.session.id, lineId: line.id, reason: "Variance independently reviewed", idempotencyKey: "count-session-approval-decision-test" });
+  const finalPost = await countSessions.postCountSession(operator, { sessionId: created.session.id, postingDate: "2026-09-02" });
+  assert.equal(finalPost.finished, true);
+  assert.equal(db.sqlite.prepare("SELECT status FROM inventory_count_sessions WHERE id=?").get(created.session.id).status, "posted");
+  assert.equal(db.sqlite.prepare("SELECT on_hand_qty FROM inventory_balances WHERE product_id='product-count-test' AND location_id='location-count-test'").get().on_hand_qty, 3);
+  const posted = db.sqlite.prepare(`SELECT ic.count_session_id AS sessionId,ic.count_session_line_id AS lineId,sm.movement_type AS movementType,sm.inventory_status AS inventoryStatus
+    FROM inventory_counts ic JOIN stock_movements sm ON sm.source_document_id=ic.id WHERE ic.count_session_id=?`).get(created.session.id);
+  assert.deepEqual({ ...posted }, { sessionId: created.session.id, lineId: line.id, movementType: "inventory_adjustment_gain", inventoryStatus: "usable" });
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE entity_type='inventory_count_session' AND entity_id=?").get(created.session.id).count >= 3, true);
+});
+
+test("opening inventory uses opening balance accounting and stale count sessions never overwrite newer stock", async () => {
+  const administrator = { id: "count-admin", email: "admin@example.com", name: "Admin", role: "administrator", label: "Admin <admin@example.com>", localDevelopment: false };
+  await run("INSERT INTO warehouses (id,code,name,timezone,active,version) VALUES ('warehouse-opening-test','OPEN','Opening Test Warehouse','America/Edmonton',1,1)");
+  await run("INSERT INTO locations (id,code,name,location_type,inventory_status,warehouse_id,active,version) VALUES ('location-opening-test','OPEN-QA','Opening quarantine','quarantine','quarantine','warehouse-opening-test',1,1)");
+  for (const [id, sku] of [["product-opening-test", "OPEN-SKU"], ["product-conflict-test", "CONFLICT-SKU"]]) {
+    await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES (?,?,?,'test','test','test','test','quantity','stocked',5000,7000,0,'uom-each','uom-each','uom-each',1,1,'2026-09-01')", id, sku, `${sku} product`);
+  }
+  const opening = await countSessions.createCountSession(administrator, { countType: "opening", warehouseId: "warehouse-opening-test", effectiveDate: "2026-09-02", idempotencyKey: "opening-session-create-test" });
+  await countSessions.addCountLine(administrator, { sessionId: opening.session.id, productId: "product-opening-test", locationId: "location-opening-test" });
+  let workspace = await countSessions.getCountSessionWorkspace({ sessionId: opening.session.id });
+  await countSessions.saveCountLine(administrator, { sessionId: opening.session.id, lineId: workspace.lines[0].id, version: workspace.lines[0].version, countedQuantity: 4, unitCostCents: 5000, reason: "Initial warehouse cutover" });
+  await countSessions.submitCountSession(administrator, { sessionId: opening.session.id });
+  assert.equal((await countSessions.postCountSession(administrator, { sessionId: opening.session.id, postingDate: "2026-09-02" })).finished, true);
+  const openingMovement = db.sqlite.prepare("SELECT movement_type,inventory_status FROM stock_movements WHERE source_document_id=(SELECT id FROM inventory_counts WHERE count_session_id=?)").get(opening.session.id);
+  assert.deepEqual({ ...openingMovement }, { movement_type: "opening_balance", inventory_status: "quarantine" });
+  assert.equal(db.sqlite.prepare("SELECT entry_type FROM inventory_value_entries WHERE reference_id=(SELECT id FROM inventory_counts WHERE count_session_id=?)").get(opening.session.id).entry_type, "opening_balance");
+
+  await run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('product-conflict-test','location-opening-test',1,0,1)");
+  const conflict = await countSessions.createCountSession(administrator, { countType: "correction", warehouseId: "warehouse-opening-test", effectiveDate: "2026-09-02", idempotencyKey: "conflict-session-create-test" });
+  await countSessions.addCountLine(administrator, { sessionId: conflict.session.id, productId: "product-conflict-test", locationId: "location-opening-test" });
+  workspace = await countSessions.getCountSessionWorkspace({ sessionId: conflict.session.id });
+  await countSessions.saveCountLine(administrator, { sessionId: conflict.session.id, lineId: workspace.lines[0].id, version: workspace.lines[0].version, countedQuantity: 1, reason: "Count confirmed" });
+  await countSessions.submitCountSession(administrator, { sessionId: conflict.session.id });
+  await run("UPDATE inventory_balances SET on_hand_qty=2,version=version+1 WHERE product_id='product-conflict-test' AND location_id='location-opening-test'");
+  const result = await countSessions.postCountSession(administrator, { sessionId: conflict.session.id, postingDate: "2026-09-02" });
+  assert.equal(result.finished, false);
+  assert.equal(result.blocked[0].code, "VERSION_CONFLICT");
+  assert.equal(db.sqlite.prepare("SELECT on_hand_qty FROM inventory_balances WHERE product_id='product-conflict-test' AND location_id='location-opening-test'").get().on_hand_qty, 2);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM inventory_counts WHERE count_session_id=?").get(conflict.session.id).count, 0);
 });

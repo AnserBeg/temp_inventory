@@ -44,7 +44,17 @@ export const products = sqliteTable(
     trackingPolicy: text("tracking_policy").notNull().default("quantity"),
     inventoryPolicy: text("inventory_policy").notNull().default("stocked"),
     standardCostCents: integer("standard_cost_cents").notNull(),
+    lastUnitCostCents: integer("last_unit_cost_cents"),
+    lastUnitCostSourcePoId: text("last_unit_cost_source_po_id"),
+    lastUnitCostSourcePoLineId: text("last_unit_cost_source_po_line_id"),
+    lastUnitCostVendorId: text("last_unit_cost_vendor_id"),
+    lastUnitCostAt: text("last_unit_cost_at"),
     sellingPriceCents: integer("selling_price_cents").notNull(),
+    suggestedSellingPriceCents: integer("suggested_selling_price_cents"),
+    pricingMode: text("pricing_mode").notNull().default("manual"),
+    appliedMarginRuleId: text("applied_margin_rule_id"),
+    manualPriceReason: text("manual_price_reason"),
+    pricingUpdatedAt: text("pricing_updated_at"),
     reorderPoint: real("reorder_point").notNull().default(0),
     maxStockLevel: real("max_stock_level").notNull().default(0),
     baseUomId: text("base_uom_id").notNull().default("uom-each"),
@@ -57,6 +67,8 @@ export const products = sqliteTable(
   (table) => [
     uniqueIndex("idx_products_sku").on(table.sku),
     index("idx_products_active_name").on(table.active, table.name),
+    index("idx_products_pricing_mode").on(table.pricingMode, table.category),
+    check("products_pricing_mode_check", sql`${table.pricingMode} IN ('automatic','manual')`),
   ]
 );
 
@@ -1281,6 +1293,83 @@ export const uomConversions = sqliteTable(
   (table) => [
     uniqueIndex("idx_uom_conversion_scope").on(table.productId, table.fromUomId, table.toUomId),
     check("uom_conversion_positive_check", sql`${table.numerator} > 0 AND ${table.denominator} > 0`),
+  ]
+);
+
+export const marginRules = sqliteTable(
+  "margin_rules",
+  {
+    id: text("id").primaryKey(),
+    code: text("code").notNull(),
+    name: text("name").notNull(),
+    productId: text("product_id").references(() => products.id),
+    category: text("category"),
+    minimumCostCents: integer("minimum_cost_cents").notNull().default(0),
+    maximumCostCents: integer("maximum_cost_cents"),
+    targetMarginBps: integer("target_margin_bps").notNull(),
+    minimumGrossProfitCents: integer("minimum_gross_profit_cents").notNull().default(0),
+    roundingIncrementCents: integer("rounding_increment_cents").notNull().default(100),
+    priority: integer("priority").notNull().default(0),
+    validFrom: text("valid_from"),
+    validTo: text("valid_to"),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_margin_rules_code").on(table.code),
+    index("idx_margin_rules_resolution").on(table.active, table.productId, table.category, table.minimumCostCents, table.priority),
+    check("margin_rules_cost_range_check", sql`${table.minimumCostCents} >= 0 AND (${table.maximumCostCents} IS NULL OR ${table.maximumCostCents} > ${table.minimumCostCents})`),
+    check("margin_rules_margin_check", sql`${table.targetMarginBps} >= 0 AND ${table.targetMarginBps} < 10000`),
+    check("margin_rules_profit_check", sql`${table.minimumGrossProfitCents} >= 0`),
+    check("margin_rules_rounding_check", sql`${table.roundingIncrementCents} > 0`),
+  ]
+);
+
+export const productCostHistory = sqliteTable(
+  "product_cost_history",
+  {
+    id: text("id").primaryKey(),
+    productId: text("product_id").notNull().references(() => products.id),
+    sourcePurchaseOrderId: text("source_purchase_order_id").notNull().references(() => purchaseOrders.id),
+    sourcePurchaseOrderLineId: text("source_purchase_order_line_id").references(() => purchaseOrderLines.id),
+    purchaseOrderRevision: integer("purchase_order_revision").notNull(),
+    vendorId: text("vendor_id").notNull().references(() => businessPartners.id),
+    lastUnitCostCents: integer("last_unit_cost_cents").notNull(),
+    sourceCurrency: text("source_currency").notNull(),
+    exchangeRateToBase: real("exchange_rate_to_base").notNull(),
+    effectiveAt: text("effective_at").notNull(),
+    recordedBy: text("recorded_by").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_product_cost_history_source").on(table.productId, table.sourcePurchaseOrderId, table.purchaseOrderRevision),
+    index("idx_product_cost_history_latest").on(table.productId, table.effectiveAt),
+    check("product_cost_history_cost_check", sql`${table.lastUnitCostCents} >= 0`),
+    check("product_cost_history_exchange_check", sql`${table.exchangeRateToBase} > 0`),
+  ]
+);
+
+export const catalogPriceHistory = sqliteTable(
+  "catalog_price_history",
+  {
+    id: text("id").primaryKey(),
+    productId: text("product_id").notNull().references(() => products.id),
+    eventType: text("event_type").notNull(),
+    costBasisCents: integer("cost_basis_cents").notNull(),
+    previousSellingPriceCents: integer("previous_selling_price_cents").notNull(),
+    suggestedSellingPriceCents: integer("suggested_selling_price_cents").notNull(),
+    effectiveSellingPriceCents: integer("effective_selling_price_cents").notNull(),
+    pricingMode: text("pricing_mode").notNull(),
+    marginRuleId: text("margin_rule_id").references(() => marginRules.id),
+    sourcePurchaseOrderId: text("source_purchase_order_id").references(() => purchaseOrders.id),
+    reason: text("reason"),
+    createdAt: text("created_at").notNull(),
+    createdBy: text("created_by").notNull(),
+  },
+  (table) => [
+    index("idx_catalog_price_history_product").on(table.productId, table.createdAt),
+    check("catalog_price_history_mode_check", sql`${table.pricingMode} IN ('automatic','manual')`),
   ]
 );
 

@@ -10,7 +10,7 @@ test("all outbound legacy postings couple stock, layers, and immutable value ent
   for (const entryType of ["receipt_reversal", "vendor_return", "shipment"]) {
     assert.ok(domain.includes(`entryType: "${entryType}"`), `${entryType} must have an immutable value entry`);
   }
-  assert.match(domain, /entryType: delta > 0 \? "inventory_adjustment_gain" : "inventory_adjustment_loss"/);
+  assert.match(domain, /entryType: openingBalance \? "opening_balance" : delta > 0 \? "inventory_adjustment_gain" : "inventory_adjustment_loss"/);
   assert.match(domain, /layerClaimPredicate\(valuation\.layers\)/);
   assert.match(domain, /layerConsumptionPrepared\(input, valuation\.layers\)/);
   assert.match(domain, /on_hand_qty - reserved_qty >= \?/);

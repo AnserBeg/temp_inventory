@@ -155,6 +155,20 @@
       "when": 1788370756780,
       "tag": "0021_big_imperial_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1788371392666,
+      "tag": "0022_normal_norrin_radd",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1788371511289,
+      "tag": "0023_clear_northstar",
+      "breakpoints": true
     }
   ]
 }

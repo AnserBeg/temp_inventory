@@ -11,6 +11,7 @@ import {
 } from "react";
 import { OperationsWorkspace } from "./components/operations-suite";
 import { EmailConnectionManager, EmailDocumentButton } from "./components/email-documents";
+import { InventoryCountSessions } from "./components/inventory-count-sessions";
 import { actorName } from "./components/format";
 import { useDialogDismiss } from "./components/use-dialog-dismiss";
 import { PAYMENT_TERMS, QuickCreateDialog, RemoteSearchSelect, SearchableSelect, type LookupKind, type QuickCreateKind } from "./components/reference-picker";
@@ -138,7 +139,15 @@ type Product = {
   maxStockLevel: number;
   inventoryPolicy: string;
   standardCost: number;
+  lastUnitCost?: number;
+  lastUnitCostSourcePoNumber?: string;
+  lastUnitCostVendorName?: string;
+  lastUnitCostAt?: string;
   sellingPrice: number;
+  suggestedSellingPrice: number;
+  pricingMode: "automatic" | "manual";
+  appliedMarginRuleCode?: string;
+  manualPriceReason?: string;
   baseUomId: string;
   baseUomCode: string;
   purchaseUomId: string;
@@ -403,12 +412,24 @@ type ComposerLine = {
   linkedPurchaseOrderLineId: string;
 };
 
+type CounterSaleLine = ComposerLine & {
+  factorToBase: number;
+  trackingPolicy: string;
+  availableQuantity: number;
+  locationId: string;
+  locationLabel: string;
+  locationAvailable: number;
+  lotId: string;
+  inventoryUnitId: string;
+};
+
 type ViewKey =
   | "home"
   | "purchase-orders"
   | "expected-receipts"
   | "vendor-returns"
   | "sales-orders"
+  | "counter-sales"
   | "fulfillment"
   | "customer-returns"
   | "stock"
@@ -429,6 +450,7 @@ type LookupOption = {
   contactName?: string; deliveryInstructions?: string;
   currency?: string; paymentTerms?: string;
   creditHold?: boolean; creditLimitCents?: number;
+  availableQuantity?: number; trackingPolicy?: string; inventoryPolicy?: string;
 };
 
 type CommandKind =
@@ -606,6 +628,7 @@ const navGroups: Array<{ label?: string; items: Array<{ key: ViewKey; label: str
   {
     label: "Sales",
     items: [
+      { key: "counter-sales", label: "Counter sale", glyph: "$" },
       { key: "sales-orders", label: "Sales orders", glyph: "SO" },
       { key: "fulfillment", label: "Ready to fulfill", glyph: "✓" },
       { key: "customer-returns", label: "Customer returns", glyph: "↙" },
@@ -648,6 +671,7 @@ const viewTitles: Record<ViewKey, { title: string; description?: string }> = {
   "expected-receipts": { title: "Expected receipts" },
   "vendor-returns": { title: "Vendor returns" },
   "sales-orders": { title: "Sales orders" },
+  "counter-sales": { title: "Counter sale", description: "Sell available stock and post the invoice in one step." },
   fulfillment: { title: "Ready to fulfill" },
   "customer-returns": { title: "Customer returns" },
   stock: { title: "Inventory" },
@@ -1348,6 +1372,12 @@ export function InventoryApp() {
                 )
               )}
               {view === "vendor-returns" && <VendorReturnsView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onReturn={(po) => setActiveCommand({ kind: "vendor-return", entityId: po.id, entityNumber: po.number })} />}
+              {view === "counter-sales" && <CounterSaleScreen
+                warehouseId={warehouseId}
+                taxDefaultRateBps={snapshot.configuration.taxDefaultRateBps}
+                canPost={snapshot.viewer.permissions.canOperate && snapshot.viewer.permissions.canPostFinancial}
+                onComplete={(message) => { setToast(message); navigate("customer-invoices", undefined, "billing-actions"); }}
+              />}
               {view === "sales-orders" && (
                 <OperationsWorkspace workspace="sales" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} onCreateOrder={() => setCreateOrder("salesOrder")}>
                 {selectedSo ? (
@@ -1382,7 +1412,7 @@ export function InventoryApp() {
                 setAppliedWorklistQuery(movement.relatedOrderNumber);
                 if (purchase) setSelectedPoId(movement.relatedOrderId); else setSelectedSoId(movement.relatedOrderId);
               }} />}
-              {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><CountsView canOperate={snapshot.viewer.permissions.canOperate} balances={snapshot.countBalances} onCount={(balance) => setActiveCommand({ kind: "count", entityId: balance.productId, entityNumber: `COUNT · ${balance.sku}`, locationId: balance.locationId, locationLabel: `${balance.warehouseName} / ${balance.locationCode}`, recordedQuantity: balance.recordedQuantity, balanceVersion: balance.version })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} /></OperationsWorkspace>}
+              {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InventoryCountSessions warehouseId={warehouseId} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} canAdminister={snapshot.viewer.permissions.canAdminister} onDurableRefresh={loadSnapshot} /></OperationsWorkspace>}
               {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} /></OperationsWorkspace>}
               {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} /></OperationsWorkspace>}
               {view === "partners" && <PartnersView partners={snapshot.partners} selectedId={selectedPartnerId} canApprove={snapshot.viewer.permissions.canApprove} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPartnerId} onEdit={setEditingPartner} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
@@ -1708,7 +1738,7 @@ const worklistColumnLabels: Partial<Record<ViewKey, Record<string, string>>> = {
   "sales-orders": { exception: "Exception", number: "SO", customer: "Customer", requested: "Requested", availability: "Availability", fulfillment: "Fulfillment", billing: "Invoice", total: "Total" },
   fulfillment: { exception: "Exception", number: "SO", customer: "Customer", requested: "Requested", availability: "Availability", fulfillment: "Fulfillment", billing: "Invoice", total: "Total" },
   stock: { product: "Product", location: "Warehouse location", onHand: "On hand", usable: "Usable", reserved: "Reserved", available: "Available", incoming: "Incoming", demand: "Demand", projected: "Projected", exception: "Exception" },
-  products: { product: "Product", configuration: "Configuration", policy: "Policy", units: "Units", standardCost: "Standard cost", sellingPrice: "Selling price", margin: "Margin", reorderPoint: "Reorder point", maxStockLevel: "Reorder up to" },
+  products: { product: "Product", configuration: "Configuration", policy: "Policy", units: "Units", standardCost: "Standard cost", lastUnitCost: "Last PO cost", sellingPrice: "Selling price", pricingMode: "Pricing", margin: "Margin", reorderPoint: "Reorder point", maxStockLevel: "Reorder up to" },
   movements: { posted: "Date and time", movement: "Movement", document: "Source document", order: "Order", product: "Product", quantity: "Quantity", from: "From", to: "To", actor: "Posted by" },
   counts: { product: "Product", location: "Warehouse location", recorded: "Book quantity", reserved: "Reserved", available: "Available" },
   partners: { partner: "Partner", type: "Type", contact: "Contact", address: "Address", terms: "Terms", credit: "Credit control" },
@@ -1915,9 +1945,10 @@ function InventoryView({ snapshot, onOpen, warehouseId, sort, setSort }: { snaps
 function CatalogView({ products, onOpen, sort, setSort }: { products: Product[]; onOpen: (id: string) => void } & WorklistSortProps) {
   return <section className="panel worklist"><div className="responsive-table"><table>
     <caption className="sr-only">Product catalog</caption>
-    <thead><tr><SortableHeader label="Product" column="product" sort={sort} setSort={setSort} /><SortableHeader label="Configuration" column="configuration" sort={sort} setSort={setSort} /><SortableHeader label="Policy" column="policy" sort={sort} setSort={setSort} /><SortableHeader label="Units · base / buy / sell" column="units" sort={sort} setSort={setSort} /><SortableHeader label="Standard cost" column="standardCost" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Selling price" column="sellingPrice" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Margin" column="margin" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reorder point" column="reorderPoint" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reorder up to" column="maxStockLevel" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /></tr></thead>
+    <thead><tr><SortableHeader label="Product" column="product" sort={sort} setSort={setSort} /><SortableHeader label="Configuration" column="configuration" sort={sort} setSort={setSort} /><SortableHeader label="Policy" column="policy" sort={sort} setSort={setSort} /><SortableHeader label="Units · base / buy / sell" column="units" sort={sort} setSort={setSort} /><SortableHeader label="Standard cost" column="standardCost" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Last PO cost" column="lastUnitCost" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Selling price" column="sellingPrice" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Pricing" column="pricingMode" sort={sort} setSort={setSort} /><SortableHeader label="Margin" column="margin" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reorder point" column="reorderPoint" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reorder up to" column="maxStockLevel" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /></tr></thead>
     <tbody>{products.map((product) => {
-      const margin = product.sellingPrice > 0 ? (product.sellingPrice - product.standardCost) / product.sellingPrice * 100 : 0;
+      const costBasis = product.lastUnitCost ?? product.standardCost;
+      const margin = product.sellingPrice > 0 ? (product.sellingPrice - costBasis) / product.sellingPrice * 100 : 0;
       return <tr key={product.id}>
         <td><button className="table-link" onClick={() => onOpen(product.id)}>{product.name}</button><small>{product.sku}</small></td>
         <td>{product.specification}</td>
@@ -1928,18 +1959,21 @@ function CatalogView({ products, onOpen, sort, setSort }: { products: Product[];
           ? product.baseUomCode
           : `${product.baseUomCode} / ${product.purchaseUomCode} / ${product.salesUomCode}`}</td>
         <td className="numeric">{exact.format(product.standardCost)}</td>
+        <td className="numeric">{product.lastUnitCost == null ? <span className="muted">—</span> : <>{exact.format(product.lastUnitCost)}<small>{product.lastUnitCostSourcePoNumber ?? "Approved PO"}</small></>}</td>
         <td className="numeric">{exact.format(product.sellingPrice)}</td>
+        <td><StatusBadge tone={product.pricingMode === "automatic" ? "success" : "info"}>{titleCase(product.pricingMode)}</StatusBadge><small>{product.pricingMode === "automatic" ? product.appliedMarginRuleCode ?? "Default margin" : `Suggested ${exact.format(product.suggestedSellingPrice)}`}</small></td>
         {/* A SKU priced at or below its own cost is a pricing error worth seeing in the list. */}
         <td className={`numeric strong ${margin <= 0 ? "text-danger" : ""}`}>{product.sellingPrice > 0 ? `${margin.toFixed(1)}%` : "—"}</td>
         <td className="numeric">{product.reorderPoint}</td>
         <td className="numeric">{product.maxStockLevel}</td>
       </tr>;
-    })}{!products.length ? <tr><td colSpan={9}><div className="empty-inline">No products match this view.</div></td></tr> : null}</tbody>
+    })}{!products.length ? <tr><td colSpan={11}><div className="empty-inline">No products match this view.</div></td></tr> : null}</tbody>
   </table></div></section>;
 }
 
 function ProductDetail({ product, movements, onBack, backLabel, onEdit }: { product: Product; movements: Movement[]; onBack: () => void; backLabel: string; onEdit?: () => void }) {
-  const margin = product.sellingPrice > 0 ? `${(((product.sellingPrice - product.standardCost) / product.sellingPrice) * 100).toFixed(1)}%` : "—";
+  const costBasis = product.lastUnitCost ?? product.standardCost;
+  const margin = product.sellingPrice > 0 ? `${(((product.sellingPrice - costBasis) / product.sellingPrice) * 100).toFixed(1)}%` : "—";
   const [movementPage, setMovementPage] = useState(1);
   const [movementTotal, setMovementTotal] = useState(0);
   const [productMovements, setProductMovements] = useState<Movement[]>(movements.filter((movement) => movement.product === product.sku));
@@ -1977,8 +2011,13 @@ function ProductDetail({ product, movements, onBack, backLabel, onEdit }: { prod
     <div className="detail-columns">
       <DocumentFacts title="Commercial" facts={[
         ["Standard cost", exact.format(product.standardCost)],
+        ["Last approved PO cost", product.lastUnitCost == null ? "No approved PO cost" : exact.format(product.lastUnitCost)],
+        ["Last cost source", product.lastUnitCostSourcePoNumber ? [product.lastUnitCostSourcePoNumber, product.lastUnitCostVendorName, product.lastUnitCostAt ? formatDocumentDate(product.lastUnitCostAt) : ""].filter(Boolean).join(" · ") : "Standard cost fallback"],
         ["Selling price", exact.format(product.sellingPrice)],
-        ["Margin", margin],
+        ["Suggested price", exact.format(product.suggestedSellingPrice)],
+        ["Pricing", `${titleCase(product.pricingMode)}${product.appliedMarginRuleCode ? ` · ${product.appliedMarginRuleCode}` : ""}`],
+        ["Gross margin on cost basis", margin],
+        ...(product.manualPriceReason ? [["Manual override reason", product.manualPriceReason] as [string, string]] : []),
         ["Reorder point", `${product.reorderPoint} ${product.baseUomCode}`],
         ["Reorder up to", `${product.maxStockLevel} ${product.baseUomCode}`],
       ]} />
@@ -2005,6 +2044,7 @@ function EditProductDialog({ product, onClose, onSaved }: { product: Product; on
     category: product.category, material: product.material, dimensions: product.dimensions, finish: product.finish,
     trackingPolicy: product.trackingPolicy, inventoryPolicy: product.inventoryPolicy,
     reorderPoint: product.reorderPoint, maxStockLevel: product.maxStockLevel, standardCost: product.standardCost, sellingPrice: product.sellingPrice,
+    pricingMode: product.pricingMode, manualPriceReason: product.manualPriceReason ?? "",
   });
   const [busy, setBusy] = useState(false);
   useDialogDismiss(onClose, busy);
@@ -2023,6 +2063,7 @@ function EditProductDialog({ product, onClose, onSaved }: { product: Product; on
           category: form.category.trim(), material: form.material.trim(), dimensions: form.dimensions.trim(), finish: form.finish.trim(),
           trackingPolicy: form.trackingPolicy, inventoryPolicy: form.inventoryPolicy, reorderPoint: form.reorderPoint, maxStockLevel: form.maxStockLevel,
           standardCostCents: Math.round(form.standardCost * 100), sellingPriceCents: Math.round(form.sellingPrice * 100),
+          pricingMode: form.pricingMode, manualPriceReason: form.pricingMode === "manual" ? form.manualPriceReason.trim() || "Manual catalog price" : "",
           baseUomId: product.baseUomId, purchaseUomId: product.purchaseUomId, salesUomId: product.salesUomId },
       }) });
       const result = await response.json() as { error?: string | { message?: string } };
@@ -2048,7 +2089,9 @@ function EditProductDialog({ product, onClose, onSaved }: { product: Product; on
         <label><span>Reorder point ({product.baseUomCode})</span><input type="number" min="0" step="0.001" value={form.reorderPoint} onChange={(event) => set({ reorderPoint: Number(event.target.value) })} /></label>
         <label><span>Reorder up to ({product.baseUomCode})</span><input type="number" min={form.reorderPoint} step="0.001" value={form.maxStockLevel} onChange={(event) => set({ maxStockLevel: Number(event.target.value) })} /></label>
         <label><span>Standard cost</span><input type="number" min="0" step="0.01" value={form.standardCost} onChange={(event) => set({ standardCost: Number(event.target.value) })} /></label>
-        <label><span>Selling price</span><input type="number" min="0" step="0.01" value={form.sellingPrice} onChange={(event) => set({ sellingPrice: Number(event.target.value) })} /></label>
+        <label><span>Pricing mode</span><select value={form.pricingMode} onChange={(event) => set({ pricingMode: event.target.value as "automatic" | "manual" })}><option value="automatic">Automatic from margin matrix</option><option value="manual">Manual override</option></select></label>
+        <label><span>Selling price</span><input type="number" min="0" step="0.01" value={form.sellingPrice} onChange={(event) => set({ sellingPrice: Number(event.target.value) })} disabled={form.pricingMode === "automatic"} /><small>{form.pricingMode === "automatic" ? `Will use the current suggestion (${exact.format(product.suggestedSellingPrice)}).` : `Current matrix suggestion: ${exact.format(product.suggestedSellingPrice)}.`}</small></label>
+        {form.pricingMode === "manual" ? <label className="full"><span>Override reason</span><input value={form.manualPriceReason} onChange={(event) => set({ manualPriceReason: event.target.value })} placeholder="Why this product does not follow the matrix" required /></label> : null}
       </div>
       {/* Units are fixed once a product has movement history, so they are shown rather than edited here. */}
       <p className="read-only-label">Units of measure ({product.baseUomCode} base · {product.purchaseUomCode} purchasing · {product.salesUomCode} sales) are managed from master data.</p>
@@ -2577,10 +2620,14 @@ function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locat
     uomCode: text(item.selectedUomCode) || undefined,
     priceSource: text(item.priceSource) || undefined,
     factorToBase: number(item.factorToBase, 1),
+    availableQuantity: number(item.availableQuantity),
+    trackingPolicy: text(item.trackingPolicy, "quantity"),
+    inventoryPolicy: text(item.inventoryPolicy, "stocked"),
   } : kind === "locations" ? {
     id: text(item.id),
     label: `${text(item.warehouseCode)} · ${text(item.code)} · ${text(item.name)}`,
-    detail: `${text(item.warehouseName)} · ${titleCase(text(item.inventoryStatus))}`,
+    detail: [text(item.warehouseName), titleCase(text(item.inventoryStatus)), productId ? `${number(item.availableQuantity)} available` : ""].filter(Boolean).join(" · "),
+    availableQuantity: number(item.availableQuantity),
   } : kind === "inventoryLots" ? {
     id: text(item.id),
     label: text(item.lotNumber),
@@ -2624,6 +2671,198 @@ function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locat
     mapItem={mapItem}
     onSelect={(option) => onSelect(option as LookupOption)}
   />;
+}
+
+/**
+ * The fast path for stock handed over at the counter. It presents one sale to the operator while
+ * the server still records the confirmed order, shipment, invoice, and (when chosen) payment that
+ * the rest of the product needs for returns, traceability, receivables, and audit history.
+ */
+function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete }: {
+  warehouseId: string;
+  taxDefaultRateBps: number;
+  canPost: boolean;
+  onComplete: (message: string) => void;
+}) {
+  const newLine = (): CounterSaleLine => ({
+    id: crypto.randomUUID(), productId: "", quantity: 1, unitAmount: 0, uomId: "", uomCode: "",
+    priceSource: "Select a product", discountRate: 0, taxCode: taxDefaultRateBps > 0 ? "GST" : "EXEMPT",
+    taxRate: taxDefaultRateBps / 100, route: "stock", projectReference: "", sourceSalesOrderLineId: "",
+    linkedPurchaseOrderLineId: "", factorToBase: 1, trackingPolicy: "quantity", availableQuantity: 0,
+    locationId: "", locationLabel: "", locationAvailable: 0, lotId: "", inventoryUnitId: "",
+  });
+  const [customerId, setCustomerId] = useState("");
+  const [customer, setCustomer] = useState<LookupOption | null>(null);
+  const [lines, setLines] = useState<CounterSaleLine[]>(() => [newLine()]);
+  const [postingDate, setPostingDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [currency, setCurrency] = useState("CAD");
+  const [exchangeRate, setExchangeRate] = useState(1);
+  const [settlement, setSettlement] = useState<"pay_now" | "on_account">("pay_now");
+  const [paymentTerms, setPaymentTerms] = useState("Due on receipt");
+  const [dueDate, setDueDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [paymentMethod, setPaymentMethod] = useState("cash");
+  const [paymentReference, setPaymentReference] = useState("");
+  const [projectReference, setProjectReference] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const attemptKey = useRef("");
+
+  const updateLine = (id: string, patch: Partial<CounterSaleLine>) => setLines((current) => current.map((line) => line.id === id ? { ...line, ...patch } : line));
+  const lineAmounts = lines.map((line) => {
+    const gross = Math.round(line.quantity * line.unitAmount * 100);
+    const discount = Math.round(gross * Math.min(Math.max(line.discountRate, 0), 100) / 100);
+    const subtotal = gross - discount;
+    const tax = Math.round(subtotal * Math.max(line.taxRate, 0) / 100);
+    return { gross, discount, subtotal, tax, total: subtotal + tax };
+  });
+  const itemGross = lineAmounts.reduce((sum, amount) => sum + amount.gross, 0);
+  const discountTotal = lineAmounts.reduce((sum, amount) => sum + amount.discount, 0);
+  const subtotal = lineAmounts.reduce((sum, amount) => sum + amount.subtotal, 0);
+  const taxTotal = lineAmounts.reduce((sum, amount) => sum + amount.tax, 0);
+  const total = subtotal + taxTotal;
+  const lineReady = (line: CounterSaleLine) => Boolean(line.productId && line.locationId && line.quantity > 0 && line.unitAmount > 0
+    && (line.trackingPolicy !== "lot" || line.lotId) && (line.trackingPolicy !== "serial" || line.inventoryUnitId));
+  const overAvailable = lines.some((line) => line.locationId && line.quantity * line.factorToBase > line.locationAvailable);
+  const ready = Boolean(customerId && lines.length && lines.every(lineReady) && !overAvailable && total > 0
+    && (currency === "CAD" || exchangeRate > 0) && (settlement !== "pay_now" || paymentReference.trim()));
+
+  const chooseCustomer = (option: LookupOption) => {
+    setCustomerId(option.id);
+    setCustomer(option);
+    const nextCurrency = option.currency || "CAD";
+    const terms = option.paymentTerms || "Due on receipt";
+    setCurrency(nextCurrency);
+    setExchangeRate(nextCurrency === "CAD" ? 1 : 0);
+    setPaymentTerms(terms);
+    setDueDate(dueDateForTerms(postingDate, settlement === "pay_now" ? "Due on receipt" : terms));
+    if (lines.some((line) => line.productId)) {
+      setLines([newLine()]);
+      setError("Product lines were cleared so customer-specific pricing can be applied.");
+    } else setError("");
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!ready || saving) return;
+    setSaving(true);
+    setError("");
+    if (!attemptKey.current) attemptKey.current = crypto.randomUUID();
+    const idempotencyKey = attemptKey.current;
+    try {
+      const response = await fetch("/api/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+        body: JSON.stringify({
+          command: "postCounterSale",
+          entityId: `counter-sale-${idempotencyKey}`,
+          idempotencyKey,
+          version: 1,
+          payload: {
+            customerId, postingDate, settlement, currency, exchangeRateToBase: exchangeRate,
+            paymentTerms: settlement === "pay_now" ? "Due on receipt" : paymentTerms,
+            dueDate: settlement === "pay_now" ? postingDate : dueDate,
+            paymentMethod, paymentReference, projectReference,
+            shipToName: customer?.label,
+            shipToAddressLine1: customer?.addressLine1,
+            shipToAddressLine2: customer?.addressLine2,
+            shipToCity: customer?.city,
+            shipToRegion: customer?.region,
+            shipToPostalCode: customer?.postalCode,
+            shipToCountry: customer?.country,
+            lines: lines.map((line, index) => ({
+              kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId || undefined,
+              unitPriceCents: Math.round(line.unitAmount * 100), discountCents: lineAmounts[index].discount,
+              taxable: line.taxRate > 0, taxCode: line.taxRate > 0 ? line.taxCode || "GST" : "EXEMPT",
+              taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: "stock", locationId: line.locationId,
+              lotId: line.lotId || undefined, inventoryUnitId: line.inventoryUnitId || undefined,
+            })),
+          },
+        }),
+      });
+      const result = await response.json() as { message?: string; error?: string | { message?: string } };
+      if (!response.ok) {
+        attemptKey.current = "";
+        throw new Error(typeof result.error === "string" ? result.error : result.error?.message || "The counter sale could not be completed.");
+      }
+      attemptKey.current = "";
+      onComplete(result.message || "Counter sale completed.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The counter sale could not be completed.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!canPost) return <section className="panel empty-state"><span className="empty-glyph" aria-hidden="true">$</span><h2>Counter-sale posting is restricted</h2><p>This action moves inventory and posts a receivable in one step. A manager or administrator with both inventory and financial posting access must complete it.</p></section>;
+
+  return <form className="counter-sale-workspace" onSubmit={submit}>
+    {error ? <div className="error-summary" role="alert"><strong>Counter sale not completed</strong><p>{error}</p></div> : null}
+    <section className="panel counter-sale-customer" aria-labelledby="counter-customer-heading">
+      <div className="panel-heading"><div><span className="section-kicker">1 · Customer</span><h2 id="counter-customer-heading">Who is buying?</h2></div><StatusBadge tone={customerId ? "success" : "neutral"}>{customerId ? "Selected" : "Required"}</StatusBadge></div>
+      <div className="command-form form-grid composer-header-fields">
+        <label className="project-field">Customer<ReferenceSearchSelect kind="partners" role="customer" value={customerId} initialOptions={[]} quickCreate="customer" onSelect={chooseCustomer} placeholder="Search customer name, code, or email" /></label>
+        <label>Sale date<input type="date" value={postingDate} onChange={(event) => { const next = event.target.value; setPostingDate(next); setDueDate(dueDateForTerms(next, settlement === "pay_now" ? "Due on receipt" : paymentTerms)); }} required /></label>
+        <label>Customer / job reference<input value={projectReference} onChange={(event) => setProjectReference(event.target.value)} placeholder="Optional" /></label>
+        <label>Currency<select value={currency} onChange={(event) => { const next = event.target.value; setCurrency(next); setExchangeRate(next === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>
+        {currency !== "CAD" ? <label>Exchange rate to CAD<input type="number" min="0.0001" step="0.0001" value={exchangeRate || ""} onChange={(event) => setExchangeRate(Number(event.target.value))} required /></label> : null}
+      </div>
+      {customer?.creditHold ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Customer is on credit hold.</strong><p>{settlement === "pay_now" ? "Payment now is still available; charging the account is blocked." : "Switch to payment now or clear the credit hold."}</p></div></div> : null}
+    </section>
+
+    <section className="panel commercial-composer" aria-labelledby="counter-lines-heading">
+      <div className="composer-section-heading"><div><span className="section-kicker">2 · Items</span><strong id="counter-lines-heading">Stock leaving with the customer</strong><small>Only usable, unreserved stock can be sold here. Special-order and drop-ship products still use a sales order.</small></div><button type="button" className="button secondary" disabled={!customerId} onClick={() => setLines((current) => [...current, newLine()])}>Add product line</button></div>
+      {!customerId ? <div className="empty-inline">Select the customer first so the product picker can apply the correct price list and currency.</div> : null}
+      {customerId ? <div className="counter-sale-lines">{lines.map((line, index) => {
+        const baseQuantity = line.quantity * line.factorToBase;
+        const short = Boolean(line.locationId && baseQuantity > line.locationAvailable);
+        return <fieldset key={line.id} className="counter-sale-line">
+          <legend>Line {index + 1}</legend>
+          <label className="product-field">Product<ReferenceSearchSelect kind="products" role="customer" partnerId={customerId} quantity={line.quantity} warehouseId={warehouseId} currency={currency} exchangeRateToBase={exchangeRate || undefined} value={line.productId} initialOptions={[]} quickCreate="product" onSelect={(option) => {
+            if (option.inventoryPolicy && option.inventoryPolicy !== "stocked") {
+              setError("That product is not stocked. Use a sales order for special-order or drop-ship demand.");
+              return;
+            }
+            const serial = option.trackingPolicy === "serial";
+            updateLine(line.id, { productId: option.id, quantity: serial ? 1 : line.quantity, unitAmount: option.unitAmount ?? 0,
+              uomId: option.uomId ?? "", uomCode: option.uomCode ?? "", priceSource: option.priceSource ?? "Catalog price",
+              factorToBase: option.factorToBase ?? 1, trackingPolicy: option.trackingPolicy ?? "quantity", availableQuantity: option.availableQuantity ?? 0,
+              locationId: "", locationLabel: "", locationAvailable: 0, lotId: "", inventoryUnitId: "" });
+            setError("");
+          }} placeholder="Search SKU, name, manufacturer code, or dimensions" /><small>{line.productId ? `${line.availableQuantity} available in scope · ${line.priceSource}` : "Price and availability appear with each result."}</small></label>
+          <label>Quantity<input type="number" min="0.001" step="0.001" value={line.quantity} disabled={line.trackingPolicy === "serial"} onChange={(event) => updateLine(line.id, { quantity: Number(event.target.value), locationId: "", locationLabel: "", locationAvailable: 0, lotId: "", inventoryUnitId: "" })} required /></label>
+          <label>UOM<input value={line.uomCode || "Base"} readOnly /></label>
+          <label>Unit price<input type="number" min="0.01" step="0.01" value={line.unitAmount || ""} onChange={(event) => updateLine(line.id, { unitAmount: Number(event.target.value) })} required /></label>
+          <label>Discount %<input type="number" min="0" max="100" step="0.01" value={line.discountRate} onChange={(event) => updateLine(line.id, { discountRate: Number(event.target.value) })} /></label>
+          <label>Tax %<input type="number" min="0" max="100" step="0.01" value={line.taxRate} onChange={(event) => updateLine(line.id, { taxRate: Number(event.target.value), taxCode: Number(event.target.value) > 0 ? "GST" : "EXEMPT" })} /></label>
+          <label className="location-field">Source location<ReferenceSearchSelect kind="locations" role="usable" productId={line.productId} quantity={baseQuantity} warehouseId={warehouseId} value={line.locationId} initialOptions={[]} onSelect={(option) => updateLine(line.id, { locationId: option.id, locationLabel: option.label, locationAvailable: option.availableQuantity ?? 0, lotId: "", inventoryUnitId: "" })} placeholder={line.productId ? "Search locations with free stock" : "Select a product first"} /><small className={short ? "text-danger" : undefined}>{line.locationId ? `${line.locationAvailable} base units free${short ? " — not enough" : ""}` : "Required for immediate handover."}</small></label>
+          {line.trackingPolicy === "lot" ? <label className="identity-field">Lot<ReferenceSearchSelect kind="inventoryLots" productId={line.productId} locationId={line.locationId} value={line.lotId} initialOptions={[]} onSelect={(option) => updateLine(line.id, { lotId: option.id })} placeholder={line.locationId ? "Search lots at this location" : "Select a location first"} /></label> : null}
+          {line.trackingPolicy === "serial" ? <label className="identity-field">Serial number<ReferenceSearchSelect kind="inventoryUnits" productId={line.productId} locationId={line.locationId} value={line.inventoryUnitId} initialOptions={[]} onSelect={(option) => updateLine(line.id, { inventoryUnitId: option.id })} placeholder={line.locationId ? "Search serials at this location" : "Select a location first"} /></label> : null}
+          <div className="counter-line-total"><span>Line total</span><strong>{formatDocumentMoney(lineAmounts[index].total / 100, currency, true)}</strong></div>
+          {lines.length > 1 ? <button type="button" className="remove-composer-line" onClick={() => setLines((current) => current.filter((item) => item.id !== line.id))}>Remove line {index + 1}</button> : null}
+        </fieldset>;
+      })}</div> : null}
+    </section>
+
+    <div className="counter-sale-finish">
+      <section className="panel counter-sale-settlement" aria-labelledby="counter-payment-heading">
+        <div className="panel-heading"><div><span className="section-kicker">3 · Settlement</span><h2 id="counter-payment-heading">How is this sale being paid?</h2></div></div>
+        <div className="segmented-control" role="group" aria-label="Settlement method"><button type="button" className={settlement === "pay_now" ? "active" : ""} onClick={() => { setSettlement("pay_now"); setDueDate(postingDate); }}>Pay now</button><button type="button" className={settlement === "on_account" ? "active" : ""} onClick={() => { setSettlement("on_account"); setDueDate(dueDateForTerms(postingDate, paymentTerms)); }}>Charge account</button></div>
+        {settlement === "pay_now" ? <div className="command-form form-grid counter-payment-fields"><label>Payment method<select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}><option value="cash">Cash</option><option value="credit_card">Credit card</option><option value="debit_card">Debit card</option><option value="bank_transfer">Bank transfer</option><option value="cheque">Cheque</option></select></label><label>Receipt / payment reference<input value={paymentReference} onChange={(event) => setPaymentReference(event.target.value)} placeholder="Till receipt, terminal, or cheque no." required /></label></div> : <div className="command-form form-grid counter-payment-fields"><label>Payment terms<select value={paymentTerms} onChange={(event) => { const next = event.target.value; setPaymentTerms(next); setDueDate(dueDateForTerms(postingDate, next)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label>Due date<input type="date" min={postingDate} value={dueDate} onChange={(event) => setDueDate(event.target.value)} required /></label></div>}
+        <ImpactPreview lines={[
+          { category: "Physical", label: "Usable on-hand", after: `−${lines.reduce((sum, line) => sum + line.quantity * line.factorToBase, 0)} base units`, tone: "warning" },
+          { category: "Commercial", label: "Internal records", after: "Confirmed order + posted pickup shipment" },
+          { category: "Financial", label: settlement === "pay_now" ? "Invoice and payment" : "Accounts receivable", after: settlement === "pay_now" ? "Posted and fully paid" : `Due ${formatDate(dueDate)}`, tone: settlement === "pay_now" ? "success" : "info" },
+        ]} />
+      </section>
+      <aside className="panel counter-sale-summary" aria-label="Counter sale total">
+        <span className="section-kicker">Sale summary</span>
+        <dl className="composer-totals"><div><dt>Items</dt><dd>{formatDocumentMoney(itemGross / 100, currency, true)}</dd></div><div><dt>Discounts</dt><dd>−{formatDocumentMoney(discountTotal / 100, currency, true)}</dd></div><div><dt>Subtotal</dt><dd>{formatDocumentMoney(subtotal / 100, currency, true)}</dd></div><div><dt>Tax</dt><dd>{formatDocumentMoney(taxTotal / 100, currency, true)}</dd></div><div className="total"><dt>{settlement === "pay_now" ? "Amount to collect" : "Invoice total"}</dt><dd>{formatDocumentMoney(total / 100, currency, true)}</dd></div></dl>
+        {overAvailable ? <p className="text-danger">A line exceeds the free stock at its selected location.</p> : null}
+        <button className="button primary counter-sale-submit" disabled={!ready || saving}>{saving ? "Completing sale…" : settlement === "pay_now" ? `Collect ${formatDocumentMoney(total / 100, currency, true)} & complete` : "Post to customer account"}</button>
+        <small>One click posts the hidden sales order, pickup shipment, invoice, and {settlement === "pay_now" ? "payment" : "receivable"} together.</small>
+      </aside>
+    </div>
+  </form>;
 }
 
 type ComposerDraftLine = {
@@ -2693,10 +2932,10 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
     id: product.id,
     label: `${product.sku} · ${product.name}`,
     detail: product.specification,
-    unitAmount: isPurchase ? product.standardCost : product.sellingPrice,
+    unitAmount: isPurchase ? product.lastUnitCost ?? product.standardCost : product.sellingPrice,
     uomId: isPurchase ? product.purchaseUomId : product.salesUomId,
     uomCode: isPurchase ? product.purchaseUomCode : product.salesUomCode,
-    priceSource: isPurchase ? "Catalog standard cost" : "Catalog selling price",
+    priceSource: isPurchase ? product.lastUnitCost != null ? `Last approved PO cost${product.lastUnitCostSourcePoNumber ? ` · ${product.lastUnitCostSourcePoNumber}` : ""}` : "Catalog standard cost fallback" : "Catalog selling price",
   }));
   draft?.lines.forEach((line) => { if (!initialProductOptions.some((option) => option.id === line.productId)) initialProductOptions.push({ id: line.productId, label: line.label, detail: line.projectReference || "Current draft line" }); });
   // Lines start empty: pre-filling an arbitrary catalog product is how the wrong SKU
@@ -3211,7 +3450,15 @@ function normalizeSnapshot(input: unknown): Snapshot {
       maxStockLevel: number(item.maxStockLevel, number(item.reorderPoint)),
       inventoryPolicy: text(item.inventoryPolicy, "stocked"),
       standardCost: number(item.standardCostCents) / 100,
+      lastUnitCost: item.lastUnitCostCents == null ? undefined : number(item.lastUnitCostCents) / 100,
+      lastUnitCostSourcePoNumber: text(item.lastUnitCostSourcePoNumber) || undefined,
+      lastUnitCostVendorName: text(item.lastUnitCostVendorName) || undefined,
+      lastUnitCostAt: text(item.lastUnitCostAt) || undefined,
       sellingPrice: number(item.sellingPriceCents) / 100,
+      suggestedSellingPrice: number(item.suggestedSellingPriceCents, number(item.sellingPriceCents)) / 100,
+      pricingMode: text(item.pricingMode, "manual") === "automatic" ? "automatic" : "manual",
+      appliedMarginRuleCode: text(item.appliedMarginRuleCode) || undefined,
+      manualPriceReason: text(item.manualPriceReason) || undefined,
       baseUomId: text(item.baseUomId),
       baseUomCode: text(item.baseUomCode, "EA"),
       purchaseUomId: text(item.purchaseUomId),

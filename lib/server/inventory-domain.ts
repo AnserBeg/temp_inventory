@@ -3,6 +3,7 @@ import { assertPeriodOpen } from "./policy";
 import type { AppCapability } from "./auth";
 import { normalizeProductQuantity, ProductQuantityError, validateBaseProductQuantity } from "./product-quantities";
 import { effectivePricesForProducts } from "./pricing";
+import { prepareOrderDraft, RecordValidationError, type CreateOrderLine, type NormalizedItem } from "./inventory-records";
 
 type CommandPayload = Record<string, unknown>;
 
@@ -24,6 +25,10 @@ export type CommandResult = {
   shipmentNumber?: string;
   invoiceId?: string;
   invoiceNumber?: string;
+  salesOrderId?: string;
+  salesOrderNumber?: string;
+  paymentId?: string;
+  paymentNumber?: string;
   impact: {
     physical: string;
     commercial: string;
@@ -549,6 +554,8 @@ export const inventoryCommandCapabilities = {
   immediateSale: "financialWrite",
   shipAndInvoice: "financialWrite",
   postImmediateSale: "financialWrite",
+  counterSale: "financialWrite",
+  postCounterSale: "financialWrite",
   reverseShipment: "operationalWrite",
   customerReturn: "operationalWrite",
   postCustomerReturn: "operationalWrite",
@@ -1493,6 +1500,294 @@ async function shipSale(input: InventoryCommand): Promise<CommandResult> {
   return requireLogged(input, "Reservation, inventory, or the sales order changed before shipment could be posted.");
 }
 
+type CounterSalePostingLine = NormalizedItem & {
+  orderLineId: string;
+  shipmentLineId: string;
+  movementId: string;
+  locationId: string;
+  tracking: OutgoingTracking;
+  cogsCents: number;
+  cogsUnitCents: number;
+};
+
+/**
+ * A counter sale deliberately hides the internal document chain without bypassing it. The order,
+ * shipment, invoice, and optional full payment are all created behind one command claim and one
+ * D1 batch, so a till failure cannot leave stock shipped but not billed (or billed but not paid).
+ */
+async function postCounterSale(input: InventoryCommand): Promise<CommandResult> {
+  if (input.version !== 1) throw new DomainError("VERSION_CONFLICT", "A new counter sale must start at version 1.", 409, 1);
+  const payload = input.payload ?? {};
+  const rawLines = Array.isArray(payload.lines) ? payload.lines.filter((line): line is Record<string, unknown> => Boolean(line) && typeof line === "object") : [];
+  const rawItems = rawLines.filter((line) => line.kind !== "charge");
+  let draft: Awaited<ReturnType<typeof prepareOrderDraft>>;
+  try {
+    draft = await prepareOrderDraft({
+      type: "salesOrder",
+      idempotencyKey: input.idempotencyKey,
+      lines: rawLines as CreateOrderLine[],
+      projectReference: typeof payload.projectReference === "string" ? payload.projectReference : undefined,
+    });
+  } catch (error) {
+    if (error instanceof RecordValidationError) throw new DomainError(error.code, error.message, error.status);
+    throw error;
+  }
+  if (rawItems.length !== draft.items.length) throw new DomainError("VALIDATION_ERROR", "Every counter-sale item must be a valid product line.");
+  if (draft.totalCents <= 0) throw new DomainError("INVALID_DOCUMENT_TOTAL", "A counter sale total must be greater than zero.");
+  if (draft.items.some((line) => line.fulfillmentRoute !== "stock")) {
+    throw new DomainError("FULFILLMENT_ROUTE_BLOCKED", "Counter sales can contain only stock lines. Use a sales order for special-order or drop-ship products.", 409);
+  }
+
+  const customerId = requiredText(payload, "customerId");
+  const customer = await first<{
+    name: string; addressLine1: string | null; addressLine2: string | null; city: string | null; region: string | null;
+    postalCode: string | null; country: string | null; currency: string; paymentTerms: string | null;
+    creditLimitCents: number; creditHold: number; outstandingBaseCents: number;
+  }>(`SELECT bp.name,bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,
+      bp.postal_code AS postalCode,bp.country,bp.currency,bp.payment_terms AS paymentTerms,
+      bp.credit_limit_cents AS creditLimitCents,bp.credit_hold AS creditHold,
+      COALESCE((SELECT SUM(MAX(ci.base_total_cents-ROUND(ci.paid_cents*ci.exchange_rate_to_base)-
+        COALESCE((SELECT SUM(cc.base_amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0),0))
+        FROM customer_invoices ci WHERE ci.customer_id=bp.id AND ci.status<>'void'),0) AS outstandingBaseCents
+      FROM business_partners bp WHERE bp.id=? AND bp.partner_type IN ('customer','both') AND bp.active=1`, customerId);
+  if (!customer) throw new DomainError("INVALID_CUSTOMER", "Select an active customer for the counter sale.", 404);
+
+  const settlement = optionalText(payload, "settlement", "pay_now").toLowerCase();
+  if (!['pay_now', 'on_account'].includes(settlement)) throw new DomainError("VALIDATION_ERROR", "settlement must be pay_now or on_account.");
+  const payNow = settlement === "pay_now";
+  const postingDate = postingDateValue(payload);
+  const currency = optionalText(payload, "currency", customer.currency || "CAD").toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) throw new DomainError("VALIDATION_ERROR", "currency must be a three-letter ISO code.");
+  const exchangeRateToBase = payload.exchangeRateToBase == null ? 1 : Number(payload.exchangeRateToBase);
+  if (!Number.isFinite(exchangeRateToBase) || exchangeRateToBase <= 0) throw new DomainError("VALIDATION_ERROR", "exchangeRateToBase must be greater than zero.");
+  if (currency === "CAD" && exchangeRateToBase !== 1) throw new DomainError("EXCHANGE_RATE_MISMATCH", "CAD counter sales must use an exchange rate of 1.");
+  if (currency !== "CAD" && payload.exchangeRateToBase == null) throw new DomainError("EXCHANGE_RATE_REQUIRED", `Enter the ${currency}-to-CAD exchange rate.`);
+  const paymentTerms = payNow ? "Due on receipt" : optionalText(payload, "paymentTerms", customer.paymentTerms || "Due on receipt");
+  const dueDate = payNow ? postingDate : optionalText(payload, "dueDate", postingDate);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || Number.isNaN(new Date(`${dueDate}T00:00:00.000Z`).valueOf())) {
+    throw new DomainError("VALIDATION_ERROR", "dueDate must be a valid YYYY-MM-DD date.");
+  }
+  if (dueDate < postingDate) throw new DomainError("VALIDATION_ERROR", "dueDate cannot be before the sale date.");
+  const baseTotalCents = Math.round(draft.totalCents * exchangeRateToBase);
+  if (!payNow) {
+    if (Boolean(customer.creditHold)) throw new DomainError("CREDIT_HOLD", "This customer is on credit hold. Take payment now or remove the hold before charging the account.", 409);
+    if (customer.creditLimitCents > 0 && currency !== customer.currency) {
+      throw new DomainError("CREDIT_CURRENCY_MISMATCH", `This customer's credit limit is denominated in ${customer.currency}; use that currency to charge the account.`, 409);
+    }
+    const outstandingCreditCents = Math.round(customer.outstandingBaseCents / exchangeRateToBase);
+    if (customer.creditLimitCents > 0 && outstandingCreditCents + draft.totalCents > customer.creditLimitCents) {
+      const exceededBy = (outstandingCreditCents + draft.totalCents - customer.creditLimitCents) / 100;
+      throw new DomainError("CREDIT_LIMIT_EXCEEDED", `This counter sale would exceed the customer's credit limit by ${exceededBy.toFixed(2)} ${customer.currency}.`, 409);
+    }
+  }
+
+  const paymentMethod = payNow ? requiredText(payload, "paymentMethod").toLowerCase() : "";
+  const paymentReference = payNow ? requiredText(payload, "paymentReference") : "";
+  if (payNow && !/^[a-z0-9_-]{2,40}$/.test(paymentMethod)) throw new DomainError("VALIDATION_ERROR", "Select a recognizable payment method.");
+
+  const postingLines: CounterSalePostingLine[] = [];
+  const stockGroups = new Map<string, { productId: string; locationId: string; quantity: number }>();
+  const lotGroups = new Map<string, { productId: string; locationId: string; lotId: string; quantity: number }>();
+  const serialIds = new Set<string>();
+  for (const [index, item] of draft.items.entries()) {
+    const source = rawItems[index];
+    const locationId = requiredText(source, "locationId");
+    await requireActiveLocation(locationId, ["usable"], `Counter-sale line ${index + 1}`);
+    const tracking = await outgoingTracking(item.productId, locationId, item.quantity, source);
+    if (tracking.unitId) {
+      if (serialIds.has(tracking.unitId)) throw new DomainError("DUPLICATE_SERIAL", "The same serial number cannot appear twice on a counter sale.", 409);
+      serialIds.add(tracking.unitId);
+    }
+    const stockKey = `${item.productId}\u0000${locationId}`;
+    const stock = stockGroups.get(stockKey) ?? { productId: item.productId, locationId, quantity: 0 };
+    stock.quantity = roundQuantity(stock.quantity + item.quantity);
+    stockGroups.set(stockKey, stock);
+    if (tracking.policy === "lot" && tracking.lotId) {
+      const lotKey = `${item.productId}\u0000${locationId}\u0000${tracking.lotId}`;
+      const lot = lotGroups.get(lotKey) ?? { productId: item.productId, locationId, lotId: tracking.lotId, quantity: 0 };
+      lot.quantity = roundQuantity(lot.quantity + item.quantity);
+      lotGroups.set(lotKey, lot);
+    }
+    postingLines.push({ ...item, orderLineId: newId("so-line"), shipmentLineId: newId("shipment-line"), movementId: newId("movement"), locationId, tracking, cogsCents: 0, cogsUnitCents: 0 });
+  }
+
+  for (const stock of stockGroups.values()) {
+    const balance = await first<{ available: number }>(`SELECT ib.on_hand_qty-ib.reserved_qty AS available
+      FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id
+      WHERE ib.product_id=? AND ib.location_id=? AND l.active=1 AND l.inventory_status='usable'`, stock.productId, stock.locationId);
+    if (!balance || Number(balance.available) < stock.quantity) throw new DomainError("INSUFFICIENT_AVAILABILITY", "There is not enough usable, unreserved stock at one of the selected locations.", 409);
+  }
+  for (const lot of lotGroups.values()) {
+    const identified = await first<{ quantity: number }>(`SELECT COALESCE(SUM(CASE WHEN sm.to_location_id=? THEN ma.quantity WHEN sm.from_location_id=? THEN -ma.quantity ELSE 0 END),0) AS quantity
+      FROM movement_assignments ma JOIN stock_movements sm ON sm.id=ma.movement_id WHERE sm.product_id=? AND ma.lot_id=?`, lot.locationId, lot.locationId, lot.productId, lot.lotId);
+    if (Number(identified?.quantity ?? 0) < lot.quantity) throw new DomainError("LOT_QUANTITY_SHORTAGE", "A selected lot does not have enough identified stock at its location.", 409);
+  }
+
+  const productGroups = new Map<string, { quantity: number; lineIndexes: number[]; valuation?: IssueValuation }>();
+  postingLines.forEach((line, index) => {
+    const group = productGroups.get(line.productId) ?? { quantity: 0, lineIndexes: [] };
+    group.quantity = roundQuantity(group.quantity + line.quantity);
+    group.lineIndexes.push(index);
+    productGroups.set(line.productId, group);
+  });
+  for (const [productId, group] of productGroups) {
+    const valuation = await valuationForIssue(productId, group.quantity);
+    group.valuation = valuation;
+    let assignedValue = 0;
+    group.lineIndexes.forEach((lineIndex, allocationIndex) => {
+      const line = postingLines[lineIndex];
+      const value = allocationIndex === group.lineIndexes.length - 1
+        ? valuation.valueCents - assignedValue
+        : Math.round(valuation.valueCents * line.quantity / group.quantity);
+      line.cogsCents = value;
+      line.cogsUnitCents = Math.round(value / line.quantity);
+      assignedValue += value;
+    });
+  }
+  const allLayers = [...productGroups.values()].flatMap((group) => group.valuation?.layers ?? []);
+  const cogsCents = postingLines.reduce((sum, line) => sum + line.cogsCents, 0);
+  const quantity = postingLines.reduce((sum, line) => roundQuantity(sum + line.quantity), 0);
+  const subtotalCents = draft.itemSubtotalCents + draft.chargeSubtotalCents;
+  const appliedTaxRates = [...new Set(draft.items.filter((line) => line.taxable && line.taxRateBps > 0).map((line) => line.taxRateBps)
+    .concat(draft.charges.filter((charge) => charge.taxable && charge.taxRateBps > 0).map((charge) => charge.taxRateBps)))];
+  const headerTaxRate = appliedTaxRates.length === 1 ? appliedTaxRates[0] : 0;
+  const headerTaxCode = appliedTaxRates.length > 1 ? "MIXED" : appliedTaxRates.length === 1
+    ? (draft.items.find((line) => line.taxable && line.taxRateBps === headerTaxRate)?.taxCode ?? draft.charges.find((charge) => charge.taxable && charge.taxRateBps === headerTaxRate)?.taxCode ?? "GST")
+    : null;
+
+  const salesOrderId = newId("so");
+  const shipmentId = newId("shipment");
+  const invoiceId = newId("customer-invoice");
+  const paymentId = payNow ? newId("payment") : undefined;
+  const salesOrderNumber = await nextDocumentNumber("SO");
+  const shipmentNumber = await nextDocumentNumber("SHP");
+  const invoiceNumber = await nextDocumentNumber("INV");
+  const paymentNumber = payNow ? await nextDocumentNumber("PAY") : undefined;
+  const actor = optionalText(payload, "actor", "Avery Morgan");
+  const now = postingTimestamp(payload);
+  const shipToName = optionalText(payload, "shipToName", customer.name);
+  const shipToAddressLine1 = optionalText(payload, "shipToAddressLine1", customer.addressLine1 ?? "");
+  const shipToAddressLine2 = optionalText(payload, "shipToAddressLine2", customer.addressLine2 ?? "");
+  const shipToCity = optionalText(payload, "shipToCity", customer.city ?? "");
+  const shipToRegion = optionalText(payload, "shipToRegion", customer.region ?? "");
+  const shipToPostalCode = optionalText(payload, "shipToPostalCode", customer.postalCode ?? "");
+  const shipToCountry = optionalText(payload, "shipToCountry", customer.country ?? "CA").toUpperCase();
+  const projectReference = optionalText(payload, "projectReference", "");
+  const deliveryInstructions = optionalText(payload, "deliveryInstructions", "Counter pickup");
+  const result: CommandResult = {
+    message: payNow
+      ? `${invoiceNumber} paid and ${shipmentNumber} posted. Internal order ${salesOrderNumber} was created automatically.`
+      : `${invoiceNumber} posted on account and ${shipmentNumber} posted. Internal order ${salesOrderNumber} was created automatically.`,
+    salesOrderId, salesOrderNumber, shipmentId, shipmentNumber, invoiceId, invoiceNumber, paymentId, paymentNumber,
+    impact: {
+      physical: `${quantity} unit${quantity === 1 ? "" : "s"} removed from usable, unreserved inventory.`,
+      commercial: `${salesOrderNumber} was created confirmed and fulfilled without a reservation step.`,
+      financial: payNow ? `${draft.totalCents} ${currency} cents invoiced and paid; ${cogsCents} cents of COGS posted.` : `${draft.totalCents} ${currency} cents posted to receivables; ${cogsCents} cents of COGS posted.`,
+      onHandDelta: -quantity, incomingDelta: 0, reservedDelta: 0, availableDelta: -quantity,
+    },
+  };
+
+  const stockClaims = [...stockGroups.values()].map(() => ` AND EXISTS (SELECT 1 FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id
+    WHERE ib.product_id=? AND ib.location_id=? AND l.active=1 AND l.inventory_status='usable' AND ib.on_hand_qty-ib.reserved_qty>=?)`).join("");
+  const stockClaimBindings = [...stockGroups.values()].flatMap((stock) => [stock.productId, stock.locationId, stock.quantity]);
+  const lotClaims = [...lotGroups.values()].map(() => ` AND (SELECT COALESCE(SUM(CASE WHEN sm.to_location_id=? THEN ma.quantity WHEN sm.from_location_id=? THEN -ma.quantity ELSE 0 END),0)
+    FROM movement_assignments ma JOIN stock_movements sm ON sm.id=ma.movement_id WHERE sm.product_id=? AND ma.lot_id=?)>=?`).join("");
+  const lotClaimBindings = [...lotGroups.values()].flatMap((lot) => [lot.locationId, lot.locationId, lot.productId, lot.lotId, lot.quantity]);
+  const serialLines = postingLines.filter((line) => line.tracking.policy === "serial");
+  const serialClaims = serialLines.map((line) => line.tracking.claimSql).join("");
+  const serialClaimBindings = serialLines.flatMap((line) => line.tracking.claimBindings);
+  const creditClaim = payNow ? "" : ` AND bp.credit_hold=0 AND (bp.credit_limit_cents=0 OR (bp.currency=? AND
+    ROUND(COALESCE((SELECT SUM(MAX(ci.base_total_cents-ROUND(ci.paid_cents*ci.exchange_rate_to_base)-
+      COALESCE((SELECT SUM(cc.base_amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0),0))
+      FROM customer_invoices ci WHERE ci.customer_id=bp.id AND ci.status<>'void'),0)/?)+?<=bp.credit_limit_cents))`;
+  const creditClaimBindings = payNow ? [] : [currency, exchangeRateToBase, draft.totalCents];
+  const exists = commandExistsPrepared(input);
+  const db = commandD1(input);
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM business_partners bp WHERE bp.id=? AND bp.partner_type IN ('customer','both') AND bp.active=1
+        ${creditClaim}${stockClaims}${layerClaimPredicate(allLayers)}${lotClaims}${serialClaims}`)
+      .bind(input.idempotencyKey, input.command, input.entityId, JSON.stringify(result), input.requestHash ?? null, input.claimToken ?? null, now,
+        customerId, ...creditClaimBindings, ...stockClaimBindings, ...layerClaimBindings(allLayers), ...lotClaimBindings, ...serialClaimBindings),
+    db.prepare(`INSERT INTO sales_orders
+      (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,owner_name,project_reference,
+       ship_to_name,ship_to_address_line_1,ship_to_address_line_2,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country,delivery_instructions,version,created_at)
+      SELECT ?,?,?,'confirmed','invoiced',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${exists}`)
+      .bind(salesOrderId, salesOrderNumber, customerId, postingDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, draft.totalCents, actor, projectReference || null,
+        shipToName, shipToAddressLine1 || null, shipToAddressLine2 || null, shipToCity || null, shipToRegion || null, shipToPostalCode || null, shipToCountry, deliveryInstructions, now),
+    db.prepare(`INSERT INTO shipments
+      (id,number,sales_order_id,status,carrier,service_level,ship_to_name,ship_to_address_line_1,ship_to_address_line_2,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country,posted_at,version)
+      SELECT ?,?,?,'posted','Customer pickup','Counter sale',?,?,?,?,?,?,?,?,1 WHERE ${exists}`)
+      .bind(shipmentId, shipmentNumber, salesOrderId, shipToName, shipToAddressLine1 || null, shipToAddressLine2 || null, shipToCity || null, shipToRegion || null, shipToPostalCode || null, shipToCountry, now),
+    db.prepare(`INSERT INTO customer_invoices
+      (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version)
+      SELECT ?,?,?,?,${payNow ? "'paid'" : "'posted'"},?,?,?,?,?,?,?,?,?,?,?,?,?,?,1 WHERE ${exists}`)
+      .bind(invoiceId, invoiceNumber, customerId, salesOrderId, postingDate, dueDate, subtotalCents, draft.taxCents, draft.totalCents, payNow ? draft.totalCents : 0,
+        currency, exchangeRateToBase, baseTotalCents, headerTaxRate, headerTaxCode, paymentTerms, now, actor),
+  ];
+  postingLines.forEach((line) => {
+    const lineTotal = Math.round(line.enteredQuantity * line.enteredUnitAmountCents) - line.discountCents;
+    statements.push(
+      db.prepare(`INSERT INTO sales_order_lines
+        (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,discount_cents,taxable,tax_code,tax_rate_bps)
+        SELECT ?,?,?,?,0,?,?,?,?,?,'stock',?,?,?,?,? WHERE ${exists}`)
+        .bind(line.orderLineId, salesOrderId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents,
+          line.configurationSnapshot, line.projectReference, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps),
+      db.prepare(`INSERT INTO shipment_lines (id,shipment_id,sales_order_line_id,product_id,location_id,quantity)
+        SELECT ?,?,?,?,?,? WHERE ${exists}`).bind(line.shipmentLineId, shipmentId, line.orderLineId, line.productId, line.locationId, line.quantity),
+      db.prepare(`INSERT INTO stock_movements
+        (id,movement_type,product_id,quantity,from_location_id,inventory_status,source_document_type,source_document_id,source_line_id,sales_order_line_id,posted_at,posted_by,unit_cost_cents,idempotency_key)
+        SELECT ?,'sales_shipment',?,? ,?,'usable','shipment',?,?,?,?,?,?,? WHERE ${exists}`)
+        .bind(line.movementId, line.productId, -line.quantity, line.locationId, shipmentId, line.shipmentLineId, line.orderLineId, now, actor, line.cogsUnitCents, input.idempotencyKey),
+      valueEntryPrepared(input, { productId: line.productId, movementId: line.movementId, entryType: "shipment", quantity: -line.quantity,
+        unitCostCents: line.cogsUnitCents, valueCents: -line.cogsCents, method: productGroups.get(line.productId)!.valuation!.method,
+        referenceType: "shipment", referenceId: shipmentId, postedAt: now, postedBy: actor }),
+      db.prepare(`INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,quantity,unit_price_cents,line_total_cents)
+        SELECT ?,?,?,?,?,?,? WHERE ${exists}`).bind(newId("invoice-line"), invoiceId, line.orderLineId, line.productId, line.quantity, line.unitAmountCents, lineTotal),
+    );
+    if (line.tracking.policy !== "quantity") statements.push(db.prepare(`INSERT INTO movement_assignments
+      (id,movement_id,lot_id,inventory_unit_id,quantity) SELECT ?,?,?,?,? WHERE ${exists}`)
+      .bind(newId("assignment"), line.movementId, line.tracking.lotId, line.tracking.unitId, line.quantity));
+    if (line.tracking.policy === "serial") statements.push(db.prepare(`UPDATE inventory_units SET lifecycle_status='shipped',version=version+1
+      WHERE id=? AND product_id=? AND location_id=? AND inventory_status='usable' AND lifecycle_status='on_hand'
+        AND allocated_sales_order_line_id IS NULL AND version=? AND ${exists}`)
+      .bind(line.tracking.unitId, line.productId, line.locationId, line.tracking.unitVersion));
+  });
+  for (const stock of stockGroups.values()) statements.push(db.prepare(`UPDATE inventory_balances SET on_hand_qty=on_hand_qty-?,version=version+1
+    WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${exists}`)
+    .bind(stock.quantity, stock.productId, stock.locationId, stock.quantity));
+  statements.push(...layerConsumptionPrepared(input, allLayers));
+  for (const documentType of ["sales_order", "customer_invoice"] as const) {
+    const documentId = documentType === "sales_order" ? salesOrderId : invoiceId;
+    draft.charges.forEach((charge) => statements.push(db.prepare(`INSERT INTO document_charges
+      (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${exists}`)
+      .bind(newId("charge"), documentType, documentId, charge.chargeType, charge.description, charge.amountCents, charge.direction,
+        charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRateBps,
+        Math.round(charge.amountCents * charge.taxRateBps / 10_000), now)));
+  }
+  if (payNow && paymentId && paymentNumber) statements.push(
+    db.prepare(`INSERT INTO payments
+      (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${exists}`)
+      .bind(paymentId, paymentNumber, "inbound", customerId, "customer_invoice", invoiceId, draft.totalCents, postingDate, paymentMethod, paymentReference, now, actor, currency, exchangeRateToBase, baseTotalCents),
+    auditPrepared(input, "payment", paymentId, "payment_posted", `${paymentNumber} posted with the counter sale.`,
+      { invoiceId, invoiceNumber, customerId, amountCents: draft.totalCents, currency, method: paymentMethod, reference: paymentReference }, now),
+    outboxPrepared(input, "payment.posted", "payment", paymentId, { invoiceId, amount: draft.totalCents, base: baseTotalCents }, now),
+  );
+  statements.push(
+    auditPrepared(input, "sales_order", salesOrderId, "counter_sale_posted", result.message,
+      { salesOrderNumber, shipmentId, shipmentNumber, invoiceId, invoiceNumber, paymentId: paymentId ?? null, paymentNumber: paymentNumber ?? null, lineCount: postingLines.length, quantity, totalCents: draft.totalCents, cogsCents }, now),
+    auditPrepared(input, "customer_invoice", invoiceId, "customer_invoice_posted", result.message,
+      { salesOrderId, shipmentId, quantity, total: draft.totalCents, base: baseTotalCents, paid: payNow }, now),
+    outboxPrepared(input, "sales_order.confirmed", "sales_order", salesOrderId, { customerId, counterSale: true, total: draft.totalCents }, now),
+    outboxPrepared(input, "inventory.shipment_posted", "shipment", shipmentId, { salesOrderId, counterSale: true, quantity, cogsCents }, now),
+    outboxPrepared(input, "customer_invoice.posted", "customer_invoice", invoiceId, { salesOrderId, shipmentId, total: draft.totalCents, base: baseTotalCents, paid: payNow }, now),
+  );
+  await db.batch(statements);
+  return requireLogged(input, "Customer credit, inventory, lot/serial identity, or valuation changed before the counter sale could post.");
+}
+
 /**
  * Counter and immediate sales are one business event: goods leave usable stock and the customer
  * receives a posted invoice. Keeping both documents in this one D1 batch prevents an inventory
@@ -1999,12 +2294,12 @@ export async function executeInventoryCommand(input: InventoryCommand): Promise<
   if (prior) return prior;
   const normalizedCommand = normalizeCommand(input.command);
   const postingDate = postingDateValue(input.payload ?? {});
-  if (["receive", "postreceipt", "postreceiptbatch", "reversereceipt", "vendorreturn", "postvendorreturn", "ship", "shipsale", "postshipment", "immediatesale", "shipandinvoice", "postimmediatesale", "reverseshipment", "customerreturn", "postcustomerreturn", "inventoryadjustment", "postinventoryadjustment", "postopeningbalance"].includes(normalizedCommand)) {
+  if (["receive", "postreceipt", "postreceiptbatch", "reversereceipt", "vendorreturn", "postvendorreturn", "ship", "shipsale", "postshipment", "immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale", "reverseshipment", "customerreturn", "postcustomerreturn", "inventoryadjustment", "postinventoryadjustment", "postopeningbalance"].includes(normalizedCommand)) {
     await assertPeriodOpen("inventory", postingDate);
   }
   if (["receive", "postreceipt", "postreceiptbatch", "reversereceipt", "vendorreturn", "postvendorreturn", "priceonlycredit", "vendorpriceallowance"].includes(normalizedCommand)) await assertPeriodOpen("purchasing", postingDate);
-  if (["ship", "shipsale", "postshipment", "immediatesale", "shipandinvoice", "postimmediatesale", "reverseshipment", "customerreturn", "postcustomerreturn"].includes(normalizedCommand)) await assertPeriodOpen("sales", postingDate);
-  if (["priceonlycredit", "vendorpriceallowance", "immediatesale", "shipandinvoice", "postimmediatesale"].includes(normalizedCommand)) await assertPeriodOpen("accounting", postingDate);
+  if (["ship", "shipsale", "postshipment", "immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale", "reverseshipment", "customerreturn", "postcustomerreturn"].includes(normalizedCommand)) await assertPeriodOpen("sales", postingDate);
+  if (["priceonlycredit", "vendorpriceallowance", "immediatesale", "shipandinvoice", "postimmediatesale", "countersale", "postcountersale"].includes(normalizedCommand)) await assertPeriodOpen("accounting", postingDate);
   switch (normalizedCommand) {
     case "receive":
     case "postreceipt": return postReceipt(input);
@@ -2026,6 +2321,8 @@ export async function executeInventoryCommand(input: InventoryCommand): Promise<
     case "immediatesale":
     case "shipandinvoice":
     case "postimmediatesale": return postImmediateSale(input);
+    case "countersale":
+    case "postcountersale": return postCounterSale(input);
     case "reverseshipment": return reverseShipment(input);
     case "customerreturn":
     case "postcustomerreturn": return postCustomerReturn(input);
@@ -2184,8 +2481,9 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       policy: `${product}.inventory_policy COLLATE NOCASE`,
       units: `${baseUom}.code COLLATE NOCASE`,
       standardCost: `${product}.standard_cost_cents`,
+      lastUnitCost: `COALESCE(${product}.last_unit_cost_cents,${product}.standard_cost_cents)`,
       sellingPrice: `${product}.selling_price_cents`,
-      margin: `CASE WHEN ${product}.selling_price_cents>0 THEN (${product}.selling_price_cents-${product}.standard_cost_cents)*1.0/${product}.selling_price_cents ELSE -1 END`,
+      margin: `CASE WHEN ${product}.selling_price_cents>0 THEN (${product}.selling_price_cents-COALESCE(${product}.last_unit_cost_cents,${product}.standard_cost_cents))*1.0/${product}.selling_price_cents ELSE -1 END`,
       reorderPoint: `${product}.reorder_point`,
       maxStockLevel: `${product}.max_stock_level`,
       location: `primaryLocationCode COLLATE NOCASE`,
@@ -2375,7 +2673,14 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
     )
     SELECT p.id, p.sku, p.manufacturer_sku AS manufacturerSku, p.name, p.category, p.material, p.dimensions,
            p.finish, p.tracking_policy AS trackingPolicy, p.inventory_policy AS inventoryPolicy,
-           p.standard_cost_cents AS standardCostCents, p.selling_price_cents AS sellingPriceCents,
+           p.standard_cost_cents AS standardCostCents,p.last_unit_cost_cents AS lastUnitCostCents,
+           p.last_unit_cost_source_po_id AS lastUnitCostSourcePoId,p.last_unit_cost_at AS lastUnitCostAt,
+           (SELECT po.number FROM purchase_orders po WHERE po.id=p.last_unit_cost_source_po_id) AS lastUnitCostSourcePoNumber,
+           (SELECT bp.name FROM business_partners bp WHERE bp.id=p.last_unit_cost_vendor_id) AS lastUnitCostVendorName,
+           p.selling_price_cents AS sellingPriceCents,p.suggested_selling_price_cents AS suggestedSellingPriceCents,
+           p.pricing_mode AS pricingMode,p.applied_margin_rule_id AS appliedMarginRuleId,
+           (SELECT mr.code FROM margin_rules mr WHERE mr.id=p.applied_margin_rule_id) AS appliedMarginRuleCode,
+           p.manual_price_reason AS manualPriceReason,p.pricing_updated_at AS pricingUpdatedAt,
            p.base_uom_id AS baseUomId,p.purchase_uom_id AS purchaseUomId,p.sales_uom_id AS salesUomId,
            bu.code AS baseUomCode,pu.code AS purchaseUomCode,su.code AS salesUomCode,bu.precision AS quantityPrecision,
            -- The version column below is the balance version used for count concurrency;
@@ -3125,7 +3430,9 @@ export async function searchInventoryReferences(kind: ReferenceLookup, search = 
     // the branch can actually supply the line before committing to it.
     const items = await all<Record<string, unknown>>(`SELECT p.id,p.sku,p.manufacturer_sku AS manufacturerSku,p.name,p.category,p.material,p.dimensions,p.finish,
       p.tracking_policy AS trackingPolicy,p.inventory_policy AS inventoryPolicy,p.reorder_point AS reorderPoint,p.max_stock_level AS maxStockLevel,
-      p.selling_price_cents AS sellingPriceCents,p.standard_cost_cents AS standardCostCents,
+      p.selling_price_cents AS sellingPriceCents,p.standard_cost_cents AS standardCostCents,p.last_unit_cost_cents AS lastUnitCostCents,
+      p.last_unit_cost_source_po_id AS lastUnitCostSourcePoId,p.last_unit_cost_at AS lastUnitCostAt,p.suggested_selling_price_cents AS suggestedSellingPriceCents,
+      p.pricing_mode AS pricingMode,p.applied_margin_rule_id AS appliedMarginRuleId,
       p.base_uom_id AS baseUomId,p.purchase_uom_id AS purchaseUomId,p.sales_uom_id AS salesUomId,p.version,
       COALESCE((SELECT SUM(ib.on_hand_qty-ib.reserved_qty) FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id
                  WHERE ib.product_id=p.id AND l.active=1 AND l.inventory_status='usable' AND (?='' OR l.warehouse_id=?)),0) AS availableQuantity,
@@ -3138,13 +3445,17 @@ export async function searchInventoryReferences(kind: ReferenceLookup, search = 
   }
   if (kind === "locations") {
     const inventoryStatus = ["usable", "quarantine", "damaged", "in_transit", "return_pending", "non_usable"].includes(role ?? "") ? role! : "";
+    const scopedProduct = productId?.trim() ?? "";
     const items = await all<Record<string, unknown>>(`SELECT l.id,l.code,l.name,l.location_type AS locationType,l.inventory_status AS inventoryStatus,
-      l.warehouse_id AS warehouseId,w.code AS warehouseCode,w.name AS warehouseName,l.version
+      l.warehouse_id AS warehouseId,w.code AS warehouseCode,w.name AS warehouseName,l.version,
+      COALESCE((SELECT ib.on_hand_qty-ib.reserved_qty FROM inventory_balances ib WHERE ib.product_id=? AND ib.location_id=l.id),0) AS availableQuantity
       FROM locations l JOIN warehouses w ON w.id=l.warehouse_id
       WHERE l.active=1 AND w.active=1 AND (?='' OR (?='non_usable' AND l.inventory_status IN ('quarantine','damaged')) OR l.inventory_status=?)
+        AND (?='' OR COALESCE((SELECT ib.on_hand_qty-ib.reserved_qty FROM inventory_balances ib WHERE ib.product_id=? AND ib.location_id=l.id),0)>0)
         AND (?='' OR l.code LIKE ? ESCAPE '\\' OR l.name LIKE ? ESCAPE '\\' OR w.code LIKE ? ESCAPE '\\' OR w.name LIKE ? ESCAPE '\\')
       ORDER BY CASE WHEN ?<>'' AND l.warehouse_id=? THEN 0 ELSE 1 END,w.code,l.code,l.id LIMIT ?`,
-      inventoryStatus, inventoryStatus, inventoryStatus, term, like, like, like, like, scopedWarehouse, scopedWarehouse, boundedLimit);
+      scopedProduct, inventoryStatus, inventoryStatus, inventoryStatus, scopedProduct, scopedProduct,
+      term, like, like, like, like, scopedWarehouse, scopedWarehouse, boundedLimit);
     return { items };
   }
   const partnerRole = role === "vendor" || role === "customer" ? role : "";

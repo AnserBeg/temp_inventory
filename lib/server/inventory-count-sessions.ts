@@ -69,7 +69,8 @@ function requiredText(value: unknown, label: string) {
 
 function validDate(value: unknown, label: string) {
   const normalized = requiredText(value, label);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized) || new Date(`${normalized}T00:00:00.000Z`).toISOString().slice(0, 10) !== normalized) {
+  const parsed = new Date(`${normalized}T00:00:00.000Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized) || Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== normalized) {
     throw new CountSessionError("VALIDATION_ERROR", `${label} must be a valid YYYY-MM-DD date.`);
   }
   return normalized;
@@ -253,7 +254,7 @@ export async function saveCountLine(actor: ActorIdentity, payload: Record<string
   const result = await getD1().prepare(`UPDATE inventory_count_session_lines SET counted_qty=?,variance_qty=?,reason=?,unit_cost_cents=COALESCE(?,unit_cost_cents),
     status=?,counted_by=?,counted_by_id=?,counted_at=?,last_error=NULL,version=version+1 WHERE id=? AND session_id=? AND version=?`)
     .bind(countedQuantity, varianceQuantity, reason || null, unitCostCents, status, actor.label, actor.id, now, lineId, sessionId, expectedLineVersion).run();
-  if (!result.meta.changes) throw new CountSessionError("VERSION_CONFLICT", "This count line changed before it could be saved.", 409);
+  if (!result.meta?.changes) throw new CountSessionError("VERSION_CONFLICT", "This count line changed before it could be saved.", 409);
   if (session.status === "draft") {
     await getD1().prepare("UPDATE inventory_count_sessions SET status='counting',started_at=COALESCE(started_at,?),version=version+1 WHERE id=? AND status='draft'").bind(now, sessionId).run();
   }

@@ -1,5 +1,6 @@
 import { ensureDatabase, first, getD1, newId, nextDocumentNumber } from "./inventory-db";
 import { normalizeProductQuantity, ProductQuantityError } from "./product-quantities";
+import { prepareApprovedPurchaseCostStatements } from "./catalog-pricing";
 
 export type CreateOrderLine = {
   kind?: "item" | "charge";
@@ -361,7 +362,8 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
         SELECT ?,?,?,?,'not_billed',?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
         .bind(recordId, number, vendorId, fastTrack ? "approved" : "draft", expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, now, idempotencyKey, recordId, claimToken),
     ];
-    items.forEach((line) => {const lineId=newId("po-line");statements.push(db.prepare(`INSERT INTO purchase_order_lines
+    const purchaseLines = items.map((line) => ({ line, lineId: newId("po-line") }));
+    purchaseLines.forEach(({ line, lineId }) => {statements.push(db.prepare(`INSERT INTO purchase_order_lines
       (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
       SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId,line.discountCents,line.taxable ? 1 : 0,line.taxCode,line.taxRateBps, idempotencyKey, recordId, claimToken));if(line.sourceSalesOrderLineId)statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=? WHERE id=? AND product_id=? AND linked_purchase_order_line_id IS NULL AND EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`).bind(lineId,line.sourceSalesOrderLineId,line.productId,idempotencyKey,recordId,claimToken));});
@@ -373,6 +375,19 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
       SELECT ?,'purchase_order',?,'purchase_order_fast_track','approved',?,?,?,?,?,?,?,1
       WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(newId("approval"), recordId, actor, fastTrackApprovalReason, now, actor, fastTrackApprovalReason, now, JSON.stringify({ selfAuthorized: true, actorId, actorEmail }), idempotencyKey, recordId, claimToken));
+    if (fastTrack) statements.push(...await prepareApprovedPurchaseCostStatements({
+      claim: { idempotencyKey, claimToken },
+      actor: { label: actor, id: actorId, email: actorEmail },
+      purchaseOrderId: recordId,
+      purchaseOrderNumber: number,
+      purchaseOrderRevision: 1,
+      vendorId,
+      currency,
+      exchangeRateToBase,
+      effectiveAt: now,
+      eventType: "purchase_order_fast_track_approved",
+      lines: purchaseLines.map(({ line, lineId }) => ({ id: lineId, productId: line.productId, quantity: line.quantity, unitCostCents: line.unitAmountCents, discountCents: line.discountCents })),
+    }));
   } else {
     const customerId = requiredText(input.customerId, "customerId");
     const requestedDate = validDate(input.requestedDate, "requestedDate");
