@@ -117,7 +117,7 @@ test("a fully shipped sales order offers no dead fulfillment buttons (#20)", () 
   assert.match(sources.app, /const fulfillmentOpen = confirmed && so\.open > 0;/);
   assert.match(sources.app, /\{canShip \? <button className=\{canPostFinancial \? "button secondary" : "button primary"\} onClick=\{onShip\}>Post shipment<\/button> : null\}/);
   assert.match(sources.app, /\{canReserve \? <button className="button secondary" onClick=\{onReserve\} disabled=\{reserveBlocked\}/);
-  assert.match(sources.app, /Fully shipped: no fulfillment actions remain\./);
+  assert.match(sources.app, /Fully fulfilled: no fulfillment actions remain\./);
 });
 
 test("multi-line receipts start at zero with a fill-all action (#22)", () => {
@@ -170,4 +170,17 @@ test("posted customer invoices expose their printable document", () => {
   assert.match(sources.suite, /recordHref=\{\(record\) => `\/api\/documents\/pdf\?documentType=customer_invoice&documentId=\$\{encodeURIComponent\(record\.id\)\}`\}/);
   assert.match(sources.suite, /title=\{`Open \$\{record\.number\} PDF`\}/);
   assert.match(sources.suite, /Paid invoices remain here as completed records\./);
+});
+
+test("sales progression only offers actions whose supply prerequisite is ready", () => {
+  assert.match(sources.app, /Dedicated supplier supply is required/);
+  assert.match(sources.app, /Create linked purchase order/);
+  assert.match(sources.app, /Approve the linked purchase order/);
+  assert.match(sources.app, /Receive the linked special-order supply/);
+  assert.match(sources.app, /line\.fulfillmentRoute === "drop_ship" && line\.open > 0 && line\.linkedPurchaseOrderLifecycle === "approved"/);
+  assert.match(sources.app, /line\.fulfillmentRoute === "stock" && line\.open > line\.reserved/);
+  assert.match(sources.app, /Canceled with shipment history/);
+  assert.match(sources.suite, /Confirm \/ cancel/);
+  assert.match(sources.suite, /kind: "voidVendorBill"/);
+  assert.match(sources.suite, /Void an entirely unpaid and uncredited vendor bill/);
 });

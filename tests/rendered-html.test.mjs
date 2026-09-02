@@ -26,8 +26,8 @@ test("exposes the required operational language and impact previews", async () =
   ])).join("\n");
 
   for (const required of [
-    "Reopen quantity to receive",
-    "Close unreceived quantity",
+    "Reopen stock-receipt quantity",
+    "Close unfulfilled quantity",
     "Post receipt",
     "Reverse incorrect receipt",
     "Return to vendor",
@@ -36,7 +36,7 @@ test("exposes the required operational language and impact previews", async () =
     "Create purchase order",
     "Create sales order",
     "approved purchase order",
-    "Sales order with invoiceable delivery",
+    "Sales order with invoiceable fulfillment",
     "Physical inventory",
     "Commercial commitment",
     "Financial effect",

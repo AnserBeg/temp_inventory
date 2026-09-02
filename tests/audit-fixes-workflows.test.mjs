@@ -46,8 +46,8 @@ async function insertApprovedPurchaseOrder(id, lines, extra = {}) {
   await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,revision_number,version,created_at) VALUES (?,?,'vendor-audit','approved','not_billed','2026-09-10','CAD',1,?,?,1,1,'2026-09-01')", id, extra.number ?? id.toUpperCase(), total, total);
   await run("INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at) VALUES (?,?,1,'approved','{}','Seeded approved commitment','Audit seed','2026-09-01')", `revision-${id}-1`, id);
   for (const line of lines) {
-    await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps,version) VALUES (?,?,?,?,0,?,?,?,?,'stock',0,0,0,1)",
-      line.id, id, line.productId, line.quantity, line.unitCost, line.uomId ?? "uom-each", line.uomQuantity ?? line.quantity, line.uomUnitCost ?? line.unitCost);
+    await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps,version) VALUES (?,?,?,?,0,?,?,?,?,?,0,0,0,1)",
+      line.id, id, line.productId, line.quantity, line.unitCost, line.uomId ?? "uom-each", line.uomQuantity ?? line.quantity, line.uomUnitCost ?? line.unitCost, line.route ?? "stock");
   }
 }
 
@@ -498,4 +498,146 @@ test("a sales order is only 'invoiced' once every open unit is invoiced, not mer
   await ship("sol-audit-bill-2", "prod-audit-b", "audit-ship-2");
   await advancedDomain.executeWorkflow({ command: "createCustomerInvoice", entityId: "so-audit-billing", version: 2, idempotencyKey: "audit-invoice-2", actor: accountant, payload: { invoiceDate: "2026-09-03", dueDate: "2026-10-03" } });
   assert.equal(row("SELECT billing_status FROM sales_orders WHERE id='so-audit-billing'").billing_status, "invoiced");
+});
+
+test("drop-ship delivery advances PO, SO, and invoice worklists without creating receipt or shipment work", async () => {
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-audit-drop','SO-AUDIT-DROP','customer-audit','confirmed','not_invoiced','2026-09-10','CAD',1,1800,1800,1,'2026-09-01')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-audit-drop','so-audit-drop','prod-audit-b',6,0,300,'drop_ship',0,0,0)");
+  await insertApprovedPurchaseOrder("po-audit-drop", [{ id: "pol-audit-drop", productId: "prod-audit-b", quantity: 6, unitCost: 150, route: "drop_ship" }], { number: "PO-AUDIT-DROP" });
+  await run("UPDATE purchase_order_lines SET source_sales_order_line_id='sol-audit-drop' WHERE id='pol-audit-drop'");
+  await run("UPDATE sales_order_lines SET linked_purchase_order_line_id='pol-audit-drop' WHERE id='sol-audit-drop'");
+  await run("INSERT INTO supply_allocations (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version) VALUES ('allocation-audit-drop','pol-audit-drop','sol-audit-drop',6,0,'active','2026-09-01','2026-09-01',1)");
+
+  await advancedDomain.executeWorkflow({ command: "postDropShipDelivery", entityId: "sol-audit-drop", version: 1, idempotencyKey: "audit-drop-delivery", actor: operator, payload: { quantity: 6, deliveryDate: "2026-09-02", externalReference: "POD-AUDIT-DROP" } });
+
+  const purchasing = await inventoryDomain.getInventorySnapshot({ scope: "purchase-orders", search: "PO-AUDIT-DROP" });
+  const purchaseOrder = purchasing.purchaseOrders[0];
+  assert.deepEqual({ fulfilled: purchaseOrder.supplierFulfilledQuantity, received: purchaseOrder.netReceivedQuantity, openReceive: purchaseOrder.openToReceiveQuantity, openDeliver: purchaseOrder.openToDeliverQuantity, open: purchaseOrder.openToFulfillQuantity, status: purchaseOrder.fulfillmentStatus },
+    { fulfilled: 6, received: 0, openReceive: 0, openDeliver: 0, open: 0, status: "fully_fulfilled" });
+  assert.deepEqual({ lineFulfilled: purchaseOrder.lines[0].supplierFulfilledQuantity, lineReceived: purchaseOrder.lines[0].netReceivedQuantity, lineOpen: purchaseOrder.lines[0].openToFulfillQuantity }, { lineFulfilled: 6, lineReceived: 0, lineOpen: 0 });
+
+  const expectedReceipts = await inventoryDomain.getInventorySnapshot({ scope: "expected-receipts", status: "open", search: "PO-AUDIT-DROP" });
+  assert.equal(expectedReceipts.purchaseOrders.length, 0);
+  const sales = await inventoryDomain.getInventorySnapshot({ scope: "sales-orders", search: "SO-AUDIT-DROP" });
+  const salesOrder = sales.salesOrders[0];
+  assert.deepEqual({ fulfilled: salesOrder.fulfilledQuantity, shipped: salesOrder.shippedQuantity, openShip: salesOrder.openToShipQuantity, openDeliver: salesOrder.openToDeliverQuantity, open: salesOrder.openToFulfillQuantity, status: salesOrder.fulfillmentStatus },
+    { fulfilled: 6, shipped: 0, openShip: 0, openDeliver: 0, open: 0, status: "fully_fulfilled" });
+  assert.deepEqual({ lineFulfilled: salesOrder.lines[0].fulfilledQuantity, lineShipped: salesOrder.lines[0].shippedQuantity }, { lineFulfilled: 6, lineShipped: 0 });
+  assert.deepEqual({ linkedNumber: salesOrder.lines[0].linkedPurchaseOrderNumber, linkedLifecycle: salesOrder.lines[0].linkedPurchaseOrderLifecycle }, { linkedNumber: "PO-AUDIT-DROP", linkedLifecycle: "approved" });
+  const invoiceQueue = await inventoryDomain.getInventorySnapshot({ scope: "customer-invoices", search: "SO-AUDIT-DROP" });
+  assert.equal(invoiceQueue.salesOrders[0].fulfilledQuantity, 6);
+  assert.equal(invoiceQueue.salesOrders[0].invoicedQuantity, 0);
+});
+
+test("vendor bill register subtracts posted credits and exposes real outstanding and settled filters", async () => {
+  await run("INSERT INTO vendor_bills (id,number,vendor_invoice_number,vendor_id,status,match_status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,version,posted_at) VALUES ('bill-audit-credit','VB-AUDIT-CREDIT','SUP-CREDIT','vendor-audit','approved','matched','2026-09-02','2026-10-02',1000,0,1000,0,'CAD',1,1000,1,'2026-09-02T12:00:00Z')");
+  await run("INSERT INTO vendor_credits (id,number,vendor_id,vendor_bill_id,amount_cents,reason,status,posted_at,posted_by,version,currency,exchange_rate_to_base,base_amount_cents) VALUES ('credit-audit-bill','VC-AUDIT-BILL','vendor-audit','bill-audit-credit',1000,'Full supplier credit','posted','2026-09-03T12:00:00Z','Audit Accountant',1,'CAD',1,1000)");
+  const settled = await inventoryDomain.getInventorySnapshot({ scope: "vendor-bills", status: "settled", search: "VB-AUDIT-CREDIT" });
+  assert.equal(settled.bills.length, 1);
+  assert.equal(settled.bills[0].outstandingCents, 0);
+  const outstanding = await inventoryDomain.getInventorySnapshot({ scope: "vendor-bills", status: "outstanding", search: "VB-AUDIT-CREDIT" });
+  assert.equal(outstanding.bills.length, 0);
+});
+
+test("early drop-ship bills use delivery language and PO billing tracks the committed quantity", async () => {
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-audit-early-drop','SO-AUDIT-EARLY-DROP','customer-audit','confirmed','not_invoiced','2026-09-10','CAD',1,1200,1200,1,'2026-09-01')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-audit-early-drop','so-audit-early-drop','prod-audit-b',4,0,300,'drop_ship',0,0,0)");
+  await insertApprovedPurchaseOrder("po-audit-early-drop", [{ id: "pol-audit-early-drop", productId: "prod-audit-b", quantity: 4, unitCost: 150, route: "drop_ship" }]);
+  await run("UPDATE purchase_order_lines SET source_sales_order_line_id='sol-audit-early-drop' WHERE id='pol-audit-early-drop'");
+  await run("UPDATE sales_order_lines SET linked_purchase_order_line_id='pol-audit-early-drop' WHERE id='sol-audit-early-drop'");
+  await run("INSERT INTO supply_allocations (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version) VALUES ('allocation-audit-early-drop','pol-audit-early-drop','sol-audit-early-drop',4,0,'active','2026-09-01','2026-09-01',1)");
+
+  const firstBill = await advancedDomain.executeWorkflow({ command: "createVendorBill", entityId: "po-audit-early-drop", version: 1, idempotencyKey: "audit-early-drop-bill-1", actor: accountant, payload: {
+    purchaseOrderId: "po-audit-early-drop", vendorInvoiceNumber: "AUDIT-EARLY-DROP-1", invoiceDate: "2026-09-02", dueDate: "2026-10-02",
+    lines: [{ purchaseOrderLineId: "pol-audit-early-drop", quantity: 2, unitCostCents: 150 }],
+  } });
+  assert.deepEqual(firstBill.impact.exceptions.map((exception) => exception.code), ["BILL_BEFORE_DELIVERY"]);
+  assert.equal(row("SELECT billing_status FROM purchase_orders WHERE id='po-audit-early-drop'").billing_status, "partially_billed");
+
+  const secondBill = await advancedDomain.executeWorkflow({ command: "createVendorBill", entityId: "po-audit-early-drop", version: 2, idempotencyKey: "audit-early-drop-bill-2", actor: accountant, payload: {
+    purchaseOrderId: "po-audit-early-drop", vendorInvoiceNumber: "AUDIT-EARLY-DROP-2", invoiceDate: "2026-09-02", dueDate: "2026-10-02",
+    lines: [{ purchaseOrderLineId: "pol-audit-early-drop", quantity: 2, unitCostCents: 150 }],
+  } });
+  assert.equal(row("SELECT billing_status FROM purchase_orders WHERE id='po-audit-early-drop'").billing_status, "fully_billed");
+
+  const delivery = await advancedDomain.executeWorkflow({ command: "postDropShipDelivery", entityId: "sol-audit-early-drop", version: 1, idempotencyKey: "audit-early-drop-delivery", actor: operator, payload: { quantity: 4, deliveryDate: "2026-09-03", externalReference: "POD-EARLY-DROP" } });
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "reverseDropShipDelivery", entityId: delivery.recordId, version: 1, idempotencyKey: "audit-early-drop-reverse", actor: operator, payload: { quantity: 1, postingDate: "2026-09-03", reason: "Supplier corrected proof" } }), rejectsWithCode("BILLED_DELIVERY"));
+  await advancedDomain.executeWorkflow({ command: "voidVendorBill", entityId: firstBill.recordId, version: 1, idempotencyKey: "audit-early-drop-void-1", actor: accountant, payload: { reason: "Vendor invoice was premature" } });
+  assert.equal(row("SELECT billing_status FROM purchase_orders WHERE id='po-audit-early-drop'").billing_status, "partially_billed");
+  await advancedDomain.executeWorkflow({ command: "voidVendorBill", entityId: secondBill.recordId, version: 1, idempotencyKey: "audit-early-drop-void-2", actor: accountant, payload: { reason: "Vendor invoice was premature" } });
+  assert.equal(row("SELECT billing_status FROM purchase_orders WHERE id='po-audit-early-drop'").billing_status, "not_billed");
+  await advancedDomain.executeWorkflow({ command: "reverseDropShipDelivery", entityId: delivery.recordId, version: 1, idempotencyKey: "audit-early-drop-reverse-after-void", actor: operator, payload: { quantity: 1, postingDate: "2026-09-03", reason: "Supplier corrected proof" } });
+});
+
+test("closing dedicated supply releases the unfulfilled allocation so customer demand can be canceled", async () => {
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-audit-close-drop','SO-AUDIT-CLOSE-DROP','customer-audit','confirmed','not_invoiced','2026-09-10','CAD',1,1200,1200,1,'2026-09-01')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-audit-close-drop','so-audit-close-drop','prod-audit-b',4,0,300,'drop_ship',0,0,0)");
+  await insertApprovedPurchaseOrder("po-audit-close-drop", [{ id: "pol-audit-close-drop", productId: "prod-audit-b", quantity: 4, unitCost: 150, route: "drop_ship" }]);
+  await run("UPDATE purchase_order_lines SET source_sales_order_line_id='sol-audit-close-drop' WHERE id='pol-audit-close-drop'");
+  await run("UPDATE sales_order_lines SET linked_purchase_order_line_id='pol-audit-close-drop' WHERE id='sol-audit-close-drop'");
+  await run("INSERT INTO supply_allocations (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version) VALUES ('allocation-audit-close-drop','pol-audit-close-drop','sol-audit-close-drop',4,0,'active','2026-09-01','2026-09-01',1)");
+
+  const delivery = await advancedDomain.executeWorkflow({ command: "postDropShipDelivery", entityId: "sol-audit-close-drop", version: 1, idempotencyKey: "audit-close-drop-delivery", actor: operator, payload: { quantity: 2, deliveryDate: "2026-09-02", externalReference: "POD-CLOSE-DROP" } });
+  await inventoryDomain.executeInventoryCommand({ command: "closeRemainder", entityId: "po-audit-close-drop", version: 2, idempotencyKey: "audit-close-drop-remainder", payload: { lineId: "pol-audit-close-drop", quantity: 2, reason: "Vendor cannot supply balance", actor: "Audit Buyer" } });
+  assert.deepEqual(row("SELECT allocated_qty,received_qty,status FROM supply_allocations WHERE id='allocation-audit-close-drop'"), { allocated_qty: 2, received_qty: 2, status: "active" });
+  assert.equal(row("SELECT closed_qty FROM purchase_order_lines WHERE id='pol-audit-close-drop'").closed_qty, 2);
+
+  await advancedDomain.executeWorkflow({ command: "cancelSalesOrder", entityId: "so-audit-close-drop", version: 3, idempotencyKey: "audit-close-drop-cancel-sale", actor: operator, payload: { reason: "Customer canceled unsupplied balance" } });
+  assert.deepEqual(row("SELECT lifecycle_status FROM sales_orders WHERE id='so-audit-close-drop'"), { lifecycle_status: "canceled" });
+  assert.deepEqual(row("SELECT canceled_qty FROM sales_order_lines WHERE id='sol-audit-close-drop'"), { canceled_qty: 2 });
+
+  await advancedDomain.executeWorkflow({ command: "reverseDropShipDelivery", entityId: delivery.recordId, version: 1, idempotencyKey: "audit-close-drop-reverse", actor: operator, payload: { quantity: 1, postingDate: "2026-09-03", reason: "Delivery proof overstated" } });
+  assert.deepEqual(row("SELECT canceled_qty FROM sales_order_lines WHERE id='sol-audit-close-drop'"), { canceled_qty: 3 });
+  assert.deepEqual(row("SELECT allocated_qty,received_qty,status FROM supply_allocations WHERE id='allocation-audit-close-drop'"), { allocated_qty: 1, received_qty: 1, status: "active" });
+  const corrections = await advancedDomain.getAdvancedSnapshot(operator, { scope: "sales", page: 1, pageSize: 100 });
+  assert.equal(corrections.dropShipDeliveries.some((item) => item.id === delivery.recordId && item.netDeliveredQuantity === 1), true);
+});
+
+test("a partial immediate sale stays partially invoiced and a canceled order still accepts its customer return", async () => {
+  await insertProduct("prod-audit-immediate", "AUDIT-IMMEDIATE", 125, 250);
+  await insertApprovedPurchaseOrder("po-audit-immediate-stock", [{ id: "pol-audit-immediate-stock", productId: "prod-audit-immediate", quantity: 3, unitCost: 125 }]);
+  await receive("po-audit-immediate-stock", "pol-audit-immediate-stock", 3, "audit-immediate-stock-receipt");
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at,ship_to_name,ship_to_address_line_1,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country) VALUES ('so-audit-immediate-flow','SO-AUDIT-IMMEDIATE-FLOW','customer-audit','confirmed','not_invoiced','2026-09-10','CAD',1,750,750,1,'2026-09-01','Audit Customer','1 Audit Way','Edmonton','AB','T5J 0N1','CA')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-audit-immediate-flow','so-audit-immediate-flow','prod-audit-immediate',3,0,250,'stock',0,0,0)");
+
+  const sale = await inventoryDomain.executeInventoryCommand({ command: "postImmediateSale", entityId: "so-audit-immediate-flow", version: 1, idempotencyKey: "audit-immediate-flow-sale", payload: { lineId: "sol-audit-immediate-flow", quantity: 1, locationId: "loc-audit-a", postingDate: "2026-09-02", actor: "Audit Seller" } });
+  assert.equal(row("SELECT billing_status FROM sales_orders WHERE id='so-audit-immediate-flow'").billing_status, "partially_invoiced");
+  await advancedDomain.executeWorkflow({ command: "cancelSalesOrder", entityId: "so-audit-immediate-flow", version: 2, idempotencyKey: "audit-immediate-flow-cancel", actor: operator, payload: { reason: "Customer canceled the balance" } });
+  assert.equal(row("SELECT canceled_qty FROM sales_order_lines WHERE id='sol-audit-immediate-flow'").canceled_qty, 2);
+
+  await inventoryDomain.executeInventoryCommand({ command: "postCustomerReturn", entityId: "so-audit-immediate-flow", version: 3, idempotencyKey: "audit-immediate-flow-return", payload: { lineId: "sol-audit-immediate-flow", quantity: 1, locationId: "loc-audit-a", condition: "usable", postingDate: "2026-09-03", reason: "Customer returned item", actor: "Audit Receiver" } });
+  assert.equal(row("SELECT COUNT(*) AS count FROM customer_returns WHERE sales_order_id='so-audit-immediate-flow'").count, 1);
+  await advancedDomain.executeWorkflow({ command: "voidCustomerInvoice", entityId: sale.invoiceId, version: 1, idempotencyKey: "audit-immediate-flow-void", actor: accountant, payload: { reason: "Testing the physical correction boundary" } });
+  const corrections = await advancedDomain.getAdvancedSnapshot(operator, { scope: "sales", page: 1, pageSize: 100 });
+  assert.equal(corrections.shipments.some((item) => item.id === sale.shipmentId), false);
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "reverseShipment", entityId: sale.shipmentId, version: 1, idempotencyKey: "audit-immediate-flow-double-correction", actor: operator, payload: { quantity: 1, postingDate: "2026-09-03", reason: "Duplicate correction" } }), rejectsWithCode("RETURNED_SHIPMENT"));
+});
+
+test("a canceled stock order keeps its uninvoiced shipment available for correction", async () => {
+  await insertProduct("prod-audit-canceled-shipment", "AUDIT-CANCELED-SHIP", 140, 280);
+  await insertApprovedPurchaseOrder("po-audit-canceled-shipment", [{ id: "pol-audit-canceled-shipment", productId: "prod-audit-canceled-shipment", quantity: 2, unitCost: 140 }]);
+  await receive("po-audit-canceled-shipment", "pol-audit-canceled-shipment", 2, "audit-canceled-shipment-receipt");
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at,ship_to_name,ship_to_address_line_1,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country) VALUES ('so-audit-canceled-shipment','SO-AUDIT-CANCELED-SHIP','customer-audit','confirmed','not_invoiced','2026-09-10','CAD',1,560,560,1,'2026-09-01','Audit Customer','1 Audit Way','Edmonton','AB','T5J 0N1','CA')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-audit-canceled-shipment','so-audit-canceled-shipment','prod-audit-canceled-shipment',2,0,280,'stock',0,0,0)");
+  await inventoryDomain.executeInventoryCommand({ command: "reserveSale", entityId: "so-audit-canceled-shipment", version: 1, idempotencyKey: "audit-canceled-shipment-reserve", payload: { lineId: "sol-audit-canceled-shipment", quantity: 1, locationId: "loc-audit-a", actor: "Audit Seller" } });
+  await inventoryDomain.executeInventoryCommand({ command: "shipSale", entityId: "so-audit-canceled-shipment", version: 2, idempotencyKey: "audit-canceled-shipment-ship", payload: { lineId: "sol-audit-canceled-shipment", quantity: 1, carrier: "Audit Freight", trackingNumber: "AUDIT-CANCEL-1", postingDate: "2026-09-02", actor: "Audit Seller" } });
+  await advancedDomain.executeWorkflow({ command: "cancelSalesOrder", entityId: "so-audit-canceled-shipment", version: 3, idempotencyKey: "audit-canceled-shipment-cancel", actor: operator, payload: { reason: "Customer canceled remaining unit" } });
+  const shipment = row("SELECT id,version FROM shipments WHERE sales_order_id='so-audit-canceled-shipment'");
+  const visibleBefore = await advancedDomain.getAdvancedSnapshot(operator, { scope: "sales", page: 1, pageSize: 100 });
+  assert.equal(visibleBefore.shipments.some((item) => item.id === shipment.id && item.quantity === 1), true);
+  await advancedDomain.executeWorkflow({ command: "reverseShipment", entityId: shipment.id, version: shipment.version, idempotencyKey: "audit-canceled-shipment-reverse", actor: operator, payload: { quantity: 1, postingDate: "2026-09-03", reason: "Shipment was posted in error" } });
+  assert.deepEqual(row("SELECT canceled_qty FROM sales_order_lines WHERE id='sol-audit-canceled-shipment'"), { canceled_qty: 2 });
+});
+
+test("fully closing unreceived dedicated supply clears the link and dedicated quantity cannot be reopened blindly", async () => {
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-audit-close-special','SO-AUDIT-CLOSE-SPECIAL','customer-audit','confirmed','not_invoiced','2026-09-10','CAD',1,900,900,1,'2026-09-01')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-audit-close-special','so-audit-close-special','prod-audit-b',3,0,300,'special_order',0,0,0)");
+  await insertApprovedPurchaseOrder("po-audit-close-special", [{ id: "pol-audit-close-special", productId: "prod-audit-b", quantity: 3, unitCost: 150, route: "special_order" }]);
+  await run("UPDATE purchase_order_lines SET source_sales_order_line_id='sol-audit-close-special' WHERE id='pol-audit-close-special'");
+  await run("UPDATE sales_order_lines SET linked_purchase_order_line_id='pol-audit-close-special' WHERE id='sol-audit-close-special'");
+  await run("INSERT INTO supply_allocations (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version) VALUES ('allocation-audit-close-special','pol-audit-close-special','sol-audit-close-special',3,0,'active','2026-09-01','2026-09-01',1)");
+  await inventoryDomain.executeInventoryCommand({ command: "closeRemainder", entityId: "po-audit-close-special", version: 1, idempotencyKey: "audit-close-special-remainder", payload: { lineId: "pol-audit-close-special", quantity: 3, reason: "Vendor declined", actor: "Audit Buyer" } });
+  assert.deepEqual(row("SELECT status FROM supply_allocations WHERE id='allocation-audit-close-special'"), { status: "released" });
+  assert.deepEqual(row("SELECT linked_purchase_order_line_id FROM sales_order_lines WHERE id='sol-audit-close-special'"), { linked_purchase_order_line_id: null });
+  await assert.rejects(inventoryDomain.executeInventoryCommand({ command: "reopenRemainder", entityId: "po-audit-close-special", version: 2, idempotencyKey: "audit-reopen-special-remainder", payload: { lineId: "pol-audit-close-special", quantity: 1, expectedDate: "2026-09-20", reason: "Vendor changed its mind", actor: "Audit Buyer" } }), rejectsWithCode("FULFILLMENT_ROUTE_BLOCKED"));
 });

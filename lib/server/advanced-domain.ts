@@ -70,6 +70,7 @@ export const workflowCapabilities = {
   createApprovedVendorBill: "approve",
   approveVendorBill: "approve",
   createVendorCredit: "financialWrite",
+  voidVendorBill: "financialWrite",
   createCustomerInvoice: "financialWrite",
   createCustomerCredit: "financialWrite",
   voidCustomerInvoice: "financialWrite",
@@ -1117,12 +1118,13 @@ async function reverseShipment(command: WorkflowCommand) {
   const source = await first<{
     movementId: string; productId: string; locationId: string; inventoryStatus: string; salesLineId: string;
     shipped: number; reversed: number; shipmentVersion: number; salesOrderId: string; orderVersion: number;
-    orderStatus: string; invoiced: number; trackingPolicy: string; lotId: string | null; unitId: string | null; assignedQuantity: number;
+    orderStatus: string; invoiced: number; returned: number; trackingPolicy: string; lotId: string | null; unitId: string | null; assignedQuantity: number;
   }>(`SELECT sm.id AS movementId,sm.product_id AS productId,sm.from_location_id AS locationId,sm.inventory_status AS inventoryStatus,
       sm.sales_order_line_id AS salesLineId,-sm.quantity AS shipped,
       COALESCE((SELECT SUM(r.quantity) FROM stock_movements r WHERE r.reversal_of_movement_id=sm.id AND r.movement_type='shipment_reversal'),0) AS reversed,
       s.version AS shipmentVersion,so.id AS salesOrderId,so.version AS orderVersion,so.lifecycle_status AS orderStatus,
       COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sm.sales_order_line_id AND ci.status<>'void'),0) AS invoiced,
+      COALESCE((SELECT SUM(cr.quantity) FROM customer_returns cr WHERE cr.sales_order_line_id=sm.sales_order_line_id),0) AS returned,
       p.tracking_policy AS trackingPolicy,
       COALESCE(sm.lot_id,(SELECT ma.lot_id FROM movement_assignments ma WHERE ma.movement_id=sm.id AND ma.lot_id IS NOT NULL LIMIT 1)) AS lotId,
       COALESCE(sm.inventory_unit_id,(SELECT ma.inventory_unit_id FROM movement_assignments ma WHERE ma.movement_id=sm.id AND ma.inventory_unit_id IS NOT NULL LIMIT 1)) AS unitId,
@@ -1136,7 +1138,7 @@ async function reverseShipment(command: WorkflowCommand) {
     ORDER BY sm.posted_at DESC,sm.id LIMIT 1`, shipmentId, lineId, lineId);
   if (!source) throw new WorkflowError("NOT_FOUND", "Posted shipment movement was not found.", 404);
   if (command.version !== source.shipmentVersion) throw new WorkflowError("VERSION_CONFLICT", "Shipment changed; refresh before reversal.", 409, source.shipmentVersion);
-  if (source.orderStatus !== "confirmed") throw new WorkflowError("INVALID_STATE", "Only shipments for confirmed sales orders can be reversed.", 409);
+  if (!["confirmed", "canceled"].includes(source.orderStatus)) throw new WorkflowError("INVALID_STATE", "Only shipments for confirmed or canceled sales orders can be reversed.", 409);
   if (quantity > source.shipped - source.reversed) throw new WorkflowError("INVALID_QUANTITY", "Reversal exceeds the unreversed shipment quantity.", 409);
   if (source.trackingPolicy === "lot" && (!source.lotId || source.assignedQuantity < quantity)) throw new WorkflowError("LOT_ASSIGNMENT_REQUIRED", "The original tracked shipment does not contain enough immutable lot assignment to reverse.", 409);
   if (source.trackingPolicy === "serial") {
@@ -1147,6 +1149,9 @@ async function reverseShipment(command: WorkflowCommand) {
   const netShipped = await first<{ quantity: number }>(`SELECT COALESCE(SUM(CASE WHEN movement_type='sales_shipment' THEN -quantity WHEN movement_type='shipment_reversal' THEN -quantity ELSE 0 END),0) AS quantity FROM stock_movements WHERE sales_order_line_id=?`, source.salesLineId);
   if (Number(netShipped?.quantity ?? 0) - quantity < source.invoiced) {
     throw new WorkflowError("INVOICED_SHIPMENT", "Credit or reverse the related customer invoice before reversing this shipped quantity.", 409);
+  }
+  if (Number(netShipped?.quantity ?? 0) - quantity < source.returned) {
+    throw new WorkflowError("RETURNED_SHIPMENT", "This shipped quantity has already been received through a customer return and cannot also be reversed as a shipment correction.", 409);
   }
   const historical = await first<{ quantity: number; value: number; restored: number; method: string }>(`SELECT COALESCE(SUM(-quantity),0) AS quantity,COALESCE(SUM(-value_cents),0) AS value,
       COALESCE((SELECT SUM(reversal_value.value_cents) FROM inventory_value_entries reversal_value JOIN stock_movements reversal_movement ON reversal_movement.id=reversal_value.movement_id WHERE reversal_movement.reversal_of_movement_id=? AND reversal_movement.movement_type='shipment_reversal'),0) AS restored,
@@ -1160,7 +1165,7 @@ async function reverseShipment(command: WorkflowCommand) {
   const totalOnHand = await first<{ quantity: number }>("SELECT COALESCE(SUM(on_hand_qty),0) AS quantity FROM inventory_balances WHERE product_id=?", source.productId);
   const nextAverage = Math.round(((Number(totalOnHand?.quantity ?? 0) * Number(policy?.averageCost ?? unitCost)) + valueCents) / (Number(totalOnHand?.quantity ?? 0) + quantity));
   const movementId = newId("movement");
-  const result: WorkflowResult = { message: `${quantity} shipped units reversed into usable stock.`, impact: { physical: `${quantity} units restored to on-hand.`, commercial: `${quantity} units reopened for fulfillment.`, financial: `COGS was reversed by ${valueCents} cents; customer invoices remain separate.`, onHandDelta: quantity }, recordId: movementId };
+  const result: WorkflowResult = { message: `${quantity} shipped units reversed into usable stock.`, impact: { physical: `${quantity} units restored to on-hand.`, commercial: source.orderStatus === "canceled" ? `${quantity} units were removed from fulfillment history; canceled demand remains closed.` : `${quantity} units reopened for fulfillment.`, financial: `COGS was reversed by ${valueCents} cents; customer invoices remain separate.`, onHandDelta: quantity }, recordId: movementId };
   const serialUnit = source.unitId ? await first<{ version: number }>("SELECT version FROM inventory_units WHERE id=?", source.unitId) : null;
   const reverseTrackingClaim = source.trackingPolicy === "quantity"
     ? { sql: "1=1", bindings: [] as unknown[] }
@@ -1171,12 +1176,14 @@ async function reverseShipment(command: WorkflowCommand) {
   const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM shipments s WHERE s.id=? AND s.version=?
-        AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=? AND so.version=? AND so.lifecycle_status='confirmed')
+        AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=? AND so.version=? AND so.lifecycle_status IN ('confirmed','canceled'))
         AND EXISTS (SELECT 1 FROM stock_movements original WHERE original.id=? AND -original.quantity-COALESCE((SELECT SUM(r.quantity) FROM stock_movements r WHERE r.reversal_of_movement_id=original.id AND r.movement_type='shipment_reversal'),0)>=?)
         AND COALESCE((SELECT SUM(CASE WHEN movement_type='sales_shipment' THEN -quantity WHEN movement_type='shipment_reversal' THEN -quantity ELSE 0 END) FROM stock_movements WHERE sales_order_line_id=?),0)-?
           >=COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=? AND ci.status<>'void'),0)
+        AND COALESCE((SELECT SUM(CASE WHEN movement_type='sales_shipment' THEN -quantity WHEN movement_type='shipment_reversal' THEN -quantity ELSE 0 END) FROM stock_movements WHERE sales_order_line_id=?),0)-?
+          >=COALESCE((SELECT SUM(cr.quantity) FROM customer_returns cr WHERE cr.sales_order_line_id=?),0)
         AND COALESCE((SELECT version FROM valuation_policies WHERE product_id=?),0)=? AND ${reverseTrackingClaim.sql}`)
-      .bind(...claimValues(command, result, movementId), shipmentId, source.shipmentVersion, source.salesOrderId, source.orderVersion, source.movementId, quantity, source.salesLineId, quantity, source.salesLineId, source.productId, policy?.version ?? 0, ...reverseTrackingClaim.bindings),
+      .bind(...claimValues(command, result, movementId), shipmentId, source.shipmentVersion, source.salesOrderId, source.orderVersion, source.movementId, quantity, source.salesLineId, quantity, source.salesLineId, source.salesLineId, quantity, source.salesLineId, source.productId, policy?.version ?? 0, ...reverseTrackingClaim.bindings),
     db.prepare(`UPDATE shipments SET version=version+1,status=CASE WHEN NOT EXISTS (
       SELECT 1 FROM stock_movements original WHERE original.source_document_type='shipment' AND original.source_document_id=shipments.id AND original.movement_type='sales_shipment'
         AND -original.quantity-COALESCE((SELECT SUM(reversal.quantity) FROM stock_movements reversal WHERE reversal.reversal_of_movement_id=original.id AND reversal.movement_type='shipment_reversal'),0)
@@ -1193,6 +1200,9 @@ async function reverseShipment(command: WorkflowCommand) {
     auditStatement(command, "shipment", shipmentId, "shipment_reversed", result.message, { quantity, reason, movementId, originalMovementId: source.movementId, cogsReversedCents: valueCents }, when),
     outboxStatement(command, "shipment.reversed", "shipment", shipmentId, { quantity, movementId, cogsReversedCents: valueCents }, when),
   ];
+  if (source.orderStatus === "canceled") statements.push(
+    db.prepare(`UPDATE sales_order_lines SET canceled_qty=MIN(ordered_qty,canceled_qty+?) WHERE id=? AND ${marker(command)}`).bind(quantity, source.salesLineId),
+  );
   if (policy?.method === "average") {
     statements.push(db.prepare(`UPDATE valuation_policies SET average_cost_cents=?,version=version+1,updated_at=?,updated_by=? WHERE product_id=? AND version=? AND method='average' AND ${marker(command)}`).bind(nextAverage, when, command.actor.label, source.productId, policy.version));
   }
@@ -1446,7 +1456,7 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
     const poLineId = requestedLineIds[index];
     const quantity = roundQuantity(numberValue(line, "quantity"));
     const unitCost = numberValue(line, "unitCostCents", { integer: true });
-    const poLine = await first<{ productId: string; ordered: number; poCost: number; received: number; billed: number }>(`SELECT pol.product_id AS productId,pol.ordered_qty AS ordered,pol.unit_cost_cents AS poCost,
+    const poLine = await first<{ productId: string; ordered: number; poCost: number; received: number; billed: number; route: string }>(`SELECT pol.product_id AS productId,pol.ordered_qty AS ordered,pol.unit_cost_cents AS poCost,pol.fulfillment_route AS route,
         CASE WHEN pol.fulfillment_route='drop_ship'
           THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
           ELSE COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0) END AS received,
@@ -1463,7 +1473,7 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
       throw new WorkflowError("BILLED_ABOVE_ORDERED", `Bill line ${index + 1} bills ${quantity} against ${remainingOrdered} unbilled ordered unit${remainingOrdered === 1 ? "" : "s"}${tolerances.quantity ? ` (tolerance ${tolerances.quantity})` : ""}. Amend the purchase order before billing above it.`, 409);
     }
     const aheadOfReceipt = quantity > remainingReceived + tolerances.quantity;
-    if (aheadOfReceipt) lineExceptions.push({ code: "BILL_BEFORE_RECEIPT", severity: "blocking", variance: roundQuantity(quantity - remainingReceived) });
+    if (aheadOfReceipt) lineExceptions.push({ code: poLine.route === "drop_ship" ? "BILL_BEFORE_DELIVERY" : "BILL_BEFORE_RECEIPT", severity: "blocking", variance: roundQuantity(quantity - remainingReceived) });
     if (Math.abs(unitCost - poLine.poCost) > tolerances.unitPriceCents) lineExceptions.push({ code: "UNIT_PRICE_VARIANCE", severity: "approval", varianceCents: unitCost - poLine.poCost });
     exceptions.push(...lineExceptions.map((item) => ({ ...item, lineId: poLineId })));
     normalized.push({ poLineId, productId: poLine.productId, quantity, unitCost, poCost: poLine.poCost, lineTotal: Math.round(quantity * unitCost), status: lineExceptions.length ? "exception" : "matched", aheadOfReceipt, details: { exceptions: lineExceptions, ordered: poLine.ordered, netReceived: poLine.received, previouslyBilled: poLine.billed, remainingReceived, poUnitCostCents: poLine.poCost } });
@@ -1520,9 +1530,7 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
     db.prepare(`UPDATE purchase_orders SET billing_status=CASE WHEN NOT EXISTS (
       SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id=purchase_orders.id
         AND COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)
-          < CASE WHEN pol.fulfillment_route='drop_ship'
-              THEN MAX(COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0),0)
-              ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END
+          < MAX(pol.ordered_qty-pol.closed_qty,0)
       ) THEN 'fully_billed' ELSE 'partially_billed' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(purchaseOrderId, order.version),
     auditStatement(command, "vendor_bill", billId, fastTrack ? "vendor_bill_fast_track_approved" : "vendor_bill_posted", result.message, { purchaseOrderId, exceptions, total, currency, exchange, lineCount: normalized.length, chargeCount: charges.length, fastTrack, approvalReason }, when),
     outboxStatement(command, "vendor_bill.posted", "vendor_bill", billId, { status: hold ? "on_hold" : "approved", total, baseTotal }, when)
@@ -1543,7 +1551,7 @@ async function approveVendorBill(command: WorkflowCommand) {
   // receipts (net of every other live bill) cover each billed line within the quantity tolerance.
   let holdExceptions: Array<Record<string, unknown>> = [];
   try { const parsed = JSON.parse(bill.holdReason ?? "[]") as unknown; holdExceptions = Array.isArray(parsed) ? parsed as Array<Record<string, unknown>> : []; } catch { holdExceptions = []; }
-  const awaitingReceipt = holdExceptions.some((exception) => exception.code === "BILL_BEFORE_RECEIPT" || exception.code === "BILLED_ABOVE_RECEIVED");
+  const awaitingReceipt = holdExceptions.some((exception) => exception.code === "BILL_BEFORE_RECEIPT" || exception.code === "BILL_BEFORE_DELIVERY" || exception.code === "BILLED_ABOVE_RECEIVED");
   const tolerances = awaitingReceipt ? await setting<{ quantity: number }>("matching.tolerances", { quantity: 0 }) : { quantity: 0 };
   const unreceivedLineSql = `EXISTS (SELECT 1 FROM vendor_bill_lines vbl JOIN purchase_order_lines pol ON pol.id=vbl.purchase_order_line_id
     WHERE vbl.vendor_bill_id=vendor_bills.id AND vbl.quantity>(CASE WHEN pol.fulfillment_route='drop_ship'
@@ -1552,7 +1560,7 @@ async function approveVendorBill(command: WorkflowCommand) {
       -COALESCE((SELECT SUM(other.quantity) FROM vendor_bill_lines other JOIN vendor_bills ob ON ob.id=other.vendor_bill_id
         WHERE other.purchase_order_line_id=pol.id AND ob.status<>'void' AND ob.id<>vendor_bills.id),0)+?)`;
   if (awaitingReceipt && await first(`SELECT 1 AS unreceived FROM vendor_bills WHERE id=? AND ${unreceivedLineSql}`, id, tolerances.quantity)) {
-    throw new WorkflowError("RECEIPT_REQUIRED", "This bill was posted before the goods arrived. Receive the purchase order (or void the bill) before releasing the hold.", 409, bill.version);
+    throw new WorkflowError("RECEIPT_REQUIRED", "Post the missing supplier fulfillment (warehouse receipt or drop-ship delivery), or void/correct the bill, before releasing the hold.", 409, bill.version);
   }
   const result: WorkflowResult = { message: "Vendor bill hold approved; payable released without moving inventory.", impact: { physical: "No stock movement.", financial: "Payable released.", onHandDelta: 0 }, recordId: id };
   const db = commandD1(command); const when = new Date().toISOString();
@@ -1564,6 +1572,41 @@ async function approveVendorBill(command: WorkflowCommand) {
     auditStatement(command, "vendor_bill", id, "vendor_bill_approved", result.message, { reason }, when),
     outboxStatement(command, "vendor_bill.approved", "vendor_bill", id, { reason }, when),
   ]);
+  return finish(command);
+}
+
+async function voidVendorBill(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const reason = textValue(command.payload ?? {}, "reason");
+  const bill = await first<{ version: number; status: string; paid: number; credited: number; purchaseOrderId: string | null; purchaseVersion: number | null; invoiceDate: string }>(`SELECT vb.version,vb.status,vb.paid_cents AS paid,vb.purchase_order_id AS purchaseOrderId,vb.invoice_date AS invoiceDate,
+      po.version AS purchaseVersion,COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted'),0) AS credited
+    FROM vendor_bills vb LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id WHERE vb.id=?`, id);
+  if (!bill) throw new WorkflowError("NOT_FOUND", "Vendor bill was not found.", 404);
+  if (bill.version !== (command.version ?? 0)) throw new WorkflowError("VERSION_CONFLICT", "Vendor bill changed; refresh before voiding.", 409, bill.version);
+  if (bill.status === "void") throw new WorkflowError("INVALID_STATE", "Vendor bill is already void.", 409);
+  if (bill.paid !== 0 || bill.credited !== 0) throw new WorkflowError("BILL_CORRECTION_REQUIRED", "Only an entirely unpaid and uncredited vendor bill can be voided; reverse settlement or retain the bill and its credit history.", 409);
+  await assertPeriodOpen("accounting", bill.invoiceDate);
+  const result: WorkflowResult = { message: "Vendor bill voided; its quantities no longer block supplier-fulfillment correction.", impact: { physical: "No stock movement.", financial: "The unpaid payable was voided.", onHandDelta: 0 }, recordId: id };
+  const db = commandD1(command); const when = new Date().toISOString();
+  const purchaseClaim = bill.purchaseOrderId ? " AND EXISTS (SELECT 1 FROM purchase_orders po WHERE po.id=vb.purchase_order_id AND po.version=?)" : "";
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM vendor_bills vb WHERE vb.id=? AND vb.version=? AND vb.status<>'void' AND vb.paid_cents=0
+        AND NOT EXISTS (SELECT 1 FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted')${purchaseClaim}`)
+      .bind(...claimValues(command, result, id), id, bill.version, ...(bill.purchaseOrderId ? [bill.purchaseVersion ?? 0] : [])),
+    db.prepare(`UPDATE vendor_bills SET status='void',hold_reason=NULL,version=version+1 WHERE id=? AND version=? AND paid_cents=0 AND ${marker(command)}`).bind(id, bill.version),
+    db.prepare(`UPDATE approvals SET status='rejected',decided_by=?,decision_reason=?,decided_at=?,version=version+1 WHERE entity_type='vendor_bill' AND entity_id=? AND status='pending' AND ${marker(command)}`).bind(command.actor.label, `Bill voided: ${reason}`, when, id),
+    auditStatement(command, "vendor_bill", id, "vendor_bill_voided", result.message, { reason, purchaseOrderId: bill.purchaseOrderId }, when),
+    outboxStatement(command, "vendor_bill.voided", "vendor_bill", id, { reason, purchaseOrderId: bill.purchaseOrderId }, when),
+  ];
+  if (bill.purchaseOrderId) statements.splice(2, 0,
+    db.prepare(`UPDATE purchase_orders SET billing_status=CASE
+      WHEN NOT EXISTS (SELECT 1 FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vb.purchase_order_id=purchase_orders.id AND vb.status<>'void') THEN 'not_billed'
+      WHEN NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id=purchase_orders.id
+        AND COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)<MAX(pol.ordered_qty-pol.closed_qty,0)) THEN 'fully_billed'
+      ELSE 'partially_billed' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(bill.purchaseOrderId, bill.purchaseVersion ?? 0),
+  );
+  await db.batch(statements);
   return finish(command);
 }
 
@@ -2974,7 +3017,9 @@ async function setSalesOrderLifecycle(command: WorkflowCommand, target: "confirm
       db.prepare(`UPDATE inventory_balances SET reserved_qty=reserved_qty-?,version=version+1 WHERE product_id=? AND location_id=? AND reserved_qty>=? AND ${marker(command)}`).bind(reservation.quantity, reservation.productId, reservation.locationId, reservation.quantity),
       db.prepare(`UPDATE reservations SET status='released' WHERE id=? AND status='active' AND quantity=? AND ${marker(command)}`).bind(reservation.id, reservation.quantity)
     );
-    statements.push(db.prepare(`UPDATE sales_order_lines SET canceled_qty=MAX(0,ordered_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sales_order_lines.id),0)) WHERE sales_order_id=? AND ${marker(command)}`).bind(id));
+    statements.push(db.prepare(`UPDATE sales_order_lines SET canceled_qty=MAX(0,ordered_qty-CASE WHEN fulfillment_route='drop_ship'
+      THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sales_order_lines.id),0)
+      ELSE COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sales_order_lines.id),0) END) WHERE sales_order_id=? AND ${marker(command)}`).bind(id));
   }
   statements.push(auditStatement(command, "sales_order", id, `sales_order_${target}`, result.message, { reason }, when), outboxStatement(command, `sales_order.${target}`, "sales_order", id, { reason }, when));
   await db.batch(statements);
@@ -3046,33 +3091,41 @@ async function reverseDropShipDelivery(command: WorkflowCommand) {
   const postingDate = dateValue(payload, "postingDate", today());
   await assertPeriodOpen("sales", postingDate);
   await assertPeriodOpen("purchasing", postingDate);
-  const delivery = await first<{ version: number; quantity: number; reversed: number; salesOrderId: string; salesLineId: string; salesVersion: number; purchaseOrderId: string; purchaseLineId: string; purchaseVersion: number; allocationId: string; allocationVersion: number; allocationReceived: number; netDelivered: number; invoiced: number }>(`SELECT d.version,d.quantity,d.reversed_qty AS reversed,d.sales_order_id AS salesOrderId,d.sales_order_line_id AS salesLineId,so.version AS salesVersion,
+  const delivery = await first<{ version: number; quantity: number; reversed: number; salesOrderId: string; salesLineId: string; salesVersion: number; salesStatus: string; purchaseOrderId: string; purchaseLineId: string; purchaseVersion: number; allocationId: string; allocationVersion: number; allocationQuantity: number; allocationReceived: number; netDelivered: number; netDeliveredPurchase: number; invoiced: number; vendorBilled: number }>(`SELECT d.version,d.quantity,d.reversed_qty AS reversed,d.sales_order_id AS salesOrderId,d.sales_order_line_id AS salesLineId,so.version AS salesVersion,so.lifecycle_status AS salesStatus,
       d.purchase_order_id AS purchaseOrderId,d.purchase_order_line_id AS purchaseLineId,po.version AS purchaseVersion,
-      sa.id AS allocationId,sa.version AS allocationVersion,sa.received_qty AS allocationReceived,
+      sa.id AS allocationId,sa.version AS allocationVersion,sa.allocated_qty AS allocationQuantity,sa.received_qty AS allocationReceived,
       COALESCE((SELECT SUM(other.quantity-other.reversed_qty) FROM drop_ship_deliveries other WHERE other.sales_order_line_id=d.sales_order_line_id),0) AS netDelivered,
-      COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=d.sales_order_line_id AND ci.status<>'void'),0) AS invoiced
+      COALESCE((SELECT SUM(other.quantity-other.reversed_qty) FROM drop_ship_deliveries other WHERE other.purchase_order_line_id=d.purchase_order_line_id),0) AS netDeliveredPurchase,
+      COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=d.sales_order_line_id AND ci.status<>'void'),0) AS invoiced,
+      COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=d.purchase_order_line_id AND vb.status<>'void'),0) AS vendorBilled
     FROM drop_ship_deliveries d JOIN sales_orders so ON so.id=d.sales_order_id JOIN purchase_orders po ON po.id=d.purchase_order_id
     JOIN supply_allocations sa ON sa.purchase_order_line_id=d.purchase_order_line_id AND sa.sales_order_line_id=d.sales_order_line_id WHERE d.id=?`, id);
   if (!delivery) throw new WorkflowError("NOT_FOUND", "Drop-ship delivery was not found.", 404);
   if (delivery.version !== (command.version ?? 0)) throw new WorkflowError("VERSION_CONFLICT", "Drop-ship delivery changed; refresh before reversing.", 409, delivery.version);
   if (quantity > delivery.quantity - delivery.reversed) throw new WorkflowError("INVALID_QUANTITY", "Reversal exceeds the delivery's remaining quantity.", 409);
   if (delivery.netDelivered - quantity < delivery.invoiced) throw new WorkflowError("INVOICED_DELIVERY", "Credit or void the related customer invoice quantity before reversing this delivery.", 409);
-  const result: WorkflowResult = { message: `${quantity} drop-ship delivery units reversed.`, impact: { physical: "No internal stock or valuation movement.", commercial: `${quantity} externally delivered units are no longer billable or invoiceable.`, financial: "Posted invoices and bills remain separate.", onHandDelta: 0, deliveredDelta: -quantity }, recordId: id };
+  if (delivery.netDeliveredPurchase - quantity < delivery.vendorBilled) throw new WorkflowError("BILLED_DELIVERY", "Void or correct the related vendor bill before reversing this supplier delivery.", 409);
+  const result: WorkflowResult = { message: `${quantity} drop-ship delivery units reversed.`, impact: { physical: "No internal stock or valuation movement.", commercial: delivery.salesStatus === "canceled" ? `${quantity} externally delivered units were removed from fulfillment history; canceled demand remains closed.` : `${quantity} externally delivered units are no longer billable or invoiceable.`, financial: "Posted invoices and bills remain separate.", onHandDelta: 0, deliveredDelta: -quantity }, recordId: id };
   const db = commandD1(command); const when = new Date().toISOString();
   await db.batch([
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM drop_ship_deliveries d WHERE d.id=? AND d.version=? AND d.quantity-d.reversed_qty>=?
         AND COALESCE((SELECT SUM(other.quantity-other.reversed_qty) FROM drop_ship_deliveries other WHERE other.sales_order_line_id=d.sales_order_line_id),0)-?
           >=COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=d.sales_order_line_id AND ci.status<>'void'),0)
-        AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=d.sales_order_id AND so.version=?)
+        AND COALESCE((SELECT SUM(other.quantity-other.reversed_qty) FROM drop_ship_deliveries other WHERE other.purchase_order_line_id=d.purchase_order_line_id),0)-?
+          >=COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=d.purchase_order_line_id AND vb.status<>'void'),0)
+        AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=d.sales_order_id AND so.version=? AND so.lifecycle_status IN ('confirmed','canceled'))
         AND EXISTS (SELECT 1 FROM purchase_orders po WHERE po.id=d.purchase_order_id AND po.version=?)
-        AND EXISTS (SELECT 1 FROM supply_allocations sa WHERE sa.id=? AND sa.version=? AND sa.received_qty>=?)`)
-      .bind(...claimValues(command, result, id), id, delivery.version, quantity, quantity, delivery.salesVersion, delivery.purchaseVersion, delivery.allocationId, delivery.allocationVersion, quantity),
+        AND EXISTS (SELECT 1 FROM supply_allocations sa WHERE sa.id=? AND sa.version=? AND sa.received_qty>=? AND (?<>'canceled' OR sa.allocated_qty=sa.received_qty))`)
+      .bind(...claimValues(command, result, id), id, delivery.version, quantity, quantity, quantity, delivery.salesVersion, delivery.purchaseVersion, delivery.allocationId, delivery.allocationVersion, quantity, delivery.salesStatus),
     db.prepare(`UPDATE drop_ship_deliveries SET reversed_qty=reversed_qty+?,status=CASE WHEN reversed_qty+?=quantity THEN 'reversed' ELSE 'partially_reversed' END,version=version+1 WHERE id=? AND version=? AND quantity-reversed_qty>=? AND ${marker(command)}`).bind(quantity, quantity, id, delivery.version, quantity),
     db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(delivery.salesOrderId, delivery.salesVersion),
+    db.prepare(`UPDATE sales_order_lines SET canceled_qty=MIN(ordered_qty,canceled_qty+?) WHERE id=? AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=sales_order_lines.sales_order_id AND so.lifecycle_status='canceled') AND ${marker(command)}`).bind(quantity, delivery.salesLineId),
     db.prepare(`UPDATE purchase_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(delivery.purchaseOrderId, delivery.purchaseVersion),
-    db.prepare(`UPDATE supply_allocations SET received_qty=received_qty-?,updated_at=?,version=version+1 WHERE id=? AND version=? AND received_qty>=? AND ${marker(command)}`)
-      .bind(quantity, when, delivery.allocationId, delivery.allocationVersion, quantity),
+    db.prepare(delivery.salesStatus === "canceled"
+      ? `UPDATE supply_allocations SET received_qty=received_qty-?,allocated_qty=CASE WHEN received_qty-?>0 THEN allocated_qty-? ELSE allocated_qty END,status=CASE WHEN received_qty-?>0 THEN status ELSE 'released' END,updated_at=?,version=version+1 WHERE id=? AND version=? AND received_qty>=? AND allocated_qty=received_qty AND ${marker(command)}`
+      : `UPDATE supply_allocations SET received_qty=received_qty-?,updated_at=?,version=version+1 WHERE id=? AND version=? AND received_qty>=? AND ${marker(command)}`)
+      .bind(...(delivery.salesStatus === "canceled" ? [quantity, quantity, quantity, quantity, when, delivery.allocationId, delivery.allocationVersion, quantity] : [quantity, when, delivery.allocationId, delivery.allocationVersion, quantity])),
     auditStatement(command, "drop_ship_delivery", id, "drop_ship_delivery_reversed", result.message, { quantity, reason, postingDate, salesOrderLineId: delivery.salesLineId, purchaseOrderLineId: delivery.purchaseLineId }, when),
     outboxStatement(command, "drop_ship.delivery_reversed", "drop_ship_delivery", id, { quantity, reason }, when),
   ]);
@@ -3358,17 +3411,25 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
     (SELECT sm.source_document_type||' · '||sm.source_document_id FROM movement_assignments ma JOIN stock_movements sm ON sm.id=ma.movement_id WHERE ma.inventory_unit_id=iu.id ORDER BY sm.posted_at,sm.id LIMIT 1) AS sourceDocument
     FROM inventory_units iu JOIN products p ON p.id=iu.product_id JOIN locations l ON l.id=iu.location_id LEFT JOIN inventory_lots il ON il.id=iu.lot_id ORDER BY iu.created_at DESC`),
   scopedAll<Record<string,unknown>>(["inventory"],"SELECT it.id,it.number,it.transfer_type AS transferType,it.status,it.from_warehouse_id AS fromWarehouseId,it.to_warehouse_id AS toWarehouseId,it.in_transit_location_id AS inTransitLocationId,it.posted_at AS postedAt,it.posted_by AS postedBy,it.version,itl.id AS lineId,itl.product_id AS productId,itl.from_location_id AS fromLocationId,itl.to_location_id AS toLocationId,itl.quantity,itl.received_qty AS receivedQuantity FROM inventory_transfers it JOIN inventory_transfer_lines itl ON itl.transfer_id=it.id ORDER BY it.posted_at DESC"),
-  scopedAll<Record<string,unknown>>(["sales"],"SELECT d.id,d.number,d.purchase_order_id AS purchaseOrderId,po.number AS purchaseOrderNumber,d.purchase_order_line_id AS purchaseOrderLineId,d.sales_order_id AS salesOrderId,so.number AS salesOrderNumber,d.sales_order_line_id AS salesOrderLineId,d.product_id AS productId,p.sku,p.name AS productName,d.quantity,d.reversed_qty AS reversedQuantity,d.quantity-d.reversed_qty AS netDeliveredQuantity,d.status,d.delivery_date AS deliveryDate,d.external_reference AS externalReference,d.posted_at AS postedAt,d.posted_by AS postedBy,d.version FROM drop_ship_deliveries d JOIN purchase_orders po ON po.id=d.purchase_order_id JOIN sales_orders so ON so.id=d.sales_order_id JOIN products p ON p.id=d.product_id WHERE d.quantity-d.reversed_qty>0 AND so.lifecycle_status='confirmed' ORDER BY d.posted_at DESC"),
+  scopedAll<Record<string,unknown>>(["sales"],"SELECT d.id,d.number,d.purchase_order_id AS purchaseOrderId,po.number AS purchaseOrderNumber,d.purchase_order_line_id AS purchaseOrderLineId,d.sales_order_id AS salesOrderId,so.number AS salesOrderNumber,d.sales_order_line_id AS salesOrderLineId,d.product_id AS productId,p.sku,p.name AS productName,d.quantity,d.reversed_qty AS reversedQuantity,d.quantity-d.reversed_qty AS netDeliveredQuantity,d.status,d.delivery_date AS deliveryDate,d.external_reference AS externalReference,d.posted_at AS postedAt,d.posted_by AS postedBy,d.version FROM drop_ship_deliveries d JOIN purchase_orders po ON po.id=d.purchase_order_id JOIN sales_orders so ON so.id=d.sales_order_id JOIN products p ON p.id=d.product_id WHERE d.quantity-d.reversed_qty>0 AND so.lifecycle_status IN ('confirmed','canceled') ORDER BY d.posted_at DESC"),
   scopedAll<Record<string,unknown>>(["sales"],"SELECT r.id,r.sales_order_line_id AS salesOrderLineId,sol.sales_order_id AS salesOrderId,so.number AS salesOrderNumber,r.product_id AS productId,p.sku,p.name AS productName,r.location_id AS locationId,l.code AS locationCode,r.quantity,r.status,r.created_at AS createdAt,so.version AS orderVersion FROM reservations r JOIN sales_order_lines sol ON sol.id=r.sales_order_line_id JOIN sales_orders so ON so.id=sol.sales_order_id JOIN products p ON p.id=r.product_id JOIN locations l ON l.id=r.location_id WHERE r.status='active' AND r.quantity>0 AND so.lifecycle_status='confirmed' ORDER BY r.created_at DESC"),
   scopedAll<Record<string,unknown>>(["sales"],`SELECT s.id,s.number,s.sales_order_id AS salesOrderId,so.number AS salesOrderNumber,bp.name AS customerName,s.status,s.posted_at AS postedAt,s.version,sl.id AS lineId,sl.sales_order_line_id AS salesOrderLineId,sl.product_id AS productId,p.sku,p.name AS productName,sl.location_id AS locationId,l.code AS locationCode,
-    MAX(-original.quantity-COALESCE((SELECT SUM(reversal.quantity) FROM stock_movements reversal WHERE reversal.reversal_of_movement_id=original.id AND reversal.movement_type='shipment_reversal'),0),0) AS quantity
+    MIN(
+      MAX(-original.quantity-COALESCE((SELECT SUM(reversal.quantity) FROM stock_movements reversal WHERE reversal.reversal_of_movement_id=original.id AND reversal.movement_type='shipment_reversal'),0),0),
+      MAX(COALESCE((SELECT SUM(CASE WHEN line_movement.movement_type='sales_shipment' THEN -line_movement.quantity WHEN line_movement.movement_type='shipment_reversal' THEN -line_movement.quantity ELSE 0 END) FROM stock_movements line_movement WHERE line_movement.sales_order_line_id=sl.sales_order_line_id),0)
+        -MAX(COALESCE((SELECT SUM(invoice_line.quantity) FROM customer_invoice_lines invoice_line JOIN customer_invoices invoice ON invoice.id=invoice_line.customer_invoice_id WHERE invoice_line.sales_order_line_id=sl.sales_order_line_id AND invoice.status<>'void'),0),
+             COALESCE((SELECT SUM(cr.quantity) FROM customer_returns cr WHERE cr.sales_order_line_id=sl.sales_order_line_id),0)),0)
+    ) AS quantity
     FROM shipments s JOIN shipment_lines sl ON sl.shipment_id=s.id JOIN sales_orders so ON so.id=s.sales_order_id JOIN business_partners bp ON bp.id=so.customer_id JOIN products p ON p.id=sl.product_id JOIN locations l ON l.id=sl.location_id
     JOIN stock_movements original ON original.source_document_type='shipment' AND original.source_document_id=s.id AND original.source_line_id=sl.id AND original.movement_type='sales_shipment'
-    WHERE so.lifecycle_status='confirmed'
+    WHERE so.lifecycle_status IN ('confirmed','canceled')
     GROUP BY s.id,sl.id
-    HAVING MAX(-original.quantity-COALESCE((SELECT SUM(reversal.quantity) FROM stock_movements reversal WHERE reversal.reversal_of_movement_id=original.id AND reversal.movement_type='shipment_reversal'),0),0)>0
-      AND COALESCE((SELECT SUM(CASE WHEN line_movement.movement_type='sales_shipment' THEN -line_movement.quantity WHEN line_movement.movement_type='shipment_reversal' THEN -line_movement.quantity ELSE 0 END) FROM stock_movements line_movement WHERE line_movement.sales_order_line_id=sl.sales_order_line_id),0)
-        > COALESCE((SELECT SUM(invoice_line.quantity) FROM customer_invoice_lines invoice_line JOIN customer_invoices invoice ON invoice.id=invoice_line.customer_invoice_id WHERE invoice_line.sales_order_line_id=sl.sales_order_line_id AND invoice.status<>'void'),0)
+    HAVING MIN(
+      MAX(-original.quantity-COALESCE((SELECT SUM(reversal.quantity) FROM stock_movements reversal WHERE reversal.reversal_of_movement_id=original.id AND reversal.movement_type='shipment_reversal'),0),0),
+      MAX(COALESCE((SELECT SUM(CASE WHEN line_movement.movement_type='sales_shipment' THEN -line_movement.quantity WHEN line_movement.movement_type='shipment_reversal' THEN -line_movement.quantity ELSE 0 END) FROM stock_movements line_movement WHERE line_movement.sales_order_line_id=sl.sales_order_line_id),0)
+        -MAX(COALESCE((SELECT SUM(invoice_line.quantity) FROM customer_invoice_lines invoice_line JOIN customer_invoices invoice ON invoice.id=invoice_line.customer_invoice_id WHERE invoice_line.sales_order_line_id=sl.sales_order_line_id AND invoice.status<>'void'),0),
+             COALESCE((SELECT SUM(cr.quantity) FROM customer_returns cr WHERE cr.sales_order_line_id=sl.sales_order_line_id),0)),0)
+    )>0
     ORDER BY s.posted_at DESC,sl.id`),
   scopedAll<Record<string,unknown>>(["vendor-billing"],"SELECT vb.*,bp.name AS vendorName,po.number AS purchaseOrderNumber,(SELECT COUNT(*) FROM vendor_bill_lines WHERE vendor_bill_id=vb.id) AS lineCount,COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted'),0) AS credited_cents FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id WHERE vb.status='on_hold' OR MAX(vb.total_cents-vb.paid_cents-COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted'),0),0)>0 ORDER BY COALESCE(vb.posted_at,vb.due_date) DESC"),
   scopedAll<Record<string,unknown>>(["vendor-billing"],"SELECT vc.*,bp.name AS vendorName FROM vendor_credits vc JOIN business_partners bp ON bp.id=vc.vendor_id ORDER BY vc.posted_at DESC"),
@@ -3408,6 +3469,7 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
       -- An approver decides on this row alone, so it has to carry who raised the order, the
       -- justification they were required to type, and what is actually being bought.
       po.buyer_name AS buyerName,po.created_at AS orderDate,po.project_reference AS projectReference,
+      po.supplier_quote_number AS supplierQuoteNumber,po.supplier_reference AS supplierReference,
       (SELECT por.reason FROM purchase_order_revisions por WHERE por.purchase_order_id=po.id
         AND por.revision_number=po.revision_number ORDER BY por.rowid DESC LIMIT 1) AS submissionNote,
       (SELECT json_group_array(json_object('id',l.id,'sku',l.sku,'productName',l.productName,
@@ -3547,6 +3609,7 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
     case "createvendorbill": return createVendorBill(command);
     case "createapprovedvendorbill": return createVendorBill(command, true);
     case "approvevendorbill": return approveVendorBill(command);
+    case "voidvendorbill": return voidVendorBill(command);
     case "createvendorcredit": return createFinancialCreditV2(command, "vendor");
     case "createcustomerinvoice": return createCustomerInvoiceV2(command);
     case "createcustomercredit": return createFinancialCreditV2(command, "customer");

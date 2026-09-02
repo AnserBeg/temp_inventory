@@ -3,6 +3,7 @@ import handler from "vinext/server/app-router-entry";
 import { processOutboxBatch } from "@/lib/server/outbox";
 import { processQboSyncBatch } from "@/lib/server/qbo-sync";
 import { processQboWebhookBatch } from "@/lib/server/qbo-webhook";
+import { processHelcimIntegrationBatch } from "@/lib/server/helcim-payments";
 
 interface Env {
   ASSETS: Fetcher;
@@ -16,6 +17,13 @@ interface Env {
   QBO_REDIRECT_URI?: string;
   QBO_WEBHOOK_VERIFIER_TOKEN?: string;
   QBO_MINOR_VERSION?: string;
+  HELCIM_API_TOKEN?: string;
+  HELCIM_WEBHOOK_VERIFIER_TOKEN?: string;
+  HELCIM_TOKEN_ENCRYPTION_KEY?: string;
+  HELCIM_CHECKOUT_PAYMENT_METHODS?: string;
+  HELCIM_PAYMENT_LINK_TTL_DAYS?: string;
+  HELCIM_CHECKOUT_MODE?: string;
+  HELCIM_INVOICE_HOST?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -58,6 +66,7 @@ const worker = {
       processOutboxBatch({ limit: 100 }),
       processQboWebhookBatch(100),
       processQboSyncBatch({ limit: 100 }),
+      processHelcimIntegrationBatch(100),
     ]);
     const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
     if (failures.length) {

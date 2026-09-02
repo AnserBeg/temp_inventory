@@ -108,12 +108,17 @@ export const purchaseOrders = sqliteTable(
     totalCents: integer("total_cents").notNull(),
     buyerName: text("buyer_name"),
     projectReference: text("project_reference"),
+    supplierQuoteNumber: text("supplier_quote_number"),
+    supplierReference: text("supplier_reference"),
+    sourceDocumentHash: text("source_document_hash"),
     revisionNumber: integer("revision_number").notNull().default(1),
     version: integer("version").notNull().default(1),
     createdAt: text("created_at").notNull(),
   },
   (table) => [
     uniqueIndex("idx_purchase_orders_number").on(table.number),
+    uniqueIndex("idx_purchase_orders_vendor_supplier_quote").on(table.vendorId, table.supplierQuoteNumber),
+    uniqueIndex("idx_purchase_orders_source_document_hash").on(table.sourceDocumentHash),
     index("idx_purchase_orders_vendor_status").on(table.vendorId, table.lifecycleStatus),
     index("idx_purchase_orders_status_expected").on(table.lifecycleStatus, table.expectedDate),
   ]
@@ -945,6 +950,97 @@ export const payments = sqliteTable(
   (table) => [
     uniqueIndex("idx_payments_number").on(table.number),
     index("idx_payments_document_date").on(table.documentType, table.documentId, table.direction, table.paymentDate),
+  ]
+);
+
+/** Bearer links sent to customers. Only the SHA-256 digest is persisted. */
+export const invoicePaymentLinks = sqliteTable(
+  "invoice_payment_links",
+  {
+    id: text("id").primaryKey(),
+    customerInvoiceId: text("customer_invoice_id").notNull().references(() => customerInvoices.id),
+    tokenHash: text("token_hash").notNull(),
+    status: text("status").notNull().default("active"),
+    createdBy: text("created_by").notNull(),
+    createdAt: text("created_at").notNull(),
+    expiresAt: text("expires_at").notNull(),
+    lastViewedAt: text("last_viewed_at"),
+  },
+  (table) => [
+    uniqueIndex("idx_invoice_payment_links_token_hash").on(table.tokenHash),
+    index("idx_invoice_payment_links_invoice_status").on(table.customerInvoiceId, table.status),
+    index("idx_invoice_payment_links_expiry").on(table.status, table.expiresAt),
+    check("invoice_payment_link_status_check", sql`${table.status} IN ('active','paid','revoked','expired')`),
+  ]
+);
+
+/** PaneFlow remains authoritative; this table records the matching Helcim invoice identity. */
+export const helcimInvoiceMirrors = sqliteTable(
+  "helcim_invoice_mirrors",
+  {
+    customerInvoiceId: text("customer_invoice_id").primaryKey().references(() => customerInvoices.id),
+    helcimInvoiceId: text("helcim_invoice_id").notNull(),
+    helcimInvoiceNumber: text("helcim_invoice_number").notNull(),
+    helcimInvoiceToken: text("helcim_invoice_token"),
+    localVersion: integer("local_version").notNull(),
+    syncedAt: text("synced_at").notNull(),
+    lastError: text("last_error"),
+  },
+  (table) => [
+    uniqueIndex("idx_helcim_invoice_mirrors_id").on(table.helcimInvoiceId),
+    uniqueIndex("idx_helcim_invoice_mirrors_number").on(table.helcimInvoiceNumber),
+  ]
+);
+
+/** One short-lived HelcimPay.js initialization and its eventual accounting result. */
+export const helcimCheckoutSessions = sqliteTable(
+  "helcim_checkout_sessions",
+  {
+    id: text("id").primaryKey(),
+    paymentLinkId: text("payment_link_id").notNull().references(() => invoicePaymentLinks.id),
+    customerInvoiceId: text("customer_invoice_id").notNull().references(() => customerInvoices.id),
+    checkoutToken: text("checkout_token").notNull(),
+    encryptedSecretToken: text("encrypted_secret_token").notNull(),
+    amountCents: integer("amount_cents").notNull(),
+    currency: text("currency").notNull(),
+    status: text("status").notNull().default("initialized"),
+    providerTransactionId: text("provider_transaction_id"),
+    providerMethod: text("provider_method"),
+    providerStatus: text("provider_status"),
+    providerResponseJson: text("provider_response_json").notNull().default("{}"),
+    paymentId: text("payment_id").references(() => payments.id),
+    createdAt: text("created_at").notNull(),
+    expiresAt: text("expires_at").notNull(),
+    completedAt: text("completed_at"),
+    reconciledAt: text("reconciled_at"),
+    lastError: text("last_error"),
+  },
+  (table) => [
+    uniqueIndex("idx_helcim_checkout_sessions_token").on(table.checkoutToken),
+    uniqueIndex("idx_helcim_checkout_sessions_transaction").on(table.providerTransactionId),
+    index("idx_helcim_checkout_sessions_invoice_created").on(table.customerInvoiceId, table.createdAt),
+    index("idx_helcim_checkout_sessions_status_expiry").on(table.status, table.expiresAt),
+    check("helcim_checkout_session_status_check", sql`${table.status} IN ('initialized','pending','settled','failed','expired','review')`),
+  ]
+);
+
+/** Verified webhook envelopes are durable before any remote lookup or posting is attempted. */
+export const helcimWebhookEvents = sqliteTable(
+  "helcim_webhook_events",
+  {
+    webhookId: text("webhook_id").primaryKey(),
+    webhookType: text("webhook_type").notNull(),
+    objectId: text("object_id"),
+    bodyJson: text("body_json").notNull(),
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    receivedAt: text("received_at").notNull(),
+    processedAt: text("processed_at"),
+    lastError: text("last_error"),
+  },
+  (table) => [
+    index("idx_helcim_webhook_events_status_received").on(table.status, table.receivedAt),
+    check("helcim_webhook_event_status_check", sql`${table.status} IN ('pending','processed','ignored','failed')`),
   ]
 );
 

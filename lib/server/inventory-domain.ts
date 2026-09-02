@@ -818,13 +818,15 @@ async function getPurchaseLine(orderId: string, lineId?: string) {
             pol.unit_cost_cents AS unitCostCents,pol.fulfillment_route AS fulfillmentRoute,pol.version AS lineVersion,
             pol.source_sales_order_line_id AS sourceSalesOrderLineId,po.version, po.expected_date AS expectedDate,
             po.lifecycle_status AS lifecycleStatus,
-            COALESCE(SUM(sm.quantity), 0) AS netReceivedQty,
-            MAX(pol.ordered_qty - pol.closed_qty - COALESCE(SUM(sm.quantity), 0), 0) AS openToReceiveQty
+            CASE WHEN pol.fulfillment_route='drop_ship'
+              THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
+              ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END AS netReceivedQty,
+            MAX(pol.ordered_qty - pol.closed_qty - CASE WHEN pol.fulfillment_route='drop_ship'
+              THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)
+              ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END, 0) AS openToReceiveQty
        FROM purchase_order_lines pol
        JOIN purchase_orders po ON po.id = pol.purchase_order_id
-       LEFT JOIN stock_movements sm ON sm.purchase_order_line_id = pol.id
       WHERE po.id = ? AND (? IS NULL OR pol.id = ?)
-      GROUP BY pol.id
       ORDER BY pol.id LIMIT 1`,
     orderId,
     lineId ?? null,
@@ -1243,22 +1245,43 @@ async function closeRemainder(input: InventoryCommand): Promise<CommandResult> {
   const line = await getPurchaseLine(input.entityId, typeof payload.lineId === "string" ? payload.lineId : undefined);
   if (line.lifecycleStatus !== "approved") throw new DomainError("INVALID_STATE", "Only approved purchase-order commitments can be closed.", 409, line.version);
   const quantity = payload.quantity == null ? line.openToReceiveQty : (await normalizedQuantity({ productId: line.productId, quantity: positive(payload), uomId: typeof payload.uomId === "string" ? payload.uomId : null, usage: "purchase", field: "quantity" })).baseQuantity;
-  const allocatedOpen = await first<{ quantity: number }>(`SELECT COALESCE(SUM(allocated_qty-received_qty),0) AS quantity
-    FROM supply_allocations WHERE purchase_order_line_id=? AND status='active'`, line.id);
-  const unallocatedOpen = Math.max(roundQuantity(line.openToReceiveQty - Number(allocatedOpen?.quantity ?? 0)), 0);
+  const allocations = await all<{ id: string; version: number; allocated: number; received: number; salesOrderLineId: string; salesOrderId: string; salesOrderVersion: number }>(`SELECT sa.id,sa.version,sa.allocated_qty AS allocated,sa.received_qty AS received,
+      sa.sales_order_line_id AS salesOrderLineId,sol.sales_order_id AS salesOrderId,so.version AS salesOrderVersion
+    FROM supply_allocations sa JOIN sales_order_lines sol ON sol.id=sa.sales_order_line_id
+    JOIN sales_orders so ON so.id=sol.sales_order_id
+    WHERE sa.purchase_order_line_id=? AND sa.status='active' AND sa.allocated_qty-sa.received_qty>0
+    ORDER BY sa.created_at,sa.id`, line.id);
+  const allocatedOpen = roundQuantity(allocations.reduce((sum, allocation) => sum + allocation.allocated - allocation.received, 0));
+  const unallocatedOpen = Math.max(roundQuantity(line.openToReceiveQty - allocatedOpen), 0);
   const reason = requiredText(payload, "reason");
   if (line.version !== input.version) throw new DomainError("VERSION_CONFLICT", "The purchase order changed. Refresh before closing the remainder.", 409, line.version);
   if (quantity > line.openToReceiveQty) throw new DomainError("INVALID_QUANTITY", `Only ${line.openToReceiveQty} units can be closed.`, 409, line.version);
-  if (quantity > unallocatedOpen) throw new DomainError("ALLOCATED_SUPPLY_PROTECTED", `Only ${unallocatedOpen} unallocated units can be closed; release or amend the customer supply allocations first.`, 409, line.version);
+  let allocationReleaseRemaining = roundQuantity(Math.max(quantity - unallocatedOpen, 0));
+  const allocationPlans: Array<typeof allocations[number] & { release: number; nextAllocated: number; fullyReleased: boolean }> = [];
+  for (const allocation of allocations) {
+    if (allocationReleaseRemaining <= 0) break;
+    const release = roundQuantity(Math.min(allocationReleaseRemaining, allocation.allocated - allocation.received));
+    if (release <= 0) continue;
+    const nextAllocated = roundQuantity(allocation.allocated - release);
+    allocationPlans.push({ ...allocation, release, nextAllocated, fullyReleased: nextAllocated <= 0 });
+    allocationReleaseRemaining = roundQuantity(allocationReleaseRemaining - release);
+  }
+  if (allocationReleaseRemaining > 0) throw new DomainError("VERSION_CONFLICT", "Dedicated supply changed. Refresh before closing the remainder.", 409, line.version);
+  const releasedDedicated = roundQuantity(allocationPlans.reduce((sum, allocation) => sum + allocation.release, 0));
   const result: CommandResult = {
     message: `${quantity} unit${quantity === 1 ? "" : "s"} closed without receipt.`,
-    impact: { physical: "On-hand inventory is unchanged.", commercial: `Incoming forecast decreased by ${quantity}.`, financial: "No financial posting was created.", onHandDelta: 0, incomingDelta: -quantity, reservedDelta: 0, availableDelta: 0 },
+    impact: { physical: "On-hand inventory is unchanged.", commercial: `Incoming forecast decreased by ${quantity}.${releasedDedicated ? ` ${releasedDedicated} unit${releasedDedicated === 1 ? "" : "s"} of dedicated customer supply were released for re-sourcing or cancellation.` : ""}`, financial: "No financial posting was created.", onHandDelta: 0, incomingDelta: -quantity, reservedDelta: 0, availableDelta: 0 },
   };
   const exists = commandExistsPrepared(input);
   const db = commandD1(input);
   const now = new Date().toISOString();
+  const allocationClaims = allocationPlans.map(() => `AND EXISTS (SELECT 1 FROM supply_allocations sa WHERE sa.id=? AND sa.version=? AND sa.status='active' AND sa.allocated_qty=? AND sa.received_qty=?)`).join(" ");
+  const allocationClaimBindings = allocationPlans.flatMap((allocation) => [allocation.id, allocation.version, allocation.allocated, allocation.received]);
+  const salesOrderVersions = new Map(allocationPlans.map((allocation) => [allocation.salesOrderId, allocation.salesOrderVersion]));
+  const salesOrderClaims = [...salesOrderVersions].map(() => `AND EXISTS (SELECT 1 FROM sales_orders so WHERE so.id=? AND so.version=?)`).join(" ");
+  const salesOrderClaimBindings = [...salesOrderVersions].flatMap(([salesOrderId, version]) => [salesOrderId, version]);
   const commands: D1PreparedStatement[] = [
-    logPrepared(input, result, "purchase_orders", `AND COALESCE((SELECT SUM(sa.allocated_qty-sa.received_qty) FROM supply_allocations sa WHERE sa.purchase_order_line_id=? AND sa.status='active'),0)<=?`, [line.id, roundQuantity(line.openToReceiveQty - quantity)]),
+    logPrepared(input, result, "purchase_orders", `AND EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.id=? AND pol.purchase_order_id=purchase_orders.id AND pol.ordered_qty-pol.closed_qty-(CASE WHEN pol.fulfillment_route='drop_ship' THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0) ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END)>=?) ${allocationClaims} ${salesOrderClaims}`, [line.id, quantity, ...allocationClaimBindings, ...salesOrderClaimBindings]),
     db.prepare(`UPDATE purchase_order_lines SET closed_qty = closed_qty + ? WHERE id = ? AND ${exists}`).bind(quantity, line.id),
     db.prepare(`UPDATE purchase_orders SET version = version + 1 WHERE id = ? AND version = ? AND ${exists}`).bind(input.entityId, input.version),
     auditPrepared(input, "purchase_order", input.entityId, "remainder_closed", result.message,
@@ -1266,6 +1289,17 @@ async function closeRemainder(input: InventoryCommand): Promise<CommandResult> {
     outboxPrepared(input, "purchase_order.remainder_closed", "purchase_order", input.entityId,
       { quantity, lineId: line.id, reason }, now),
   ];
+  for (const allocation of allocationPlans) {
+    if (allocation.fullyReleased) {
+      commands.push(db.prepare(`UPDATE supply_allocations SET status='released',updated_at=?,version=version+1 WHERE id=? AND version=? AND status='active' AND received_qty=0 AND ${exists}`).bind(now, allocation.id, allocation.version));
+    } else {
+      commands.push(db.prepare(`UPDATE supply_allocations SET allocated_qty=?,updated_at=?,version=version+1 WHERE id=? AND version=? AND status='active' AND allocated_qty-received_qty>=? AND ${exists}`).bind(allocation.nextAllocated, now, allocation.id, allocation.version, allocation.release));
+    }
+    commands.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=(SELECT active.purchase_order_line_id FROM supply_allocations active WHERE active.sales_order_line_id=sales_order_lines.id AND active.status='active' ORDER BY active.created_at,active.id LIMIT 1) WHERE id=? AND linked_purchase_order_line_id=? AND ${exists}`).bind(allocation.salesOrderLineId, line.id));
+  }
+  for (const [salesOrderId, version] of salesOrderVersions) commands.push(
+    db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${exists}`).bind(salesOrderId, version),
+  );
   await db.batch(commands);
   return requireLogged(input, "The purchase order changed before the remainder could be closed.");
 }
@@ -1277,6 +1311,7 @@ async function reopenRemainder(input: InventoryCommand): Promise<CommandResult> 
   const line = await getPurchaseLine(input.entityId, typeof payload.lineId === "string" ? payload.lineId : undefined);
   const quantity = (await normalizedQuantity({ productId: line.productId, quantity: positive(payload), uomId: typeof payload.uomId === "string" ? payload.uomId : null, usage: "purchase", field: "quantity" })).baseQuantity;
   if (line.lifecycleStatus !== "approved") throw new DomainError("INVALID_STATE", "Only approved purchase-order commitments can be reopened.", 409, line.version);
+  if (line.fulfillmentRoute !== "stock") throw new DomainError("FULFILLMENT_ROUTE_BLOCKED", "Closed dedicated-supply quantity cannot be reopened without restoring its customer allocation. Create a new linked purchase-order line instead.", 409, line.version);
   if (line.version !== input.version) throw new DomainError("VERSION_CONFLICT", "The purchase order changed. Refresh before reopening quantity.", 409, line.version);
   if (quantity > line.closedQty) throw new DomainError("INVALID_QUANTITY", `Only ${line.closedQty} closed units can be reopened.`, 409, line.version);
   const result: CommandResult = {
@@ -2417,8 +2452,7 @@ async function postImmediateSale(input: InventoryCommand): Promise<CommandResult
     .bind(tracking.unitId, line.productId, balance.locationId, tracking.unitVersion));
   statements.push(
     db.prepare(`UPDATE sales_orders SET billing_status=CASE WHEN NOT EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.sales_order_id=sales_orders.id AND
-      (CASE WHEN sol.fulfillment_route='drop_ship' THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)
-        ELSE COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0) END)
+      MAX(sol.ordered_qty-sol.canceled_qty,0)
       >COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sol.id AND ci.status<>'void'),0))
       THEN 'invoiced' ELSE 'partially_invoiced' END,version=version+1 WHERE id=? AND version=? AND ${exists}`)
       .bind(input.entityId, input.version),
@@ -2441,7 +2475,7 @@ async function postCustomerReturn(input: InventoryCommand): Promise<CommandResul
   const reason = requiredText(payload, "reason");
   const line = await getSalesLine(input.entityId, typeof payload.lineId === "string" ? payload.lineId : undefined);
   const quantity = (await normalizedQuantity({ productId: line.productId, quantity: positive(payload), uomId: typeof payload.uomId === "string" ? payload.uomId : null, usage: "sales", field: "quantity" })).baseQuantity;
-  if (line.lifecycleStatus !== "confirmed") throw new DomainError("INVALID_STATE", "Customer returns require a confirmed sales order with posted shipment.", 409, line.version);
+  if (!["confirmed", "canceled"].includes(line.lifecycleStatus)) throw new DomainError("INVALID_STATE", "Customer returns require a confirmed or canceled sales order with posted shipment history.", 409, line.version);
   if (line.version !== input.version) throw new DomainError("VERSION_CONFLICT", "The sales order changed. Refresh before receiving the return.", 409, line.version);
   const remainingReturnable = roundQuantity(line.shippedQty - line.returnedQty);
   if (quantity > remainingReturnable) throw new DomainError("INVALID_QUANTITY", `Only ${Math.max(remainingReturnable, 0)} shipped units remain returnable.`, 409, line.version);
@@ -2723,11 +2757,19 @@ export function normalizeSnapshotPage(input: SnapshotPage = {}) {
  * quantity remaining on their lines. The fragments carry no bindings, so any query can splice
  * them in without disturbing its positional parameters.
  */
+const purchaseLineFulfilledQuantity = (line: string) => `(CASE WHEN ${line}.fulfillment_route='drop_ship'
+  THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=${line}.id),0)
+  ELSE COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=${line}.id),0) END)`;
+const salesLineFulfilledQuantity = (line: string) => `(CASE WHEN ${line}.fulfillment_route='drop_ship'
+  THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=${line}.id),0)
+  ELSE COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity
+    WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=${line}.id),0) END)`;
 export const purchaseOpenLines = (order: string) => `EXISTS (SELECT 1 FROM purchase_order_lines pl WHERE pl.purchase_order_id=${order}.id
-  AND pl.ordered_qty-pl.closed_qty-COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pl.id),0)>0)`;
+  AND pl.ordered_qty-pl.closed_qty-${purchaseLineFulfilledQuantity("pl")}>0)`;
+const purchaseReceiptOpenLines = (order: string) => `EXISTS (SELECT 1 FROM purchase_order_lines pl WHERE pl.purchase_order_id=${order}.id
+  AND pl.fulfillment_route<>'drop_ship' AND pl.ordered_qty-pl.closed_qty-${purchaseLineFulfilledQuantity("pl")}>0)`;
 export const salesOpenLines = (order: string) => `EXISTS (SELECT 1 FROM sales_order_lines sl WHERE sl.sales_order_id=${order}.id
-  AND sl.ordered_qty-sl.canceled_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity
-    WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sl.id),0)>0)`;
+  AND sl.ordered_qty-sl.canceled_qty-${salesLineFulfilledQuantity("sl")}>0)`;
 
 /**
  * The default ("priority") worklist order for orders: still-open approved/confirmed documents
@@ -2742,10 +2784,9 @@ export const salesOrderPriorityOrder = (order: string, openQuantity: string) =>
               WHEN ${order}.lifecycle_status='confirmed' AND ${openQuantity} > 0 THEN 0
               ELSE 1 END,${order}.requested_date,${order}.number`;
 /** Open-quantity expressions for queries that have no line CTEs to draw on. */
-export const purchaseOpenQuantity = (order: string) => `(SELECT COALESCE(SUM(pl.ordered_qty-pl.closed_qty-COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pl.id),0)),0)
+export const purchaseOpenQuantity = (order: string) => `(SELECT COALESCE(SUM(pl.ordered_qty-pl.closed_qty-${purchaseLineFulfilledQuantity("pl")}),0)
   FROM purchase_order_lines pl WHERE pl.purchase_order_id=${order}.id)`;
-export const salesOpenQuantity = (order: string) => `(SELECT COALESCE(SUM(sl.ordered_qty-sl.canceled_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity
-    WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sl.id),0)),0)
+export const salesOpenQuantity = (order: string) => `(SELECT COALESCE(SUM(sl.ordered_qty-sl.canceled_qty-${salesLineFulfilledQuantity("sl")}),0)
   FROM sales_order_lines sl WHERE sl.sales_order_id=${order}.id)`;
 
 /**
@@ -2840,13 +2881,13 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
   const purchaseCompletionQuantities = (order: string) => ({
     ordered: `(SELECT COALESCE(SUM(pl.ordered_qty),0) FROM purchase_order_lines pl WHERE pl.purchase_order_id=${order}.id)`,
     closed: `(SELECT COALESCE(SUM(pl.closed_qty),0) FROM purchase_order_lines pl WHERE pl.purchase_order_id=${order}.id)`,
-    received: `(SELECT COALESCE(SUM(sm.quantity),0) FROM purchase_order_lines pl LEFT JOIN stock_movements sm ON sm.purchase_order_line_id=pl.id WHERE pl.purchase_order_id=${order}.id)`,
+    fulfilled: `(SELECT COALESCE(SUM(${purchaseLineFulfilledQuantity("pl")}),0) FROM purchase_order_lines pl WHERE pl.purchase_order_id=${order}.id)`,
   });
   const purchaseCompletionFilter = (order: string, completion: "closed" | "fully_received" | "closed_short") => {
     const quantity = purchaseCompletionQuantities(order);
     const eligible = `${order}.lifecycle_status NOT IN ('draft','pending_approval','rejected') AND EXISTS (SELECT 1 FROM purchase_order_lines pl WHERE pl.purchase_order_id=${order}.id)`;
-    const fullyReceived = `(${eligible} AND ${quantity.received}=${quantity.ordered})`;
-    const closedShort = `(${eligible} AND ${quantity.received}<${quantity.ordered} AND ${quantity.closed}>0 AND ${quantity.ordered}-${quantity.received}-${quantity.closed}<=0)`;
+    const fullyReceived = `(${eligible} AND ${quantity.fulfilled}=${quantity.ordered})`;
+    const closedShort = `(${eligible} AND ${quantity.fulfilled}<${quantity.ordered} AND ${quantity.closed}>0 AND ${quantity.ordered}-${quantity.fulfilled}-${quantity.closed}<=0)`;
     return completion === "fully_received" ? fullyReceived : completion === "closed_short" ? closedShort : `(${fullyReceived} OR ${closedShort})`;
   };
 
@@ -2858,8 +2899,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
    * disturbing its positional parameters.
    */
   const purchaseWorklistFilter = (order: string) =>
-    requestedPurchaseStatus === "open" ? ` AND ${order}.lifecycle_status='approved' AND ${purchaseOpenLines(order)}`
-      : requestedPurchaseStatus === "late" ? ` AND ${order}.lifecycle_status='approved' AND ${order}.expected_date<${todaySql} AND ${purchaseOpenLines(order)}`
+    requestedPurchaseStatus === "open" ? ` AND ${order}.lifecycle_status='approved' AND ${scope === "expected-receipts" ? purchaseReceiptOpenLines(order) : purchaseOpenLines(order)}`
+      : requestedPurchaseStatus === "late" ? ` AND ${order}.lifecycle_status='approved' AND ${order}.expected_date<${todaySql} AND ${scope === "expected-receipts" ? purchaseReceiptOpenLines(order) : purchaseOpenLines(order)}`
       : ["closed", "fully_received", "closed_short"].includes(requestedPurchaseStatus) ? ` AND ${purchaseCompletionFilter(order, requestedPurchaseStatus as "closed" | "fully_received" | "closed_short")}`
       : requestedPurchaseStatus === "returnable" ? ` AND EXISTS (SELECT 1 FROM purchase_order_lines pl JOIN stock_movements sm ON sm.purchase_order_line_id=pl.id WHERE pl.purchase_order_id=${order}.id AND sm.movement_type='purchase_receipt')`
       : "";
@@ -2869,9 +2910,9 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
              SUM(MIN(line_demand.open_qty,line_demand.reserved_qty)) reserved_qty
         FROM (
           SELECT sl.product_id,
-                 MAX(sl.ordered_qty-sl.canceled_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sl.id),0),0) open_qty,
+                 MAX(sl.ordered_qty-sl.canceled_qty-${salesLineFulfilledQuantity("sl")},0) open_qty,
                  COALESCE((SELECT SUM(rv.quantity) FROM reservations rv WHERE rv.sales_order_line_id=sl.id AND rv.status='active'),0) reserved_qty
-            FROM sales_order_lines sl WHERE sl.sales_order_id=${order}.id
+            FROM sales_order_lines sl WHERE sl.sales_order_id=${order}.id AND sl.fulfillment_route<>'drop_ship'
         ) line_demand GROUP BY line_demand.product_id
     ) demand
     WHERE demand.open_qty>demand.reserved_qty
@@ -2917,11 +2958,11 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
   /** Sales-order page ordering uses the same fixed column map for the parent page and its
    *  child-line page. That keeps lines attached to the orders selected after any header click. */
   const salesOrderOrder = (order: string, partner: string, totals: string, movements: string, reserved: string, invoiced: string, supply: string) => {
-    const open = `CASE WHEN ${order}.lifecycle_status='confirmed' THEN MAX(COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.canceled_qty,0)-COALESCE(${movements}.shipped_qty,0),0) ELSE 0 END`;
+    const open = `CASE WHEN ${order}.lifecycle_status='confirmed' THEN MAX(COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.canceled_qty,0)-COALESCE(${totals}.fulfilled_qty,0),0) ELSE 0 END`;
     const committed = `COALESCE(${reserved}.reserved_qty,0)`;
     const available = `COALESCE(${supply}.available_now_qty,0)`;
     const incoming = `COALESCE(${supply}.incoming_supply_qty,0)`;
-    const fulfillment = `CASE WHEN ${order}.lifecycle_status='draft' THEN 'draft' WHEN ${order}.lifecycle_status!='confirmed' THEN ${order}.lifecycle_status WHEN COALESCE(${movements}.shipped_qty,0)>=COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.canceled_qty,0) THEN 'fully_shipped' WHEN COALESCE(${movements}.shipped_qty,0)>0 THEN 'partially_shipped' WHEN COALESCE(${reserved}.reserved_qty,0)>0 THEN 'reserved' ELSE 'unreserved' END`;
+    const fulfillment = `CASE WHEN ${order}.lifecycle_status='draft' THEN 'draft' WHEN ${order}.lifecycle_status!='confirmed' THEN ${order}.lifecycle_status WHEN COALESCE(${totals}.fulfilled_qty,0)>=COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.canceled_qty,0) THEN 'fully_fulfilled' WHEN COALESCE(${totals}.fulfilled_qty,0)>0 THEN 'partially_fulfilled' WHEN COALESCE(${reserved}.reserved_qty,0)>0 THEN 'reserved' ELSE 'unfulfilled' END`;
     if (requestedColumnSort) return columnOrder({
       exception: `MAX(${open}-${committed}-${available}-${incoming},0)`,
       number: `${order}.number COLLATE NOCASE`,
@@ -2932,15 +2973,15 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       billing: `${order}.billing_status COLLATE NOCASE`,
       total: `${order}.total_cents`,
       ordered: `COALESCE(${totals}.ordered_qty,0)`,
-      shipped: `COALESCE(${movements}.shipped_qty,0)`,
+      shipped: `COALESCE(${totals}.fulfilled_qty,0)`,
       invoiced: `COALESCE(${invoiced}.invoiced_qty,0)`,
-      availableToInvoice: `MAX(COALESCE(${movements}.shipped_qty,0)-COALESCE(${invoiced}.invoiced_qty,0),0)`,
+      availableToInvoice: `MAX(COALESCE(${totals}.fulfilled_qty,0)-COALESCE(${invoiced}.invoiced_qty,0),0)`,
     }, `${order}.number`, `${order}.number`);
     return sort === "newest" ? `${order}.created_at DESC,${order}.number`
       : sort === "name" ? `${partner}.name,${order}.number`
       : scope === "fulfillment" ? `CASE WHEN COALESCE(${reserved}.reserved_qty,0) > COALESCE(${movements}.shipped_qty,0) THEN 0 ELSE 1 END,${order}.requested_date,${order}.number`
       : scope === "customer-returns" ? `CASE WHEN COALESCE(${movements}.shipped_qty,0) > 0 THEN 0 ELSE 1 END,${order}.requested_date DESC,${order}.number`
-      : salesOrderPriorityOrder(order, `COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.canceled_qty,0)-COALESCE(${movements}.shipped_qty,0)`);
+      : salesOrderPriorityOrder(order, `COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.canceled_qty,0)-COALESCE(${totals}.fulfilled_qty,0)`);
   };
 
   const productOrder = (product: string, balance: string, incoming: string, demand: string, baseUom: string) => {
@@ -2982,7 +3023,13 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
    * returned an empty table while the dashboard counted 28. Defined as the complement of
    * 'matched', exactly like the matchExceptions summary metric.
    */
-  const billWorklistFilter = (bill: string) => scope === "vendor-bills" && status === "exception" ? ` AND ${bill}.match_status='exception'` : "";
+  const billOutstanding = (bill: string) => `MAX(${bill}.total_cents-${bill}.paid_cents-COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=${bill}.id AND vc.status='posted'),0),0)`;
+  const billWorklistFilter = (bill: string) => scope !== "vendor-bills" ? ""
+    : status === "exception" ? ` AND ${bill}.match_status='exception'`
+    : status === "matched" ? ` AND ${bill}.match_status='matched'`
+    : status === "outstanding" ? ` AND ${bill}.status<>'void' AND ${billOutstanding(bill)}>0`
+    : status === "settled" ? ` AND ${bill}.status<>'void' AND ${billOutstanding(bill)}=0`
+    : "";
   const billStatus = scope === "vendor-bills" && !billWorklistFilter("vb") ? status : "";
   const productStatus = ["stock", "products", "counts"].includes(scope) ? status : "";
   // Home only consumes products for the special-order watchlist. Filtering before paging
@@ -2998,28 +3045,28 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
    */
   const purchaseOrderOrder = (order: string, partner: string, totals: string, movements: string) =>
     requestedColumnSort ? columnOrder({
-      exception: `CASE WHEN ${order}.lifecycle_status='approved' AND ${order}.expected_date<${todaySql} AND COALESCE(${totals}.ordered_qty,0)-COALESCE(${movements}.net_received_qty,0)-COALESCE(${totals}.closed_qty,0)>0 THEN 1 ELSE 0 END`,
+      exception: `CASE WHEN ${order}.lifecycle_status='approved' AND ${order}.expected_date<${todaySql} AND COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.fulfilled_qty,0)-COALESCE(${totals}.closed_qty,0)>0 THEN 1 ELSE 0 END`,
       number: `${order}.number COLLATE NOCASE`,
       vendor: `${partner}.name COLLATE NOCASE`,
       status: `CASE
         WHEN ${order}.lifecycle_status IN ('draft','pending_approval','rejected','canceled') THEN ${order}.lifecycle_status
-        WHEN COALESCE(${totals}.ordered_qty,0)-COALESCE(${movements}.net_received_qty,0)-COALESCE(${totals}.closed_qty,0)>0
-          THEN CASE WHEN COALESCE(${movements}.net_received_qty,0)>0 THEN 'partially_received' ELSE 'open_to_receive' END
+        WHEN COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.fulfilled_qty,0)-COALESCE(${totals}.closed_qty,0)>0
+          THEN CASE WHEN COALESCE(${totals}.fulfilled_qty,0)>0 THEN 'partially_fulfilled' ELSE 'open_fulfillment' END
         WHEN ${order}.billing_status='partially_billed' THEN 'partially_billed'
-        WHEN ${order}.billing_status IN ('fully_billed','billed') THEN 'complete'
+        WHEN ${order}.billing_status IN ('fully_billed','billed') THEN 'fully_billed'
         ELSE 'awaiting_vendor_bill' END COLLATE NOCASE`,
       expected: `${order}.expected_date`,
       ordered: `COALESCE(${totals}.ordered_qty,0)`,
-      received: `COALESCE(${movements}.net_received_qty,0)`,
+      received: `COALESCE(${totals}.fulfilled_qty,0)`,
       closed: `COALESCE(${totals}.closed_qty,0)`,
-      open: `CASE WHEN ${order}.lifecycle_status='approved' THEN MAX(COALESCE(${totals}.ordered_qty,0)-COALESCE(${movements}.net_received_qty,0)-COALESCE(${totals}.closed_qty,0),0) ELSE 0 END`,
+      open: `CASE WHEN ${order}.lifecycle_status='approved' THEN MAX(COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.fulfilled_qty,0)-COALESCE(${totals}.closed_qty,0),0) ELSE 0 END`,
       billing: `${order}.billing_status COLLATE NOCASE`,
       total: `${order}.total_cents`,
     }, `${order}.number`, `${order}.number`)
       : sort === "newest" ? `${order}.created_at DESC,${order}.number`
       : sort === "name" ? `${partner}.name,${order}.number`
       : scope === "vendor-returns" ? `CASE WHEN COALESCE(${movements}.net_received_qty,0) > 0 THEN 0 ELSE 1 END,${order}.expected_date DESC,${order}.number`
-      : purchaseOrderPriorityOrder(order, `COALESCE(${totals}.ordered_qty,0)-COALESCE(${movements}.net_received_qty,0)-COALESCE(${totals}.closed_qty,0)`);
+      : purchaseOrderPriorityOrder(order, `COALESCE(${totals}.ordered_qty,0)-COALESCE(${totals}.fulfilled_qty,0)-COALESCE(${totals}.closed_qty,0)`);
 
   /**
    * Only the datasets the requested view actually renders are queried. Each of these reads
@@ -3066,7 +3113,12 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
 
   const [purchaseOrders, purchaseLineRows, products, salesOrders, salesLineRows, movements, bills, activities, counts, locations, partners, inventoryBalanceRows, countBalances, aggregate] = await Promise.all([
     needs("purchaseOrders") ? (pageAll<Record<string, unknown>>(`WITH line_totals AS (
-      SELECT purchase_order_id, SUM(ordered_qty) ordered_qty, SUM(closed_qty) closed_qty FROM purchase_order_lines GROUP BY purchase_order_id
+      SELECT pol.purchase_order_id, SUM(pol.ordered_qty) ordered_qty, SUM(pol.closed_qty) closed_qty,
+             SUM(${purchaseLineFulfilledQuantity("pol")}) fulfilled_qty,
+             SUM(CASE WHEN pol.fulfillment_route='drop_ship' THEN ${purchaseLineFulfilledQuantity("pol")} ELSE 0 END) delivered_qty,
+             SUM(CASE WHEN pol.fulfillment_route<>'drop_ship' THEN MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")},0) ELSE 0 END) open_receipt_qty,
+             SUM(CASE WHEN pol.fulfillment_route='drop_ship' THEN MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")},0) ELSE 0 END) open_delivery_qty
+        FROM purchase_order_lines pol GROUP BY pol.purchase_order_id
     ), movement_totals AS (
       SELECT pol.purchase_order_id, SUM(sm.quantity) net_received_qty,
              SUM(CASE WHEN sm.movement_type = 'purchase_receipt' THEN sm.quantity ELSE 0 END) gross_received_qty,
@@ -3079,6 +3131,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
            po.expected_date AS expectedDate, po.currency, po.exchange_rate_to_base AS exchangeRateToBase,
            po.payment_terms AS paymentTerms, po.due_date AS dueDate, po.total_cents AS totalCents, po.buyer_name AS buyerName,
            po.created_at AS orderDate, po.project_reference AS projectReference,
+           po.supplier_quote_number AS supplierQuoteNumber, po.supplier_reference AS supplierReference,
            -- The commercial revision, which only a renegotiated order advances. Distinct from
            -- po.version, the optimistic-lock counter that every state change bumps.
            po.revision_number AS revisionNumber,
@@ -3098,24 +3151,28 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
            COALESCE(lt.ordered_qty, 0) AS orderedQuantity, COALESCE(mt.gross_received_qty, 0) AS grossReceivedQuantity,
            COALESCE(mt.reversed_qty, 0) AS receiptReversedQuantity, COALESCE(mt.returned_qty, 0) AS vendorReturnedQuantity,
            COALESCE(mt.net_received_qty, 0) AS netReceivedQuantity, COALESCE(lt.closed_qty, 0) AS closedWithoutReceiptQuantity,
-           CASE WHEN po.lifecycle_status='approved' THEN MAX(COALESCE(lt.ordered_qty,0) - COALESCE(mt.net_received_qty,0) - COALESCE(lt.closed_qty,0), 0) ELSE 0 END AS openToReceiveQuantity,
+           COALESCE(lt.fulfilled_qty,0) AS supplierFulfilledQuantity, COALESCE(lt.delivered_qty,0) AS dropShipDeliveredQuantity,
+           CASE WHEN po.lifecycle_status='approved' THEN COALESCE(lt.open_receipt_qty,0) ELSE 0 END AS openToReceiveQuantity,
+           CASE WHEN po.lifecycle_status='approved' THEN COALESCE(lt.open_delivery_qty,0) ELSE 0 END AS openToDeliverQuantity,
+           CASE WHEN po.lifecycle_status='approved' THEN COALESCE(lt.open_receipt_qty,0)+COALESCE(lt.open_delivery_qty,0) ELSE 0 END AS openToFulfillQuantity,
            CASE WHEN po.lifecycle_status='draft' THEN 'draft'
                 WHEN po.lifecycle_status='pending_approval' THEN 'pending_approval'
                 WHEN po.lifecycle_status='rejected' THEN 'rejected'
-                WHEN COALESCE(mt.net_received_qty,0) > COALESCE(lt.ordered_qty,0) THEN 'over_received'
-                WHEN COALESCE(mt.net_received_qty,0) = COALESCE(lt.ordered_qty,0) THEN 'fully_received'
-                WHEN COALESCE(mt.net_received_qty,0) > 0 AND COALESCE(lt.ordered_qty,0) - COALESCE(mt.net_received_qty,0) - COALESCE(lt.closed_qty,0) > 0 THEN 'partially_received'
-                WHEN COALESCE(lt.closed_qty,0) > 0 AND COALESCE(lt.ordered_qty,0) - COALESCE(mt.net_received_qty,0) - COALESCE(lt.closed_qty,0) <= 0 THEN 'closed_short'
-                ELSE 'not_received' END AS fulfillmentStatus
+                WHEN COALESCE(lt.fulfilled_qty,0) > COALESCE(lt.ordered_qty,0) THEN 'over_fulfilled'
+                WHEN COALESCE(lt.fulfilled_qty,0) = COALESCE(lt.ordered_qty,0) THEN CASE WHEN COALESCE(lt.delivered_qty,0)>0 THEN 'fully_fulfilled' ELSE 'fully_received' END
+                WHEN COALESCE(lt.fulfilled_qty,0) > 0 AND COALESCE(lt.open_receipt_qty,0)+COALESCE(lt.open_delivery_qty,0) > 0 THEN CASE WHEN COALESCE(lt.delivered_qty,0)>0 THEN 'partially_fulfilled' ELSE 'partially_received' END
+                WHEN COALESCE(lt.closed_qty,0) > 0 AND COALESCE(lt.open_receipt_qty,0)+COALESCE(lt.open_delivery_qty,0) <= 0 THEN 'closed_short'
+                ELSE CASE WHEN COALESCE(lt.delivered_qty,0)>0 THEN 'not_fulfilled' ELSE 'not_received' END END AS fulfillmentStatus
       FROM purchase_orders po JOIN business_partners bp ON bp.id = po.vendor_id
       LEFT JOIN line_totals lt ON lt.purchase_order_id = po.id LEFT JOIN movement_totals mt ON mt.purchase_order_id = po.id
       LEFT JOIN receipts lr ON lr.id = (
         SELECT r2.id FROM receipts r2 WHERE r2.purchase_order_id = po.id
         ORDER BY r2.posted_at DESC, r2.id DESC LIMIT 1
       )
-      WHERE (?='' OR po.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.project_reference,'') LIKE ? ESCAPE '\\')
+      WHERE (?='' OR po.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.project_reference,'') LIKE ? ESCAPE '\\'
+        OR COALESCE(po.supplier_quote_number,'') LIKE ? ESCAPE '\\' OR COALESCE(po.supplier_reference,'') LIKE ? ESCAPE '\\')
         AND (?='' OR po.lifecycle_status=?)${purchaseWorklistFilter('po')}
-      ORDER BY ${purchaseOrderOrder("po", "bp", "lt", "mt")}`, term, like, like, like, purchaseStatus, purchaseStatus)) : Promise.resolve([]),
+      ORDER BY ${purchaseOrderOrder("po", "bp", "lt", "mt")}`, term, like, like, like, like, like, purchaseStatus, purchaseStatus)) : Promise.resolve([]),
     Promise.resolve([] as Array<Record<string, unknown>>),
     needs("products") ? (pageAll<Record<string, unknown>>(`WITH balance AS (
       SELECT ib.product_id, SUM(ib.on_hand_qty) on_hand_qty, SUM(ib.reserved_qty) reserved_qty,
@@ -3129,7 +3186,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       SELECT pol.id, pol.product_id, pol.ordered_qty, pol.closed_qty, COALESCE(SUM(sm.quantity),0) net_received
         FROM purchase_order_lines pol JOIN purchase_orders po ON po.id=pol.purchase_order_id
         LEFT JOIN stock_movements sm ON sm.purchase_order_line_id=pol.id
-       WHERE po.lifecycle_status='approved' GROUP BY pol.id
+       WHERE po.lifecycle_status='approved' AND pol.fulfillment_route<>'drop_ship' GROUP BY pol.id
     ), incoming AS (
       SELECT product_id, SUM(MAX(ordered_qty-closed_qty-net_received,0)) incoming_qty FROM line_net GROUP BY product_id
     ), sales_line_net AS (
@@ -3138,7 +3195,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                                WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END),0) shipped_qty
         FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id
         LEFT JOIN stock_movements sm ON sm.sales_order_line_id=sol.id
-       WHERE so.lifecycle_status='confirmed' GROUP BY sol.id
+       WHERE so.lifecycle_status='confirmed' AND sol.fulfillment_route<>'drop_ship' GROUP BY sol.id
     ), demand AS (
       SELECT product_id,SUM(MAX(ordered_qty-canceled_qty-shipped_qty,0)) demand_qty FROM sales_line_net GROUP BY product_id
     )
@@ -3193,7 +3250,12 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
              SUM(CASE WHEN movement_type='customer_return' THEN quantity ELSE 0 END) returned_qty
         FROM stock_movements WHERE sales_order_line_id IS NOT NULL GROUP BY sales_order_line_id
     ), line_totals AS (
-      SELECT sales_order_id, SUM(ordered_qty) ordered_qty, SUM(canceled_qty) canceled_qty FROM sales_order_lines GROUP BY sales_order_id
+      SELECT sol.sales_order_id, SUM(sol.ordered_qty) ordered_qty, SUM(sol.canceled_qty) canceled_qty,
+             SUM(${salesLineFulfilledQuantity("sol")}) fulfilled_qty,
+             SUM(CASE WHEN sol.fulfillment_route='drop_ship' THEN ${salesLineFulfilledQuantity("sol")} ELSE 0 END) delivered_qty,
+             SUM(CASE WHEN sol.fulfillment_route<>'drop_ship' THEN MAX(sol.ordered_qty-sol.canceled_qty-${salesLineFulfilledQuantity("sol")},0) ELSE 0 END) open_shipment_qty,
+             SUM(CASE WHEN sol.fulfillment_route='drop_ship' THEN MAX(sol.ordered_qty-sol.canceled_qty-${salesLineFulfilledQuantity("sol")},0) ELSE 0 END) open_delivery_qty
+        FROM sales_order_lines sol GROUP BY sol.sales_order_id
     ), movement_totals AS (
       SELECT sol.sales_order_id, SUM(COALESCE(slm.shipped_qty,0)) shipped_qty, SUM(COALESCE(slm.returned_qty,0)) returned_qty
         FROM sales_order_lines sol LEFT JOIN sales_line_movements slm ON slm.sales_order_line_id=sol.id GROUP BY sol.sales_order_id
@@ -3227,7 +3289,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                  WHERE sa.purchase_order_line_id=pol.id AND sa.status='active'),0),0) unallocated_incoming_qty
         FROM purchase_order_lines pol JOIN purchase_orders po2 ON po2.id=pol.purchase_order_id
         LEFT JOIN stock_movements sm ON sm.purchase_order_line_id=pol.id
-       WHERE po2.lifecycle_status='approved' GROUP BY pol.id
+       WHERE po2.lifecycle_status='approved' AND pol.fulfillment_route<>'drop_ship' GROUP BY pol.id
     ), incoming_product_date AS (
       SELECT product_id,expected_date,SUM(unallocated_incoming_qty) incoming_qty
       FROM purchase_line_net GROUP BY product_id,expected_date
@@ -3240,20 +3302,20 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
        WHERE sa.status='active' AND po2.lifecycle_status='approved' AND sa.allocated_qty>sa.received_qty
        GROUP BY sol.sales_order_id,sol.product_id,po2.expected_date
     ), sales_line_demand AS (
-      SELECT sol.sales_order_id,sol.product_id,so.requested_date,
-             MAX(sol.ordered_qty-sol.canceled_qty-COALESCE(slm.shipped_qty,0),0) open_qty,
-             MIN(MAX(sol.ordered_qty-sol.canceled_qty-COALESCE(slm.shipped_qty,0),0),COALESCE(rl.reserved_qty,0)) reserved_qty
+      SELECT sol.sales_order_id,sol.product_id,sol.fulfillment_route,so.requested_date,
+             MAX(sol.ordered_qty-sol.canceled_qty-${salesLineFulfilledQuantity("sol")},0) open_qty,
+             MIN(MAX(sol.ordered_qty-sol.canceled_qty-${salesLineFulfilledQuantity("sol")},0),COALESCE(rl.reserved_qty,0)) reserved_qty
         FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id
         LEFT JOIN sales_line_movements slm ON slm.sales_order_line_id=sol.id
         LEFT JOIN reserved_line rl ON rl.sales_order_line_id=sol.id
     ), sales_product_demand AS (
-      SELECT sales_order_id,product_id,requested_date,SUM(open_qty) open_qty,SUM(reserved_qty) reserved_qty
-        FROM sales_line_demand GROUP BY sales_order_id,product_id,requested_date
+      SELECT sales_order_id,product_id,fulfillment_route,requested_date,SUM(open_qty) open_qty,SUM(reserved_qty) reserved_qty
+        FROM sales_line_demand GROUP BY sales_order_id,product_id,fulfillment_route,requested_date
     ), sales_product_supply AS (
       SELECT spd.sales_order_id,spd.product_id,spd.open_qty,spd.reserved_qty,
-             COALESCE(up.usable_qty,0) usable_qty,
-             COALESCE((SELECT SUM(ipd.incoming_qty) FROM incoming_product_date ipd
-               WHERE ipd.product_id=spd.product_id AND ipd.expected_date<=spd.requested_date),0)
+             CASE WHEN spd.fulfillment_route='stock' THEN COALESCE(up.usable_qty,0) ELSE 0 END usable_qty,
+             CASE WHEN spd.fulfillment_route='stock' THEN COALESCE((SELECT SUM(ipd.incoming_qty) FROM incoming_product_date ipd
+               WHERE ipd.product_id=spd.product_id AND ipd.expected_date<=spd.requested_date),0) ELSE 0 END
              +COALESCE((SELECT SUM(aspd.incoming_qty) FROM allocated_sales_product_date aspd
                WHERE aspd.sales_order_id=spd.sales_order_id AND aspd.product_id=spd.product_id AND aspd.expected_date<=spd.requested_date),0) incoming_qty
         FROM sales_product_demand spd LEFT JOIN usable_product up ON up.product_id=spd.product_id
@@ -3292,7 +3354,10 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
            COALESCE(lt.ordered_qty,0) AS orderedQuantity, COALESCE(mt.shipped_qty,0) AS shippedQuantity,
            COALESCE(mt.returned_qty,0) AS returnedQuantity, COALESCE(r.reserved_qty,0) AS reservedQuantity,
            COALESCE(inv.invoiced_qty,0) AS invoicedQuantity,
-           CASE WHEN so.lifecycle_status='confirmed' THEN MAX(COALESCE(lt.ordered_qty,0)-COALESCE(lt.canceled_qty,0)-COALESCE(mt.shipped_qty,0),0) ELSE 0 END AS openToShipQuantity,
+           COALESCE(lt.fulfilled_qty,0) AS fulfilledQuantity, COALESCE(lt.delivered_qty,0) AS dropShipDeliveredQuantity,
+           CASE WHEN so.lifecycle_status='confirmed' THEN COALESCE(lt.open_shipment_qty,0) ELSE 0 END AS openToShipQuantity,
+           CASE WHEN so.lifecycle_status='confirmed' THEN COALESCE(lt.open_delivery_qty,0) ELSE 0 END AS openToDeliverQuantity,
+           CASE WHEN so.lifecycle_status='confirmed' THEN COALESCE(lt.open_shipment_qty,0)+COALESCE(lt.open_delivery_qty,0) ELSE 0 END AS openToFulfillQuantity,
            -- Supply position across every line, evaluated exactly like the blocked worklist
            -- filter above so a row and the queue it belongs to can never disagree. The client
            -- previously derived this from the first line's product within the current product
@@ -3301,8 +3366,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
             COALESCE(os.incoming_supply_qty,0) AS incomingSupplyQuantity,
            CASE WHEN so.lifecycle_status='draft' THEN 'draft'
                 WHEN so.lifecycle_status!='confirmed' THEN so.lifecycle_status
-                WHEN COALESCE(mt.shipped_qty,0)>=COALESCE(lt.ordered_qty,0)-COALESCE(lt.canceled_qty,0) THEN 'fully_shipped'
-                WHEN COALESCE(mt.shipped_qty,0)>0 THEN 'partially_shipped'
+                WHEN COALESCE(lt.fulfilled_qty,0)>=COALESCE(lt.ordered_qty,0)-COALESCE(lt.canceled_qty,0) THEN CASE WHEN COALESCE(lt.delivered_qty,0)>0 THEN 'fully_fulfilled' ELSE 'fully_shipped' END
+                WHEN COALESCE(lt.fulfilled_qty,0)>0 THEN CASE WHEN COALESCE(lt.delivered_qty,0)>0 THEN 'partially_fulfilled' ELSE 'partially_shipped' END
                 WHEN COALESCE(r.reserved_qty,0)>0 THEN 'reserved' ELSE 'unreserved' END AS fulfillmentStatus
       FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id
       LEFT JOIN line_totals lt ON lt.sales_order_id=so.id LEFT JOIN movement_totals mt ON mt.sales_order_id=so.id
@@ -3345,10 +3410,10 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       -- payable, and AP had no vendor reference to match the supplier's invoice against.
       vb.vendor_invoice_number AS vendorInvoiceNumber, vb.invoice_date AS invoiceDate,
       vb.subtotal_cents AS subtotalCents, vb.tax_cents AS taxCents, vb.paid_cents AS paidCents,
-      MAX(vb.total_cents-vb.paid_cents,0) AS outstandingCents, vb.payment_terms AS paymentTerms, vb.hold_reason AS holdReason,
+      ${billOutstanding("vb")} AS outstandingCents, vb.payment_terms AS paymentTerms, vb.hold_reason AS holdReason,
       COALESCE((SELECT SUM(ROUND(vbl.quantity*pol.unit_cost_cents)) FROM vendor_bill_lines vbl JOIN purchase_order_lines pol ON pol.id=vbl.purchase_order_line_id WHERE vbl.vendor_bill_id=vb.id),0) AS authorizedLineValueCents,
       COALESCE((SELECT SUM(vbl.line_total_cents) FROM vendor_bill_lines vbl WHERE vbl.vendor_bill_id=vb.id),0) AS billedLineValueCents,
-      bp.id AS vendorId, bp.name AS vendorName, po.number AS purchaseOrderNumber
+      bp.id AS vendorId, bp.name AS vendorName, po.id AS purchaseOrderId, po.number AS purchaseOrderNumber
        FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id
        LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id
       WHERE (?='' OR vb.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.number,'') LIKE ? ESCAPE '\\' OR vb.vendor_invoice_number LIKE ? ESCAPE '\\')
@@ -3414,19 +3479,18 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
         available: "ib.on_hand_qty-ib.reserved_qty",
       }, "w.code,l.code,p.sku", "ib.product_id") : "w.code,l.code,p.sku"}`, ...countBalanceBindings)) : Promise.resolve([]),
     first<Record<string, unknown>>(`WITH po_line_state AS MATERIALIZED (
-      SELECT pol.id,pol.purchase_order_id,pol.product_id,po.lifecycle_status,po.expected_date,
-             MAX(pol.ordered_qty-pol.closed_qty-COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) open_qty
+      SELECT pol.id,pol.purchase_order_id,pol.product_id,pol.fulfillment_route,po.lifecycle_status,po.expected_date,
+             MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")},0) open_qty
         FROM purchase_order_lines pol JOIN purchase_orders po ON po.id=pol.purchase_order_id
     ), so_line_state AS MATERIALIZED (
-      SELECT sol.id,sol.sales_order_id,sol.product_id,so.lifecycle_status,so.requested_date,
-             MAX(sol.ordered_qty-sol.canceled_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity
-               WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=sol.id),0),0) open_qty,
+      SELECT sol.id,sol.sales_order_id,sol.product_id,sol.fulfillment_route,so.lifecycle_status,so.requested_date,
+             MAX(sol.ordered_qty-sol.canceled_qty-${salesLineFulfilledQuantity("sol")},0) open_qty,
              COALESCE((SELECT SUM(rv.quantity) FROM reservations rv WHERE rv.sales_order_line_id=sol.id AND rv.status='active'),0) reserved_qty
         FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id
     ), so_product_demand AS MATERIALIZED (
       SELECT sales_order_id,product_id,lifecycle_status,requested_date,SUM(open_qty) open_qty,
              SUM(MIN(open_qty,reserved_qty)) reserved_qty
-        FROM so_line_state GROUP BY sales_order_id,product_id,lifecycle_status,requested_date
+        FROM so_line_state WHERE fulfillment_route<>'drop_ship' GROUP BY sales_order_id,product_id,lifecycle_status,requested_date
     ), product_balance AS MATERIALIZED (
       SELECT ib.product_id,SUM(ib.on_hand_qty) on_hand,
              SUM(CASE WHEN l.inventory_status='usable' THEN ib.on_hand_qty ELSE 0 END) usable_on_hand,
@@ -3434,12 +3498,12 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
              SUM(CASE WHEN l.inventory_status<>'usable' THEN ib.on_hand_qty ELSE 0 END) quarantine
         FROM inventory_balances ib JOIN locations l ON l.id=ib.location_id WHERE l.active=1 GROUP BY ib.product_id
     ), incoming_product AS MATERIALIZED (
-      SELECT product_id,SUM(open_qty) incoming_qty FROM po_line_state WHERE lifecycle_status='approved' GROUP BY product_id
+      SELECT product_id,SUM(open_qty) incoming_qty FROM po_line_state WHERE lifecycle_status='approved' AND fulfillment_route<>'drop_ship' GROUP BY product_id
     ), incoming_product_date AS MATERIALIZED (
       SELECT product_id,expected_date,SUM(open_qty) incoming_qty FROM po_line_state
-       WHERE lifecycle_status='approved' GROUP BY product_id,expected_date
+       WHERE lifecycle_status='approved' AND fulfillment_route<>'drop_ship' GROUP BY product_id,expected_date
     ), demand_product AS MATERIALIZED (
-      SELECT product_id,SUM(open_qty) demand_qty FROM so_line_state WHERE lifecycle_status='confirmed' GROUP BY product_id
+      SELECT product_id,SUM(open_qty) demand_qty FROM so_line_state WHERE lifecycle_status='confirmed' AND fulfillment_route<>'drop_ship' GROUP BY product_id
     ), so_product_supply AS MATERIALIZED (
       SELECT spd.sales_order_id,spd.product_id,spd.lifecycle_status,spd.requested_date,
              spd.open_qty,spd.reserved_qty,COALESCE(SUM(ipd.incoming_qty),0) incoming_qty
@@ -3460,13 +3524,13 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       (SELECT COALESCE(SUM(CASE WHEN inventory_status='usable' THEN on_hand_qty ELSE 0 END),0) FROM scoped_balance) AS usable,
       (SELECT COALESCE(SUM(reserved_qty),0) FROM scoped_balance) AS reserved,
       (SELECT COALESCE(SUM(CASE WHEN inventory_status='usable' THEN on_hand_qty-reserved_qty ELSE 0 END),0) FROM scoped_balance) AS available,
-      (SELECT COALESCE(SUM(open_qty),0) FROM po_line_state WHERE lifecycle_status='approved') AS incoming,
+      (SELECT COALESCE(SUM(open_qty),0) FROM po_line_state WHERE lifecycle_status='approved' AND fulfillment_route<>'drop_ship') AS incoming,
       (SELECT COALESCE(SUM(CASE WHEN inventory_status<>'usable' THEN on_hand_qty ELSE 0 END),0) FROM scoped_balance) AS quarantine,
       (SELECT COALESCE(SUM(value_cents),0) FROM inventory_value_entries) AS inventoryValueCents,
-      (SELECT COALESCE(SUM(open_qty),0) FROM so_line_state WHERE lifecycle_status='confirmed') AS openDemand,
+      (SELECT COALESCE(SUM(open_qty),0) FROM so_line_state WHERE lifecycle_status='confirmed' AND fulfillment_route<>'drop_ship') AS openDemand,
       (SELECT COUNT(DISTINCT purchase_order_id) FROM po_line_state WHERE lifecycle_status='approved' AND open_qty>0) AS openPurchaseOrders,
-      (SELECT COALESCE(SUM(open_qty),0) FROM po_line_state WHERE lifecycle_status='approved') AS openReceiptUnits,
-      (SELECT COUNT(DISTINCT purchase_order_id) FROM po_line_state WHERE lifecycle_status='approved' AND expected_date<${todaySql} AND open_qty>0) AS latePurchaseOrders,
+      (SELECT COALESCE(SUM(open_qty),0) FROM po_line_state WHERE lifecycle_status='approved' AND fulfillment_route<>'drop_ship') AS openReceiptUnits,
+      (SELECT COUNT(DISTINCT purchase_order_id) FROM po_line_state WHERE lifecycle_status='approved' AND fulfillment_route<>'drop_ship' AND expected_date<${todaySql} AND open_qty>0) AS latePurchaseOrders,
       (SELECT COUNT(*) FROM purchase_orders WHERE lifecycle_status='pending_approval') AS pendingApprovals,
       (SELECT COUNT(DISTINCT sales_order_id) FROM so_line_state WHERE lifecycle_status='confirmed' AND open_qty>0) AS openSalesOrders,
       (SELECT COUNT(DISTINCT sps.sales_order_id) FROM so_product_supply sps
@@ -3512,6 +3576,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       COALESCE(SUM(sm.quantity),0) AS netReceivedQuantity,
       COALESCE(SUM(CASE WHEN sm.movement_type='purchase_receipt' THEN sm.quantity ELSE 0 END),0) AS grossReceivedQuantity,
       COALESCE(SUM(CASE WHEN sm.movement_type='vendor_return' THEN -sm.quantity WHEN sm.movement_type='receipt_reversal' THEN -sm.quantity ELSE 0 END),0) AS returnedQuantity,
+      COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0) AS dropShipDeliveredQuantity,
+      ${purchaseLineFulfilledQuantity("pol")} AS supplierFulfilledQuantity,
       COALESCE((SELECT MAX(${receiptMovementReversible}) FROM stock_movements receipt_movement WHERE ${latestReceiptMovementFilter("pol")}),0) AS latestReceiptReversibleQuantity,
       -- One entry per condition the latest receipt was split into, so a caller can reverse the
       -- quarantined part by inventoryStatus/receiptLineId instead of only the largest movement.
@@ -3520,7 +3586,9 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
         'locationId',receipt_movement.to_location_id,'locationCode',(SELECT l.code FROM locations l WHERE l.id=receipt_movement.to_location_id),
         'remainingQuantity',${receiptMovementRemaining},'reversibleQuantity',${receiptMovementReversible}))
         FROM stock_movements receipt_movement WHERE ${latestReceiptMovementFilter("pol")} AND ${receiptMovementRemaining}>0),'[]') AS latestReceiptReversibleJson,
-      MAX(pol.ordered_qty-pol.closed_qty-COALESCE(SUM(sm.quantity),0),0) AS openToReceiveQuantity,
+      CASE WHEN pol.fulfillment_route<>'drop_ship' THEN MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")},0) ELSE 0 END AS openToReceiveQuantity,
+      CASE WHEN pol.fulfillment_route='drop_ship' THEN MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")},0) ELSE 0 END AS openToDeliverQuantity,
+      MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")},0) AS openToFulfillQuantity,
       pol.unit_cost_cents AS unitCostCents,pol.configuration_snapshot AS configurationSnapshot,
       pol.discount_cents AS discountCents,pol.taxable,pol.tax_code AS taxCode,pol.tax_rate_bps AS taxRateBps,
       pol.fulfillment_route AS fulfillmentRoute,pol.source_sales_order_line_id AS sourceSalesOrderLineId,p.tracking_policy AS trackingPolicy,
@@ -3547,22 +3615,23 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
        WHERE l.active=1 AND l.inventory_status='usable' GROUP BY ib.product_id
     ), purchase_line_net AS MATERIALIZED (
       SELECT pol.id,pol.product_id,po3.expected_date,
-             MAX(pol.ordered_qty-pol.closed_qty-COALESCE((SELECT SUM(sm3.quantity)
-               FROM stock_movements sm3 WHERE sm3.purchase_order_line_id=pol.id),0),0) incoming_qty,
-             MAX(pol.ordered_qty-pol.closed_qty-COALESCE((SELECT SUM(sm3.quantity)
-               FROM stock_movements sm3 WHERE sm3.purchase_order_line_id=pol.id),0)
+             MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")},0) incoming_qty,
+             MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")}
                -COALESCE((SELECT SUM(sa.allocated_qty-sa.received_qty) FROM supply_allocations sa
                  WHERE sa.purchase_order_line_id=pol.id AND sa.status='active'),0),0) unallocated_incoming_qty
         FROM purchase_order_lines pol JOIN purchase_orders po3 ON po3.id=pol.purchase_order_id
-       WHERE po3.lifecycle_status='approved' GROUP BY pol.id
+       WHERE po3.lifecycle_status='approved' AND pol.fulfillment_route<>'drop_ship' GROUP BY pol.id
     ) SELECT sol.id,sol.sales_order_id AS salesOrderId,sol.product_id AS productId,
       p.sku,p.name AS productName,sol.ordered_qty AS orderedQuantity,sol.canceled_qty AS canceledQuantity,
       sol.ordered_uom_id AS orderedUomId,sol.ordered_uom_qty AS orderedUomQuantity,sol.ordered_uom_unit_price_cents AS orderedUomUnitPriceCents,ou.code AS orderedUomCode,
       COALESCE(SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END),0) AS shippedQuantity,
       COALESCE(SUM(CASE WHEN sm.movement_type='customer_return' THEN sm.quantity ELSE 0 END),0) AS returnedQuantity,
+      COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0) AS dropShipDeliveredQuantity,
+      ${salesLineFulfilledQuantity("sol")} AS fulfilledQuantity,
       COALESCE((SELECT SUM(r.quantity) FROM reservations r WHERE r.sales_order_line_id=sol.id AND r.status='active'),0) AS reservedQuantity,
       sol.unit_price_cents AS unitPriceCents,sol.configuration_snapshot AS configurationSnapshot,
-      sol.fulfillment_route AS fulfillmentRoute,sol.project_reference AS projectReference,sol.linked_purchase_order_line_id AS linkedPurchaseOrderLineId,p.tracking_policy AS trackingPolicy,
+      sol.fulfillment_route AS fulfillmentRoute,sol.project_reference AS projectReference,sol.linked_purchase_order_line_id AS linkedPurchaseOrderLineId,
+      linked_po.id AS linkedPurchaseOrderId,linked_po.number AS linkedPurchaseOrderNumber,linked_po.lifecycle_status AS linkedPurchaseOrderLifecycle,p.tracking_policy AS trackingPolicy,
       CASE WHEN (SELECT COUNT(DISTINCT ar.location_id) FROM reservations ar WHERE ar.sales_order_line_id=sol.id AND ar.status='active' AND ar.quantity>0)=1
         THEN (SELECT MAX(ar.location_id) FROM reservations ar WHERE ar.sales_order_line_id=sol.id AND ar.status='active' AND ar.quantity>0) ELSE NULL END AS reservationLocationId,
       sol.discount_cents AS discountCents,sol.taxable,sol.tax_code AS taxCode,sol.tax_rate_bps AS taxRateBps,
@@ -3576,6 +3645,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                    AND allocated_order.expected_date<=so.requested_date),0) END AS productIncomingQuantity
       FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id
       JOIN products p ON p.id=sol.product_id LEFT JOIN units_of_measure ou ON ou.id=sol.ordered_uom_id
+      LEFT JOIN purchase_order_lines linked_pol ON linked_pol.id=sol.linked_purchase_order_line_id
+      LEFT JOIN purchase_orders linked_po ON linked_po.id=linked_pol.purchase_order_id
       LEFT JOIN stock_movements sm ON sm.sales_order_line_id=sol.id
       LEFT JOIN product_available pa ON pa.product_id=sol.product_id
       WHERE sol.sales_order_id IN (SELECT value FROM json_each(?))
@@ -3629,7 +3700,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
   let filteredTotal: number | null = null;
   if (term || status || scope === "customer-invoices") {
     let total: { count: number } | null = null;
-    if (["purchase-orders", "expected-receipts", "vendor-returns"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id WHERE (?='' OR po.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.project_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR po.lifecycle_status=?)${purchaseWorklistFilter("po")}`, term, like, like, like, purchaseStatus, purchaseStatus);
+    if (["purchase-orders", "expected-receipts", "vendor-returns"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id WHERE (?='' OR po.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.project_reference,'') LIKE ? ESCAPE '\\' OR COALESCE(po.supplier_quote_number,'') LIKE ? ESCAPE '\\' OR COALESCE(po.supplier_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR po.lifecycle_status=?)${purchaseWorklistFilter("po")}`, term, like, like, like, like, like, purchaseStatus, purchaseStatus);
     else if (["sales-orders", "fulfillment", "customer-returns", "customer-invoices"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id WHERE (?='' OR so.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(so.project_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR so.lifecycle_status=?)${salesWorklistFilter("so")}`, term, like, like, like, salesStatus, salesStatus);
     else if (scope === "counts") total = await first<{ count: number }>(`SELECT COUNT(*) AS count ${countBalanceFrom}`, ...countBalanceBindings);
     else if (["stock", "products"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM products p WHERE p.active=1 AND (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(p.manufacturer_sku,'') LIKE ? ESCAPE '\\' OR p.dimensions LIKE ? ESCAPE '\\' OR p.material LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM product_aliases pa WHERE pa.product_id=p.id AND pa.alias LIKE ? ESCAPE '\\')) AND (?='' OR p.inventory_policy=? OR p.tracking_policy=?)`, term, like, like, like, like, like, like, productStatus, productStatus, productStatus);

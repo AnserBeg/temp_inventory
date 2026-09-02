@@ -1,7 +1,8 @@
 import type { ActorIdentity, AppCapability } from "./auth";
 import { all, first, getD1 } from "./inventory-db";
 import { sendWithConnectedMailbox } from "./email-client";
-import type { DocumentEmailPreview, EmailDocumentType } from "./email-types";
+import { maybeCreateInvoicePaymentLink } from "./helcim-payments";
+import type { DocumentEmailPreview, EmailDocumentType, PrintableDocumentType } from "./email-types";
 
 type DocumentHeader = {
   id: string;
@@ -17,6 +18,8 @@ type DocumentHeader = {
   dueOrExpectedDate: string | null;
   paymentTerms: string | null;
   reference: string | null;
+  supplierQuoteNumber: string | null;
+  supplierReference: string | null;
   addressLine1: string | null;
   addressLine2: string | null;
   city: string | null;
@@ -39,7 +42,7 @@ type DocumentLine = {
 };
 
 type DocumentCharge = { description: string; amountCents: number; direction: string; taxAmountCents: number };
-type LoadedDocument = { type: EmailDocumentType; label: string; header: DocumentHeader; lines: DocumentLine[]; charges: DocumentCharge[] };
+type LoadedDocument = { type: PrintableDocumentType; label: string; header: DocumentHeader; lines: DocumentLine[]; charges: DocumentCharge[] };
 
 export class DocumentEmailError extends Error {
   code: string;
@@ -57,11 +60,16 @@ export function isEmailDocumentType(value: string): value is EmailDocumentType {
   return ["purchase_order", "sales_order", "customer_invoice"].includes(value);
 }
 
-async function documentHeader(type: EmailDocumentType, id: string) {
+export function isPrintableDocumentType(value: string): value is PrintableDocumentType {
+  return isEmailDocumentType(value) || value === "vendor_bill";
+}
+
+async function documentHeader(type: PrintableDocumentType, id: string) {
   if (type === "purchase_order") {
     return first<DocumentHeader>(`SELECT po.id,po.number,po.lifecycle_status AS status,bp.name AS partyName,bp.email AS partyEmail,
       po.currency,po.total_cents AS totalCents,NULL AS subtotalCents,NULL AS taxCents,substr(po.created_at,1,10) AS documentDate,
       po.expected_date AS dueOrExpectedDate,po.payment_terms AS paymentTerms,po.project_reference AS reference,
+      po.supplier_quote_number AS supplierQuoteNumber,po.supplier_reference AS supplierReference,
       bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
       FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id WHERE po.id=? LIMIT 1`, id);
   }
@@ -69,20 +77,31 @@ async function documentHeader(type: EmailDocumentType, id: string) {
     return first<DocumentHeader>(`SELECT so.id,so.number,so.lifecycle_status AS status,bp.name AS partyName,bp.email AS partyEmail,
       so.currency,so.total_cents AS totalCents,NULL AS subtotalCents,NULL AS taxCents,substr(so.created_at,1,10) AS documentDate,
       so.requested_date AS dueOrExpectedDate,so.payment_terms AS paymentTerms,so.project_reference AS reference,
+      NULL AS supplierQuoteNumber,NULL AS supplierReference,
       COALESCE(so.ship_to_address_line_1,bp.address_line_1) AS addressLine1,COALESCE(so.ship_to_address_line_2,bp.address_line_2) AS addressLine2,
       COALESCE(so.ship_to_city,bp.city) AS city,COALESCE(so.ship_to_region,bp.region) AS region,
       COALESCE(so.ship_to_postal_code,bp.postal_code) AS postalCode,COALESCE(so.ship_to_country,bp.country) AS country
       FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id WHERE so.id=? LIMIT 1`, id);
   }
+  if (type === "vendor_bill") {
+    return first<DocumentHeader>(`SELECT vb.id,vb.number,vb.status,bp.name AS partyName,bp.email AS partyEmail,
+      vb.currency,vb.total_cents AS totalCents,vb.subtotal_cents AS subtotalCents,vb.tax_cents AS taxCents,
+      vb.invoice_date AS documentDate,vb.due_date AS dueOrExpectedDate,vb.payment_terms AS paymentTerms,po.number AS reference,
+      NULL AS supplierQuoteNumber,NULL AS supplierReference,
+      bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
+      FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id
+      LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id WHERE vb.id=? LIMIT 1`, id);
+  }
   return first<DocumentHeader>(`SELECT ci.id,ci.number,ci.status,bp.name AS partyName,bp.email AS partyEmail,
     ci.currency,ci.total_cents AS totalCents,ci.subtotal_cents AS subtotalCents,ci.tax_cents AS taxCents,
     ci.invoice_date AS documentDate,ci.due_date AS dueOrExpectedDate,ci.payment_terms AS paymentTerms,so.number AS reference,
+    NULL AS supplierQuoteNumber,NULL AS supplierReference,
     bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
     FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id
     LEFT JOIN sales_orders so ON so.id=ci.sales_order_id WHERE ci.id=? LIMIT 1`, id);
 }
 
-async function documentLines(type: EmailDocumentType, id: string) {
+async function documentLines(type: PrintableDocumentType, id: string) {
   if (type === "purchase_order") {
     return all<DocumentLine>(`SELECT p.sku,p.name AS productName,pol.configuration_snapshot AS description,
       COALESCE(pol.ordered_uom_qty,pol.ordered_qty) AS quantity,u.code AS uomCode,
@@ -99,6 +118,14 @@ async function documentLines(type: EmailDocumentType, id: string) {
       FROM sales_order_lines sol JOIN products p ON p.id=sol.product_id
       LEFT JOIN units_of_measure u ON u.id=sol.ordered_uom_id WHERE sol.sales_order_id=? ORDER BY sol.rowid`, id);
   }
+  if (type === "vendor_bill") {
+    return all<DocumentLine>(`SELECT p.sku,p.name AS productName,pol.configuration_snapshot AS description,
+      vbl.quantity,u.code AS uomCode,vbl.unit_cost_cents AS unitAmountCents,0 AS discountCents,
+      0 AS taxRateBps,0 AS taxable,vbl.line_total_cents AS lineTotalCents
+      FROM vendor_bill_lines vbl JOIN products p ON p.id=vbl.product_id
+      LEFT JOIN purchase_order_lines pol ON pol.id=vbl.purchase_order_line_id
+      LEFT JOIN units_of_measure u ON u.id=pol.ordered_uom_id WHERE vbl.vendor_bill_id=? ORDER BY vbl.rowid`, id);
+  }
   return all<DocumentLine>(`SELECT p.sku,p.name AS productName,sol.configuration_snapshot AS description,
     cil.quantity,NULL AS uomCode,cil.unit_price_cents AS unitAmountCents,
     MAX(ROUND(cil.quantity*cil.unit_price_cents)-cil.line_total_cents,0) AS discountCents,
@@ -107,19 +134,21 @@ async function documentLines(type: EmailDocumentType, id: string) {
     JOIN sales_order_lines sol ON sol.id=cil.sales_order_line_id WHERE cil.customer_invoice_id=? ORDER BY cil.rowid`, id);
 }
 
-function documentLabel(type: EmailDocumentType) {
+function documentLabel(type: PrintableDocumentType) {
   if (type === "purchase_order") return "Purchase order";
   if (type === "sales_order") return "Sales order";
+  if (type === "vendor_bill") return "Vendor bill";
   return "Invoice";
 }
 
-async function loadDocument(type: EmailDocumentType, id: string): Promise<LoadedDocument> {
+async function loadDocument(type: PrintableDocumentType, id: string): Promise<LoadedDocument> {
   const header = await documentHeader(type, id);
   if (!header) throw new DocumentEmailError(`${documentLabel(type)} not found.`, "DOCUMENT_NOT_FOUND", 404);
   const status = header.status.toLowerCase();
   if (type === "purchase_order" && status !== "approved") throw new DocumentEmailError("Only an approved purchase order can be emailed to a vendor.", "DOCUMENT_NOT_SENDABLE", 409);
   if (type === "sales_order" && status !== "confirmed") throw new DocumentEmailError("Only a confirmed sales order can be emailed to a customer.", "DOCUMENT_NOT_SENDABLE", 409);
   if (type === "customer_invoice" && status === "void") throw new DocumentEmailError("A void invoice cannot be emailed.", "DOCUMENT_NOT_SENDABLE", 409);
+  if (type === "vendor_bill" && status === "void") throw new DocumentEmailError("A void vendor bill cannot be printed.", "DOCUMENT_NOT_SENDABLE", 409);
   const [lines, charges] = await Promise.all([
     documentLines(type, id),
     all<DocumentCharge>(`SELECT description,amount_cents AS amountCents,direction,tax_amount_cents AS taxAmountCents
@@ -144,7 +173,9 @@ export async function getDocumentEmailPreview(type: EmailDocumentType, id: strin
     partyName: header.partyName,
     defaultRecipient: header.partyEmail ?? "",
     defaultSubject: `${label} ${header.number} from PaneFlow`,
-    defaultMessage: `Hello ${header.partyName},\n\nPlease find ${label.toLowerCase()} ${header.number} attached.\n\nThank you.`,
+    defaultMessage: type === "customer_invoice"
+      ? `Hello ${header.partyName},\n\nPlease find invoice ${header.number} attached. A secure online payment button is included below when available.\n\nThank you.`
+      : `Hello ${header.partyName},\n\nPlease find ${label.toLowerCase()} ${header.number} attached.\n\nThank you.`,
     fileName: `${safeFilePart(header.number)}.pdf`,
   };
 }
@@ -241,16 +272,19 @@ function renderDocumentPdf(document: LoadedDocument, senderEmail?: string) {
     { text: "PANEFLOW OPERATIONS", size: 11, bold: true },
     { text: document.label.toUpperCase(), size: 20, bold: true },
     { text: header.number, size: 14, bold: true, gapAfter: 8 },
-    { text: `${document.type === "purchase_order" ? "Vendor" : "Customer"}: ${header.partyName}`, bold: true },
+    { text: `${document.type === "purchase_order" || document.type === "vendor_bill" ? "Vendor" : "Customer"}: ${header.partyName}`, bold: true },
   ];
   const address = [header.addressLine1, header.addressLine2, header.city, header.region, header.postalCode, header.country].filter(Boolean).join(", ");
   if (address) rows.push(...wrapText(address).map((text) => ({ text })));
   if (header.partyEmail) rows.push({ text: `Email: ${header.partyEmail}` });
   rows.push(
     { text: `Status: ${cleanPdfText(header.status).replaceAll("_", " ")}` },
-    { text: `${document.type === "customer_invoice" ? "Invoice" : "Order"} date: ${header.documentDate || "-"}` },
+    { text: `${document.type === "customer_invoice" || document.type === "vendor_bill" ? "Invoice" : "Order"} date: ${header.documentDate || "-"}` },
     { text: `${document.type === "purchase_order" ? "Expected" : document.type === "sales_order" ? "Requested" : "Due"}: ${header.dueOrExpectedDate || "-"}` },
-    { text: `Currency: ${header.currency}${header.paymentTerms ? `   Terms: ${header.paymentTerms}` : ""}${header.reference ? `   Reference: ${header.reference}` : ""}`, gapAfter: 8 },
+    { text: `Currency: ${header.currency}${header.paymentTerms ? `   Terms: ${header.paymentTerms}` : ""}${header.reference ? `   Reference: ${header.reference}` : ""}`, gapAfter: document.type === "purchase_order" && (header.supplierQuoteNumber || header.supplierReference) ? 0 : 8 },
+    ...(document.type === "purchase_order" && (header.supplierQuoteNumber || header.supplierReference)
+      ? [{ text: `Supplier quote: ${header.supplierQuoteNumber || "-"}${header.supplierReference ? `   Supplier reference: ${header.supplierReference}` : ""}`, gapAfter: 8 }]
+      : []),
     { text: "ITEMS", size: 12, bold: true },
   );
   document.lines.forEach((line, index) => {
@@ -283,7 +317,7 @@ function renderDocumentPdf(document: LoadedDocument, senderEmail?: string) {
 }
 
 /** Build the same authoritative PDF used for email without requiring a mailbox connection. */
-export async function getDocumentPdf(type: EmailDocumentType, id: string) {
+export async function getDocumentPdf(type: PrintableDocumentType, id: string) {
   const document = await loadDocument(type, id);
   return {
     documentNumber: document.header.number,
@@ -307,7 +341,7 @@ function validateRecipients(values: unknown) {
   return recipients;
 }
 
-export async function sendDocumentEmail(actor: ActorIdentity, input: { documentType: EmailDocumentType; documentId: string; recipients: unknown; subject: unknown; message: unknown }) {
+export async function sendDocumentEmail(actor: ActorIdentity, input: { documentType: EmailDocumentType; documentId: string; recipients: unknown; subject: unknown; message: unknown }, requestUrl?: string) {
   const document = await loadDocument(input.documentType, input.documentId);
   const preview = await getDocumentEmailPreview(input.documentType, input.documentId);
   const recipients = validateRecipients(input.recipients);
@@ -315,7 +349,13 @@ export async function sendDocumentEmail(actor: ActorIdentity, input: { documentT
   const message = String(input.message ?? "").trim();
   if (!subject || subject.length > 200 || /[\r\n]/u.test(subject)) throw new DocumentEmailError("Enter a subject of 200 characters or fewer.", "INVALID_SUBJECT");
   if (message.length > 5_000) throw new DocumentEmailError("The email message must be 5,000 characters or fewer.", "MESSAGE_TOO_LONG");
-  const htmlBody = `<div style="font-family:Arial,sans-serif;color:#17342f;line-height:1.5">${escapeHtml(message || preview.defaultMessage).replaceAll("\n", "<br>")}<p style="color:#5c6f6b;font-size:12px">${escapeHtml(document.label)} ${escapeHtml(document.header.number)} is attached as a PDF generated from PaneFlow&apos;s current system record.</p></div>`;
+  const paymentLink = input.documentType === "customer_invoice" && requestUrl
+    ? await maybeCreateInvoicePaymentLink(document.header.id, actor, requestUrl)
+    : null;
+  const paymentAction = paymentLink
+    ? `<p style="margin:24px 0"><a href="${escapeHtml(paymentLink.url)}" style="display:inline-block;padding:12px 19px;border-radius:8px;background:#1f5b4c;color:#fff;text-decoration:none;font-weight:700">Pay ${escapeHtml(document.header.number)} securely</a></p><p style="color:#5c6f6b;font-size:12px">${paymentLink.checkoutMode === "embedded" ? `This PaneFlow payment link expires ${escapeHtml(paymentLink.expiresAt.slice(0, 10))}. ` : "This button opens the Helcim-hosted online invoice. "}Card or bank details are entered directly with Helcim.</p>`
+    : "";
+  const htmlBody = `<div style="font-family:Arial,sans-serif;color:#17342f;line-height:1.5">${escapeHtml(message || preview.defaultMessage).replaceAll("\n", "<br>")}${paymentAction}<p style="color:#5c6f6b;font-size:12px">${escapeHtml(document.label)} ${escapeHtml(document.header.number)} is attached as a PDF generated from PaneFlow&apos;s current system record.</p></div>`;
   const deliveryId = `email-delivery-${crypto.randomUUID()}`;
   const now = new Date().toISOString();
   const connection = await first<{ provider: string; emailAddress: string }>("SELECT provider,email_address AS emailAddress FROM email_connections WHERE user_id=? AND status='connected' LIMIT 1", actor.id);
@@ -334,7 +374,7 @@ export async function sendDocumentEmail(actor: ActorIdentity, input: { documentT
         .bind(sent.messageId || null, sentAt, deliveryId),
       db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)`)
-        .bind(`audit-email-${crypto.randomUUID()}`, input.documentType, document.header.id, "document_emailed", `${document.label} ${document.header.number} emailed to ${recipients.join(", ")}.`, actor.label, actor.id, actor.email, JSON.stringify({ deliveryId, provider: sent.provider, senderEmail: sent.senderEmail, recipients, subject }), sentAt),
+        .bind(`audit-email-${crypto.randomUUID()}`, input.documentType, document.header.id, "document_emailed", `${document.label} ${document.header.number} emailed to ${recipients.join(", ")}.`, actor.label, actor.id, actor.email, JSON.stringify({ deliveryId, provider: sent.provider, senderEmail: sent.senderEmail, recipients, subject, paymentLinkId: paymentLink?.id ?? null }), sentAt),
       db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
         VALUES (?,'document.emailed',?,?,?,'pending',0,?,?)`)
         .bind(`outbox-email-${crypto.randomUUID()}`, input.documentType, document.header.id, JSON.stringify({ deliveryId, documentType: input.documentType, documentId: document.header.id, documentNumber: document.header.number, provider: sent.provider, senderEmail: sent.senderEmail, recipients }), sentAt, sentAt),

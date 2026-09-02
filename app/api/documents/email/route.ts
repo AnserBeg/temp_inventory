@@ -31,7 +31,6 @@ export async function POST(request: Request) {
     const documentId = String(input.documentId ?? "").trim();
     if (!isEmailDocumentType(documentType) || !documentId) return Response.json({ error: { code: "INVALID_DOCUMENT", message: "A supported documentType and documentId are required." } }, { status: 400 });
     requireCapability(actor, emailDocumentCapability(documentType));
-    return Response.json(await sendDocumentEmail(actor, { documentType, documentId, recipients: input.recipients, subject: input.subject, message: input.message }));
+    return Response.json(await sendDocumentEmail(actor, { documentType, documentId, recipients: input.recipients, subject: input.subject, message: input.message }, request.url));
   } catch (error) { return responseFor(error); }
 }
-

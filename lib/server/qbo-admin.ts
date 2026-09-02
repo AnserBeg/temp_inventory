@@ -14,6 +14,7 @@ export const qboAccountRoles = [
   { key: "accounts_receivable", label: "Accounts receivable", types: ["Accounts Receivable"] },
   { key: "accounts_payable", label: "Accounts payable", types: ["Accounts Payable"] },
   { key: "cash", label: "Cash / operating bank", types: ["Bank"] },
+  { key: "helcim_clearing", label: "Helcim clearing", types: ["Other Current Asset", "Bank"] },
   { key: "credit_card", label: "Vendor payment credit card", types: ["Credit Card"] },
   { key: "inventory", label: "Inventory asset", types: ["Other Current Asset"] },
   { key: "inventory_clearing", label: "Inventory clearing", types: ["Other Current Asset", "Other Current Liability", "Expense"] },
@@ -105,7 +106,7 @@ async function localReferenceValues() {
   ]);
   return {
     taxCodes: Array.from(new Set(["GST", "ZERO", "EXEMPT", ...taxCodes.results.map((item) => canonicalTaxCode(item.value)).filter(Boolean)])),
-    terms: terms.results.map((item) => item.value), paymentMethods: methods.results.map((item) => item.value),
+    terms: terms.results.map((item) => item.value), paymentMethods: Array.from(new Set(["helcim_card", "helcim_eft", ...methods.results.map((item) => item.value)])),
   };
 }
 

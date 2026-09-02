@@ -28,6 +28,7 @@ Changing one document never silently fabricates another. Reopening a PO restores
 - Server-backed worklist search, status filtering, sorting, and pagination across the full product, partner, order, movement, and billing data set.
 - Operational base/purchase/sales units of measure with precision enforcement and global or product-specific conversions applied to orders, receipts, reservations, shipments, and returns.
 - Customer-assigned contract price lists with priorities, validity dates, UOMs, and quantity breaks; catalog cost/price remains the explicit fallback.
+- Secure customer invoice links backed by HelcimPay.js, with partial amounts, card collection, pending Canadian bank-payment clearing, signed webhooks, and automatic receivable posting.
 - Empty-database onboarding for products, units, conversions, vendors/customers, warehouses, locations, returnable types, customer pricing, and user roles.
 - Missing-location reconciliation that restores the original historical ID; inventory and accounting exports remain blocked until every location reference resolves.
 
@@ -55,6 +56,23 @@ Configure one or both OAuth providers and a dedicated encryption secret of at le
 
 For production, each redirect URI must be the exact public URL ending in `/api/integrations/email/callback/google` or `/api/integrations/email/callback/microsoft`.
 
+## Helcim customer payments
+
+PaneFlow owns the customer invoice and payment ledger. Helcim provides the PCI-scoped checkout, processor transaction, and settlement state; it does not replace the PaneFlow invoice or write accounting entries directly to QBO. Accounting users can create a payment link from an open customer invoice, and invoice emails automatically include one while Helcim is configured. By default, that button opens Helcim's public Online Invoice View, which keeps a private PaneFlow deployment private. An optional embedded mode renders HelcimPay.js on a separately public HTTPS PaneFlow checkout origin. In both modes, card numbers and bank credentials never pass through PaneFlow.
+
+PaneFlow mirrors each payable invoice into Helcim under a `PF-` invoice number. A signed Pay.js success response posts an approved card purchase immediately through the same idempotent payment workflow used by accounting staff. Canadian bank payments remain pending until the five-minute reconciliation job observes approved clearing. Every processor transaction ID is unique in D1; duplicate browser callbacks and webhook deliveries cannot post a second payment. Webhook response data persisted for audit is stripped of cardholder, card-token, and bank-account fields.
+
+To configure Helcim:
+
+1. Start with a Helcim Developer Test account, then use an approved merchant account for production. In the API Access Configuration, enable invoice create/update/read and card/ACH transaction reads. Also enable HelcimPay.js checkout initialization if embedded mode will be used.
+2. Create a Helcim webhook pointing to `https://YOUR_HOST/api/integrations/helcim/webhook`, subscribe to card and ACH/bank transaction events, and copy its base64 Webhook Verifier Token.
+3. Set `HELCIM_API_TOKEN`, `HELCIM_WEBHOOK_VERIFIER_TOKEN`, and an independent random `HELCIM_TOKEN_ENCRYPTION_KEY` of at least 32 characters as Worker secrets. The last key encrypts each short-lived Pay.js validation secret before D1 storage and must remain stable across deploys.
+4. Leave `HELCIM_CHECKOUT_MODE=hosted` for a private PaneFlow site and set `HELCIM_INVOICE_HOST` to the hostname shown by **Actions → View Online** on any Helcim invoice, for example `your-business.myhelcim.com`. To use PaneFlow's `/pay/...` page instead, set the mode to `embedded`, host that route on a public HTTPS origin, and whitelist the origin in Helcim; Pay.js does not render directly on localhost. `HELCIM_CHECKOUT_PAYMENT_METHODS` accepts `cc`, `ach`, or `cc-ach` and defaults to `cc-ach`; USD embedded checkouts are always limited to cards. `HELCIM_PAYMENT_LINK_TTL_DAYS` defaults to 90 and accepts 1–365 for embedded links.
+5. In **Reports & admin → Integrations**, map **Helcim clearing** to a QBO Other Current Asset (or dedicated Bank-type clearing) account, and map local payment methods `helcim_card` and `helcim_eft` to the corresponding QBO methods. Do not map processor receipts directly to the operating bank account: Helcim payouts and fees should reconcile from the clearing account to the bank feed.
+6. Send a low-value test invoice link, complete a card test and a bank-payment test, wait for the latter to clear, then verify the PaneFlow payment, QBO Payment, clearing-account deposit, and fee reconciliation before switching to production credentials.
+
+The initial connection accepts purchase payments. Refunds, chargebacks, and ACH returns must be initiated in Helcim and handled as explicit accounting corrections in PaneFlow/QBO; they are never silently netted against an invoice by the collection callback.
+
 ## QuickBooks Online integration
 
 PaneFlow is the operational and inventory source of truth; QuickBooks Online remains the general ledger and banking system. The native integration sends customers, vendors, non-inventory products, approved purchase orders, customer invoices, approved vendor bills, credits, and payments. Draft or pending purchase orders and match-held bills remain in PaneFlow until approval. Inventory receipts, COGS, returns, scrap, counts, landed cost, and returnable-deposit forfeitures are sent as balanced journal entries so QBO does not maintain a second, competing stock valuation. Lots, serials, bins, reservations, physical movements, and R2 attachments stay in PaneFlow.
@@ -66,7 +84,7 @@ To configure an Intuit app:
 1. Create an app in the Intuit Developer dashboard and enable the `com.intuit.quickbooks.accounting` scope. A QBO Plus or Advanced company is required when purchase orders are part of the workflow.
 2. Register `https://YOUR_HOST/api/integrations/qbo/callback` as an OAuth redirect URI and `https://YOUR_HOST/api/integrations/qbo/webhook` as the webhook endpoint. Enable the current CloudEvents v1.0 webhook payload; the endpoint also accepts Intuit's legacy payload during migration. Use the equivalent localhost callback for sandbox development.
 3. Set `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `QBO_REDIRECT_URI`, and `QBO_WEBHOOK_VERIFIER_TOKEN` as Worker secrets. Set `QBO_TOKEN_ENCRYPTION_KEY` to an independent, randomly generated value of at least 32 characters. `QBO_MINOR_VERSION` defaults to `75`.
-4. Open **Reports & admin → Integrations**, connect a sandbox company, load its reference lists, and map every applicable PaneFlow accounting role plus all local tax codes, payment terms, and payment methods. Map **Vendor payment credit card** if bills can be paid from a credit-card account.
+4. Open **Reports & admin → Integrations**, connect a sandbox company, load its reference lists, and map every applicable PaneFlow accounting role plus all local tax codes, payment terms, and payment methods. Map **Vendor payment credit card** if bills can be paid from a credit-card account, and **Helcim clearing** if online customer payments are enabled.
 5. Run the initial sync from the chosen cutover date, resolve any worklist conflicts, reconcile, and only then repeat the connection process for production.
 
 The same screen supports manual sync, retry, disconnect/revocation, delivery inspection, and round-robin reconciliation. The Worker also projects and delivers QBO work every five minutes. QBO webhook edits are treated as conflicts because the integration is intentionally one-way for PaneFlow-owned records; an administrator can retry the conflict to refresh its current `SyncToken` and overwrite it from PaneFlow.

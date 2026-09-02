@@ -271,6 +271,28 @@ test("document numbers are sequential, unique, and never reused", async () => {
   assert.equal(await inventoryDb.nextDocumentNumber("INV"), "INV-000001");
 });
 
+test("imported supplier quotes retain external references while PaneFlow generates the PO number", async () => {
+  await run("INSERT INTO business_partners (id,code,name,partner_type,currency,active,version,created_at) VALUES ('vendor-ply-import','PLY-TEST','Ply Gem Test','vendor','CAD',1,1,'2026-08-01')");
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('product-ply-import','PLY-3030','Ply Gem 3030 Casement','Window','Vinyl','760 x 760 mm','White','quantity','stocked',10000,15000,0,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
+  const actor = { id: "ply-import-operator", email: "ply-import@example.com", name: "Ply Import Operator", role: "operator", label: "Ply Import Operator <ply-import@example.com>", localDevelopment: false };
+  const payload = {
+    vendorId: "vendor-ply-import", expectedDate: "2026-09-09", currency: "CAD", exchangeRateToBase: 1,
+    supplierQuoteNumber: "993389", supplierReference: "UNKNOWN-UNTIL-PANEFLOW", sourceDocumentHash: "a".repeat(64),
+    projectReference: "Source quote 993389 · UNKNOWN-UNTIL-PANEFLOW",
+    lines: [{ kind: "item", productId: "product-ply-import", quantity: 2, unitCostCents: 10000, taxable: true, taxCode: "GST", taxRateBps: 500, fulfillmentRoute: "stock" }],
+  };
+  const created = await advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", idempotencyKey: "ply-import-first", actor, payload });
+  assert.match(created.number, /^PO-\d{6}$/);
+  assert.notEqual(created.number, payload.supplierReference);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT number,supplier_quote_number,supplier_reference,source_document_hash,lifecycle_status FROM purchase_orders WHERE id=?").get(created.recordId) }, {
+    number: created.number, supplier_quote_number: "993389", supplier_reference: "UNKNOWN-UNTIL-PANEFLOW", source_document_hash: "a".repeat(64), lifecycle_status: "draft",
+  });
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", idempotencyKey: "ply-import-duplicate-quote", actor, payload: { ...payload, sourceDocumentHash: "b".repeat(64) } }), (error) => error?.code === "DUPLICATE_SUPPLIER_QUOTE");
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", idempotencyKey: "ply-import-duplicate-file", actor, payload: { ...payload, supplierQuoteNumber: "993390", sourceDocumentHash: "a".repeat(64) } }), (error) => error?.code === "DUPLICATE_SUPPLIER_QUOTE");
+  const found = await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 10, scope: "purchase-orders", search: "UNKNOWN-UNTIL-PANEFLOW" });
+  assert.deepEqual(found.purchaseOrders.map((order) => order.id), [created.recordId]);
+});
+
 test("host headers cannot enable local auth and email mappings cannot transfer roles", async () => {
   await assert.rejects(
     auth.resolveActor(new Request("https://attacker.local/api", { headers: { host: "localhost" } })),
