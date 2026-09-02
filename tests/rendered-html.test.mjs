@@ -96,7 +96,7 @@ test("purchase-order drafts round-trip their line discount and tax through the c
   assert.match(purchaseLines, /taxRateBps: number\(line\.taxRateBps\)/);
   // Optional fields would silently normalise a stored discount to zero, which is the exact
   // failure this guards: the order would reopen showing 0% against a total that included it.
-  assert.match(app, /\n  discountCents: number;\n  taxable: boolean;\n  taxRateBps: number;\n  version: number;\n\};/);
+  assert.match(app, /\r?\n  discountCents: number;\r?\n  taxable: boolean;\r?\n  taxRateBps: number;\r?\n  version: number;\r?\n\};/);
 
   const draft = app.slice(app.indexOf("function composerDraft("), app.indexOf("function AdvancedCreateOrderDialog("));
   assert.match(draft, /discountCents: line\.discountCents, taxable: line\.taxable, taxRateBps: line\.taxRateBps/);
