@@ -83,6 +83,17 @@ test("runtime storage preserves inventory, upload, and onboarding invariants", a
   assert.match(attachments, /MAX_BYTES\s*=\s*10\s*\*\s*1024\s*\*\s*1024/);
   assert.match(attachments, /CONTENT_MISMATCH/);
   assert.match(attachments, /attachment\.delete_requested/);
+  assert.match(attachments, /product:\s*["']products["']/);
+  assert.match(attachments, /product_photo/);
+});
+
+test("stock item detail supports durable product picture galleries", async () => {
+  const source = await read("app/inventory-app.tsx");
+  assert.match(source, /function ProductPictures/);
+  assert.match(source, /documentType",\s*"product"/);
+  assert.match(source, /category",\s*"product_photo"/);
+  assert.match(source, /multiple/);
+  assert.match(source, /image\/jpeg,image\/png,image\/webp/);
 });
 
 test("multi-line order contract retains currency, tax, routes, fees, and refundable deposits", async () => {

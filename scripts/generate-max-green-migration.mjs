@@ -21,8 +21,8 @@ function add(sql) {
   statements.push(sql.trim());
 }
 
-const importGuardTable = "_max_green_import_guard";
-const importGuardExists = `EXISTS (SELECT 1 FROM temp.${importGuardTable} WHERE enabled=1)`;
+const importGuardKey = "__migration.max_green_import_guard";
+const importGuardExists = `EXISTS (SELECT 1 FROM system_settings WHERE key=${sqlText(importGuardKey)})`;
 
 function addGuardedInsert(sql) {
   const normalized = sql.trim();
@@ -104,10 +104,9 @@ const businessTables = [
 ];
 
 add("PRAGMA defer_foreign_keys=TRUE");
-add(`DROP TABLE IF EXISTS temp.${importGuardTable}`);
-add(`CREATE TEMP TABLE ${importGuardTable} (enabled INTEGER PRIMARY KEY)`);
-add(`INSERT INTO temp.${importGuardTable} (enabled)
-SELECT 1
+add(`DELETE FROM system_settings WHERE key=${sqlText(importGuardKey)}`);
+add(`INSERT INTO system_settings (key,value_json,description,version,updated_by,updated_at)
+SELECT ${sqlText(importGuardKey)},'true','Deployment-scoped Max Green import guard.',1,'Max Green inventory import',CURRENT_TIMESTAMP
 WHERE (SELECT COUNT(*) FROM products)=6
   AND (SELECT COUNT(*) FROM business_partners)=6
   AND (SELECT COUNT(*) FROM locations)=6
@@ -221,7 +220,7 @@ BEGIN SELECT RAISE(ABORT, 'stock movement ledger is immutable'); END`);
 add(`CREATE TRIGGER stock_movements_immutable_delete
 BEFORE DELETE ON stock_movements
 BEGIN SELECT RAISE(ABORT, 'stock movement ledger is immutable'); END`);
-add(`DROP TABLE temp.${importGuardTable}`);
+add(`DELETE FROM system_settings WHERE key=${sqlText(importGuardKey)}`);
 add("PRAGMA optimize");
 const migration = `${statements.join(`;${statementBreakpoint}\n`)};\n`;
 const outputFlagIndex = process.argv.indexOf("--output");

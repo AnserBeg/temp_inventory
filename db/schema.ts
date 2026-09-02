@@ -143,7 +143,7 @@ export const purchaseOrderLines = sqliteTable(
   (table) => [
     index("idx_purchase_order_lines_order").on(table.purchaseOrderId),
     index("idx_purchase_order_lines_product").on(table.productId),
-    uniqueIndex("idx_purchase_order_lines_source_sales_line").on(table.sourceSalesOrderLineId),
+    index("idx_purchase_order_lines_source_sales_line").on(table.sourceSalesOrderLineId),
   ]
 );
 
@@ -290,6 +290,34 @@ export const reservations = sqliteTable(
   ]
 );
 
+/**
+ * Quantity-level commercial pegs between inbound PO supply and customer SO demand.
+ * `receivedQty` advances only when accepted inventory is posted, while physical custody and
+ * active warehouse commitments continue to live in stock movements and reservations.
+ */
+export const supplyAllocations = sqliteTable(
+  "supply_allocations",
+  {
+    id: text("id").primaryKey(),
+    purchaseOrderLineId: text("purchase_order_line_id").notNull().references(() => purchaseOrderLines.id, { onDelete: "cascade" }),
+    salesOrderLineId: text("sales_order_line_id").notNull().references(() => salesOrderLines.id),
+    allocatedQty: real("allocated_qty").notNull(),
+    receivedQty: real("received_qty").notNull().default(0),
+    status: text("status").notNull().default("active"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    version: integer("version").notNull().default(1),
+  },
+  (table) => [
+    uniqueIndex("idx_supply_allocations_pair").on(table.purchaseOrderLineId, table.salesOrderLineId),
+    index("idx_supply_allocations_purchase_line_status").on(table.purchaseOrderLineId, table.status),
+    index("idx_supply_allocations_sales_line_status").on(table.salesOrderLineId, table.status),
+    check("supply_allocations_allocated_quantity_check", sql`${table.allocatedQty} > 0`),
+    check("supply_allocations_received_quantity_check", sql`${table.receivedQty} >= 0 AND ${table.receivedQty} <= ${table.allocatedQty}`),
+    check("supply_allocations_status_check", sql`${table.status} IN ('active','released')`),
+  ]
+);
+
 export const shipments = sqliteTable(
   "shipments",
   {
@@ -386,6 +414,33 @@ export const stockMovements = sqliteTable(
     index("idx_stock_movements_so_line").on(table.salesOrderLineId),
     index("idx_stock_movements_source").on(table.sourceDocumentType, table.sourceDocumentId),
     index("idx_stock_movements_reversal").on(table.reversalOfMovementId),
+  ]
+);
+
+/**
+ * Immutable receipt-to-allocation lineage. Reservation rows are mutable as picks, releases,
+ * and shipments consume them, so this table preserves how much of each accepted receipt was
+ * pegged and which automatic reservation was originally created from it.
+ */
+export const supplyAllocationReceipts = sqliteTable(
+  "supply_allocation_receipts",
+  {
+    id: text("id").primaryKey(),
+    supplyAllocationId: text("supply_allocation_id").notNull().references(() => supplyAllocations.id),
+    receiptMovementId: text("receipt_movement_id").notNull().references(() => stockMovements.id),
+    reservationId: text("reservation_id").references(() => reservations.id),
+    quantity: real("quantity").notNull(),
+    reservedQuantity: real("reserved_quantity").notNull().default(0),
+    reversedQty: real("reversed_qty").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_supply_allocation_receipts_pair").on(table.supplyAllocationId, table.receiptMovementId),
+    index("idx_supply_allocation_receipts_movement").on(table.receiptMovementId),
+    index("idx_supply_allocation_receipts_reservation").on(table.reservationId),
+    check("supply_allocation_receipts_quantity_check", sql`${table.quantity} > 0`),
+    check("supply_allocation_receipts_reserved_quantity_check", sql`${table.reservedQuantity} >= 0 AND ${table.reservedQuantity} <= ${table.quantity}`),
+    check("supply_allocation_receipts_reversed_quantity_check", sql`${table.reversedQty} >= 0 AND ${table.reversedQty} <= ${table.quantity}`),
   ]
 );
 

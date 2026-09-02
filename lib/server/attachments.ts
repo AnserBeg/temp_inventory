@@ -4,8 +4,9 @@ import { all, ensureDatabase, first, getD1, newId } from "./inventory-db";
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "application/pdf"]);
-const allowedCategories = new Set(["document","damage_photo","proof_of_delivery","packing_slip","invoice","label","other"]);
+const allowedCategories = new Set(["document","damage_photo","proof_of_delivery","packing_slip","invoice","label","product_photo","other"]);
 const documentTables: Record<string, string> = {
+  product: "products",
   purchase_order: "purchase_orders", receipt: "receipts", vendor_return: "vendor_returns",
   sales_order: "sales_orders", shipment: "shipments", customer_return: "customer_returns",
   vendor_bill: "vendor_bills", customer_invoice: "customer_invoices", inventory_count: "inventory_counts",
@@ -53,6 +54,7 @@ export async function uploadAttachment(actor: ActorIdentity, form: FormData) {
   if(!allowedCategories.has(category)) throw new AttachmentError("INVALID_CATEGORY","Unsupported attachment category.");
   await validateDocument(documentType, documentId);
   if (!allowedTypes.has(file.type)) throw new AttachmentError("UNSUPPORTED_CONTENT_TYPE", "Only JPEG, PNG, WebP, and PDF attachments are allowed.", 415);
+  if (category === "product_photo" && !file.type.startsWith("image/")) throw new AttachmentError("UNSUPPORTED_CONTENT_TYPE", "Product pictures must be JPEG, PNG, or WebP images.", 415);
   if (file.size <= 0 || file.size > MAX_BYTES) throw new AttachmentError("FILE_SIZE_INVALID", "Attachments must be between 1 byte and 10 MB.", 413);
   const bytes=await file.arrayBuffer();const header=new Uint8Array(bytes.slice(0,16));
   const detected=header[0]===0xff&&header[1]===0xd8&&header[2]===0xff?"image/jpeg":header[0]===0x89&&header[1]===0x50&&header[2]===0x4e&&header[3]===0x47?"image/png":String.fromCharCode(...header.slice(0,4))==="%PDF"?"application/pdf":String.fromCharCode(...header.slice(0,4))==="RIFF"&&String.fromCharCode(...header.slice(8,12))==="WEBP"?"image/webp":"unknown";

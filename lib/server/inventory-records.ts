@@ -21,6 +21,7 @@ export type CreateOrderLine = {
   fulfillmentRoute?: "stock" | "special_order" | "drop_ship";
   projectReference?: string;
   sourceSalesOrderLineId?: string;
+  supplyAllocations?: Array<{ salesOrderLineId?: string; quantity?: number }>;
   linkedPurchaseOrderLineId?: string;
   configurationSnapshot?: string;
 };
@@ -101,6 +102,7 @@ export type NormalizedItem = {
   projectReference: string | null;
   configurationSnapshot: string | null;
   sourceSalesOrderLineId: string | null;
+  supplyAllocations: Array<{ salesOrderLineId: string; quantity: number; enteredQuantity: number }>;
   linkedPurchaseOrderLineId: string | null;
 };
 
@@ -249,25 +251,48 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
     const unitAmount = enteredUnitAmount / normalizedQuantity.factorToBase;
     const discountCents = cents(line.discountCents ?? 0, `lines[${index}].discountCents`, true);
     if (discountCents > Math.round(enteredQuantity * enteredUnitAmount)) throw new RecordValidationError("VALIDATION_ERROR", `Line ${index + 1} discount exceeds its gross amount.`);
-    const sourceSalesOrderLineId=typeof line.sourceSalesOrderLineId==="string"&&line.sourceSalesOrderLineId.trim()?line.sourceSalesOrderLineId.trim():null;
+    const legacySourceSalesOrderLineId=typeof line.sourceSalesOrderLineId==="string"&&line.sourceSalesOrderLineId.trim()?line.sourceSalesOrderLineId.trim():null;
     const linkedPurchaseOrderLineId=typeof line.linkedPurchaseOrderLineId==="string"&&line.linkedPurchaseOrderLineId.trim()?line.linkedPurchaseOrderLineId.trim():null;
+    const rawAllocations = Array.isArray(line.supplyAllocations) && line.supplyAllocations.length
+      ? line.supplyAllocations
+      : legacySourceSalesOrderLineId
+        ? [{ salesOrderLineId: legacySourceSalesOrderLineId, quantity: enteredQuantity }]
+        : [];
+    const supplyAllocations: NormalizedItem["supplyAllocations"] = [];
+    for (const [allocationIndex, allocation] of rawAllocations.entries()) {
+      const salesOrderLineId = requiredText(allocation.salesOrderLineId, `lines[${index}].supplyAllocations[${allocationIndex}].salesOrderLineId`);
+      const allocationEnteredQuantity = positiveNumber(allocation.quantity, `lines[${index}].supplyAllocations[${allocationIndex}].quantity`);
+      let allocationQuantity: Awaited<ReturnType<typeof normalizeProductQuantity>>;
+      try {
+        allocationQuantity = await normalizeProductQuantity({
+          productId,
+          quantity: allocationEnteredQuantity,
+          uomId: normalizedQuantity.fromUomId,
+          usage: "purchase",
+          field: `lines[${index}].supplyAllocations[${allocationIndex}].quantity`,
+        });
+      } catch (error) {
+        if (error instanceof ProductQuantityError) throw new RecordValidationError(error.code, error.message, error.status);
+        throw error;
+      }
+      supplyAllocations.push({ salesOrderLineId, quantity: allocationQuantity.baseQuantity, enteredQuantity: allocationEnteredQuantity });
+    }
+    const sourceSalesOrderLineId = supplyAllocations[0]?.salesOrderLineId ?? null;
     if (input.type === "purchaseOrder") {
       if (linkedPurchaseOrderLineId) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot use linkedPurchaseOrderLineId on a purchase order.`);
-      if (route === "stock" && sourceSalesOrderLineId) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot link stock replenishment to customer demand.`);
+      if (route === "stock" && supplyAllocations.length) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot allocate stock replenishment to customer demand.`);
       if (route !== "stock") {
-        if (!sourceSalesOrderLineId) throw new RecordValidationError("SUPPLY_LINK_REQUIRED", `Line ${index + 1} requires sourceSalesOrderLineId for ${route}.`);
-        const demand = await first("SELECT id FROM sales_order_lines WHERE id=? AND product_id=? AND fulfillment_route=?", sourceSalesOrderLineId, productId, route);
-        if (!demand) throw new RecordValidationError("SUPPLY_LINK_MISMATCH", `Line ${index + 1} source sales line does not match product and route.`, 409);
-        const editingId = input.editingPurchaseOrderId?.trim() ?? "";
-        const available = await first(`SELECT sol.id FROM sales_order_lines sol
-          LEFT JOIN purchase_order_lines linked ON linked.id=sol.linked_purchase_order_line_id
-          WHERE sol.id=? AND (sol.linked_purchase_order_line_id IS NULL OR linked.purchase_order_id=?)
-            AND NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.source_sales_order_line_id=sol.id AND pol.purchase_order_id<>?)`, sourceSalesOrderLineId, editingId, editingId);
-        if (!available) throw new RecordValidationError("SUPPLY_LINK_IN_USE", `Line ${index + 1} customer demand is already linked to another purchase order.`, 409);
+        if (!supplyAllocations.length) throw new RecordValidationError("SUPPLY_LINK_REQUIRED", `Line ${index + 1} requires at least one quantity allocation for ${route}.`);
+        if (new Set(supplyAllocations.map((allocation) => allocation.salesOrderLineId)).size !== supplyAllocations.length) {
+          throw new RecordValidationError("DUPLICATE_SUPPLY_ALLOCATION", `Line ${index + 1} cannot allocate twice to the same sales-order line.`, 409);
+        }
+        const allocated = supplyAllocations.reduce((sum, allocation) => sum + allocation.quantity, 0);
+        if (allocated > quantity + 0.000001) throw new RecordValidationError("OVER_ALLOCATION", `Line ${index + 1} allocates ${allocated} base units from only ${quantity} ordered units.`, 409);
+        if (route === "drop_ship" && supplyAllocations.length !== 1) throw new RecordValidationError("DROP_SHIP_ALLOCATION_AMBIGUOUS", "A drop-ship PO line must allocate to exactly one sales-order line.", 409);
       }
     }
     if (input.type === "salesOrder") {
-      if (sourceSalesOrderLineId) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot use sourceSalesOrderLineId on a sales order.`);
+      if (legacySourceSalesOrderLineId || supplyAllocations.length) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot define supply allocations on a sales order.`);
       if (linkedPurchaseOrderLineId) throw new RecordValidationError("SUPPLY_LINK_NOT_ALLOWED", `Line ${index + 1} cannot link supply from the sales-order side. Save the demand first, then create the dedicated purchase order from that sales line.`, 409);
     }
     const taxable = line.taxable !== false;
@@ -281,13 +306,39 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
       fulfillmentRoute: route,
       projectReference: typeof line.projectReference === "string" && line.projectReference.trim() ? line.projectReference.trim() : input.projectReference?.trim() || null,
       configurationSnapshot: typeof line.configurationSnapshot === "string" && line.configurationSnapshot.trim() ? line.configurationSnapshot : null,
-      sourceSalesOrderLineId,linkedPurchaseOrderLineId,
+      sourceSalesOrderLineId,supplyAllocations,linkedPurchaseOrderLineId,
     });
   }
   if (!items.length) throw new RecordValidationError("VALIDATION_ERROR", "At least one item line is required.");
   if (input.type === "purchaseOrder") {
-    const sourceIds = items.flatMap((line) => line.sourceSalesOrderLineId ? [line.sourceSalesOrderLineId] : []);
-    if (new Set(sourceIds).size !== sourceIds.length) throw new RecordValidationError("DUPLICATE_SUPPLY_LINK", "Each source sales-order line can be linked only once in a purchase order.", 409);
+    const requestedByDemand = new Map<string, { quantity: number; productId: string; route: NormalizedItem["fulfillmentRoute"] }>();
+    for (const line of items) for (const allocation of line.supplyAllocations) {
+      const requested = requestedByDemand.get(allocation.salesOrderLineId);
+      requestedByDemand.set(allocation.salesOrderLineId, {
+        quantity: (requested?.quantity ?? 0) + allocation.quantity,
+        productId: line.productId,
+        route: line.fulfillmentRoute,
+      });
+    }
+    const editingId = input.editingPurchaseOrderId?.trim() ?? "";
+    for (const [salesOrderLineId, requested] of requestedByDemand) {
+      const demand = await first<{ productId: string; route: string; lifecycleStatus: string; demandQty: number; allocatedQty: number }>(`SELECT
+          sol.product_id AS productId,sol.fulfillment_route AS route,so.lifecycle_status AS lifecycleStatus,
+          sol.ordered_qty-sol.canceled_qty AS demandQty,
+          COALESCE((SELECT SUM(sa.allocated_qty) FROM supply_allocations sa
+            JOIN purchase_order_lines existing_line ON existing_line.id=sa.purchase_order_line_id
+            WHERE sa.sales_order_line_id=sol.id AND sa.status='active' AND existing_line.purchase_order_id<>?),0) AS allocatedQty
+        FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id WHERE sol.id=?`, editingId, salesOrderLineId);
+      if (!demand || demand.productId !== requested.productId || demand.route !== requested.route || demand.lifecycleStatus === "canceled") {
+        throw new RecordValidationError("SUPPLY_LINK_MISMATCH", `Allocation target ${salesOrderLineId} does not match the PO product and fulfillment route.`, 409);
+      }
+      if (demand.allocatedQty + requested.quantity > demand.demandQty + 0.000001) {
+        throw new RecordValidationError("OVER_ALLOCATION", `Allocation target ${salesOrderLineId} has only ${Math.max(demand.demandQty - demand.allocatedQty, 0)} unallocated base units remaining.`, 409);
+      }
+      if (requested.route === "drop_ship" && demand.allocatedQty > 0) {
+        throw new RecordValidationError("DROP_SHIP_ALLOCATION_AMBIGUOUS", "Drop-ship demand can be supplied by only one PO line.", 409);
+      }
+    }
   }
   return { items, charges };
 }
@@ -350,23 +401,39 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
         : `${number} saved as a draft with ${items.length} item line${items.length === 1 ? "" : "s"}; approval is required before its ${quantity}-unit purchasing commitment becomes incoming supply.`,
       impact: { physical: "On-hand inventory and the immutable movement ledger are unchanged.", commercial: fastTrack ? "Approved lines increase the incoming forecast immediately." : "Draft lines do not increase incoming forecast until approval.", financial: "Charges and tax are planned only; no vendor bill or payment was created.", onHandDelta: 0, incomingDelta: fastTrack ? quantity : 0, reservedDelta: 0, availableDelta: 0 },
     };
-    const sourceLines = items.filter((line) => line.sourceSalesOrderLineId);
-    const sourceClaims = sourceLines.map(() => ` AND EXISTS (SELECT 1 FROM sales_order_lines sol
-      WHERE sol.id=? AND sol.product_id=? AND sol.fulfillment_route=? AND sol.linked_purchase_order_line_id IS NULL
-        AND NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.source_sales_order_line_id=sol.id))`).join("");
-    const sourceClaimValues = sourceLines.flatMap((line) => [line.sourceSalesOrderLineId!, line.productId, line.fulfillmentRoute]);
+    const allocationDemand = new Map<string, { quantity: number; productId: string; route: string }>();
+    for (const line of items) for (const allocation of line.supplyAllocations) {
+      const current = allocationDemand.get(allocation.salesOrderLineId);
+      allocationDemand.set(allocation.salesOrderLineId, { quantity: (current?.quantity ?? 0) + allocation.quantity, productId: line.productId, route: line.fulfillmentRoute });
+    }
+    const allocationClaims = [...allocationDemand.entries()].map(() => ` AND EXISTS (SELECT 1 FROM sales_order_lines sol
+      JOIN sales_orders so ON so.id=sol.sales_order_id
+      WHERE sol.id=? AND sol.product_id=? AND sol.fulfillment_route=? AND so.lifecycle_status<>'canceled'
+        AND sol.ordered_qty-sol.canceled_qty-COALESCE((SELECT SUM(sa.allocated_qty) FROM supply_allocations sa WHERE sa.sales_order_line_id=sol.id AND sa.status='active'),0)>=?)`).join("");
+    const allocationClaimValues = [...allocationDemand.entries()].flatMap(([salesOrderLineId, allocation]) => [salesOrderLineId, allocation.productId, allocation.route, allocation.quantity]);
     statements = [
       db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
-        SELECT ?, 'create_purchase_order', ?, ?, ?, ?, ? WHERE 1=1${sourceClaims}`).bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now, ...sourceClaimValues),
+        SELECT ?, 'create_purchase_order', ?, ?, ?, ?, ? WHERE 1=1${allocationClaims}`).bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now, ...allocationClaimValues),
       db.prepare(`INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,buyer_name,project_reference,revision_number,version,created_at)
         SELECT ?,?,?,?,'not_billed',?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
         .bind(recordId, number, vendorId, fastTrack ? "approved" : "draft", expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, now, idempotencyKey, recordId, claimToken),
     ];
     const purchaseLines = items.map((line) => ({ line, lineId: newId("po-line") }));
-    purchaseLines.forEach(({ line, lineId }) => {statements.push(db.prepare(`INSERT INTO purchase_order_lines
-      (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
-      SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId,line.discountCents,line.taxable ? 1 : 0,line.taxCode,line.taxRateBps, idempotencyKey, recordId, claimToken));if(line.sourceSalesOrderLineId)statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=? WHERE id=? AND product_id=? AND linked_purchase_order_line_id IS NULL AND EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`).bind(lineId,line.sourceSalesOrderLineId,line.productId,idempotencyKey,recordId,claimToken));});
+    purchaseLines.forEach(({ line, lineId }) => {
+      statements.push(db.prepare(`INSERT INTO purchase_order_lines
+        (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
+        SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId,line.discountCents,line.taxable ? 1 : 0,line.taxCode,line.taxRateBps, idempotencyKey, recordId, claimToken));
+      for (const allocation of line.supplyAllocations) {
+        statements.push(db.prepare(`INSERT INTO supply_allocations
+          (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version)
+          SELECT ?,?,?,?,0,'active',?,?,1 WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+          .bind(newId("allocation"), lineId, allocation.salesOrderLineId, allocation.quantity, now, now, idempotencyKey, recordId, claimToken));
+        statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=COALESCE(linked_purchase_order_line_id,?)
+          WHERE id=? AND product_id=? AND EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+          .bind(lineId, allocation.salesOrderLineId, line.productId, idempotencyKey, recordId, claimToken));
+      }
+    });
     statements.push(db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
       SELECT ?,?,1,?,?,?, ?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(newId("revision"), recordId, fastTrack ? "approved" : "draft", JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase }), fastTrackApprovalReason ?? "Initial draft", actor, now, idempotencyKey, recordId, claimToken));

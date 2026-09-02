@@ -168,6 +168,15 @@ type Product = {
   trackingPolicy: string;
 };
 
+type ProductPicture = {
+  id: string;
+  fileName: string;
+  contentType: string;
+  sizeBytes: number;
+  ownerEmail: string;
+  uploadedAt: string;
+};
+
 type LocationOption = {
   id: string;
   code: string;
@@ -1397,10 +1406,10 @@ export function InventoryApp() {
               {view === "customer-returns" && <CustomerReturnsView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onReturn={(so) => setActiveCommand({ kind: "customer-return", entityId: so.id, entityNumber: so.number })} />}
               {view === "stock" && (
                 <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}>
-                  {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="inventory" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} warehouseId={warehouseId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
+                  {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="inventory" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} warehouseId={warehouseId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
                 </OperationsWorkspace>
               )}
-              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="the catalog" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} /> : <CatalogView products={snapshot.products} onOpen={setSelectedProductId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />)}
+              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="the catalog" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canAdminister ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} /> : <CatalogView products={snapshot.products} onOpen={setSelectedProductId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />)}
               {/* Jumping to the order a movement belongs to: navigate first, then select, since
                   navigate clears the current selection. The worklist is searched by the order
                   number so the target is on the page that loads. */}
@@ -1971,7 +1980,7 @@ function CatalogView({ products, onOpen, sort, setSort }: { products: Product[];
   </table></div></section>;
 }
 
-function ProductDetail({ product, movements, onBack, backLabel, onEdit }: { product: Product; movements: Movement[]; onBack: () => void; backLabel: string; onEdit?: () => void }) {
+function ProductDetail({ product, movements, onBack, backLabel, onEdit, canManagePictures, viewerEmail, viewerRole }: { product: Product; movements: Movement[]; onBack: () => void; backLabel: string; onEdit?: () => void; canManagePictures: boolean; viewerEmail: string; viewerRole: string }) {
   const costBasis = product.lastUnitCost ?? product.standardCost;
   const margin = product.sellingPrice > 0 ? `${(((product.sellingPrice - costBasis) / product.sellingPrice) * 100).toFixed(1)}%` : "—";
   const [movementPage, setMovementPage] = useState(1);
@@ -2006,6 +2015,7 @@ function ProductDetail({ product, movements, onBack, backLabel, onEdit }: { prod
     <section className="object-header panel product-header"><div className="window-thumb large" aria-hidden="true"><span /><span /><span /><span /></div><div className="object-title"><div><span className="section-kicker">{product.policy}</span><h2>{product.name}</h2><p>{product.specification}</p><code>{product.sku}</code></div><div className="object-total"><span>Selling price</span><strong>{exact.format(product.sellingPrice)}</strong><small>margin {margin}</small></div></div>
       {onEdit ? <div className="object-actions"><button className="button primary" onClick={onEdit}>Edit product</button></div> : null}</section>
     <section className="metric-row object-metrics"><MetricDisplay label="On hand" value={product.onHand} /><MetricDisplay label="Usable" value={product.usable} /><MetricDisplay label="Reserved" value={product.reserved} tone="info" /><MetricDisplay label="Available now" value={product.available} tone="success" /><MetricDisplay label="Incoming" value={product.incoming} tone="info" /><MetricDisplay label="Projected" value={product.projected} tone={product.projected < 0 ? "danger" : "neutral"} /></section>
+    <ProductPictures product={product} canManage={canManagePictures} viewerEmail={viewerEmail} viewerRole={viewerRole} />
     {/* Cost, price, units and policy were visible in the catalog list and absent from the record
         the list links to, so the detail page could not answer what the product is or costs. */}
     <div className="detail-columns">
@@ -2032,6 +2042,94 @@ function ProductDetail({ product, movements, onBack, backLabel, onEdit }: { prod
     <section className="panel"><PanelHeading title="Location balances" /><div className="responsive-table"><table><thead><tr><SortableHeader label="Warehouse" column="warehouse" sort={balanceTable.sort} setSort={balanceTable.setSort} /><SortableHeader label="Location" column="location" sort={balanceTable.sort} setSort={balanceTable.setSort} /><SortableHeader label="Status" column="status" sort={balanceTable.sort} setSort={balanceTable.setSort} /><SortableHeader label="On hand" column="onHand" sort={balanceTable.sort} setSort={balanceTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reserved" column="reserved" sort={balanceTable.sort} setSort={balanceTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Available" column="available" sort={balanceTable.sort} setSort={balanceTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{balanceTable.rows.map((balance) => <tr key={balance.locationId}><td>{balance.warehouseName}</td><td><strong>{balance.locationCode}</strong><small>{balance.locationName}</small></td><td><StatusBadge tone={balance.inventoryStatus === "orphaned" ? "danger" : balance.inventoryStatus === "usable" ? "success" : "warning"}>{titleCase(balance.inventoryStatus)}</StatusBadge></td><td className="numeric">{balance.recordedQuantity}</td><td className="numeric">{balance.reservedQuantity}</td><td className="numeric strong">{balance.recordedQuantity - balance.reservedQuantity}</td></tr>)}</tbody></table></div></section>
     <section className="panel"><PanelHeading title="Movement history" detail={`${movementTotal} posted record${movementTotal === 1 ? "" : "s"}`} />{historyLoading ? <div className="empty-inline">Loading product history…</div> : productMovements.length ? <MovementsTable movements={productMovements} /> : <div className="empty-inline">No movement records exist for this product.</div>}{!historyLoading && movementPages > 1 ? <nav className="snapshot-pagination" aria-label="Product movement pages"><button className="button secondary" disabled={movementPage <= 1} onClick={() => setMovementPage((current) => current - 1)}>Previous</button><span>Page {movementPage} of {movementPages}</span><button className="button secondary" disabled={movementPage >= movementPages} onClick={() => setMovementPage((current) => current + 1)}>Next</button></nav> : null}</section>
   </div>;
+}
+
+function ProductPictures({ product, canManage, viewerEmail, viewerRole }: { product: Product; canManage: boolean; viewerEmail: string; viewerRole: string }) {
+  const [pictures, setPictures] = useState<ProductPicture[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const loadPictures = useCallback(async (signal?: AbortSignal) => {
+    setLoading(true); setError("");
+    try {
+      const params = new URLSearchParams({ documentType: "product", documentId: product.id });
+      const response = await fetch(`/api/attachments?${params}`, { cache: "no-store", signal });
+      const result = await response.json() as { attachments?: Array<Record<string, unknown>>; error?: { message?: string } };
+      if (!response.ok) throw new Error(result.error?.message ?? "Pictures could not be loaded.");
+      setPictures((result.attachments ?? []).filter((item) => text(item.category) === "product_photo" && text(item.contentType).startsWith("image/")).map((item) => ({
+        id: text(item.id), fileName: text(item.fileName), contentType: text(item.contentType), sizeBytes: number(item.sizeBytes), ownerEmail: text(item.ownerEmail), uploadedAt: text(item.uploadedAt),
+      })));
+    } catch (caught) {
+      if (!(caught instanceof DOMException && caught.name === "AbortError")) setError(caught instanceof Error ? caught.message : "Pictures could not be loaded.");
+    } finally { if (!signal?.aborted) setLoading(false); }
+  }, [product.id]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadPictures(controller.signal);
+    return () => controller.abort();
+  }, [loadPictures]);
+
+  const upload = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!selectedFiles.length) return;
+    setBusy(true); setError(""); setMessage("");
+    let uploaded = 0;
+    try {
+      for (const file of selectedFiles) {
+        const form = new FormData();
+        form.set("documentType", "product"); form.set("documentId", product.id); form.set("category", "product_photo"); form.set("file", file);
+        const response = await fetch("/api/attachments", { method: "POST", body: form });
+        const result = await response.json() as { error?: { message?: string } };
+        if (!response.ok) throw new Error(result.error?.message ?? `${file.name} could not be uploaded.`);
+        uploaded += 1;
+      }
+      setSelectedFiles([]);
+      if (inputRef.current) inputRef.current.value = "";
+      await loadPictures();
+      setMessage(`${uploaded} picture${uploaded === 1 ? "" : "s"} added to ${product.sku}.`);
+    } catch (caught) {
+      if (uploaded) await loadPictures();
+      setError(caught instanceof Error ? caught.message : "The pictures could not be uploaded.");
+    } finally { setBusy(false); }
+  };
+
+  const remove = async (picture: ProductPicture) => {
+    setBusy(true); setError(""); setMessage("");
+    try {
+      const response = await fetch(`/api/attachments/${encodeURIComponent(picture.id)}`, { method: "DELETE" });
+      const result = await response.json() as { error?: { message?: string } };
+      if (!response.ok) throw new Error(result.error?.message ?? `${picture.fileName} could not be removed.`);
+      setPictures((current) => current.filter((item) => item.id !== picture.id));
+      setMessage(`${picture.fileName} removed.`);
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "The picture could not be removed."); }
+    finally { setBusy(false); }
+  };
+
+  const canRemoveAny = /manager|administrator/i.test(viewerRole);
+  return <section className="panel product-pictures">
+    <PanelHeading title="Pictures" detail={`${pictures.length} picture${pictures.length === 1 ? "" : "s"}`} />
+    {canManage ? <form className="product-picture-upload" onSubmit={upload}>
+      <label><span>Add pictures</span><input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp" multiple disabled={busy} onChange={(event) => setSelectedFiles(Array.from(event.target.files ?? []))} /></label>
+      <button className="button primary" type="submit" disabled={busy || !selectedFiles.length}>{busy ? "Uploading…" : selectedFiles.length > 1 ? `Add ${selectedFiles.length} pictures` : "Add picture"}</button>
+      <small>JPEG, PNG, or WebP · up to 10 MB each</small>
+    </form> : <p className="read-only-label product-picture-readonly">Read-only access: picture uploads are hidden.</p>}
+    {error ? <div className="product-picture-feedback error" role="alert">{error}</div> : null}
+    {message ? <div className="product-picture-feedback success" role="status">{message}</div> : null}
+    {loading ? <div className="empty-inline">Loading pictures…</div> : pictures.length ? <div className="product-picture-grid">{pictures.map((picture, index) => {
+      const canRemove = canManage && (canRemoveAny || picture.ownerEmail.toLowerCase() === viewerEmail.toLowerCase());
+      return <article key={picture.id} className="product-picture-card">
+        <a className="product-picture-preview" href={`/api/attachments/${encodeURIComponent(picture.id)}`} target="_blank" rel="noreferrer" aria-label={`Open ${picture.fileName} full size`}>
+          <img src={`/api/attachments/${encodeURIComponent(picture.id)}`} alt={`${product.name} — picture ${index + 1}`} loading="lazy" />
+        </a>
+        <div className="product-picture-meta"><div><strong title={picture.fileName}>{picture.fileName}</strong><small>{(picture.sizeBytes / 1024 / 1024).toFixed(1)} MB · {formatDocumentDate(picture.uploadedAt)}</small></div>{canRemove ? <button className="text-button danger-text" type="button" disabled={busy} onClick={() => void remove(picture)}>Remove</button> : null}</div>
+      </article>;
+    })}</div> : <div className="product-picture-empty"><div className="window-thumb" aria-hidden="true"><span /><span /><span /><span /></div><div><strong>No pictures yet</strong><p>Add photos of the item, packaging, labels, or identifying details.</p></div></div>}
+  </section>;
 }
 
 /**
