@@ -43,6 +43,18 @@ The first authenticated user on an empty private deployment is recorded as the a
 
 Every write derives its actor from Sites authentication headers; client-supplied actor fields are ignored.
 
+### Per-user document email
+
+Each authenticated user can connect a Google Workspace/Gmail or Microsoft 365/Outlook mailbox from the account menu. Approved purchase orders, confirmed sales orders, and posted customer invoices can then be sent as PDF attachments from that user's own mailbox. PaneFlow reads the document from D1 at send time, enforces the same operational or financial role as the underlying document, and records the sender, recipients, document, provider result, and audit event without retaining the message body or attachment.
+
+Configure one or both OAuth providers and a dedicated encryption secret of at least 32 characters:
+
+- Google: `EMAIL_GOOGLE_CLIENT_ID`, `EMAIL_GOOGLE_CLIENT_SECRET`, and `EMAIL_GOOGLE_REDIRECT_URI`. Enable the Gmail API and register the callback URI; the app requests `gmail.send`, OpenID, and email identity scopes.
+- Microsoft: `EMAIL_MICROSOFT_CLIENT_ID`, `EMAIL_MICROSOFT_CLIENT_SECRET`, `EMAIL_MICROSOFT_REDIRECT_URI`, and optionally `EMAIL_MICROSOFT_TENANT_ID` (defaults to `common`). Register the callback URI and allow delegated `User.Read` and `Mail.Send` permissions.
+- Both providers use `EMAIL_TOKEN_ENCRYPTION_KEY`; keep it as a Worker secret and stable across deploys. OAuth access and refresh tokens are AES-GCM encrypted before being stored in D1.
+
+For production, each redirect URI must be the exact public URL ending in `/api/integrations/email/callback/google` or `/api/integrations/email/callback/microsoft`.
+
 ## QuickBooks Online integration
 
 PaneFlow is the operational and inventory source of truth; QuickBooks Online remains the general ledger and banking system. The native integration sends customers, vendors, non-inventory products, approved purchase orders, customer invoices, approved vendor bills, credits, and payments. Draft or pending purchase orders and match-held bills remain in PaneFlow until approval. Inventory receipts, COGS, returns, scrap, counts, landed cost, and returnable-deposit forfeitures are sent as balanced journal entries so QBO does not maintain a second, competing stock valuation. Lots, serials, bins, reservations, physical movements, and R2 attachments stay in PaneFlow.
@@ -110,4 +122,4 @@ npm run typecheck
 
 PaneFlow contains operational AP/AR and inventory-valuation subledgers plus balanced accounting exports. It is not a replacement for a full general ledger, bank reconciliation, payroll, tax filing, or statutory consolidation system. EDI, carrier/customer/vendor portals, demand forecasting, route optimization, manufacturing/MRP, and automated bank feeds are also outside this release. Those integrations can consume the transactional outbox and exports without weakening the operational audit trail.
 
-The product master is an operational catalog rather than a full merchandising/PIM module. Vendor-product cross references and lead times, per-warehouse replenishment policy, barcode/UPC, and dimensional weight remain explicit follow-up work. Customer contract prices and volume tiers are supported; the product selling price and global reorder point remain catalog fallbacks and must not be represented as warehouse-specific planning data.
+The product master is an operational catalog rather than a full merchandising/PIM module. Vendor-product cross references and lead times, per-warehouse replenishment policy, barcode/UPC, and dimensional weight remain explicit follow-up work. Customer contract prices and volume tiers are supported; the product selling price and global reorder/min-max levels remain catalog fallbacks and must not be represented as warehouse-specific planning data.

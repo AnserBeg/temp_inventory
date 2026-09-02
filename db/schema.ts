@@ -46,6 +46,7 @@ export const products = sqliteTable(
     standardCostCents: integer("standard_cost_cents").notNull(),
     sellingPriceCents: integer("selling_price_cents").notNull(),
     reorderPoint: real("reorder_point").notNull().default(0),
+    maxStockLevel: real("max_stock_level").notNull().default(0),
     baseUomId: text("base_uom_id").notNull().default("uom-each"),
     purchaseUomId: text("purchase_uom_id").notNull().default("uom-each"),
     salesUomId: text("sales_uom_id").notNull().default("uom-each"),
@@ -405,7 +406,75 @@ export const inventoryCounts = sqliteTable("inventory_counts", {
   reason: text("reason").notNull(),
   countedAt: text("counted_at").notNull(),
   countedBy: text("counted_by").notNull(),
-});
+  countSessionId: text("count_session_id"),
+  countSessionLineId: text("count_session_line_id"),
+}, (table) => [
+  index("idx_inventory_counts_session").on(table.countSessionId, table.countedAt),
+]);
+
+/**
+ * A durable stocktake document. Individual inventoryCounts remain the immutable posted
+ * accounting/physical records; a session is the resumable work surface used to prepare them.
+ */
+export const inventoryCountSessions = sqliteTable(
+  "inventory_count_sessions",
+  {
+    id: text("id").primaryKey(),
+    number: text("number").notNull(),
+    countType: text("count_type").notNull().default("cycle"),
+    warehouseId: text("warehouse_id").notNull().references(() => warehouses.id),
+    scopeType: text("scope_type").notNull().default("warehouse"),
+    blindCount: integer("blind_count", { mode: "boolean" }).notNull().default(false),
+    status: text("status").notNull().default("draft"),
+    effectiveDate: text("effective_date").notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdById: text("created_by_id"),
+    createdByEmail: text("created_by_email"),
+    createdAt: text("created_at").notNull(),
+    startedAt: text("started_at"),
+    submittedAt: text("submitted_at"),
+    postedAt: text("posted_at"),
+    idempotencyKey: text("idempotency_key").notNull(),
+    version: integer("version").notNull().default(1),
+  },
+  (table) => [
+    uniqueIndex("idx_inventory_count_sessions_number").on(table.number),
+    uniqueIndex("idx_inventory_count_sessions_idempotency").on(table.idempotencyKey),
+    index("idx_inventory_count_sessions_warehouse_status").on(table.warehouseId, table.status, table.createdAt),
+  ]
+);
+
+export const inventoryCountSessionLines = sqliteTable(
+  "inventory_count_session_lines",
+  {
+    id: text("id").primaryKey(),
+    sessionId: text("session_id").notNull().references(() => inventoryCountSessions.id),
+    productId: text("product_id").notNull().references(() => products.id),
+    locationId: text("location_id").notNull().references(() => locations.id),
+    trackingPolicy: text("tracking_policy").notNull().default("quantity"),
+    expectedQty: real("expected_qty").notNull().default(0),
+    expectedBalanceVersion: integer("expected_balance_version").notNull().default(1),
+    countedQty: real("counted_qty"),
+    varianceQty: real("variance_qty"),
+    unitCostCents: integer("unit_cost_cents"),
+    reason: text("reason"),
+    status: text("status").notNull().default("uncounted"),
+    approvalId: text("approval_id"),
+    postedCountId: text("posted_count_id"),
+    countedBy: text("counted_by"),
+    countedById: text("counted_by_id"),
+    countedAt: text("counted_at"),
+    lastError: text("last_error"),
+    createdAt: text("created_at").notNull(),
+    version: integer("version").notNull().default(1),
+  },
+  (table) => [
+    uniqueIndex("idx_inventory_count_session_line_scope").on(table.sessionId, table.productId, table.locationId),
+    index("idx_inventory_count_session_lines_worklist").on(table.sessionId, table.status, table.locationId),
+    index("idx_inventory_count_session_lines_approval").on(table.approvalId),
+  ]
+);
 
 export const vendorBills = sqliteTable("vendor_bills", {
   id: text("id").primaryKey(),
@@ -479,6 +548,71 @@ export const appUsers = sqliteTable("app_users", {
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [check("app_users_role_check", sql`${table.role} IN ('viewer','operator','accounting','manager','administrator')`)]);
+
+/**
+ * A mailbox connection belongs to one authenticated PaneFlow identity. Provider access and
+ * refresh tokens are AES-GCM encrypted by the Worker before they reach D1.
+ */
+export const emailConnections = sqliteTable("email_connections", {
+  userId: text("user_id").primaryKey(),
+  provider: text("provider").notNull(),
+  emailAddress: text("email_address").notNull(),
+  status: text("status").notNull().default("connected"),
+  scopes: text("scopes").notNull(),
+  encryptedAccessToken: text("encrypted_access_token").notNull(),
+  encryptedRefreshToken: text("encrypted_refresh_token").notNull(),
+  accessTokenExpiresAt: text("access_token_expires_at").notNull(),
+  connectedAt: text("connected_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  disconnectedAt: text("disconnected_at"),
+  lastError: text("last_error"),
+  version: integer("version").notNull().default(1),
+}, (table) => [
+  uniqueIndex("idx_email_connections_provider_address").on(table.provider, table.emailAddress),
+  index("idx_email_connections_status").on(table.status),
+  check("email_connections_provider_check", sql`${table.provider} IN ('google','microsoft')`),
+  check("email_connections_status_check", sql`${table.status} IN ('connected','disconnected','error','reauthorization_required')`),
+]);
+
+/** One-use OAuth state binds the provider callback to the user who started the connection. */
+export const emailOauthStates = sqliteTable("email_oauth_states", {
+  stateHash: text("state_hash").primaryKey(),
+  userId: text("user_id").notNull(),
+  userEmail: text("user_email").notNull(),
+  userName: text("user_name").notNull(),
+  provider: text("provider").notNull(),
+  returnTo: text("return_to").notNull().default("/"),
+  createdAt: text("created_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  consumedAt: text("consumed_at"),
+}, (table) => [
+  index("idx_email_oauth_states_expires").on(table.expiresAt),
+  check("email_oauth_states_provider_check", sql`${table.provider} IN ('google','microsoft')`),
+]);
+
+/** Durable send history contains routing metadata but never message or attachment contents. */
+export const documentEmailDeliveries = sqliteTable("document_email_deliveries", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull(),
+  provider: text("provider").notNull(),
+  senderEmail: text("sender_email").notNull(),
+  documentType: text("document_type").notNull(),
+  documentId: text("document_id").notNull(),
+  documentNumber: text("document_number").notNull(),
+  recipientsJson: text("recipients_json").notNull(),
+  subject: text("subject").notNull(),
+  status: text("status").notNull().default("pending"),
+  providerMessageId: text("provider_message_id"),
+  lastError: text("last_error"),
+  createdAt: text("created_at").notNull(),
+  sentAt: text("sent_at"),
+}, (table) => [
+  index("idx_document_email_deliveries_document").on(table.documentType, table.documentId, table.createdAt),
+  index("idx_document_email_deliveries_user_created").on(table.userId, table.createdAt),
+  check("document_email_deliveries_provider_check", sql`${table.provider} IN ('google','microsoft')`),
+  check("document_email_deliveries_type_check", sql`${table.documentType} IN ('purchase_order','sales_order','customer_invoice')`),
+  check("document_email_deliveries_status_check", sql`${table.status} IN ('pending','sent','failed')`),
+]);
 
 export const purchaseOrderRevisions = sqliteTable(
   "purchase_order_revisions",

@@ -141,6 +141,20 @@
       "when": 1787554384169,
       "tag": "0019_lumpy_kinsey_walden",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1787599852711,
+      "tag": "0020_easy_tinkerer",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1788370756780,
+      "tag": "0021_big_imperial_guard",
+      "breakpoints": true
     }
   ]
 }

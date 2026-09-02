@@ -507,6 +507,13 @@ a.button.disabled { opacity: .5; pointer-events: none; }
 .account-summary { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .account-summary strong { display: block; font-size: 13px; }
 .account-summary small, .account-summary span { display: block; color: var(--ink-soft); font-size: 12px; }
+.email-connection-manager { display: grid; gap: 8px; margin: 10px 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); }
+.email-connection-manager > div:first-child { min-width: 0; }
+.email-connection-manager strong, .email-connection-manager small { display: block; }
+.email-connection-manager small { margin-top: 2px; color: var(--ink-soft); font-size: 11px; overflow-wrap: anywhere; }
+.email-connection-manager p { margin: 0; font-size: 11px; }
+.email-provider-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.email-provider-actions .button { min-height: 34px; padding: 7px 10px; font-size: 11px; }
 /* The audit note a draft needs before it can be activated, kept on one row with its action. */
 .draft-activation { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-top: 14px; }
 .draft-activation label { flex: 1 1 260px; display: grid; gap: 4px; min-width: 0; font-size: 12px; font-weight: 600; }
@@ -583,6 +590,16 @@ input[type="checkbox"] { width: 17px; height: 17px; min-height: 0; padding: 0; b
 .impact-line.warning strong { color: var(--warning); }
 .impact-line.danger strong { color: var(--danger); }
 .dialog-actions { position: sticky; bottom: -20px; display: flex; justify-content: flex-end; gap: 8px; margin: 18px -20px -20px; padding: 13px 20px; border-top: 1px solid var(--line); background: #fff; }
+.email-document-dialog { width: min(620px, 100%); overscroll-behavior: contain; }
+.email-connect-required, .email-sender-summary { margin-bottom: 14px; padding: 13px; border: 1px solid #bcd6cf; border-radius: 8px; background: var(--brand-soft); }
+.email-connect-required > strong, .email-sender-summary > span, .email-sender-summary > strong, .email-sender-summary > small { display: block; }
+.email-connect-required p { margin: 4px 0 10px; color: var(--ink-soft); font-size: 12px; }
+.email-sender-summary > span { color: var(--ink-soft); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+.email-sender-summary > strong { margin-top: 2px; font-size: 13px; overflow-wrap: anywhere; }
+.email-sender-summary > small { margin-top: 3px; color: var(--ink-soft); font-size: 11px; }
+.email-delivery-success { padding: 24px 20px 20px; }
+.email-delivery-success > strong { color: var(--brand-dark); font-size: 18px; }
+.email-delivery-success > p { color: var(--ink-soft); }
 
 .toast { position: fixed; right: 22px; bottom: 22px; z-index: 150; max-width: 430px; display: flex; align-items: center; gap: 9px; padding: 12px 15px; border: 1px solid #b9d8c5; border-radius: 8px; background: #f1fbf5; color: #225d42; box-shadow: var(--shadow); font-size: 12px; font-weight: 650; }
 .toast > span { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; background: var(--success); color: #fff; }
@@ -1099,6 +1116,9 @@ input[type="checkbox"] { width: 17px; height: 17px; min-height: 0; padding: 0; b
     border-radius: 14px 14px 0 0;
   }
   .dialog-header { padding: 14px; }
+  .email-document-dialog .dialog-header .icon-button { width: 44px; height: 44px; min-width: 44px; }
+  .email-document-dialog .email-provider-actions { display: grid; grid-template-columns: 1fr; }
+  .email-document-dialog .email-provider-actions .button { width: 100%; min-height: 46px; }
   .dialog-header > div { min-width: 0; }
   .dialog-header h2, .dialog-header p { overflow-wrap: anywhere; }
   .command-dialog form { padding: 14px; }

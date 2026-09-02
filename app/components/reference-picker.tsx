@@ -305,6 +305,7 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
   const [trackingPolicy, setTrackingPolicy] = useState("quantity");
   const [inventoryPolicy, setInventoryPolicy] = useState("stocked");
   const [reorderPoint, setReorderPoint] = useState(0);
+  const [maxStockLevel, setMaxStockLevel] = useState(0);
   const [uomId, setUomId] = useState("");
   const [warehouseId, setWarehouseId] = useState("");
   const [inventoryStatus, setInventoryStatus] = useState("usable");
@@ -335,6 +336,7 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
 
   const submit = async () => {
     if (missingFields.length) return setError(`Enter the ${missingFields.join(", ")} before creating this record.`);
+    if (kind === "product" && inventoryPolicy === "stocked" && maxStockLevel < reorderPoint) return setError("Reorder up to must be at least the reorder point.");
     setError(""); setBusy(true);
     const idempotencyKey = crypto.randomUUID();
     const command = isPartner ? "createBusinessPartner"
@@ -346,7 +348,7 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
     const payload = isPartner
       ? { code, name, partnerType, email, phone, currency, paymentTerms, addressLine1, city, region, postalCode, country, creditLimitCents: 0, creditHold: false }
       : kind === "product"
-        ? { sku: code, manufacturerSku, name, category, material, dimensions, finish, trackingPolicy, inventoryPolicy, standardCostCents: Math.round(cost * 100), sellingPriceCents: Math.round(price * 100), reorderPoint, baseUomId: uomId, purchaseUomId: uomId, salesUomId: uomId }
+        ? { sku: code, manufacturerSku, name, category, material, dimensions, finish, trackingPolicy, inventoryPolicy, standardCostCents: Math.round(cost * 100), sellingPriceCents: Math.round(price * 100), reorderPoint, maxStockLevel, baseUomId: uomId, purchaseUomId: uomId, salesUomId: uomId }
       : kind === "uom" ? { code, name, dimension, precision }
       : kind === "priceList" ? { code, name, currency, priority }
       : kind === "assetType" ? { code, name, assetClass: assetClass.trim() || name, unitDepositCents: Math.round(deposit * 100) }
@@ -395,7 +397,8 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
             {field("Finish", <input value={finish} onChange={(event) => setFinish(event.target.value)} required />)}
             {field("Tracking policy", <select value={trackingPolicy} onChange={(event) => setTrackingPolicy(event.target.value)}><option value="quantity">Quantity</option><option value="lot">Lot</option><option value="serial">Serial</option></select>)}
             {field("Inventory policy", <select value={inventoryPolicy} onChange={(event) => setInventoryPolicy(event.target.value)}><option value="stocked">Stocked</option><option value="special_order">Special order</option><option value="drop_ship">Drop ship</option></select>)}
-            {field("Reorder point", <input type="number" min="0" step="0.001" value={reorderPoint} onChange={(event) => setReorderPoint(Number(event.target.value))} />)}
+            {field("Reorder point", <input type="number" min="0" step="0.001" value={reorderPoint} onChange={(event) => { const value = Number(event.target.value); setReorderPoint(value); setMaxStockLevel((current) => Math.max(current, value)); }} />)}
+            {field("Reorder up to", <input type="number" min={reorderPoint} step="0.001" value={maxStockLevel} onChange={(event) => setMaxStockLevel(Number(event.target.value))} />)}
             {field("Standard cost", <input type="number" min="0" step="0.01" value={cost} onChange={(event) => setCost(Number(event.target.value))} />)}
             {field("Selling price", <input type="number" min="0" step="0.01" value={price} onChange={(event) => setPrice(Number(event.target.value))} />)}
           </> : null}

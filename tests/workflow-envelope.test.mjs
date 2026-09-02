@@ -51,6 +51,8 @@ test("routes each match-exception decision to the intended durable command", () 
   assert.equal(workflowCommandForAction("resolveMatchException", "approve-variance"), "approveVendorBill");
   assert.equal(workflowCommandForAction("resolveMatchException", "request-credit"), "createVendorCredit");
   assert.equal(workflowCommandForAction("recordVendorPayment"), "recordPayment");
+  assert.equal(workflowCommandForAction("createVendorBill", "fast-track"), "createApprovedVendorBill");
+  assert.equal(workflowCommandForAction("createVendorBill"), "createVendorBill");
 });
 
 test("financial workflow envelopes use the selected source document and its current version", () => {

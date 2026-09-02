@@ -135,15 +135,16 @@ export async function openOrdersByCustomer() {
 
 /**
  * Buying worklist: what to order, ranked by how far projected stock falls below target.
- * Suggested quantity restores the reorder point once open demand and incoming supply are
- * both accounted for, so a product already covered by an open PO is not reordered twice.
+ * Once projected stock reaches the reorder point, suggested quantity restores the product's
+ * maximum stock level. Open demand and incoming supply are both accounted for so a product
+ * already covered by an open PO is not reordered twice.
  */
 export async function replenishmentWorklist(warehouseId = "") {
   await ensureDatabase();
   const scope = warehouseId.trim();
   const rows = await all<Record<string, unknown>>(
     `SELECT p.id, p.sku, p.name, p.inventory_policy AS inventoryPolicy, p.reorder_point AS reorderPoint,
-     p.standard_cost_cents AS standardCostCents,
+     p.max_stock_level AS maxStockLevel, p.standard_cost_cents AS standardCostCents,
        COALESCE((SELECT SUM(ib.on_hand_qty) FROM inventory_balances ib JOIN locations l ON l.id = ib.location_id
          WHERE ib.product_id = p.id AND l.active = 1 AND l.inventory_status = 'usable' AND (?='' OR l.warehouse_id = ?)), 0) AS usableQuantity,
        COALESCE((SELECT SUM(ib.on_hand_qty - ib.reserved_qty) FROM inventory_balances ib JOIN locations l ON l.id = ib.location_id
@@ -170,13 +171,15 @@ export async function replenishmentWorklist(warehouseId = "") {
       const incoming = Number(row.incomingQuantity ?? 0);
       const demand = Number(row.openDemandQuantity ?? 0);
       const reorderPoint = Number(row.reorderPoint ?? 0);
+      const maxStockLevel = Math.max(reorderPoint, Number(row.maxStockLevel ?? reorderPoint));
       // Open demand still includes quantities already reserved. Starting from available
       // would subtract those reservations once in `available` and again in `demand`.
       const projected = usable + incoming - demand;
-      const shortfall = reorderPoint - projected;
-      return { ...row, usableQuantity: usable, availableQuantity: available, incomingQuantity: incoming, openDemandQuantity: demand, projectedQuantity: projected, suggestedOrderQuantity: shortfall > 0 ? Math.ceil(shortfall) : 0 };
+      const targetShortfall = maxStockLevel - projected;
+      const suggestedOrderQuantity = projected <= reorderPoint && targetShortfall > 0 ? Math.ceil(targetShortfall) : 0;
+      return { ...row, maxStockLevel, usableQuantity: usable, availableQuantity: available, incomingQuantity: incoming, openDemandQuantity: demand, projectedQuantity: projected, suggestedOrderQuantity };
     })
-    .filter((row) => row.suggestedOrderQuantity > 0 || row.projectedQuantity < 0)
+    .filter((row) => row.suggestedOrderQuantity > 0)
     .sort((left, right) => left.projectedQuantity - right.projectedQuantity);
   return {
     warehouseId: scope,

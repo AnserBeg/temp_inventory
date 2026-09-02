@@ -24,12 +24,13 @@ test("advanced distributor commands remain wired through the durable dispatcher"
 });
 
 test("application routes enforce identity and capability checks", async () => {
-  const [snapshot, workflow, records, attachments, exports] = await Promise.all([
+  const [snapshot, workflow, commands, records, attachments, exports] = await Promise.all([
     read("app/api/snapshot/route.ts"), read("app/api/workflows/route.ts"),
+    read("app/api/commands/route.ts"),
     read("app/api/records/route.ts"), read("app/api/attachments/route.ts"),
     read("app/api/export/route.ts"),
   ]);
-  for (const route of [snapshot, workflow, records, attachments, exports]) {
+  for (const route of [snapshot, workflow, commands, records, attachments, exports]) {
     assert.match(route, /resolveActor/);
     assert.match(route, /requireCapability/);
   }
@@ -38,6 +39,9 @@ test("application routes enforce identity and capability checks", async () => {
   const advanced = await read("lib/server/advanced-domain.ts");
   assert.match(advanced, /updateUserRole:\s*"administer"/);
   assert.match(advanced, /refundReturnableDeposit:\s*"financialWrite"/);
+  assert.match(commands, /postimmediatesale/);
+  assert.match(commands, /requireCapability\(actor,\s*"operationalWrite"\)/);
+  assert.match(commands, /requireCapability\(actor,\s*"financialWrite"\)/);
   assert.match(workflow, /scope:\s*url\.searchParams\.get\("scope"\)/);
   assert.match(advanced, /workflowCoreScope/);
 });
@@ -88,7 +92,8 @@ test("multi-line order contract retains currency, tax, routes, fees, and refunda
     "freightCents", "feeCents", "refundableDepositCents", "discountCents",
   ]) assert.match(source, new RegExp(field), field);
   assert.match(source, /INSERT INTO purchase_orders/);
-  assert.match(source, /'draft'/);
+  assert.match(source, /fastTrack \? "approved" : "draft"/);
+  assert.match(source, /fastTrackApprovalReason/);
   assert.match(source, /outbox_events/);
 });
 

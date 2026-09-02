@@ -103,18 +103,18 @@ async function seedDatabase(db: D1Database) {
   ));
 
   const productRows: Array<Array<SqlValue>> = [
-    ["prod-casement-3648", "AW100-CAS-3648-L", "100CAS3648L", "100 Series Casement · 36 × 48", "Casement", "Fibrex composite", "36 × 48 in", "White / White", "quantity", "stocked", 41700, 65900, 8],
-    ["prod-doublehung-3054", "PG-CLASSIC-3054", "PG3054DH", "Classic Double-Hung · 30 × 54", "Double-hung", "Vinyl", "30 × 54 in", "White", "quantity", "stocked", 29800, 47900, 6],
-    ["prod-slider-6048", "AWW-SS-6048", "SS6048", "Series 700 Slider · 60 × 48", "Slider", "Vinyl", "60 × 48 in", "Black / White", "quantity", "stocked", 53600, 81900, 5],
-    ["prod-awning-2436", "AW400-AWN-2436", "400AWN2436", "400 Series Awning · 24 × 36", "Awning", "Wood clad", "24 × 36 in", "Pine / Sandtone", "quantity", "stocked", 48200, 74900, 4],
-    ["prod-patio-6068", "PG-PATIO-6068", "PG6068PD", "Select Patio Door · 60 × 80", "Patio door", "Vinyl", "60 × 80 in", "White", "quantity", "stocked", 118500, 169900, 2],
-    ["prod-custom-413859", "CUSTOM-4138-5978", null, "Custom Casement · Kitchen W-03", "Custom casement", "Fiberglass", "41 3/8 × 59 7/8 in", "Oak / Black", "serial", "special_order", 88400, 132900, 0],
+    ["prod-casement-3648", "AW100-CAS-3648-L", "100CAS3648L", "100 Series Casement · 36 × 48", "Casement", "Fibrex composite", "36 × 48 in", "White / White", "quantity", "stocked", 41700, 65900, 8, 24],
+    ["prod-doublehung-3054", "PG-CLASSIC-3054", "PG3054DH", "Classic Double-Hung · 30 × 54", "Double-hung", "Vinyl", "30 × 54 in", "White", "quantity", "stocked", 29800, 47900, 6, 18],
+    ["prod-slider-6048", "AWW-SS-6048", "SS6048", "Series 700 Slider · 60 × 48", "Slider", "Vinyl", "60 × 48 in", "Black / White", "quantity", "stocked", 53600, 81900, 5, 15],
+    ["prod-awning-2436", "AW400-AWN-2436", "400AWN2436", "400 Series Awning · 24 × 36", "Awning", "Wood clad", "24 × 36 in", "Pine / Sandtone", "quantity", "stocked", 48200, 74900, 4, 12],
+    ["prod-patio-6068", "PG-PATIO-6068", "PG6068PD", "Select Patio Door · 60 × 80", "Patio door", "Vinyl", "60 × 80 in", "White", "quantity", "stocked", 118500, 169900, 2, 6],
+    ["prod-custom-413859", "CUSTOM-4138-5978", null, "Custom Casement · Kitchen W-03", "Custom casement", "Fiberglass", "41 3/8 × 59 7/8 in", "Oak / Black", "serial", "special_order", 88400, 132900, 0, 0],
   ];
   productRows.forEach((row) => push(
     `INSERT OR IGNORE INTO products
       (id, sku, manufacturer_sku, name, category, material, dimensions, finish, tracking_policy,
-       inventory_policy, standard_cost_cents, selling_price_cents, reorder_point, active, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+       inventory_policy, standard_cost_cents, selling_price_cents, reorder_point, max_stock_level, active, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
     ...row, now
   ));
 

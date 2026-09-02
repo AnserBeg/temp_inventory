@@ -39,9 +39,11 @@ const timestampOnDate = (postingDate: string, recordedAt = new Date().toISOStrin
 
 export const workflowCapabilities = {
   createPurchaseOrderDraft: "operationalWrite",
+  createApprovedPurchaseOrder: "approve",
   updatePurchaseOrderDraft: "operationalWrite",
   cancelPurchaseOrder: "operationalWrite",
   createSalesOrderDraft: "operationalWrite",
+  createConfirmedSalesOrder: "approve",
   updateSalesOrderDraft: "operationalWrite",
   confirmSalesOrder: "operationalWrite",
   cancelSalesOrder: "operationalWrite",
@@ -64,6 +66,7 @@ export const workflowCapabilities = {
   postDropShipDelivery: "operationalWrite",
   reverseDropShipDelivery: "operationalWrite",
   createVendorBill: "financialWrite",
+  createApprovedVendorBill: "approve",
   approveVendorBill: "approve",
   createVendorCredit: "financialWrite",
   createCustomerInvoice: "financialWrite",
@@ -308,8 +311,16 @@ function validateOrderExchange(currency: string, value: unknown) {
   return exchange;
 }
 
-async function createDraft(command: WorkflowCommand, type: "purchaseOrder" | "salesOrder") {
+function assertFastTrackAuthority(command: WorkflowCommand, authorCapability: "operationalWrite" | "financialWrite") {
+  if (!hasCapability(command.actor, authorCapability) || !hasCapability(command.actor, "approve")) {
+    throw new WorkflowError("FAST_TRACK_FORBIDDEN", "Fast-track creation requires both document-authoring and approval authority.", 403);
+  }
+}
+
+async function createDraft(command: WorkflowCommand, type: "purchaseOrder" | "salesOrder", fastTrack = false) {
   const payload = command.payload ?? {};
+  if (fastTrack) assertFastTrackAuthority(command, "operationalWrite");
+  const fastTrackApprovalReason = fastTrack ? textValue(payload, "approvalReason") : undefined;
   try {
     return await createOrderRecord({
       ...(payload as Omit<CreateOrderInput, "type" | "idempotencyKey">),
@@ -319,6 +330,7 @@ async function createDraft(command: WorkflowCommand, type: "purchaseOrder" | "sa
       actorId: command.actor.id,
       actorEmail: command.actor.email,
       requestHash: command.requestHash,
+      fastTrackApprovalReason,
     } as CreateOrderInput);
   } catch (error) {
     if (error instanceof RecordValidationError) throw new WorkflowError(error.code, error.message, error.status);
@@ -1315,8 +1327,10 @@ async function updateReturnable(command: WorkflowCommand, eventType: "return" | 
   await db.batch(statements); return finish(command);
 }
 
-async function createVendorBill(command: WorkflowCommand) {
+async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
   const payload = command.payload ?? {};
+  if (fastTrack) assertFastTrackAuthority(command, "financialWrite");
+  const approvalReason = fastTrack ? textValue(payload, "approvalReason") : null;
   const purchaseOrderId = command.entityId ?? textValue(payload, "purchaseOrderId");
   const vendorInvoiceNumber = textValue(payload, "vendorInvoiceNumber");
   const invoiceDate = dateValue(payload, "invoiceDate", today());
@@ -1371,10 +1385,13 @@ async function createVendorBill(command: WorkflowCommand) {
   const currency = validateDocumentCurrency(payload.currency, order.currency);
   const exchange = validateDocumentExchange(payload.exchangeRateToBase, order.exchange);
   const baseTotal = Math.round(total * exchange);
-  const hold = exceptions.length > 0;
+  const hold = exceptions.length > 0 && !fastTrack;
+  const matchStatus = exceptions.length > 0 ? fastTrack ? "approved_variance" : "exception" : "matched";
   const billId = newId("vendor-bill");
   const number = await nextDocumentNumber("VB");
-  const result: WorkflowResult = { message: hold ? `${number} posted on hold with ${exceptions.length} three-way-match exception${exceptions.length === 1 ? "" : "s"}.` : `${number} posted and matched to PO and cumulative receipts.`, impact: { physical: "No stock movement.", financial: `Payable ${total} ${currency} cents recorded${hold ? " on hold" : ""}.`, matchStatus: hold ? "exception" : "matched", exceptions, onHandDelta: 0 }, recordId: billId };
+  const result: WorkflowResult = { message: fastTrack
+    ? `${number} posted and approved by its author${exceptions.length ? ` with ${exceptions.length} authorized three-way-match exception${exceptions.length === 1 ? "" : "s"}` : " after a successful three-way match"}.`
+    : hold ? `${number} posted on hold with ${exceptions.length} three-way-match exception${exceptions.length === 1 ? "" : "s"}.` : `${number} posted and matched to PO and cumulative receipts.`, impact: { physical: "No stock movement.", financial: `Payable ${total} ${currency} cents recorded${hold ? " on hold" : fastTrack ? " and author-approved" : ""}.`, matchStatus, exceptions, onHandDelta: 0 }, recordId: billId };
   const db = commandD1(command); const when = new Date().toISOString();
   const lineClaims = normalized.map(() => `EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.id=? AND pol.purchase_order_id=?
     AND pol.ordered_qty-COALESCE((SELECT SUM(vbl.quantity) FROM vendor_bill_lines vbl JOIN vendor_bills vb ON vb.id=vbl.vendor_bill_id WHERE vbl.purchase_order_line_id=pol.id AND vb.status<>'void'),0)+?>=?
@@ -1388,13 +1405,17 @@ async function createVendorBill(command: WorkflowCommand) {
       SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='approved'
         AND NOT EXISTS (SELECT 1 FROM vendor_bills WHERE vendor_id=? AND vendor_invoice_number=?) AND ${lineClaims}`)
       .bind(...claimValues(command, result, billId), purchaseOrderId, order.version, order.vendorId, vendorInvoiceNumber, ...lineClaimBindings),
-    db.prepare(`INSERT INTO vendor_bills (id,number,vendor_id,purchase_order_id,status,match_status,total_cents,due_date,currency,vendor_invoice_number,invoice_date,posted_at,subtotal_cents,tax_cents,paid_cents,hold_reason,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,version)
-      SELECT ?,?,?,?, ?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,1 WHERE ${marker(command)}`)
-      .bind(billId, number, order.vendorId, purchaseOrderId, hold ? "on_hold" : "approved", hold ? "exception" : "matched", total, dueDate, currency, vendorInvoiceNumber, invoiceDate, when, subtotal, tax, hold ? JSON.stringify(exceptions) : null, exchange, baseTotal, taxRate, optionalText(payload, "taxCode"), optionalText(payload, "paymentTerms")),
+    db.prepare(`INSERT INTO vendor_bills (id,number,vendor_id,purchase_order_id,status,match_status,total_cents,due_date,currency,vendor_invoice_number,invoice_date,posted_at,approved_at,approved_by,subtotal_cents,tax_cents,paid_cents,hold_reason,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,version)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,1 WHERE ${marker(command)}`)
+      .bind(billId, number, order.vendorId, purchaseOrderId, hold ? "on_hold" : "approved", matchStatus, total, dueDate, currency, vendorInvoiceNumber, invoiceDate, when, fastTrack ? when : null, fastTrack ? command.actor.label : null, subtotal, tax, hold ? JSON.stringify(exceptions) : null, exchange, baseTotal, taxRate, optionalText(payload, "taxCode"), optionalText(payload, "paymentTerms")),
   ];
   normalized.forEach((line) => statements.push(db.prepare(`INSERT INTO vendor_bill_lines (id,vendor_bill_id,purchase_order_line_id,product_id,quantity,unit_cost_cents,line_total_cents,match_status,match_details_json) SELECT ?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("vendor-bill-line"), billId, line.poLineId, line.productId, line.quantity, line.unitCost, line.lineTotal, line.status, JSON.stringify(line.details))));
   charges.forEach((charge) => statements.push(db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,'vendor_bill',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("charge"), billId, charge.chargeType, charge.description, charge.amount, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRate, charge.taxAmount, when)));
   if (hold) statements.push(db.prepare(`INSERT INTO approvals (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,metadata_json,version) SELECT ?,'vendor_bill',?,'vendor_bill_match_exception','pending',?,?,?, ?,1 WHERE ${marker(command)}`).bind(newId("approval"), billId, command.actor.label, "Three-way match exception", when, JSON.stringify({ exceptions })));
+  if (fastTrack) statements.push(db.prepare(`INSERT INTO approvals
+    (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,decided_by,decision_reason,decided_at,consumed_at,consumed_by,consumed_entity_id,metadata_json,version)
+    SELECT ?,'vendor_bill',?,?, 'approved',?,?,?,?,?,?,?,?,?,?,1 WHERE ${marker(command)}`)
+    .bind(newId("approval"), billId, exceptions.length ? "vendor_bill_match_exception" : "vendor_bill_fast_track", command.actor.label, approvalReason, when, command.actor.label, approvalReason, when, when, command.actor.label, billId, JSON.stringify({ selfAuthorized: true, exceptions })));
   statements.push(
     db.prepare(`UPDATE purchase_orders SET billing_status=CASE WHEN NOT EXISTS (
       SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id=purchase_orders.id
@@ -1403,7 +1424,7 @@ async function createVendorBill(command: WorkflowCommand) {
               THEN MAX(COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0),0)
               ELSE MAX(COALESCE((SELECT SUM(sm.quantity) FROM stock_movements sm WHERE sm.purchase_order_line_id=pol.id),0),0) END
       ) THEN 'fully_billed' ELSE 'partially_billed' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(purchaseOrderId, order.version),
-    auditStatement(command, "vendor_bill", billId, "vendor_bill_posted", result.message, { purchaseOrderId, exceptions, total, currency, exchange, lineCount: normalized.length, chargeCount: charges.length }, when),
+    auditStatement(command, "vendor_bill", billId, fastTrack ? "vendor_bill_fast_track_approved" : "vendor_bill_posted", result.message, { purchaseOrderId, exceptions, total, currency, exchange, lineCount: normalized.length, chargeCount: charges.length, fastTrack, approvalReason }, when),
     outboxStatement(command, "vendor_bill.posted", "vendor_bill", billId, { status: hold ? "on_hold" : "approved", total, baseTotal }, when)
   );
   await db.batch(statements);
@@ -1815,7 +1836,9 @@ async function saveProduct(command: WorkflowCommand) {
   const standard = numberValue(payload, "standardCostCents", { positive: false, integer: true });
   const price = numberValue(payload, "sellingPriceCents", { positive: false, integer: true });
   const reorder = payload.reorderPoint == null ? 0 : numberValue(payload, "reorderPoint", { positive: false });
-  if (standard < 0 || price < 0 || reorder < 0) throw new WorkflowError("VALIDATION_ERROR", "Costs, prices, and reorder points cannot be negative.");
+  const maxStock = payload.maxStockLevel == null ? reorder : numberValue(payload, "maxStockLevel", { positive: false });
+  if (standard < 0 || price < 0 || reorder < 0 || maxStock < 0) throw new WorkflowError("VALIDATION_ERROR", "Costs and replenishment levels cannot be negative.");
+  if (policy === "stocked" && maxStock < reorder) throw new WorkflowError("VALIDATION_ERROR", "The reorder-up-to maximum must be at least the reorder point.");
 
   const baseUomId = optionalText(payload, "baseUomId");
   const purchaseUomId = optionalText(payload, "purchaseUomId") ?? baseUomId;
@@ -1857,10 +1880,10 @@ async function saveProduct(command: WorkflowCommand) {
     : db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
         SELECT ?,?,?,?,?,?,? FROM products WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM products WHERE sku=? AND id<>?) ${immutableHistoryGuard}`)
       .bind(...claimValues(command, result, id), id, version, sku, id, ...(changesImmutableInventoryIdentity ? [id, id, id, id] : []));
-  const values = [sku, optionalText(payload, "manufacturerSku"), name, textValue(payload, "category"), textValue(payload, "material"), textValue(payload, "dimensions"), textValue(payload, "finish"), tracking, policy, standard, price, reorder, baseUomId, purchaseUomId, salesUomId, active ? 1 : 0] as const;
+  const values = [sku, optionalText(payload, "manufacturerSku"), name, textValue(payload, "category"), textValue(payload, "material"), textValue(payload, "dimensions"), textValue(payload, "finish"), tracking, policy, standard, price, reorder, maxStock, baseUomId, purchaseUomId, salesUomId, active ? 1 : 0] as const;
   const write = creating
-    ? db.prepare(`INSERT INTO products (id,sku,manufacturer_sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(id, ...values, when)
-    : db.prepare(`UPDATE products SET sku=?,manufacturer_sku=?,name=?,category=?,material=?,dimensions=?,finish=?,tracking_policy=?,inventory_policy=?,standard_cost_cents=?,selling_price_cents=?,reorder_point=?,base_uom_id=?,purchase_uom_id=?,sales_uom_id=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(...values, id, version);
+    ? db.prepare(`INSERT INTO products (id,sku,manufacturer_sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,max_stock_level,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(id, ...values, when)
+    : db.prepare(`UPDATE products SET sku=?,manufacturer_sku=?,name=?,category=?,material=?,dimensions=?,finish=?,tracking_policy=?,inventory_policy=?,standard_cost_cents=?,selling_price_cents=?,reorder_point=?,max_stock_level=?,base_uom_id=?,purchase_uom_id=?,sales_uom_id=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(...values, id, version);
   const statements: D1PreparedStatement[] = [claim, write];
   if (creating) {
     const configuredMethod = await setting<string>("valuation.defaultMethod", "fifo");
@@ -1868,7 +1891,7 @@ async function saveProduct(command: WorkflowCommand) {
     statements.push(db.prepare(`INSERT INTO valuation_policies (product_id,method,standard_cost_cents,average_cost_cents,version,updated_at,updated_by)
       SELECT ?,?,?,?,1,?,? WHERE ${marker(command)}`).bind(id, method, standard, standard, when, command.actor.label));
   }
-  statements.push(auditStatement(command, "product", id, creating ? "created" : "updated", result.message, { sku, tracking, policy, baseUomId, purchaseUomId, salesUomId, active }, when), outboxStatement(command, creating ? "master.product_created" : "master.product_updated", "product", id, { sku, active }, when));
+  statements.push(auditStatement(command, "product", id, creating ? "created" : "updated", result.message, { sku, tracking, policy, reorderPoint: reorder, maxStockLevel: maxStock, baseUomId, purchaseUomId, salesUomId, active }, when), outboxStatement(command, creating ? "master.product_created" : "master.product_updated", "product", id, { sku, active }, when));
   await db.batch(statements);
   return finish(command);
 }
@@ -2686,7 +2709,7 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
   scopedAll<Record<string,unknown>>(["customer-billing"],"SELECT cc.*,bp.name AS customerName FROM customer_credits cc JOIN business_partners bp ON bp.id=cc.customer_id ORDER BY cc.posted_at DESC"),
   scopedAll<Record<string,unknown>>(["vendor-billing","customer-billing"],"SELECT * FROM payments ORDER BY posted_at DESC"),scopedAll<Record<string,unknown>>(["vendor-billing","customer-billing"],"SELECT * FROM document_charges ORDER BY created_at DESC"),scopedAll<Record<string,unknown>>(["inventory","controls"],"SELECT id,code,name,asset_class AS assetClass,unit_deposit_cents AS unitDepositCents,active,version FROM returnable_asset_types ORDER BY name"),
   scopedAll<Record<string,unknown>>(["inventory"],"SELECT ro.*,bp.name AS partnerName,rat.code AS assetCode,rat.name AS assetName,ro.issued_qty-ro.returned_qty-ro.forfeited_qty AS outstandingQuantity,MAX(ro.deposit_charged_cents-ro.deposit_refunded_cents-COALESCE((SELECT SUM(re.amount_cents) FROM returnable_events re WHERE re.obligation_id=ro.id AND re.event_type='forfeit'),0),0) AS depositBalanceCents,MAX(MIN(ro.deposit_charged_cents,CASE WHEN ro.issued_qty>0 THEN ROUND(ro.returned_qty*ro.deposit_charged_cents/ro.issued_qty) ELSE 0 END)-ro.deposit_refunded_cents,0) AS refundableDepositCents FROM returnable_obligations ro JOIN business_partners bp ON bp.id=ro.partner_id JOIN returnable_asset_types rat ON rat.id=ro.asset_type_id ORDER BY ro.created_at DESC"),
-  scopedAll<Record<string,unknown>>(["inventory"],"SELECT * FROM returnable_events ORDER BY posted_at DESC"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT vp.*,p.sku,p.name AS productName FROM valuation_policies vp JOIN products p ON p.id=vp.product_id ORDER BY p.name"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT cl.*,p.sku,p.name AS productName FROM cost_layers cl JOIN products p ON p.id=cl.product_id WHERE cl.remaining_qty>0 ORDER BY cl.received_at DESC"),scopedAll<Record<string,unknown>>([],"SELECT ive.*,p.sku,p.name AS productName FROM inventory_value_entries ive JOIN products p ON p.id=ive.product_id ORDER BY ive.posted_at DESC"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT lca.*,COALESCE(SUM(lcal.allocated_cents),0) AS allocatedCents FROM landed_cost_allocations lca LEFT JOIN landed_cost_allocation_lines lcal ON lcal.allocation_id=lca.id GROUP BY lca.id ORDER BY lca.posted_at DESC"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,event_type AS eventType,aggregate_type AS aggregateType,aggregate_id AS aggregateId,status,attempts,available_at AS availableAt,last_error AS lastError,created_at AS createdAt,processed_at AS processedAt FROM outbox_events ORDER BY created_at DESC"),scopedAll<Record<string,unknown>>(["purchasing","controls"],"SELECT id,document_type AS documentType,document_id AS documentId,file_name AS fileName,content_type AS contentType,size_bytes AS sizeBytes,category,owner_id AS ownerId,owner_email AS ownerEmail,uploaded_at AS uploadedAt,version FROM attachments WHERE deleted_at IS NULL ORDER BY uploaded_at DESC"),scopedAll<Record<string,unknown>>(["controls"],"SELECT user_id AS userId,email,full_name AS fullName,role,active,version FROM app_users ORDER BY full_name"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,code,name,dimension,precision,active FROM units_of_measure ORDER BY code"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,product_id AS productId,from_uom_id AS fromUomId,to_uom_id AS toUomId,numerator,denominator,rounding_mode AS roundingMode FROM uom_conversions ORDER BY id"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,code,name,partner_type AS partnerType,email,phone,payment_terms AS paymentTerms,currency,active,version FROM business_partners ORDER BY code"),scopedAll<Record<string,unknown>>(["inventory","controls"],"SELECT id,sku,manufacturer_sku AS manufacturerSku,name,category,material,dimensions,finish,tracking_policy AS trackingPolicy,inventory_policy AS inventoryPolicy,standard_cost_cents AS standardCostCents,selling_price_cents AS sellingPriceCents,reorder_point AS reorderPoint,base_uom_id AS baseUomId,purchase_uom_id AS purchaseUomId,sales_uom_id AS salesUomId,active,version FROM products ORDER BY sku")
+  scopedAll<Record<string,unknown>>(["inventory"],"SELECT * FROM returnable_events ORDER BY posted_at DESC"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT vp.*,p.sku,p.name AS productName FROM valuation_policies vp JOIN products p ON p.id=vp.product_id ORDER BY p.name"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT cl.*,p.sku,p.name AS productName FROM cost_layers cl JOIN products p ON p.id=cl.product_id WHERE cl.remaining_qty>0 ORDER BY cl.received_at DESC"),scopedAll<Record<string,unknown>>([],"SELECT ive.*,p.sku,p.name AS productName FROM inventory_value_entries ive JOIN products p ON p.id=ive.product_id ORDER BY ive.posted_at DESC"),scopedAll<Record<string,unknown>>(["inventory"],"SELECT lca.*,COALESCE(SUM(lcal.allocated_cents),0) AS allocatedCents FROM landed_cost_allocations lca LEFT JOIN landed_cost_allocation_lines lcal ON lcal.allocation_id=lca.id GROUP BY lca.id ORDER BY lca.posted_at DESC"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,event_type AS eventType,aggregate_type AS aggregateType,aggregate_id AS aggregateId,status,attempts,available_at AS availableAt,last_error AS lastError,created_at AS createdAt,processed_at AS processedAt FROM outbox_events ORDER BY created_at DESC"),scopedAll<Record<string,unknown>>(["purchasing","controls"],"SELECT id,document_type AS documentType,document_id AS documentId,file_name AS fileName,content_type AS contentType,size_bytes AS sizeBytes,category,owner_id AS ownerId,owner_email AS ownerEmail,uploaded_at AS uploadedAt,version FROM attachments WHERE deleted_at IS NULL ORDER BY uploaded_at DESC"),scopedAll<Record<string,unknown>>(["controls"],"SELECT user_id AS userId,email,full_name AS fullName,role,active,version FROM app_users ORDER BY full_name"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,code,name,dimension,precision,active FROM units_of_measure ORDER BY code"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,product_id AS productId,from_uom_id AS fromUomId,to_uom_id AS toUomId,numerator,denominator,rounding_mode AS roundingMode FROM uom_conversions ORDER BY id"),scopedAll<Record<string,unknown>>(["controls"],"SELECT id,code,name,partner_type AS partnerType,email,phone,payment_terms AS paymentTerms,currency,active,version FROM business_partners ORDER BY code"),scopedAll<Record<string,unknown>>(["inventory","controls"],"SELECT id,sku,manufacturer_sku AS manufacturerSku,name,category,material,dimensions,finish,tracking_policy AS trackingPolicy,inventory_policy AS inventoryPolicy,standard_cost_cents AS standardCostCents,selling_price_cents AS sellingPriceCents,reorder_point AS reorderPoint,max_stock_level AS maxStockLevel,base_uom_id AS baseUomId,purchase_uom_id AS purchaseUomId,sales_uom_id AS salesUomId,active,version FROM products ORDER BY sku")
 ]);
   const [priceLists, priceListAssignments, priceListEntries] = await Promise.all([
     scopedAll<Record<string, unknown>>(["controls"],`SELECT id,code,name,currency,priority,valid_from AS validFrom,valid_to AS validTo,active,version,updated_at AS updatedAt FROM price_lists ORDER BY active DESC,priority DESC,code`),
@@ -2812,9 +2835,11 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
   const prior = await replay(command); if (prior) return prior;
   switch (normalize(command.command)) {
     case "createpurchaseorderdraft": return createDraft(command, "purchaseOrder");
+    case "createapprovedpurchaseorder": return createDraft(command, "purchaseOrder", true);
     case "updatepurchaseorderdraft": return updatePurchaseOrderDraft(command);
     case "cancelpurchaseorder": return cancelPurchaseOrder(command);
     case "createsalesorderdraft": return createDraft(command, "salesOrder");
+    case "createconfirmedsalesorder": return createDraft(command, "salesOrder", true);
     case "updatesalesorderdraft": return updateSalesOrderDraft(command);
     case "confirmsalesorder": return setSalesOrderLifecycle(command, "confirmed");
     case "cancelsalesorder": return setSalesOrderLifecycle(command, "canceled");
@@ -2836,6 +2861,7 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
     case "postdropshipdelivery": return postDropShipDelivery(command);
     case "reversedropshipdelivery": return reverseDropShipDelivery(command);
     case "createvendorbill": return createVendorBill(command);
+    case "createapprovedvendorbill": return createVendorBill(command, true);
     case "approvevendorbill": return approveVendorBill(command);
     case "createvendorcredit": return createFinancialCreditV2(command, "vendor");
     case "createcustomerinvoice": return createCustomerInvoiceV2(command);

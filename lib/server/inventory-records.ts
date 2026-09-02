@@ -59,6 +59,11 @@ export type CreateOrderInput = {
   editingPurchaseOrderId?: string;
   /** Supplied by the workflow envelope so both layers persist the same idempotency fingerprint. */
   requestHash?: string;
+  /**
+   * Internal, server-authorized fast-track context. The workflow layer only supplies this after
+   * checking that the actor can both author and approve the document.
+   */
+  fastTrackApprovalReason?: string;
 };
 
 type CreateOrderResult = {
@@ -309,6 +314,10 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
   const actor = requiredText(input.actor, "server actor");
   const actorId = requiredText(input.actorId, "server actor id");
   const actorEmail = requiredText(input.actorEmail, "server actor email");
+  const fastTrackApprovalReason = typeof input.fastTrackApprovalReason === "string" && input.fastTrackApprovalReason.trim()
+    ? input.fastTrackApprovalReason.trim()
+    : null;
+  const fastTrack = fastTrackApprovalReason !== null;
   const projectReference = typeof input.projectReference === "string" && input.projectReference.trim() ? input.projectReference.trim() : null;
   const currency = typeof input.currency === "string" && input.currency.trim() ? input.currency.trim().toUpperCase() : "CAD";
   if (!/^[A-Z]{3}$/.test(currency)) throw new RecordValidationError("VALIDATION_ERROR", "currency must be a three-letter ISO code.");
@@ -335,8 +344,10 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     result = {
       recordId,
       number,
-      message: `${number} saved as a draft with ${items.length} item line${items.length === 1 ? "" : "s"}; approval is required before its ${quantity}-unit purchasing commitment becomes incoming supply.`,
-      impact: { physical: "On-hand inventory and the immutable movement ledger are unchanged.", commercial: "Draft lines do not increase incoming forecast until approval.", financial: "Charges and tax are planned only; no vendor bill or payment was created.", onHandDelta: 0, incomingDelta: 0, reservedDelta: 0, availableDelta: 0 },
+      message: fastTrack
+        ? `${number} created and approved by its author with ${items.length} item line${items.length === 1 ? "" : "s"}; its ${quantity}-unit purchasing commitment is active incoming supply.`
+        : `${number} saved as a draft with ${items.length} item line${items.length === 1 ? "" : "s"}; approval is required before its ${quantity}-unit purchasing commitment becomes incoming supply.`,
+      impact: { physical: "On-hand inventory and the immutable movement ledger are unchanged.", commercial: fastTrack ? "Approved lines increase the incoming forecast immediately." : "Draft lines do not increase incoming forecast until approval.", financial: "Charges and tax are planned only; no vendor bill or payment was created.", onHandDelta: 0, incomingDelta: fastTrack ? quantity : 0, reservedDelta: 0, availableDelta: 0 },
     };
     const sourceLines = items.filter((line) => line.sourceSalesOrderLineId);
     const sourceClaims = sourceLines.map(() => ` AND EXISTS (SELECT 1 FROM sales_order_lines sol
@@ -347,20 +358,30 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
       db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
         SELECT ?, 'create_purchase_order', ?, ?, ?, ?, ? WHERE 1=1${sourceClaims}`).bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now, ...sourceClaimValues),
       db.prepare(`INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,buyer_name,project_reference,revision_number,version,created_at)
-        SELECT ?,?,?,'draft','not_billed',?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-        .bind(recordId, number, vendorId, expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, now, idempotencyKey, recordId, claimToken),
+        SELECT ?,?,?,?,'not_billed',?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(recordId, number, vendorId, fastTrack ? "approved" : "draft", expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, now, idempotencyKey, recordId, claimToken),
     ];
     items.forEach((line) => {const lineId=newId("po-line");statements.push(db.prepare(`INSERT INTO purchase_order_lines
       (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
       SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId,line.discountCents,line.taxable ? 1 : 0,line.taxCode,line.taxRateBps, idempotencyKey, recordId, claimToken));if(line.sourceSalesOrderLineId)statements.push(db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=? WHERE id=? AND product_id=? AND linked_purchase_order_line_id IS NULL AND EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`).bind(lineId,line.sourceSalesOrderLineId,line.productId,idempotencyKey,recordId,claimToken));});
     statements.push(db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
-      SELECT ?,?,1,'draft',?,'Initial draft',?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("revision"), recordId, JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase }), actor, now, idempotencyKey, recordId, claimToken));
+      SELECT ?,?,1,?,?,?, ?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+      .bind(newId("revision"), recordId, fastTrack ? "approved" : "draft", JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase }), fastTrackApprovalReason ?? "Initial draft", actor, now, idempotencyKey, recordId, claimToken));
+    if (fastTrack) statements.push(db.prepare(`INSERT INTO approvals
+      (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,decided_by,decision_reason,decided_at,metadata_json,version)
+      SELECT ?,'purchase_order',?,'purchase_order_fast_track','approved',?,?,?,?,?,?,?,1
+      WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+      .bind(newId("approval"), recordId, actor, fastTrackApprovalReason, now, actor, fastTrackApprovalReason, now, JSON.stringify({ selfAuthorized: true, actorId, actorEmail }), idempotencyKey, recordId, claimToken));
   } else {
     const customerId = requiredText(input.customerId, "customerId");
     const requestedDate = validDate(input.requestedDate, "requestedDate");
-    const customer = await first<{ name: string; addressLine1: string | null; addressLine2: string | null; city: string | null; region: string | null; postalCode: string | null; country: string | null }>("SELECT name,address_line_1 AS addressLine1,address_line_2 AS addressLine2,city,region,postal_code AS postalCode,country FROM business_partners WHERE id = ? AND partner_type IN ('customer','both') AND active=1", customerId);
+    const customer = await first<{ name: string; addressLine1: string | null; addressLine2: string | null; city: string | null; region: string | null; postalCode: string | null; country: string | null; partnerCurrency: string; creditLimitCents: number; creditHold: number; outstandingBaseCents: number }>(`SELECT bp.name,bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country,
+      bp.currency AS partnerCurrency,bp.credit_limit_cents AS creditLimitCents,bp.credit_hold AS creditHold,
+      COALESCE((SELECT SUM(MAX(ci.base_total_cents-ROUND(ci.paid_cents*ci.exchange_rate_to_base)-
+        COALESCE((SELECT SUM(cc.base_amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0),0))
+        FROM customer_invoices ci WHERE ci.customer_id=bp.id AND ci.status<>'void'),0) AS outstandingBaseCents
+      FROM business_partners bp WHERE bp.id = ? AND bp.partner_type IN ('customer','both') AND bp.active=1`, customerId);
     if (!customer) throw new RecordValidationError("INVALID_CUSTOMER", "Select a valid customer.", 404);
     const shipToName = typeof input.shipToName === "string" && input.shipToName.trim() ? input.shipToName.trim() : customer.name;
     const shipToAddressLine1 = typeof input.shipToAddressLine1 === "string" && input.shipToAddressLine1.trim() ? input.shipToAddressLine1.trim() : customer.addressLine1;
@@ -371,18 +392,31 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     const shipToCountry = typeof input.shipToCountry === "string" && input.shipToCountry.trim() ? input.shipToCountry.trim().toUpperCase() : customer.country ?? "CA";
     const deliveryInstructions = typeof input.deliveryInstructions === "string" && input.deliveryInstructions.trim() ? input.deliveryInstructions.trim() : null;
     if (!shipToAddressLine1 || !shipToCity || !shipToRegion || !shipToPostalCode || !shipToCountry) throw new RecordValidationError("SHIP_TO_REQUIRED", "A complete ship-to address is required on the sales-order draft.");
+    if (fastTrack) {
+      if (Boolean(customer.creditHold)) throw new RecordValidationError("CREDIT_HOLD", "This customer is on credit hold. Remove the hold before confirming the sales order.", 409);
+      if (customer.creditLimitCents > 0 && currency !== customer.partnerCurrency) {
+        throw new RecordValidationError("CREDIT_CURRENCY_MISMATCH", `This customer's credit limit is denominated in ${customer.partnerCurrency}; use that currency for a credit-controlled sales order.`, 409);
+      }
+      const outstandingCreditCents = Math.round(customer.outstandingBaseCents / exchangeRateToBase);
+      if (customer.creditLimitCents > 0 && outstandingCreditCents + totalCents > customer.creditLimitCents) {
+        const exceededBy = (outstandingCreditCents + totalCents - customer.creditLimitCents) / 100;
+        throw new RecordValidationError("CREDIT_LIMIT_EXCEEDED", `Confirming this order would exceed the customer's credit limit by ${exceededBy.toFixed(2)} ${customer.partnerCurrency}.`, 409);
+      }
+    }
     const number = await nextDocumentNumber("SO");
     result = {
       recordId,
       number,
-      message: `${number} saved as a draft with ${items.length} item line${items.length === 1 ? "" : "s"}; confirmation is required before its ${quantity} unit${quantity === 1 ? "" : "s"} become${quantity === 1 ? "s" : ""} customer demand.`,
-      impact: { physical: "On-hand inventory and the immutable movement ledger are unchanged.", commercial: "Draft lines do not create active demand or reserve stock.", financial: "Charges and tax are planned only; no customer invoice or revenue posting was created.", onHandDelta: 0, incomingDelta: 0, reservedDelta: 0, availableDelta: 0 },
+      message: fastTrack
+        ? `${number} created and confirmed by its author with ${items.length} item line${items.length === 1 ? "" : "s"}; its ${quantity} unit${quantity === 1 ? "" : "s"} are active customer demand.`
+        : `${number} saved as a draft with ${items.length} item line${items.length === 1 ? "" : "s"}; confirmation is required before its ${quantity} unit${quantity === 1 ? "" : "s"} become${quantity === 1 ? "s" : ""} customer demand.`,
+      impact: { physical: "On-hand inventory and the immutable movement ledger are unchanged.", commercial: fastTrack ? "Confirmed lines create active demand immediately; stock is not reserved automatically." : "Draft lines do not create active demand or reserve stock.", financial: "Charges and tax are planned only; no customer invoice or revenue posting was created.", onHandDelta: 0, incomingDelta: 0, reservedDelta: 0, availableDelta: 0 },
     };
     statements = [
       db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at) VALUES (?, 'create_sales_order', ?, ?, ?, ?, ?)").bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now),
       db.prepare(`INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,owner_name,project_reference,ship_to_name,ship_to_address_line_1,ship_to_address_line_2,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country,delivery_instructions,version,created_at)
-        SELECT ?,?,?,'draft','not_invoiced',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-        .bind(recordId, number, customerId, requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, now, idempotencyKey, recordId, claimToken),
+        SELECT ?,?,?,?,'not_invoiced',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(recordId, number, customerId, fastTrack ? "confirmed" : "draft", requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, now, idempotencyKey, recordId, claimToken),
     ];
     items.forEach((line) => statements.push(db.prepare(`INSERT INTO sales_order_lines
       (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
@@ -397,10 +431,10 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
   statements.push(
     db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
       SELECT ?,?,?,?, ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("audit"), input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, input.type === "purchaseOrder" ? "purchase_order_draft_created" : "sales_order_draft_created", result.message, actor, actorId, actorEmail, JSON.stringify({ items, charges, totalCents, taxCents, projectReference, currency, exchangeRateToBase, paymentTerms, dueDate }), now, idempotencyKey, recordId, claimToken),
+      .bind(newId("audit"), input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, fastTrack ? input.type === "purchaseOrder" ? "purchase_order_fast_track_approved" : "sales_order_fast_track_confirmed" : input.type === "purchaseOrder" ? "purchase_order_draft_created" : "sales_order_draft_created", result.message, actor, actorId, actorEmail, JSON.stringify({ items, charges, totalCents, taxCents, projectReference, currency, exchangeRateToBase, paymentTerms, dueDate, fastTrack, approvalReason: fastTrackApprovalReason }), now, idempotencyKey, recordId, claimToken),
     db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
       SELECT ?,?,?,?,?,'pending',0,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("outbox"), input.type === "purchaseOrder" ? "purchase_order.draft_created" : "sales_order.draft_created", input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, JSON.stringify({ recordId, itemCount: items.length, totalCents }), now, now, idempotencyKey, recordId, claimToken)
+      .bind(newId("outbox"), fastTrack ? input.type === "purchaseOrder" ? "purchase_order.approved" : "sales_order.confirmed" : input.type === "purchaseOrder" ? "purchase_order.draft_created" : "sales_order.draft_created", input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, JSON.stringify({ recordId, itemCount: items.length, totalCents, fastTrack }), now, now, idempotencyKey, recordId, claimToken)
   );
 
   await db.batch(statements);

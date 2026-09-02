@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 
 import { env } from "./cloudflare-workers-stub.mjs";
 import { D1SqliteDatabase } from "./d1-sqlite.mjs";
+import { calculateSalesAvailability } from "../lib/domain/sales-availability.ts";
 
 const db = new D1SqliteDatabase();
 let inventoryDb;
@@ -54,6 +55,25 @@ test("a clean migration chain boots the production database contract", async () 
   const balanceFks = db.sqlite.prepare("PRAGMA foreign_key_list(inventory_balances)").all().map((row) => row.table).sort();
   assert.deepEqual(balanceFks, ["locations", "products"]);
   await assert.rejects(run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('missing-product','missing-location',1,0,1)"), /FOREIGN KEY constraint failed/);
+});
+
+test("sales availability treats this order's reservation as committed coverage", () => {
+  assert.deepEqual(calculateSalesAvailability(1, 1, 0, 0), {
+    required: 1,
+    reserved: 1,
+    uncovered: 0,
+    availableNow: 0,
+    incomingBeforeDate: 0,
+    shortage: 0,
+  });
+  assert.deepEqual(calculateSalesAvailability(4, 1, 1, 1), {
+    required: 4,
+    reserved: 1,
+    uncovered: 3,
+    availableNow: 1,
+    incomingBeforeDate: 1,
+    shortage: 1,
+  });
 });
 
 test("the transactional outbox signs delivery and retains failures for retry", async () => {
@@ -159,7 +179,7 @@ test("worklist column sorts apply to the full server-side result set", async () 
     "sales-orders": ["exception", "number", "customer", "requested", "availability", "fulfillment", "billing", "total"],
     "customer-invoices": ["number", "customer", "ordered", "shipped", "invoiced", "availableToInvoice", "billing"],
     stock: ["product", "location", "onHand", "usable", "reserved", "available", "incoming", "demand", "projected", "exception"],
-    products: ["product", "configuration", "policy", "units", "standardCost", "sellingPrice", "margin", "reorderPoint"],
+    products: ["product", "configuration", "policy", "units", "standardCost", "sellingPrice", "margin", "reorderPoint", "maxStockLevel"],
     movements: ["posted", "movement", "document", "order", "product", "quantity", "from", "to", "actor"],
     counts: ["product", "location", "recorded", "reserved", "available"],
     partners: ["partner", "type", "contact", "address", "terms", "credit"],
@@ -492,6 +512,14 @@ test("product creation requires an explicit UOM instead of silently choosing one
   await assert.rejects(advancedDomain.executeWorkflow({ command: "createProduct", idempotencyKey: "product-without-uom", actor: administrator, payload: { sku: "NO-UOM", name: "No UOM", category: "test", material: "test", dimensions: "test", finish: "test", trackingPolicy: "quantity", inventoryPolicy: "stocked", standardCostCents: 0, sellingPriceCents: 0 } }), (error) => error?.code === "UOM_REQUIRED");
 });
 
+test("stocked products persist valid min-max replenishment levels", async () => {
+  const administrator = { id: "administrator", email: "admin@example.com", name: "Administrator", role: "administrator", label: "Administrator <admin@example.com>", localDevelopment: false };
+  const payload = { sku: "MIN-MAX", name: "Min-max product", category: "test", material: "test", dimensions: "test", finish: "test", trackingPolicy: "quantity", inventoryPolicy: "stocked", standardCostCents: 100, sellingPriceCents: 200, reorderPoint: 5, baseUomId: "uom-each", purchaseUomId: "uom-each", salesUomId: "uom-each" };
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "createProduct", idempotencyKey: "invalid-min-max-product", actor: administrator, payload: { ...payload, maxStockLevel: 4 } }), (error) => error?.code === "VALIDATION_ERROR");
+  const created = await advancedDomain.executeWorkflow({ command: "createProduct", idempotencyKey: "valid-min-max-product", actor: administrator, payload: { ...payload, maxStockLevel: 12 } });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT reorder_point,max_stock_level FROM products WHERE id=?").get(created.recordId) }, { reorder_point: 5, max_stock_level: 12 });
+});
+
 test("typed system policies change future transaction defaults with version control", async () => {
   const administrator = { id: "administrator", email: "admin@example.com", name: "Administrator", role: "administrator", label: "Administrator <admin@example.com>", localDevelopment: false };
   const version = (key) => db.sqlite.prepare("SELECT version FROM system_settings WHERE key=?").get(key).version;
@@ -600,6 +628,48 @@ test("sales-order confirmation enforces address, credit hold, and credit limit",
   await assert.rejects(advancedDomain.executeWorkflow({ ...command, entityId: "so-credit-foreign", idempotencyKey: "confirm-credit-currency" }), (error) => error?.code === "CREDIT_CURRENCY_MISMATCH");
 });
 
+test("authorized authors can atomically fast-track orders and vendor bills", async () => {
+  const manager = { id: "fast-track-manager", email: "fast-track@example.com", name: "Fast Track Manager", role: "manager", label: "Fast Track Manager <fast-track@example.com>", localDevelopment: false };
+  const operator = { id: "fast-track-operator", email: "fast-track-operator@example.com", name: "Fast Track Operator", role: "operator", label: "Fast Track Operator <fast-track-operator@example.com>", localDevelopment: false };
+  const orderLine = { kind: "item", productId: "prod-a", quantity: 2, unitCostCents: 100, taxable: false, taxRateBps: 0 };
+
+  assert.equal(advancedDomain.workflowCapability("createApprovedPurchaseOrder"), "approve");
+  assert.equal(advancedDomain.workflowCapability("createConfirmedSalesOrder"), "approve");
+  assert.equal(advancedDomain.workflowCapability("createApprovedVendorBill"), "approve");
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "createApprovedPurchaseOrder", idempotencyKey: "fast-track-denied", actor: operator, payload: { approvalReason: "Not authorized" } }), (error) => error?.code === "FAST_TRACK_FORBIDDEN" && error?.status === 403);
+
+  const purchaseOrder = await advancedDomain.executeWorkflow({
+    command: "createApprovedPurchaseOrder", idempotencyKey: "fast-track-po", actor: manager,
+    payload: { vendorId: "vendor-receipt", expectedDate: "2026-09-15", currency: "CAD", exchangeRateToBase: 1, paymentTerms: "Net 30", dueDate: "2026-10-15", approvalReason: "Within my purchasing signing authority", lines: [orderLine] },
+  });
+  assert.match(purchaseOrder.message, /created and approved by its author/);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT lifecycle_status,version FROM purchase_orders WHERE id=?").get(purchaseOrder.recordId) }, { lifecycle_status: "approved", version: 1 });
+  assert.equal(db.sqlite.prepare("SELECT lifecycle_status FROM purchase_order_revisions WHERE purchase_order_id=?").get(purchaseOrder.recordId).lifecycle_status, "approved");
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT status,requested_by,decided_by,decision_reason FROM approvals WHERE entity_id=?").get(purchaseOrder.recordId) }, { status: "approved", requested_by: manager.label, decided_by: manager.label, decision_reason: "Within my purchasing signing authority" });
+  assert.equal(db.sqlite.prepare("SELECT event_type FROM outbox_events WHERE aggregate_id=?").get(purchaseOrder.recordId).event_type, "purchase_order.approved");
+
+  await run("INSERT INTO business_partners (id,code,name,partner_type,address_line_1,city,region,postal_code,country,currency,credit_limit_cents,credit_hold,active,version,created_at) VALUES ('customer-fast-track','CUST-FAST','Fast Track Customer','customer','1 Authority Way','Edmonton','AB','T5J 0N1','CA','CAD',10000,1,1,1,'2026-08-01')");
+  const salesPayload = { customerId: "customer-fast-track", requestedDate: "2026-09-20", currency: "CAD", exchangeRateToBase: 1, paymentTerms: "Net 30", dueDate: "2026-10-20", shipToName: "Fast Track Site", shipToAddressLine1: "2 Authority Way", shipToCity: "Edmonton", shipToRegion: "AB", shipToPostalCode: "T5J 0N2", shipToCountry: "CA", approvalReason: "Customer commitment signed", lines: [{ kind: "item", productId: "prod-a", quantity: 1, unitPriceCents: 200, taxable: false, taxRateBps: 0 }] };
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "createConfirmedSalesOrder", idempotencyKey: "fast-track-so-held", actor: manager, payload: salesPayload }), (error) => error?.code === "CREDIT_HOLD");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM sales_orders WHERE customer_id='customer-fast-track'").get().count, 0);
+  await run("UPDATE business_partners SET credit_hold=0 WHERE id='customer-fast-track'");
+  const salesOrder = await advancedDomain.executeWorkflow({ command: "createConfirmedSalesOrder", idempotencyKey: "fast-track-so", actor: manager, payload: salesPayload });
+  assert.match(salesOrder.message, /created and confirmed by its author/);
+  assert.equal(db.sqlite.prepare("SELECT lifecycle_status FROM sales_orders WHERE id=?").get(salesOrder.recordId).lifecycle_status, "confirmed");
+  assert.equal(db.sqlite.prepare("SELECT action FROM audit_events WHERE entity_id=?").get(salesOrder.recordId).action, "sales_order_fast_track_confirmed");
+
+  await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('po-fast-bill','PO-FAST-BILL','vendor-receipt','approved','not_billed','2026-08-24','CAD',1,200,200,1,'2026-08-01')");
+  await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,fulfillment_route,version) VALUES ('pol-fast-bill','po-fast-bill','prod-a',2,0,100,'stock',1)");
+  await run("INSERT INTO stock_movements (id,movement_type,product_id,quantity,to_location_id,inventory_status,source_document_type,source_document_id,purchase_order_line_id,posted_at,posted_by,idempotency_key) VALUES ('movement-fast-bill','purchase_receipt','prod-a',2,'loc-a','usable','purchase_order','po-fast-bill','pol-fast-bill','2026-08-24T12:00:00Z','Receiver','movement-fast-bill')");
+  const vendorBill = await advancedDomain.executeWorkflow({
+    command: "createApprovedVendorBill", entityId: "po-fast-bill", version: 1, idempotencyKey: "fast-track-vendor-bill", actor: manager,
+    payload: { purchaseOrderId: "po-fast-bill", vendorInvoiceNumber: "FAST-BILL-001", invoiceDate: "2026-08-24", dueDate: "2026-09-23", currency: "CAD", exchangeRateToBase: 1, paymentTerms: "Net 30", approvalReason: "I authorize the supplier variance", lines: [{ purchaseOrderLineId: "pol-fast-bill", quantity: 2, unitCostCents: 5000 }] },
+  });
+  assert.match(vendorBill.message, /approved by its author/);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT status,match_status,approved_by,hold_reason FROM vendor_bills WHERE id=?").get(vendorBill.recordId) }, { status: "approved", match_status: "approved_variance", approved_by: manager.label, hold_reason: null });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT status,request_type,decided_by FROM approvals WHERE entity_id=?").get(vendorBill.recordId) }, { status: "approved", request_type: "vendor_bill_match_exception", decided_by: manager.label });
+});
+
 test("receivables reports preserve document currency and reconstruct historical postings in base CAD", async () => {
   await run("INSERT INTO business_partners (id,code,name,partner_type,currency,credit_limit_cents,credit_hold,active,version,created_at) VALUES ('customer-report','CUST-RPT','Report Customer','customer','USD',20000,0,1,1,'2026-01-01')");
   await run("INSERT INTO customer_invoices (id,number,customer_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,posted_at,posted_by,version) VALUES ('invoice-report','INV-REPORT','customer-report','partially_paid','2026-01-01','2026-01-15',10000,0,10000,3000,'USD',1.25,12500,'2026-01-01T12:00:00Z','Tester',1)");
@@ -693,6 +763,45 @@ test("one shipment consumes reservations split across locations", async () => {
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,version FROM shipments WHERE id=?").get(shipment.id) }, { status: "reversed", version: 3 });
 });
 
+test("immediate sale ships free stock and posts the customer invoice atomically without a reservation", async () => {
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('prod-immediate','SKU-IMMEDIATE','Immediate sale product','test','test','test','test','quantity','stocked',400,1000,0,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
+  await run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('prod-immediate','loc-a',3,0,1)");
+  await run("INSERT INTO valuation_policies (product_id,method,standard_cost_cents,average_cost_cents,version,updated_at,updated_by) VALUES ('prod-immediate','fifo',400,400,1,'2026-08-01','Tester')");
+  await run("INSERT INTO cost_layers (id,product_id,received_qty,remaining_qty,unit_cost_cents,landed_cost_cents,received_at,status) VALUES ('layer-immediate','prod-immediate',3,3,400,0,'2026-08-01','open')");
+  await run("INSERT INTO business_partners (id,code,name,partner_type,address_line_1,city,region,postal_code,country,payment_terms,currency,active,version,created_at) VALUES ('customer-immediate','CUST-IMMEDIATE','Immediate Customer','customer','12 Counter Way','Edmonton','AB','T5J 0N3','CA','Net 30','CAD',1,1,'2026-08-01')");
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,version,created_at,ship_to_name,ship_to_address_line_1,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country) VALUES ('so-immediate','SO-IMMEDIATE','customer-immediate','confirmed','not_invoiced','2026-08-24','CAD',1,2205,'Net 30','2026-09-23',2205,1,'2026-08-24','Immediate Customer','12 Counter Way','Edmonton','AB','T5J 0N3','CA')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_code,tax_rate_bps) VALUES ('sol-immediate','so-immediate','prod-immediate',2,0,1000,'stock',100,1,'GST',500)");
+  await run("INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) VALUES ('charge-immediate','sales_order','so-immediate','delivery','Counter delivery',200,'add',1,0,'GST',500,10,'2026-08-24')");
+
+  const command = { command: "postImmediateSale", entityId: "so-immediate", version: 1, idempotencyKey: "post-immediate-sale", payload: { lineId: "sol-immediate", quantity: 2, postingDate: "2026-08-24", carrier: "Customer pickup", trackingNumber: "PICKUP-42", actor: "Tester", actorId: "tester", actorEmail: "tester@example.com" } };
+  const result = await inventoryDomain.executeInventoryCommand(command);
+  assert.match(result.message, new RegExp(`${result.shipmentNumber} posted and ${result.invoiceNumber} is ready`));
+  assert.ok(result.shipmentId);
+  assert.ok(result.invoiceId);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT on_hand_qty,reserved_qty FROM inventory_balances WHERE product_id='prod-immediate' AND location_id='loc-a'").get() }, { on_hand_qty: 1, reserved_qty: 0 });
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM reservations WHERE sales_order_line_id='sol-immediate'").get().count, 0);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT carrier,service_level,tracking_number,status FROM shipments WHERE id=?").get(result.shipmentId) }, { carrier: "Customer pickup", service_level: "Immediate sale", tracking_number: "PICKUP-42", status: "posted" });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,payment_terms FROM customer_invoices WHERE id=?").get(result.invoiceId) }, { status: "posted", invoice_date: "2026-08-24", due_date: "2026-09-23", subtotal_cents: 2100, tax_cents: 105, total_cents: 2205, payment_terms: "Net 30" });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT quantity,unit_price_cents,line_total_cents FROM customer_invoice_lines WHERE customer_invoice_id=?").get(result.invoiceId) }, { quantity: 2, unit_price_cents: 1000, line_total_cents: 1900 });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT quantity,value_cents FROM inventory_value_entries WHERE reference_id=?").get(result.shipmentId) }, { quantity: -2, value_cents: -800 });
+  assert.equal(db.sqlite.prepare("SELECT remaining_qty FROM cost_layers WHERE id='layer-immediate'").get().remaining_qty, 1);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT billing_status,version FROM sales_orders WHERE id='so-immediate'").get() }, { billing_status: "invoiced", version: 2 });
+  assert.deepEqual(db.sqlite.prepare("SELECT event_type FROM outbox_events WHERE aggregate_id IN (?,?) ORDER BY event_type").all(result.shipmentId, result.invoiceId).map((row) => row.event_type), ["customer_invoice.posted", "inventory.shipment_posted"]);
+
+  const repeated = await inventoryDomain.executeInventoryCommand(command);
+  assert.equal(repeated.invoiceId, result.invoiceId);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM shipments WHERE sales_order_id='so-immediate'").get().count, 1);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM customer_invoices WHERE sales_order_id='so-immediate'").get().count, 1);
+
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at,ship_to_name,ship_to_address_line_1,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country) VALUES ('so-immediate-short','SO-IMMEDIATE-SHORT','customer-immediate','confirmed','not_invoiced','2026-08-24','CAD',1,2000,2000,1,'2026-08-24','Immediate Customer','12 Counter Way','Edmonton','AB','T5J 0N3','CA')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-immediate-short','so-immediate-short','prod-immediate',2,0,1000,'stock',0,0,0)");
+  await assert.rejects(inventoryDomain.executeInventoryCommand({ command: "postImmediateSale", entityId: "so-immediate-short", version: 1, idempotencyKey: "post-immediate-sale-short", payload: { lineId: "sol-immediate-short", quantity: 2, postingDate: "2026-08-24", actor: "Tester" } }), (error) => error?.code === "INSUFFICIENT_AVAILABILITY");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM shipments WHERE sales_order_id='so-immediate-short'").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM customer_invoices WHERE sales_order_id='so-immediate-short'").get().count, 0);
+  assert.equal(db.sqlite.prepare("SELECT on_hand_qty FROM inventory_balances WHERE product_id='prod-immediate' AND location_id='loc-a'").get().on_hand_qty, 1);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM command_log WHERE idempotency_key='post-immediate-sale-short'").get().count, 0);
+});
+
 test("accounting exports reject base-total plugs and emit tax from the tax component", async () => {
   await run("INSERT INTO business_partners (id,code,name,partner_type,currency,active,version,created_at) VALUES ('vendor-a','VEND-A','Vendor A','vendor','USD',1,1,'2026-08-01')");
   await run("INSERT INTO vendor_bills (id,number,vendor_invoice_number,vendor_id,status,match_status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,version) VALUES ('bill-fx','VB-FX','V-FX','vendor-a','posted','matched','2026-08-02','2026-09-01',10000,500,10500,0,'USD',1.5,16000,1)");
@@ -744,6 +853,10 @@ test("sales-order availability is computed across every line, independent of the
   // the same moment it leaves the blocked queue.
   await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('po-avail','PO-AVAIL','vendor-a','approved','not_billed','2026-08-25','CAD',1,300,300,1,'2026-08-01')");
   await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,fulfillment_route) VALUES ('pol-avail','po-avail','prod-avail-short',3,0,100,'stock')");
+  // Supply expected after the customer's requested date must not appear in the
+  // "incoming before date" quantity or rescue the order from the blocked queue.
+  await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('po-avail-late','PO-AVAIL-LATE','vendor-a','approved','not_billed','2026-09-02','CAD',1,300,300,1,'2026-08-01')");
+  await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,fulfillment_route) VALUES ('pol-avail-late','po-avail-late','prod-avail-short',3,0,100,'stock')");
 
   const supplied = await load();
   assert.equal(supplied.order.availableNowQuantity, 4);
@@ -759,9 +872,30 @@ test("sales-order availability is computed across every line, independent of the
   assert.equal(byId["sol-avail-short"].productIncomingQuantity, 3);
 });
 
+test("a fully reserved sales order is covered and is absent from the blocked queue", async () => {
+  const before = await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 1, scope: "sales-orders" });
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('prod-reserved-covered','SKU-RESERVED-COVERED','Reserved covered product','test','test','test','test','quantity','stocked',100,200,0,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
+  await run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('prod-reserved-covered','loc-a',1,1,1)");
+  await run("INSERT INTO business_partners (id,code,name,partner_type,currency,active,version,created_at) VALUES ('customer-reserved-covered','CUST-RES-COVERED','Reserved Coverage Customer','customer','CAD',1,1,'2026-08-01')");
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-reserved-covered','SO-RESERVED-COVERED','customer-reserved-covered','confirmed','not_invoiced','2026-09-14','CAD',1,200,200,1,'2026-08-01')");
+  await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-reserved-covered','so-reserved-covered','prod-reserved-covered',1,0,200,'stock',0,1,0)");
+  await run("INSERT INTO reservations (id,sales_order_line_id,product_id,location_id,quantity,status,created_at) VALUES ('res-reserved-covered','sol-reserved-covered','prod-reserved-covered','loc-a',1,'active','2026-08-01T00:00:00Z')");
+
+  const snapshot = await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 50, scope: "sales-orders", search: "SO-RESERVED-COVERED" });
+  const order = snapshot.salesOrders.find((row) => row.number === "SO-RESERVED-COVERED");
+  assert.deepEqual({
+    open: order.openToShipQuantity,
+    reserved: order.reservedQuantity,
+    available: order.availableNowQuantity,
+    incoming: order.incomingSupplyQuantity,
+  }, { open: 1, reserved: 1, available: 0, incoming: 0 });
+  assert.equal((await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 50, scope: "sales-orders", search: "SO-RESERVED-COVERED", status: "blocked" })).salesOrders.length, 0);
+  assert.equal(snapshot.summary.blockedSalesOrders, before.summary.blockedSalesOrders);
+});
+
 test("management and warehouse calculations use complete, non-overlapping quantities", async () => {
   await run("INSERT INTO business_partners (id,code,name,partner_type,currency,active,version,created_at) VALUES ('customer-ops-reports','CUST-OPS-RPT','Operations Report Customer','customer','CAD',1,1,'2026-08-01')");
-  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('prod-replenishment','SKU-REPLENISH','Reserved replenishment product','test','test','test','test','quantity','stocked',100,200,7,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,max_stock_level,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('prod-replenishment','SKU-REPLENISH','Reserved replenishment product','test','test','test','test','quantity','stocked',100,200,7,20,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
   await run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('prod-replenishment','loc-a',10,4,1)");
   await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-report-open','SO-REPORT-OPEN','customer-ops-reports','confirmed','not_invoiced','2026-09-10','CAD',1,800,800,1,'2026-08-01')");
   await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-report-open','so-report-open','prod-replenishment',4,0,200,'stock',0,0,0)");
@@ -774,7 +908,9 @@ test("management and warehouse calculations use complete, non-overlapping quanti
     demand: replenishmentRow.openDemandQuantity,
     projected: replenishmentRow.projectedQuantity,
     suggested: replenishmentRow.suggestedOrderQuantity,
-  }, { usable: 10, available: 6, demand: 4, projected: 6, suggested: 1 });
+    reorderPoint: replenishmentRow.reorderPoint,
+    maxStockLevel: replenishmentRow.maxStockLevel,
+  }, { usable: 10, available: 6, demand: 4, projected: 6, suggested: 14, reorderPoint: 7, maxStockLevel: 20 });
 
   await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-report-shipped','SO-REPORT-SHIPPED','customer-ops-reports','confirmed','not_invoiced','2026-01-05','CAD',1,1000,1000,1,'2026-01-01')");
   await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-report-shipped','so-report-shipped','prod-replenishment',5,0,200,'stock',0,0,0)");
