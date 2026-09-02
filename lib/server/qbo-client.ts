@@ -77,11 +77,38 @@ export function qboConfig(_requestUrl?: string): QboRuntimeConfig {
 }
 
 export function qboConfigurationStatus(requestUrl?: string) {
+  const runtime = {
+    QBO_CLIENT_ID: runtimeValue("QBO_CLIENT_ID"),
+    QBO_CLIENT_SECRET: runtimeValue("QBO_CLIENT_SECRET"),
+    QBO_TOKEN_ENCRYPTION_KEY: runtimeValue("QBO_TOKEN_ENCRYPTION_KEY"),
+    QBO_REDIRECT_URI: runtimeValue("QBO_REDIRECT_URI"),
+  };
+  const missing = Object.entries(runtime).filter(([, value]) => !value).map(([name]) => name);
+  const expectedRedirectUri = requestUrl ? `${new URL(requestUrl).origin}/api/integrations/qbo/callback` : "";
   try {
     const config = qboConfig(requestUrl);
-    return { configured: true, redirectUri: config.redirectUri, webhookConfigured: Boolean(config.webhookVerifierToken), minorVersion: config.minorVersion };
+    const redirectMatchesSite = !expectedRedirectUri || config.redirectUri === expectedRedirectUri;
+    return {
+      configured: redirectMatchesSite,
+      missing: redirectMatchesSite ? [] : ["QBO_REDIRECT_URI"],
+      message: redirectMatchesSite ? "QuickBooks platform credentials are ready." : `QBO_REDIRECT_URI must exactly match ${expectedRedirectUri}.`,
+      redirectUri: config.redirectUri,
+      expectedRedirectUri,
+      redirectMatchesSite,
+      webhookConfigured: Boolean(config.webhookVerifierToken),
+      minorVersion: config.minorVersion,
+    };
   } catch (error) {
-    return { configured: false, message: error instanceof Error ? error.message : String(error), redirectUri: requestUrl ? `${new URL(requestUrl).origin}/api/integrations/qbo/callback` : "" };
+    return {
+      configured: false,
+      missing,
+      message: error instanceof Error ? error.message : String(error),
+      redirectUri: runtime.QBO_REDIRECT_URI || expectedRedirectUri,
+      expectedRedirectUri,
+      redirectMatchesSite: !runtime.QBO_REDIRECT_URI || runtime.QBO_REDIRECT_URI === expectedRedirectUri,
+      webhookConfigured: Boolean(runtimeValue("QBO_WEBHOOK_VERIFIER_TOKEN")),
+      minorVersion: runtimeValue("QBO_MINOR_VERSION") || "75",
+    };
   }
 }
 

@@ -64,6 +64,8 @@ PaneFlow mirrors each payable invoice into Helcim under a `PF-` invoice number. 
 
 To configure Helcim:
 
+Open **Reports & admin → Company connections** in PaneFlow. The Helcim card shows every missing deployment setting and provides a copyable setup request.
+
 1. Start with a Helcim Developer Test account, then use an approved merchant account for production. In the API Access Configuration, enable invoice create/update/read and card/ACH transaction reads. Also enable HelcimPay.js checkout initialization if embedded mode will be used.
 2. Set `HELCIM_API_TOKEN` and an independent random `HELCIM_TOKEN_ENCRYPTION_KEY` of at least 32 characters as Worker secrets. The last key encrypts each short-lived Pay.js validation secret before D1 storage and must remain stable across deploys.
 3. The private Site uses scheduled API polling and does not require a webhook. If a separately public signed-ingress host is added later, it may forward Helcim card and ACH transaction events to `/api/integrations/helcim/webhook`; set its base64 verifier as `HELCIM_WEBHOOK_VERIFIER_TOKEN`. Do not point Helcim at an owner-only Site URL because private Sites require interactive sign-in.
@@ -80,6 +82,8 @@ PaneFlow is the operational and inventory source of truth; QuickBooks Online rem
 The connection uses Intuit OAuth 2.0. Access and refresh tokens are AES-GCM encrypted before they are stored in D1; the encryption key remains a Worker secret. Delivery is durable and at least once, with local idempotency, stable QBO-ID links, `SyncToken` conflict detection, exponential retry, signed webhook ingestion, and reconciliation. PaneFlow never guesses a chart-of-accounts or Canadian tax mapping: missing mappings appear as administrator-visible conflicts.
 
 To configure an Intuit app:
+
+Open **Reports & admin → Company connections** in PaneFlow. The QuickBooks card shows the exact OAuth callback to register, identifies missing platform settings, and enables **Sign in & choose company** only when the Intuit app is ready.
 
 1. Create an app in the Intuit Developer dashboard and enable the `com.intuit.quickbooks.accounting` scope. A QBO Plus or Advanced company is required when purchase orders are part of the workflow.
 2. Register `https://YOUR_HOST/api/integrations/qbo/callback` as an OAuth redirect URI and `https://YOUR_HOST/api/integrations/qbo/webhook` as the webhook endpoint. Enable the current CloudEvents v1.0 webhook payload; the endpoint also accepts Intuit's legacy payload during migration. Use the equivalent localhost callback for sandbox development.

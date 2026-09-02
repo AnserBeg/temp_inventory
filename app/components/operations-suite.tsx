@@ -9,6 +9,7 @@ import { actorName } from "./format";
 import { EmailDocumentButton } from "./email-documents";
 import { HelcimPaymentLinkButton } from "./helcim-payment-link";
 import { PlyGemImportButton } from "./ply-gem-import";
+import { AlertIcon, CheckIcon, InfoIcon } from "./icons";
 import { workflowCommandEnvelope, workflowCommandForAction, workflowSnapshotParts } from "@/lib/domain/workflow-envelope";
 
 export type OperationsWorkspaceKind = "purchasing" | "sales" | "inventory" | "vendor-billing" | "customer-billing" | "controls";
@@ -193,7 +194,7 @@ const tabs: Record<OperationsWorkspaceKind, Array<{ key: string; label: string }
   // themselves live on the other tab. Labelling the first one "Invoices" sent anyone looking
   // for an invoice to the tab that has none, so each label now names what the tab shows.
   "customer-billing": [{ key: "overview", label: "Ready to invoice" }, { key: "billing-actions", label: "Posted invoices" }],
-  controls: [{ key: "overview", label: "Reports" }, { key: "approvals", label: "Approvals" }, { key: "audit", label: "Audit timeline" }, { key: "policies", label: "System policies" }, { key: "periods-access", label: "Periods & access" }, { key: "integrations", label: "Integrations" }, { key: "reconciliation", label: "Reconciliation" }, { key: "pricing", label: "Pricing" }, { key: "units", label: "Units & conversions" }, { key: "master-data", label: "Master data" }],
+  controls: [{ key: "overview", label: "Reports" }, { key: "approvals", label: "Approvals" }, { key: "audit", label: "Audit timeline" }, { key: "policies", label: "System policies" }, { key: "periods-access", label: "Periods & access" }, { key: "integrations", label: "Company connections" }, { key: "reconciliation", label: "Reconciliation" }, { key: "pricing", label: "Pricing" }, { key: "units", label: "Units & conversions" }, { key: "master-data", label: "Master data" }],
 };
 
 /** Create actions offered above a workspace's main list, alongside the records they add to. */
@@ -347,7 +348,7 @@ function PeriodsAndAccess({ state, canAction, openAction }: { state: WorkflowSta
 }
 
 type QboAdminState = {
-  configuration: { configured: boolean; message?: string; redirectUri?: string; webhookConfigured?: boolean; minorVersion?: string };
+  configuration: { configured: boolean; message?: string; missing?: string[]; redirectUri?: string; expectedRedirectUri?: string; redirectMatchesSite?: boolean; webhookConfigured?: boolean; minorVersion?: string };
   connections: Array<Record<string, unknown>>;
   selectedConnectionId: string | null;
   accountRoles: Array<{ key: string; label: string; types: readonly string[] }>;
@@ -368,8 +369,30 @@ function qboError(body: unknown, fallback: string) {
   return fallback;
 }
 
+type ConnectionStepStatus = "complete" | "action" | "next";
+
+function ConnectionStep({ number, title, detail, status = "next" }: { number: number; title: string; detail: string; status?: ConnectionStepStatus }) {
+  const label = status === "complete" ? "Complete" : status === "action" ? "Action required" : "Next step";
+  return <li className={`integration-step ${status}`}>
+    <span className="integration-step-marker" aria-hidden="true">{status === "complete" ? <CheckIcon /> : status === "action" ? <AlertIcon /> : <span>{number}</span>}</span>
+    <div><strong>{title}</strong><p>{detail}</p></div>
+    <small>{label}</small>
+  </li>;
+}
+
+function CopyableSetting({ label, value, onCopy }: { label: string; value: string; onCopy: (value: string, label: string) => void }) {
+  return <div className="integration-setting"><span>{label}</span><code>{value}</code><button type="button" onClick={() => onCopy(value, label)}>Copy</button></div>;
+}
+
+function CompanyConnectionsIntro() {
+  return <section className="integration-hub-intro">
+    <div><span className="integration-eyebrow">Company connections</span><h2>Connect accounting and customer payments</h2><p>QuickBooks uses a company-admin login. Helcim uses a merchant API connection. Complete each card in order; credentials are stored as protected deployment settings, never in customer or invoice records.</p></div>
+    <div className="integration-models"><span><strong>QBO</strong>OAuth company authorization</span><span><strong>Helcim</strong>Merchant API credentials</span></div>
+  </section>;
+}
+
 type HelcimAdminState = {
-  configuration: { configured: boolean; message: string; missing: string[]; paymentMethod: string };
+  configuration: { configured: boolean; message: string; missing: string[]; paymentMethod: string; checkoutMode: string; invoiceHost: string; webhookConfigured: boolean };
   webhookUrl: string;
   activeLinks: number;
   counts: Record<string, number>;
@@ -405,13 +428,32 @@ function HelcimIntegration({ canAdminister }: { canAdminister: boolean }) {
   };
   if (!canAdminister) return <Section title="Helcim payments"><div className="workflow-banner"><strong>Administrator access required</strong><span>Only administrators can inspect payment-processor configuration and reconciliation.</span></div></Section>;
   const counts = data?.counts ?? {};
-  return <Section title="Helcim payments" detail="Secure invoice checkout; PaneFlow posts only verified card approvals and cleared bank payments.">
-    {!data ? <div className="workflow-empty">{message || "Loading Helcim integration…"}</div> : <>
-      <div className="qbo-connection-summary"><div><span>Configuration</span><strong>{data.configuration.configured ? "Ready" : "Action required"}</strong><small>{data.configuration.message}</small></div><div><span>Collection</span><strong>{data.activeLinks} active links</strong><small>{Number(counts.settled ?? 0)} settled · {Number(counts.pending ?? 0)} pending</small></div><div><span>Exceptions</span><strong>{Number(counts.review ?? 0)} need review</strong><small>{Number(counts.failed ?? 0)} failed · {Number(counts.expired ?? 0)} expired sessions</small></div><div className="qbo-actions"><button className="workflow-action primary" type="button" disabled={!data.configuration.configured || busy} onClick={() => void reconcile()}>{busy ? "Reconciling…" : "Reconcile now"}</button></div></div>
-      <div className="workflow-banner"><strong>Webhook endpoint</strong><span>{data.webhookUrl}</span></div>
-      {data.recent.length ? <div className="workflow-stack">{data.recent.map((item) => <div className="workflow-banner" key={String(item.id)}><strong>{String(item.invoiceNumber)} · {String(item.status)}</strong><span>{String(item.transactionId || "No transaction id")}{item.lastError ? ` · ${String(item.lastError)}` : ""}</span></div>)}</div> : null}
-      {message ? <p className="workflow-banner" role="status">{message}</p> : null}
-    </>}
+  if (!data) return <Section title="Helcim payments"><div className="workflow-empty">{message || "Loading Helcim integration…"}</div></Section>;
+  const missing = new Set(data.configuration.missing);
+  const apiReady = !missing.has("HELCIM_API_TOKEN");
+  const hostReady = !missing.has("HELCIM_INVOICE_HOST");
+  const encryptionReady = !missing.has("HELCIM_TOKEN_ENCRYPTION_KEY");
+  const setupRequest = data.configuration.missing.length
+    ? data.configuration.missing.map((key) => `${key}=${key.includes("TOKEN") || key.includes("KEY") ? "<store as secret>" : "<value>"}`).join("\n")
+    : "Helcim is configured in PaneFlow.";
+  const copy = (value: string, label: string) => void navigator.clipboard.writeText(value).then(() => setMessage(`${label} copied.`)).catch(() => setMessage(`Could not copy ${label.toLowerCase()}.`));
+  return <Section title="Helcim payments" detail="Connect one Helcim merchant account to collect customer invoice payments.">
+    <div className="integration-provider-card helcim">
+      <div className="integration-provider-heading"><span className="integration-provider-mark">H</span><div><span className="integration-eyebrow">Payment processor</span><h3>Helcim merchant connection</h3><p>PaneFlow creates the invoice link; the customer enters card or bank details on Helcim&apos;s hosted payment page.</p></div><span className={`integration-state ${data.configuration.configured ? "ready" : "attention"}`}>{data.configuration.configured ? "Ready" : "Setup required"}</span></div>
+      <ol className="integration-step-list">
+        <ConnectionStep number={1} title="Open or approve the merchant account" detail="Sign in to the business's Helcim account and confirm its deposit bank account is approved, especially for ACH." status="next" />
+        <ConnectionStep number={2} title="Create dedicated API access" detail={apiReady ? "The protected Helcim API token is stored." : "In Helcim, open All Tools → Integrations and create an API Access Configuration for invoice and transaction access."} status={apiReady ? "complete" : "action"} />
+        <ConnectionStep number={3} title="Identify the invoice host" detail={hostReady ? `Using ${data.configuration.invoiceHost}.` : "Open any Helcim invoice, choose Actions → View Online, and copy the business.myhelcim.com hostname."} status={hostReady ? "complete" : "action"} />
+        <ConnectionStep number={4} title="Test payment collection" detail={data.configuration.configured ? `Hosted checkout is ready for ${data.configuration.paymentMethod === "cc-ach" ? "cards and ACH" : data.configuration.paymentMethod}. PaneFlow checks Helcim every five minutes.` : "This becomes available after the protected settings above are stored."} status={data.configuration.configured ? "complete" : "next"} />
+      </ol>
+      <div className="integration-setup-footer">
+        <div><strong>{data.configuration.configured ? "Connection ready" : "Settings still needed"}</strong><p>{data.configuration.message}</p>{!encryptionReady ? <small>The encryption key must be at least 32 characters and remain stable across deployments.</small> : null}</div>
+        <div className="integration-actions"><a className="workflow-action" href="https://www.helcim.com/login/" target="_blank" rel="noreferrer">Open Helcim</a><a className="workflow-action" href="https://devdocs.helcim.com/docs/authentication-with-the-helcim-api-and-helcimpayjs" target="_blank" rel="noreferrer">API setup guide</a>{data.configuration.missing.length ? <button className="workflow-action" type="button" onClick={() => copy(setupRequest, "Setup request")}>Copy setup request</button> : <button className="workflow-action primary" type="button" disabled={busy} onClick={() => void reconcile()}>{busy ? "Testing…" : "Test connection"}</button>}</div>
+      </div>
+    </div>
+    {data.configuration.missing.length ? <div className="integration-missing-list" aria-label="Missing Helcim settings">{data.configuration.missing.map((key) => <span key={key}>{key}</span>)}</div> : <div className="qbo-connection-summary"><div><span>Collection</span><strong>{data.activeLinks} active links</strong><small>{Number(counts.settled ?? 0)} settled · {Number(counts.pending ?? 0)} pending</small></div><div><span>Exceptions</span><strong>{Number(counts.review ?? 0)} need review</strong><small>{Number(counts.failed ?? 0)} failed · {Number(counts.expired ?? 0)} expired sessions</small></div><div><span>Recovery</span><strong>5-minute polling</strong><small>Signed webhook ingress is optional, not required.</small></div></div>}
+    {data.recent.length ? <div className="workflow-stack integration-exceptions">{data.recent.map((item) => <div className="workflow-banner" key={String(item.id)}><strong>{String(item.invoiceNumber)} · {String(item.status)}</strong><span>{String(item.transactionId || "No transaction id")}{item.lastError ? ` · ${String(item.lastError)}` : ""}</span></div>)}</div> : null}
+    {message ? <p className="workflow-banner integration-message" role="status">{message}</p> : null}
   </Section>;
 }
 
@@ -500,12 +542,33 @@ function QuickBooksIntegration({ canAdminister }: { canAdminister: boolean }) {
     integrationErrorCode: String(item.lastErrorCode ?? ""),
   }));
   const counts = data?.summary?.counts ?? {};
+  const qboMissing = data?.configuration.missing ?? [];
+  const platformReady = data?.configuration.configured === true;
+  const companyReady = connected;
+  const mappingsReady = Boolean(selectedConnection && data && data.accountMappings.length > 0 && data.referenceMappings.length > 0);
+  const callbackUrl = data?.configuration.expectedRedirectUri || data?.configuration.redirectUri || "";
+  const qboSetupRequest = qboMissing.length ? [...qboMissing.map((key) => `${key}=${key.includes("SECRET") || key.includes("KEY") ? "<store as secret>" : "<value>"}`), callbackUrl ? `REGISTERED_REDIRECT_URI=${callbackUrl}` : ""].filter(Boolean).join("\n") : "QuickBooks platform credentials are configured in PaneFlow.";
+  const copy = (value: string, label: string) => void navigator.clipboard.writeText(value).then(() => setMessage(`${label} copied.`)).catch(() => setMessage(`Could not copy ${label.toLowerCase()}.`));
 
   return <div className="workflow-stack">
-    <Section title="QuickBooks Online" detail="PaneFlow remains the inventory source of truth; QBO receives accounting documents and balanced inventory-value journals.">
-      {!data?.configuration.configured ? <div className="workflow-banner"><strong>Configuration required</strong><span>{data?.configuration.message ?? "Add the QBO Worker secrets before connecting."}</span></div> : null}
-      {!selectedConnection ? <div className="qbo-connect-grid"><label><span>Intuit environment</span><select value={environment} onChange={(event) => setEnvironment(event.target.value as "sandbox" | "production")}><option value="sandbox">Sandbox (recommended for setup)</option><option value="production">Production company</option></select></label><label><span>Backfill accounting activity from</span><input type="date" value={syncFrom} onChange={(event) => setSyncFrom(event.target.value)} /></label><button type="button" className="workflow-action primary" disabled={!canAdminister || !data?.configuration.configured || busy === "connect"} onClick={() => void connect()}>{busy === "connect" ? "Opening Intuit…" : "Connect QuickBooks"}</button><p>Use a QBO Plus or Advanced company if purchase orders must be pushed. Start with a sandbox and verify tax/account mappings before production.</p></div>
+    <Section title="QuickBooks Online" detail="Authorize one QBO company, then map PaneFlow's accounting roles before the first sync.">
+      <div className="integration-provider-card qbo">
+        <div className="integration-provider-heading"><span className="integration-provider-mark">qb</span><div><span className="integration-eyebrow">Accounting system</span><h3>QuickBooks company connection</h3><p>A QuickBooks company administrator signs in through Intuit and chooses the company PaneFlow may access.</p></div><span className={`integration-state ${companyReady ? "ready" : platformReady ? "available" : "attention"}`}>{companyReady ? "Connected" : platformReady ? "Ready to connect" : "Setup required"}</span></div>
+        <ol className="integration-step-list">
+          <ConnectionStep number={1} title="Configure the PaneFlow Intuit app" detail={platformReady ? "The client ID, protected client secret, encryption key, and production callback are ready." : "Create or open the PaneFlow app in Intuit Developer and store its client ID and client secret in the deployment."} status={platformReady ? "complete" : "action"} />
+          <ConnectionStep number={2} title="Authorize a QuickBooks company" detail={companyReady ? `${String(selectedConnection?.companyName)} is authorized for ${String(selectedConnection?.environment)} access.` : platformReady ? "Choose sandbox or production below, then sign in with a QuickBooks company administrator." : "Company login unlocks after the platform settings are complete."} status={companyReady ? "complete" : platformReady ? "action" : "next"} />
+          <ConnectionStep number={3} title="Map and verify accounting" detail={mappingsReady ? `${data?.accountMappings.length ?? 0} account roles and ${data?.referenceMappings.length ?? 0} tax, term, or payment-method values are mapped.` : companyReady ? "Load the QBO lists, map the chart of accounts and tax values, then run a sandbox sync." : "Mapping becomes available after company authorization."} status={mappingsReady ? "complete" : companyReady ? "action" : "next"} />
+        </ol>
+        <div className="integration-setup-footer">
+          <div><strong>{companyReady ? "Company connected" : platformReady ? "Ready for company login" : "Platform settings still needed"}</strong><p>{data?.configuration.message ?? "Add the QuickBooks deployment settings before connecting."}</p><small>PaneFlow supports one active QBO company at a time. Use QBO Plus or Advanced when purchase orders must be pushed.</small></div>
+          <div className="integration-actions"><a className="workflow-action" href="https://developer.intuit.com/dashboard" target="_blank" rel="noreferrer">Open Intuit Developer</a>{qboMissing.length ? <button className="workflow-action" type="button" onClick={() => copy(qboSetupRequest, "Setup request")}>Copy setup request</button> : null}</div>
+        </div>
+        {callbackUrl ? <CopyableSetting label="OAuth callback to register in Intuit" value={callbackUrl} onCopy={copy} /> : null}
+      </div>
+      {!selectedConnection && platformReady ? <div className="qbo-connect-grid"><label><span>Intuit environment</span><select value={environment} onChange={(event) => setEnvironment(event.target.value as "sandbox" | "production")}><option value="sandbox">Sandbox (recommended for setup)</option><option value="production">Production company</option></select></label><label><span>Backfill accounting activity from</span><input type="date" value={syncFrom} onChange={(event) => setSyncFrom(event.target.value)} /></label><button type="button" className="workflow-action primary" disabled={!canAdminister || busy === "connect"} onClick={() => void connect()}>{busy === "connect" ? "Opening Intuit…" : "Sign in & choose company"}</button><p>Start with a sandbox company. After mappings and test documents reconcile cleanly, disconnect it and authorize the production company.</p></div>
+      : !selectedConnection ? <div className="integration-connection-locked"><InfoIcon /><div><strong>Company login is locked until the Intuit app settings are ready.</strong><p>No QuickBooks password is stored in PaneFlow. The company administrator signs in on Intuit&apos;s authorization page.</p></div></div>
       : <div className="qbo-connection-summary"><div><span>Company</span><strong>{String(selectedConnection.companyName)}</strong><small>{String(selectedConnection.environment)} · realm {String(selectedConnection.realmId)} · {String(selectedConnection.homeCurrency)}</small></div><div><span>Status</span><strong>{String(selectedConnection.status)}</strong><small>Initial sync: {String(selectedConnection.initialSyncStatus)}</small></div><div><span>Delivery</span><strong>{Number(counts.succeeded ?? 0)} succeeded</strong><small>{Number(counts.pending ?? 0)} pending · {Number(counts.failed ?? 0)} retrying · {Number(counts.conflict ?? 0)} conflicts</small></div><div className="qbo-actions">{connected ? <><button className="workflow-action primary" disabled={Boolean(busy)} onClick={() => void post("sync", { limit: 100 })}>{busy === "sync" ? "Syncing…" : "Sync now"}</button><button className="workflow-action" disabled={Boolean(busy)} onClick={() => void post("reconcile", { limit: 100 })}>{busy === "reconcile" ? "Checking…" : "Reconcile"}</button><button className="workflow-action" disabled={Boolean(busy)} onClick={() => void load(true, connectionId)}>Refresh QBO lists</button><button className="workflow-action quiet" disabled={Boolean(busy)} onClick={() => { if (window.confirm("Disconnect PaneFlow from this QuickBooks company and revoke its refresh token?")) void post("disconnect"); }}>Disconnect</button></> : <button className="workflow-action primary" disabled={!canAdminister || !data?.configuration.configured || Boolean(busy)} onClick={() => void connect()}>{busy === "connect" ? "Opening Intuit…" : "Reconnect QuickBooks"}</button>}</div></div>}
+      {qboMissing.length ? <div className="integration-missing-list" aria-label="Missing QuickBooks settings">{qboMissing.map((key) => <span key={key}>{key}</span>)}</div> : null}
       {message ? <p className="workflow-banner" role="status">{message}</p> : null}
     </Section>
     {selectedConnection ? <>
@@ -537,7 +600,7 @@ function IntegrationOutbox({ state, refresh }: { state: WorkflowState; refresh: 
     catch (caught) { setMessage(caught instanceof Error ? caught.message : "Outbox delivery failed."); }
     finally { setBusy(false); }
   };
-  return <div className="workflow-stack"><HelcimIntegration canAdminister={state.permissions.canAdminister === true} /><QuickBooksIntegration canAdminister={state.permissions.canAdminister === true} /><section className="workflow-banner"><strong>Other transactional integrations</strong><span>Every posting is also committed with a generic outbox event. Configured webhooks are delivered with signatures, retries, and durable failure state.</span><button type="button" disabled={busy || state.permissions.canAdminister !== true} onClick={() => void retry()}>{busy ? "Delivering…" : "Retry webhook deliveries"}</button></section>{message ? <p className="workflow-banner" role="status">{message}</p> : null}<Section title="Generic outbox events"><RecordTable records={state.outbox} columns={["number", "party", "reference", "status", "detail"]} /></Section></div>;
+  return <div className="workflow-stack"><CompanyConnectionsIntro /><QuickBooksIntegration canAdminister={state.permissions.canAdminister === true} /><HelcimIntegration canAdminister={state.permissions.canAdminister === true} /><section className="workflow-banner"><strong>Other transactional integrations</strong><span>Every posting is also committed with a generic outbox event. Configured webhooks are delivered with signatures, retries, and durable failure state.</span><button type="button" disabled={busy || state.permissions.canAdminister !== true} onClick={() => void retry()}>{busy ? "Delivering…" : "Retry webhook deliveries"}</button></section>{message ? <p className="workflow-banner" role="status">{message}</p> : null}<Section title="Generic outbox events"><RecordTable records={state.outbox} columns={["number", "party", "reference", "status", "detail"]} /></Section></div>;
 }
 
 function LocationReconciliationPanel({ state, refresh }: { state: WorkflowState; refresh: () => Promise<void> }) {

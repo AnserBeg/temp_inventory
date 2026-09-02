@@ -44,6 +44,10 @@ test("exposes the required operational language and impact previews", async () =
     "No change",
     "Warehouse mode",
     "Three-way match exception",
+    "Company connections",
+    "Sign in & choose company",
+    "Helcim merchant connection",
+    "Copy setup request",
   ]) {
     assert.match(source, new RegExp(required, "i"), `missing UI contract: ${required}`);
   }
