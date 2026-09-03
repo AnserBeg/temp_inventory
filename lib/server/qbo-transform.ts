@@ -129,7 +129,11 @@ function taxCodeFor(context: QboMappingContext, localValue: unknown, taxable?: u
 }
 
 function isCreditCardMethod(value: unknown) {
-  return /\b(credit|visa|mastercard|master card|amex|american express)\b/iu.test(text(value));
+  return /\b(credit|card|visa|mastercard|master card|amex|american express)\b/iu.test(text(value).replaceAll("_", " "));
+}
+
+function customerDepositAccount(method: unknown) {
+  return text(method).toLowerCase().startsWith("helcim_") ? "helcim_clearing" : "cash";
 }
 
 function customerPaymentType(value: unknown) {
@@ -452,7 +456,7 @@ async function paymentBody(delivery: QboDelivery, context: QboMappingContext) {
     TxnDate: dateOnly(payment.paymentDate), CustomerRef: requiredLink(context, "business_partner_customer", payment.partnerId, "Customer"), TotalAmt: amount,
     PaymentRefNum: limited(payment.reference || payment.number, 21), PaymentMethodRef: requiredReference(context, "payment_method", payment.method),
     PaymentType: customerPaymentType(payment.method),
-    DepositToAccountRef: requiredAccount(context, "cash"), Line: [{ Amount: amount, LinkedTxn: [{ TxnId: requiredLink(context, "customer_invoice", payment.documentId, "Invoice").value, TxnType: "Invoice" }] }],
+    DepositToAccountRef: requiredAccount(context, customerDepositAccount(payment.method)), Line: [{ Amount: amount, LinkedTxn: [{ TxnId: requiredLink(context, "customer_invoice", payment.documentId, "Invoice").value, TxnType: "Invoice" }] }],
     PrivateNote: sourceMemo("payment", text(payment.id)), ...currencyFields(payment.currency, payment.exchangeRate),
   }, null);
   if (documentType === "vendor_bill") return mapped("BillPayment", {

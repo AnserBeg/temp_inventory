@@ -35,10 +35,13 @@ type PurchaseLine = {
   ordered: number;
   received: number;
   returned: number;
+  fulfilled: number;
   /** Quantity from this line that remains reversible on the most recently posted receipt. */
   latestReceiptReversible: number;
   closed: number;
   open: number;
+  openToReceive: number;
+  openToDeliver: number;
   unitCost: number;
   orderedUomId?: string;
   orderedUomCode?: string;
@@ -75,6 +78,7 @@ type SalesLine = {
   reserved: number;
   shipped: number;
   returned: number;
+  fulfilled: number;
   open: number;
   unitPrice: number;
   orderedUomId?: string;
@@ -84,6 +88,9 @@ type SalesLine = {
   trackingPolicy: string;
   reservationLocationId?: string;
   linkedPurchaseOrderLineId?: string;
+  linkedPurchaseOrderId?: string;
+  linkedPurchaseOrderNumber?: string;
+  linkedPurchaseOrderLifecycle?: string;
   projectReference?: string;
   discountCents: number;
   taxable: boolean;
@@ -106,8 +113,11 @@ type PurchaseOrder = {
   ordered: number;
   received: number;
   returned: number;
+  fulfilled: number;
   closed: number;
   open: number;
+  openToReceive: number;
+  openToDeliver: number;
   billed: number;
   total: number;
   currency: string;
@@ -115,6 +125,8 @@ type PurchaseOrder = {
   paymentTerms?: string;
   dueDate?: string;
   projectReference?: string;
+  supplierQuoteNumber?: string;
+  supplierReference?: string;
   freightCents: number;
   freightTaxRateBps: number;
   feeCents: number;
@@ -233,8 +245,11 @@ type SalesOrder = {
   reserved: number;
   shipped: number;
   returned: number;
+  fulfilled: number;
   invoiced?: number;
   open: number;
+  openToShip: number;
+  openToDeliver: number;
   availableNow: number;
   incomingBeforeDate: number;
   shortage: number;
@@ -299,6 +314,7 @@ type Bill = {
   number: string;
   vendor: string;
   po: string;
+  purchaseOrderId?: string;
   receivedValue: number;
   billedValue: number;
   variance: number;
@@ -387,6 +403,8 @@ type Snapshot = {
     name: string;
     email: string;
     role: string;
+    tenant: { id: string; slug: string; name: string };
+    tenants: Array<{ id: string; slug: string; name: string; role: string; isDefault: boolean }>;
     permissions: { canRead: boolean; canExport: boolean; canOperate: boolean; canPostFinancial: boolean; canApprove: boolean; canAdminister: boolean };
   };
   pagination: {
@@ -410,7 +428,7 @@ const emptySnapshot: Snapshot = {
   partners: [],
   locations: [],
   configuration: { taxDefaultRateBps: 500 },
-  viewer: { name: "", email: "", role: "", permissions: { canRead: false, canExport: false, canOperate: false, canPostFinancial: false, canApprove: false, canAdminister: false } },
+  viewer: { name: "", email: "", role: "", tenant: { id: "", slug: "", name: "" }, tenants: [], permissions: { canRead: false, canExport: false, canOperate: false, canPostFinancial: false, canApprove: false, canAdminister: false } },
   pagination: { page: 1, pageSize: 50, totals: {}, filteredTotal: null },
 };
 
@@ -740,6 +758,37 @@ const viewTitles: Record<ViewKey, { title: string; description?: string }> = {
   warehouse: { title: "Warehouse mode" },
 };
 
+type WorkflowGuideStep = { label: string; detail: string; view: ViewKey; tab?: string };
+
+const purchasingWorkflow: WorkflowGuideStep[] = [
+  { label: "Commit order", detail: "Draft and approve", view: "purchase-orders" },
+  { label: "Receive stock", detail: "Post warehouse receipt", view: "expected-receipts" },
+  { label: "Match vendor bill", detail: "Order + fulfillment + invoice", view: "vendor-bills" },
+  { label: "Settle payable", detail: "Credit or record payment", view: "vendor-bills", tab: "billing-actions" },
+];
+
+const salesWorkflow: WorkflowGuideStep[] = [
+  { label: "Commit order", detail: "Confirm customer demand", view: "sales-orders" },
+  { label: "Allocate supply", detail: "Reserve or link supplier supply", view: "sales-orders", tab: "reservations" },
+  { label: "Post fulfillment", detail: "Shipment or supplier delivery", view: "fulfillment" },
+  { label: "Create invoice", detail: "Only fulfilled quantity", view: "customer-invoices" },
+  { label: "Collect or credit", detail: "Close the receivable", view: "customer-invoices", tab: "billing-actions" },
+];
+
+const vendorReturnWorkflow: WorkflowGuideStep[] = [
+  { label: "Select receipt", detail: "Choose eligible net received quantity", view: "vendor-returns" },
+  { label: "Post return", detail: "Goods out or price allowance", view: "vendor-returns" },
+  { label: "Track replacement", detail: "Keep incoming supply explicit", view: "expected-receipts" },
+  { label: "Reconcile credit", detail: "Post credit against the payable", view: "vendor-bills", tab: "billing-actions" },
+];
+
+const customerReturnWorkflow: WorkflowGuideStep[] = [
+  { label: "Select shipment", detail: "Choose eligible net shipped quantity", view: "customer-returns" },
+  { label: "Receive and inspect", detail: "Available, quarantine, or damaged", view: "customer-returns" },
+  { label: "Issue credit", detail: "Financial action stays separate", view: "customer-invoices", tab: "billing-actions" },
+  { label: "Close balance", detail: "Record refund or remaining payment", view: "customer-invoices", tab: "billing-actions" },
+];
+
 // Reason lists are suggestions, not an enumeration: every one of these pickers accepts a typed
 // value, because a branch meets reasons no shipped list anticipated and an operator who cannot
 // record the real one records a wrong one.
@@ -1032,6 +1081,51 @@ export function InventoryApp() {
     if (tab === "overview") url.searchParams.delete("tab");
     else url.searchParams.set("tab", tab);
     window.history.replaceState({}, "", url);
+  };
+  const switchTenant = async (tenantId: string) => {
+    if (!tenantId || tenantId === snapshot.viewer.tenant.id) return;
+    setSource("loading");
+    try {
+      const response = await fetch("/api/tenants/switch", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tenantId }) });
+      const result = await response.json() as Record<string, unknown>;
+      if (!response.ok) throw new Error(text(asRecord(result.error).message, "Organization could not be switched."));
+      window.localStorage.removeItem("paneflow.warehouse");
+      window.location.reload();
+    } catch (error) {
+      setSource("unavailable");
+      setSourceError(error instanceof Error ? error.message : "Organization could not be switched.");
+    }
+  };
+  const createTenant = async () => {
+    const name = window.prompt("Organization name");
+    if (!name?.trim()) return;
+    setSource("loading");
+    try {
+      const response = await fetch("/api/tenants", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: name.trim() }) });
+      const result = await response.json() as Record<string, unknown>;
+      if (!response.ok) throw new Error(text(asRecord(result.error).message, "Organization could not be created."));
+      window.localStorage.removeItem("paneflow.warehouse");
+      window.location.reload();
+    } catch (error) {
+      setSource("unavailable");
+      setSourceError(error instanceof Error ? error.message : "Organization could not be created.");
+    }
+  };
+  const addTenantMember = async () => {
+    const email = window.prompt("Registered member email");
+    if (!email?.trim()) return;
+    const role = window.prompt("Role: viewer, operator, accounting, manager, or administrator", "viewer");
+    if (!role?.trim()) return;
+    try {
+      const response = await fetch("/api/tenants/members", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: email.trim(), role: role.trim().toLowerCase() }) });
+      const result = await response.json() as Record<string, unknown>;
+      if (!response.ok) throw new Error(text(asRecord(result.error).message, "Member could not be added."));
+      setToast(text(result.message, "Organization member added."));
+      await loadSnapshot();
+      setWorkflowRefreshToken((current) => current + 1);
+    } catch (error) {
+      setSourceError(error instanceof Error ? error.message : "Member could not be added.");
+    }
   };
 
   const selectedPo = snapshot.purchaseOrders.find((po) => po.id === selectedPoId) ?? null;
@@ -1340,8 +1434,9 @@ export function InventoryApp() {
       <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`} aria-label="Primary navigation">
         <div className="brand">
           <span className="brand-mark" aria-hidden="true"><span /></span>
-          <div><strong>PaneFlow</strong><small>Max Green</small></div>
+          <div><strong>PaneFlow</strong><small>{snapshot.viewer.tenant.name || "Loading organization…"}</small></div>
         </div>
+        {snapshot.viewer.tenants.length ? <div className="tenant-switcher"><span>Organization</span><div className="tenant-switcher-row"><select aria-label="Current organization" value={snapshot.viewer.tenant.id} disabled={snapshot.viewer.tenants.length < 2} onChange={(event) => void switchTenant(event.target.value)}>{snapshot.viewer.tenants.map((tenant) => <option key={tenant.id} value={tenant.id}>{tenant.name}</option>)}</select><button type="button" onClick={() => void createTenant()} aria-label="Create organization" title="Create organization">+</button>{snapshot.viewer.permissions.canAdminister ? <button type="button" onClick={() => void addTenantMember()} aria-label="Add organization member" title="Add organization member">+👤</button> : null}</div></div> : null}
         <nav className="nav-groups">
           {navGroups.map((group, index) => (
             <div className="nav-group" key={group.label ?? index}>
@@ -1406,6 +1501,7 @@ export function InventoryApp() {
             </div>
             <PageActions view={view} source={source} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} onNavigate={navigate} onCreate={setCreateOrder} onCreatePartner={() => setEditingPartner("new")} onCreateProduct={() => setCreatingProduct(true)} />
           </div>
+          <WorkflowGuide view={view} workspaceTab={workspaceTab} onNavigate={navigate} />
           {source === "unavailable" ? <div className="connection-error" role="alert"><div><strong>Couldn&apos;t refresh operations data.</strong><p>{sourceError || "The last successfully loaded records remain on screen; no sample data was substituted."}</p></div><button className="button secondary" onClick={() => void loadSnapshot()}>Retry</button></div> : null}
           {warehouseLookupError ? <div className="connection-error" role="alert"><div><strong>Warehouse scope unavailable.</strong><p>{warehouseLookupError} Company-wide records remain visible.</p></div><button className="button secondary" onClick={() => setWarehouseLookupRefresh((current) => current + 1)}>Retry</button></div> : null}
           {/* A view has a worklist only if it has a noun for one. Reports paginates a projected
@@ -1419,7 +1515,7 @@ export function InventoryApp() {
               {view === "purchase-orders" && (
                 <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { changeWorkspaceTab("overview"); setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }}>
                 {selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1427,9 +1523,9 @@ export function InventoryApp() {
               )}
               {view === "expected-receipts" && (
                 selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
-                  <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
+                  <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} receivingOnly />
                 )
               )}
               {view === "vendor-returns" && <VendorReturnsView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onReturn={(po) => setActiveCommand({ kind: "vendor-return", entityId: po.id, entityNumber: po.number })} />}
@@ -1442,7 +1538,7 @@ export function InventoryApp() {
               {view === "sales-orders" && (
                 <OperationsWorkspace workspace="sales" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} onCreateOrder={() => setCreateOrder("salesOrder")}>
                 {selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={() => { navigate("customer-invoices"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1450,7 +1546,7 @@ export function InventoryApp() {
               )}
               {view === "fulfillment" && (
                 selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={() => { navigate("customer-invoices"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )
@@ -1474,8 +1570,8 @@ export function InventoryApp() {
                 if (purchase) setSelectedPoId(movement.relatedOrderId); else setSelectedSoId(movement.relatedOrderId);
               }} />}
               {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InventoryCountSessions warehouseId={warehouseId} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} canAdminister={snapshot.viewer.permissions.canAdminister} onDurableRefresh={loadSnapshot} /></OperationsWorkspace>}
-              {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} /></OperationsWorkspace>}
-              {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} /></OperationsWorkspace>}
+              {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenPurchaseOrder={(bill) => { if (!bill.purchaseOrderId) return; navigate("purchase-orders"); setWorklistQuery(bill.po); setAppliedWorklistQuery(bill.po); setSelectedPoId(bill.purchaseOrderId); }} /></OperationsWorkspace>}
+              {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenSalesOrder={(so) => { navigate("sales-orders"); setWorklistQuery(so.number); setAppliedWorklistQuery(so.number); setSelectedSoId(so.id); }} /></OperationsWorkspace>}
               {view === "partners" && <PartnersView partners={snapshot.partners} selectedId={selectedPartnerId} canApprove={snapshot.viewer.permissions.canApprove} canOperate={snapshot.viewer.permissions.canOperate} canAdminister={snapshot.viewer.permissions.canAdminister} onOpen={setSelectedPartnerId} onEdit={setEditingPartner} onChanged={(message) => { setToast(message); void loadSnapshot(); }} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
               {view === "reports" && <OperationsWorkspace workspace="controls" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><ReportsView snapshot={snapshot} warehouseId={warehouseId} /></OperationsWorkspace>}
               {view === "warehouse" && <WarehouseView snapshot={snapshot} source={source} canOperate={snapshot.viewer.permissions.canOperate} navigate={navigate} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} />}
@@ -1668,7 +1764,7 @@ function Dashboard({ snapshot, navigate, openPo }: { snapshot: Snapshot; navigat
         <MetricCard label="Ready to ship" value={snapshot.summary.readyToShip} detail={`${snapshot.summary.readyToShipUnits} reserved units ready`} tone="success" onClick={() => navigate("fulfillment")} />
         {/* Replaced a "Customer pickups" tile that counted a `pickup` fulfillment route the
             schema never defines, so it could only ever read zero. */}
-        <MetricCard label="Open customer demand" value={snapshot.summary.openDemand} detail="Confirmed units not yet shipped" tone="neutral" onClick={() => navigate("sales-orders")} />
+        <MetricCard label="Open warehouse demand" value={snapshot.summary.openDemand} detail="Confirmed stock and special-order units not yet shipped" tone="neutral" onClick={() => navigate("sales-orders")} />
         <MetricCard label="Inventory risks" value={snapshot.summary.inventoryRisks} detail="Below target, short, or on hold" tone="warning" onClick={() => navigate("stock")} />
       </section>
 
@@ -1793,14 +1889,14 @@ function purchaseOrderStage(po: PurchaseOrder) {
   const lifecycle = po.lifecycle.toLowerCase();
   const billing = po.billing.toLowerCase();
   if (lifecycle === "draft" || lifecycle.includes("pending") || lifecycle === "rejected" || lifecycle === "canceled") return po.lifecycle;
-  if (po.open > 0) return po.received - po.returned > 0 ? "Partially received" : "Open to receive";
+  if (po.open > 0) return po.fulfilled > 0 ? "Partially fulfilled" : "Awaiting fulfillment";
   if (billing.includes("partially")) return "Partially billed";
-  if (billing === "fully billed" || billing === "billed") return "Complete";
+  if (billing === "fully billed" || billing === "billed") return "Fully billed";
   return "Awaiting vendor bill";
 }
 
 const worklistColumnLabels: Partial<Record<ViewKey, Record<string, string>>> = {
-  "purchase-orders": { exception: "Exception", number: "PO", vendor: "Vendor", status: "Status", expected: "Expected", ordered: "Ordered", received: "Net received", closed: "Closed", open: "Open", billing: "Billing", total: "Total" },
+  "purchase-orders": { exception: "Exception", number: "PO", vendor: "Vendor", status: "Status", expected: "Expected", ordered: "Ordered", received: "Supplier fulfilled", closed: "Closed", open: "Open fulfillment", billing: "Billing", total: "Total" },
   "expected-receipts": { exception: "Exception", number: "PO", vendor: "Vendor", status: "Status", expected: "Expected", ordered: "Ordered", received: "Net received", closed: "Closed", open: "Open", billing: "Billing", total: "Total" },
   "sales-orders": { exception: "Exception", number: "SO", customer: "Customer", requested: "Requested", availability: "Availability", fulfillment: "Fulfillment", billing: "Invoice", total: "Total" },
   fulfillment: { exception: "Exception", number: "SO", customer: "Customer", requested: "Requested", availability: "Availability", fulfillment: "Fulfillment", billing: "Invoice", total: "Total" },
@@ -1810,23 +1906,23 @@ const worklistColumnLabels: Partial<Record<ViewKey, Record<string, string>>> = {
   counts: { product: "Product", location: "Warehouse location", recorded: "Book quantity", reserved: "Reserved", available: "Available" },
   partners: { partner: "Partner", type: "Type", contact: "Contact", address: "Address", terms: "Terms", credit: "Credit control" },
   "vendor-bills": { number: "Bill", vendorInvoice: "Vendor invoice", vendor: "Vendor", purchaseOrder: "Purchase order", invoiced: "Invoiced", due: "Due", authorized: "Authorized line value", billed: "Billed line value", variance: "Line variance", tax: "Tax", total: "Bill total", outstanding: "Outstanding", match: "Match", settlement: "Settlement" },
-  "customer-invoices": { number: "Sales order", customer: "Customer", ordered: "Ordered", shipped: "Posted shipment", invoiced: "Already invoiced", availableToInvoice: "Available to invoice", billing: "State" },
+  "customer-invoices": { number: "Sales order", customer: "Customer", ordered: "Ordered", shipped: "Posted fulfillment", invoiced: "Already invoiced", availableToInvoice: "Available to invoice", billing: "State" },
 };
 
 function ServerWorklistControls({ view, query, setQuery, status, setStatus, sort, setSort, total }: { view: ViewKey; query: string; setQuery: (value: string) => void; status: string; setStatus: (value: string) => void; sort: string; setSort: (value: string) => void; total: number }) {
   const statusOptions: Partial<Record<ViewKey, Array<[string, string]>>> = {
     // "Open to …" and "Late" are worklist states resolved server-side, so filtering to real
     // work no longer means paging through settled documents looking for it.
-    "purchase-orders": [["", "All states"], ["open", "Open to receive"], ["late", "Late"], ["closed", "Closed"], ["fully_received", "Fully received"], ["closed_short", "Closed short"], ["draft", "Draft"], ["pending_approval", "Pending approval"], ["approved", "Approved"]],
+    "purchase-orders": [["", "All states"], ["open", "Open fulfillment"], ["late", "Late"], ["closed", "Fulfillment closed"], ["fully_received", "Fully fulfilled"], ["closed_short", "Closed short"], ["draft", "Draft"], ["pending_approval", "Pending approval"], ["approved", "Approved"]],
     "expected-receipts": [["", "All states"], ["open", "Open to receive"], ["late", "Late"], ["approved", "Approved"], ["pending_approval", "Pending approval"]],
     "vendor-returns": [["", "All states"], ["returnable", "Has received quantity"], ["approved", "Approved"]],
-    "sales-orders": [["", "All states"], ["open", "Open to ship"], ["blocked", "Blocked by supply"], ["reserved", "Reserved"], ["draft", "Draft"], ["confirmed", "Confirmed"], ["canceled", "Canceled"]],
-    fulfillment: [["", "All states"], ["reserved", "Reserved"], ["open", "Open to ship"], ["confirmed", "Confirmed"]],
-    "customer-returns": [["", "All states"], ["shipped", "Has shipped quantity"], ["confirmed", "Confirmed"]],
+    "sales-orders": [["", "All states"], ["open", "Open fulfillment"], ["blocked", "Blocked by supply"], ["reserved", "Reserved"], ["draft", "Draft"], ["confirmed", "Confirmed"], ["canceled", "Canceled"]],
+    fulfillment: [["", "All states"], ["reserved", "Reserved"], ["open", "Open fulfillment"], ["confirmed", "Confirmed"]],
+    "customer-returns": [["", "All states"], ["shipped", "Has shipped quantity"], ["confirmed", "Confirmed"], ["canceled", "Canceled with shipment history"]],
     stock: [["", "All policies"], ["stocked", "Stocked"], ["special_order", "Special order"], ["drop_ship", "Drop ship"], ["serial", "Serial tracked"], ["lot", "Lot tracked"]],
     products: [["", "All policies"], ["stocked", "Stocked"], ["special_order", "Special order"], ["drop_ship", "Drop ship"], ["serial", "Serial tracked"], ["lot", "Lot tracked"]],
     movements: [["", "All movement types"], ["purchase_receipt", "Purchase receipt"], ["sales_shipment", "Sales shipment"], ["internal_transfer", "Internal transfer"], ["customer_return", "Customer return"], ["vendor_return", "Vendor return"]],
-    "vendor-bills": [["", "All states"], ["posted", "Posted"], ["on_hold", "On hold"], ["matched", "Matched"], ["exception", "Match exception"]],
+    "vendor-bills": [["", "All bills"], ["outstanding", "Outstanding"], ["settled", "Settled"], ["on_hold", "On hold"], ["matched", "Matched"], ["exception", "Match exception"]],
     partners: [["", "All partner types"], ["customer", "Customers"], ["vendor", "Vendors"]],
   };
   const catalogView = view === "products" || view === "stock";
@@ -1843,10 +1939,50 @@ function ServerWorklistControls({ view, query, setQuery, status, setStatus, sort
     <span className="read-only-label">{total} matching record{total === 1 ? "" : "s"}</span></div>;
 }
 
-function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSort }: { orders: PurchaseOrder[]; canOperate: boolean; onOpen: (id: string) => void; onReceive: (po: PurchaseOrder) => void } & WorklistSortProps) {
+/**
+ * A worklist explains the task in front of the user; this map explains what comes next.
+ * The highlighted step is page context, not a claim that an individual document has completed
+ * every earlier step. Record details continue to show the authoritative three-part status.
+ */
+function WorkflowGuide({ view, workspaceTab, onNavigate }: { view: ViewKey; workspaceTab: string; onNavigate: (view: ViewKey, status?: string, tab?: string) => void }) {
+  let title = "";
+  let steps: WorkflowGuideStep[] = [];
+  let active = 0;
+
+  if (["purchase-orders", "expected-receipts", "vendor-bills"].includes(view)) {
+    title = "Purchase to payment";
+    steps = purchasingWorkflow;
+    active = view === "purchase-orders" ? 0 : view === "expected-receipts" ? 1 : workspaceTab === "billing-actions" ? 3 : 2;
+  } else if (["sales-orders", "fulfillment", "customer-invoices"].includes(view)) {
+    title = "Order to cash";
+    steps = salesWorkflow;
+    active = view === "sales-orders" ? (workspaceTab === "reservations" ? 1 : workspaceTab === "drop-ship" || workspaceTab === "shipment-corrections" ? 2 : 0) : view === "fulfillment" ? 2 : workspaceTab === "billing-actions" ? 4 : 3;
+  } else if (view === "vendor-returns") {
+    title = "Vendor return";
+    steps = vendorReturnWorkflow;
+    active = 1;
+  } else if (view === "customer-returns") {
+    title = "Customer return";
+    steps = customerReturnWorkflow;
+    active = 1;
+  }
+
+  if (!steps.length) return null;
+  return <nav className="process-guide" aria-label={`${title} workflow`}>
+    <div className="process-guide-title"><span>Workflow map</span><strong>{title}</strong></div>
+    <ol>{steps.map((step, index) => <li key={`${step.view}-${step.tab ?? "overview"}-${index}`} className={index === active ? "current" : ""}>
+      <button type="button" aria-current={index === active ? "step" : undefined} onClick={() => onNavigate(step.view, undefined, step.tab)}>
+        <span className="process-guide-number" aria-hidden="true">{index + 1}</span>
+        <span><strong>{step.label}</strong><small>{step.detail}</small></span>
+      </button>
+    </li>)}</ol>
+  </nav>;
+}
+
+function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSort, receivingOnly = false }: { orders: PurchaseOrder[]; canOperate: boolean; onOpen: (id: string) => void; onReceive: (po: PurchaseOrder) => void; receivingOnly?: boolean } & WorklistSortProps) {
   // Scoped server-side by the worklist status filter; see SalesOrdersView.
   return <section className="panel worklist">
-    <div className="responsive-table"><table><caption className="sr-only">Purchase orders</caption><thead><tr><SortableHeader label="Exception" column="exception" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="PO" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Vendor" column="vendor" sort={sort} setSort={setSort} /><SortableHeader label="Status" column="status" sort={sort} setSort={setSort} /><SortableHeader label="Expected" column="expected" sort={sort} setSort={setSort} /><SortableHeader label="Ordered" column="ordered" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Net received" column="received" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Closed" column="closed" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Billing" column="billing" sort={sort} setSort={setSort} /><SortableHeader label="Total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{orders.map((po) => <tr key={po.id}>
+    <div className="responsive-table"><table><caption className="sr-only">Purchase orders</caption><thead><tr><SortableHeader label="Exception" column="exception" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="PO" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Vendor" column="vendor" sort={sort} setSort={setSort} /><SortableHeader label="Status" column="status" sort={sort} setSort={setSort} /><SortableHeader label="Expected" column="expected" sort={sort} setSort={setSort} /><SortableHeader label="Ordered" column="ordered" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label={receivingOnly ? "Net received" : "Supplier fulfilled"} column="received" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Closed" column="closed" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label={receivingOnly ? "Open to receive" : "Open fulfillment"} column="open" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Billing" column="billing" sort={sort} setSort={setSort} /><SortableHeader label="Total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{orders.map((po) => <tr key={po.id}>
       <td>{po.exception ? <span className={`exception-cell ${po.daysLate > 0 ? "danger" : "warning"}`} title={po.exception}>!</span> : <span className="muted">—</span>}</td>
       <td><button className="table-link" onClick={() => onOpen(po.id)}>{po.number}</button><small>Rev {po.revision}</small></td>
       <td><strong>{po.vendor}</strong>{po.customerRef && <small>{po.customerRef}</small>}</td>
@@ -1854,17 +1990,17 @@ function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSo
       {/* A late order still has to say which date it missed; "6 days late" alone cannot be
           matched against the vendor's confirmation. */}
       <td>{po.daysLate > 0 ? <><StatusBadge tone="danger">{po.daysLate} days late</StatusBadge><small>{expectedDateLabel(po.expectedDate)}</small></> : expectedDateLabel(po.expectedDate)}</td>
-      <td className="numeric">{po.ordered}</td><td className="numeric">{po.received - po.returned}</td><td className="numeric">{po.closed}</td><td className="numeric strong">{po.open}</td>
+      <td className="numeric">{po.ordered}</td><td className="numeric">{receivingOnly ? po.received - po.returned : po.fulfilled}</td><td className="numeric">{po.closed}</td><td className="numeric strong">{receivingOnly ? po.openToReceive : po.open}</td>
       <td><StatusBadge>{po.billing}</StatusBadge></td>
       <td className="numeric strong">{formatDocumentMoney(po.total, po.currency, false)}</td>
       {/* "Open" named both the remaining-quantity column and this button. The action says what
           it does to a document; the column keeps the ERP term for quantity. */}
-      <td>{canOperate && po.lifecycle.toLowerCase() === "approved" && po.open > 0 ? <button className="row-action" onClick={() => onReceive(po)}>Receive</button> : <button className="row-action" onClick={() => onOpen(po.id)}>View</button>}</td>
+      <td>{canOperate && po.lifecycle.toLowerCase() === "approved" && po.openToReceive > 0 ? <button className="row-action" onClick={() => onReceive(po)}>Receive</button> : <button className="row-action" onClick={() => onOpen(po.id)}>View</button>}</td>
     </tr>)}{!orders.length ? <tr><td colSpan={12}><div className="empty-inline">No purchase order matches this filter.</div></td></tr> : null}</tbody></table></div>
   </section>;
 }
 
-function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpenVendorBilling, onSubmitForApproval, onChanged }: { po: PurchaseOrder; canOperate: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void }) {
+function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpenVendorBilling, onOpenDropShip, onSubmitForApproval, onChanged }: { po: PurchaseOrder; canOperate: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: () => void; onOpenDropShip: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   const [submitNote, setSubmitNote] = useState("");
@@ -1873,7 +2009,13 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
   const isDraft = ["draft", "rejected"].includes(po.lifecycle.toLowerCase());
   const overallStage = purchaseOrderStage(po);
   const billingIsNext = overallStage === "Awaiting vendor bill" || overallStage === "Partially billed";
-  const fullyReceived = po.received - po.returned >= po.ordered && po.closed === 0;
+  const fullyFulfilled = po.fulfilled >= po.ordered && po.closed === 0;
+  const hasStockLines = po.lines.some((line) => line.fulfillmentRoute === "stock");
+  const hasDropShipLines = po.lines.some((line) => line.fulfillmentRoute === "drop_ship");
+  const hasWarehouseLines = po.lines.some((line) => line.fulfillmentRoute !== "drop_ship");
+  const destinationSummary = hasDropShipLines && !hasWarehouseLines
+    ? "supplier delivers directly to the customer"
+    : hasDropShipLines ? "warehouse receipt or supplier delivery, by line" : "warehouse destination selected per receipt";
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setActivating(true); setActivateError("");
@@ -1884,17 +2026,18 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
   const lineTable = useLocalTableSort(po.lines, { line: (row) => po.lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, customer: (row) => row.customerRef ?? "Stock", ordered: (row) => row.ordered, received: (row) => row.received - row.returned, returned: (row) => row.returned, closed: (row) => row.closed, open: (row) => row.open, unitCost: (row) => row.unitCost, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitCost, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitCost, row.discountCents) });
   return <div className="object-page">
     <button className="back-button" onClick={onBack}>← Back to purchase orders</button>
-    <section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Purchase order · Revision {po.revision}</span><h2>{po.number}</h2><p>{po.vendor} · destination selected per receipt</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(po.total, po.currency)}</strong><small>{po.currency}</small></div></div>
+    <section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Purchase order · Revision {po.revision}</span><h2>{po.number}</h2><p>{po.vendor} · {destinationSummary}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(po.total, po.currency)}</strong><small>{po.currency}</small></div></div>
       <div className="status-summary"><div><small>Commercial</small><StatusBadge>{po.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{po.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{po.billing}</StatusBadge></div></div>
-      {billingIsNext ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>{overallStage === "Partially billed" ? "Finish entering the vendor bill" : fullyReceived ? "Receipt complete · vendor bill pending" : "Receiving closed · vendor bill pending"}</strong><p>Record the supplier&apos;s invoice against this PO and its posted receipt. This creates the payable without moving inventory again.</p></div><button className="button primary" type="button" onClick={onOpenVendorBilling}>Open vendor billing</button></div> : null}
+      {billingIsNext ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>{overallStage === "Partially billed" ? "Finish entering the vendor bill" : fullyFulfilled ? "Supplier fulfillment complete · vendor bill pending" : "Remaining quantity closed · vendor bill pending"}</strong><p>Record the supplier&apos;s invoice against this PO and its posted fulfillment. This creates the payable without moving inventory again.</p></div><button className="button primary" type="button" onClick={onOpenVendorBilling}>Open vendor billing</button></div> : null}
       {po.exception && <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Action needed</strong><p>{po.exception}</p></div></div>}
       {activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}
-      {isDraft && canOperate ? <form className="draft-activation" onSubmit={submit} noValidate><label><span>Submission note{requiredMark}</span><input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required aria-required="true" /><small className="field-hint">{submitNote.trim() ? "" : "Required before the order can be submitted."}</small></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : po.lifecycle.toLowerCase() === "rejected" ? "Resubmit for approval" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button><button className="button secondary" type="button" onClick={() => setMergeOpen(true)}>Merge another draft</button></form> : null}
+      {isDraft && canOperate ? <form className="draft-activation" onSubmit={submit} noValidate><label><span>Submission note{requiredMark}</span><input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required aria-required="true" /><small className="field-hint">{submitNote.trim() ? "" : "Required before the order can be submitted."}</small></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : po.lifecycle.toLowerCase() === "rejected" ? "Resubmit for approval" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button>{po.lifecycle.toLowerCase() === "draft" ? <button className="button secondary" type="button" onClick={() => setMergeOpen(true)}>Merge another draft</button> : null}</form> : null}
       {canOperate ? <div className="object-actions">
         {po.lifecycle.toLowerCase() === "approved" && <EmailDocumentButton documentType="purchase_order" documentId={po.id} documentNumber={po.number}>Email purchase order</EmailDocumentButton>}
-        {po.lifecycle.toLowerCase() === "approved" && po.open > 0 && <button className="button primary" onClick={() => onCommand("receive")}>Receive remaining</button>}
-        {po.lifecycle.toLowerCase() === "approved" && po.closed > 0 && <button className="button primary" onClick={() => onCommand("reopen")}>Reopen quantity to receive</button>}
-        {po.lifecycle.toLowerCase() === "approved" && po.open > 0 && <button className="button secondary" onClick={() => onCommand("close")}>Close unreceived quantity</button>}
+        {po.lifecycle.toLowerCase() === "approved" && po.openToReceive > 0 && <button className="button primary" onClick={() => onCommand("receive")}>Receive remaining</button>}
+        {po.lifecycle.toLowerCase() === "approved" && po.openToDeliver > 0 && <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button>}
+        {po.lifecycle.toLowerCase() === "approved" && hasStockLines && po.lines.some((line) => line.fulfillmentRoute === "stock" && line.closed > 0) && <button className="button primary" onClick={() => onCommand("reopen")}>Reopen stock-receipt quantity</button>}
+        {po.lifecycle.toLowerCase() === "approved" && po.open > 0 && <button className="button secondary" onClick={() => onCommand("close")}>Close unfulfilled quantity</button>}
         {po.latestReceiptId && po.lines.some((line) => line.latestReceiptReversible > 0) && <button className="button secondary" onClick={() => onCommand("reverse")}>Reverse incorrect receipt</button>}
         {po.received - po.returned > 0 && <button className="button ghost" onClick={() => onCommand("vendor-return")}>Return to vendor</button>}
       </div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}
@@ -1903,12 +2046,12 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
       <MetricDisplay label="Ordered" value={po.ordered} />
       {/* Same quantity the line table calls "Net received"; two names for one number sent
           people looking for the difference between them. */}
-      <MetricDisplay label="Net received" value={po.received - po.returned} />
+      <MetricDisplay label="Supplier fulfilled" value={po.fulfilled} />
       <MetricDisplay label="Closed without receipt" value={po.closed} tone={po.closed > 0 ? "warning" : "neutral"} />
-      <MetricDisplay label="Open to receive" value={po.open} tone={po.open > 0 ? "info" : "neutral"} />
+      <MetricDisplay label="Open fulfillment" value={po.open} tone={po.open > 0 ? "info" : "neutral"} />
     </section>
     <section className="panel"><PanelHeading title="Order lines" detail={`${po.lines.length} line${po.lines.length === 1 ? "" : "s"} · amounts in ${po.currency}`} />
-      <div className="responsive-table"><table><caption className="sr-only">Purchase order lines, quantity breakdown, and extended amounts</caption><thead><tr><SortableHeader label="#" column="line" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" /><SortableHeader label="Product / configuration" column="product" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Customer / project" column="customer" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Ordered" column="ordered" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Net received" column="received" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Returned" column="returned" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Closed" column="closed" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Unit cost" column="unitCost" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Discount" column="discount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Amount" column="amount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{lineTable.rows.map((line) => <tr key={line.id}><td className="numeric muted">{po.lines.indexOf(line) + 1}</td><td><strong>{line.product}</strong><small>{line.sku} · {line.specification}</small></td><td>{line.customerRef ? <span className="allocation-tag">{line.customerRef}</span> : <span className="muted">Stock</span>}</td><td className="numeric">{line.ordered}{line.orderedUomCode ? <small>{line.orderedUomCode}</small> : null}</td><td className="numeric strong">{line.received - line.returned}</td><td className="numeric">{line.returned}</td><td className="numeric">{line.closed}</td><td className="numeric strong">{line.open}</td><td className="numeric">{formatDocumentMoney(line.unitCost, po.currency)}</td><td className="numeric">{line.discountCents ? `−${formatDocumentMoney(line.discountCents / 100, po.currency)}` : "—"}</td><td className="numeric">{line.taxable ? formatDocumentMoney(lineTaxAmount(line.ordered, line.unitCost, line.discountCents, line.taxable, line.taxRateBps), po.currency) : "Exempt"}</td><td className="numeric strong">{formatDocumentMoney(lineNetAmount(line.ordered, line.unitCost, line.discountCents), po.currency)}</td></tr>)}</tbody></table></div>
+      <div className="responsive-table"><table><caption className="sr-only">Purchase order lines, quantity breakdown, and extended amounts</caption><thead><tr><SortableHeader label="#" column="line" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" /><SortableHeader label="Product / configuration" column="product" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Customer / project" column="customer" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Ordered" column="ordered" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Supplier fulfilled" column="received" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Returned" column="returned" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Closed" column="closed" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Unit cost" column="unitCost" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Discount" column="discount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Amount" column="amount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{lineTable.rows.map((line) => <tr key={line.id}><td className="numeric muted">{po.lines.indexOf(line) + 1}</td><td><strong>{line.product}</strong><small>{line.sku} · {line.specification}</small></td><td>{line.customerRef ? <span className="allocation-tag">{line.customerRef}</span> : <span className="muted">Stock</span>}</td><td className="numeric">{line.ordered}{line.orderedUomCode ? <small>{line.orderedUomCode}</small> : null}</td><td className="numeric strong">{line.fulfilled}</td><td className="numeric">{line.returned}</td><td className="numeric">{line.closed}</td><td className="numeric strong">{line.open}</td><td className="numeric">{formatDocumentMoney(line.unitCost, po.currency)}</td><td className="numeric">{line.discountCents ? `−${formatDocumentMoney(line.discountCents / 100, po.currency)}` : "—"}</td><td className="numeric">{line.taxable ? formatDocumentMoney(lineTaxAmount(line.ordered, line.unitCost, line.discountCents, line.taxable, line.taxRateBps), po.currency) : "Exempt"}</td><td className="numeric strong">{formatDocumentMoney(lineNetAmount(line.ordered, line.unitCost, line.discountCents), po.currency)}</td></tr>)}</tbody></table></div>
     </section>
     <div className="detail-columns">
       <DocumentFacts title="Order details" facts={[
@@ -1918,6 +2061,8 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
         ["Payment due", formatDocumentDate(po.dueDate)],
         ["Currency", po.exchangeRateToBase === 1 ? po.currency : `${po.currency} · rate ${po.exchangeRateToBase} to CAD`],
         ["Buyer", po.buyer],
+        ["Supplier quote", po.supplierQuoteNumber ?? "Not imported"],
+        ["Supplier reference", po.supplierReference ?? "Not recorded"],
         ["Project reference", po.projectReference ?? "Stock replenishment"],
       ]} />
       <DocumentTotalsPanel totals={totals} currency={po.currency} />
@@ -1952,7 +2097,7 @@ function SalesOrdersView({ orders, canOperate, onOpen, onShip, sort, setSort }: 
   return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Sales orders</caption><thead><tr><SortableHeader label="Exception" column="exception" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="SO" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Customer / project" column="customer" sort={sort} setSort={setSort} /><SortableHeader label="Requested" column="requested" sort={sort} setSort={setSort} /><SortableHeader label="Availability" column="availability" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="Fulfillment" column="fulfillment" sort={sort} setSort={setSort} /><SortableHeader label="Invoice" column="billing" sort={sort} setSort={setSort} /><SortableHeader label="Total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{orders.map((so) => <tr key={so.id}><td>{so.exception ? <span className={`exception-cell ${so.shortage > 0 ? "danger" : "warning"}`}>!</span> : "—"}</td><td><button className="table-link" onClick={() => onOpen(so.id)}>{so.number}</button><small>{so.route}</small></td><td><strong>{so.customer}</strong>{so.project ? <small>{so.project}</small> : null}</td><td>{formatDate(so.requestedDate)}</td><td><div className="availability-mini"><strong>{so.availableNow} now</strong><span>{so.incomingBeforeDate} incoming</span>{so.shortage > 0 && <b>{so.shortage} short</b>}</div></td><td><StatusBadge>{so.fulfillment}</StatusBadge></td><td><StatusBadge>{so.billing}</StatusBadge></td><td className="numeric strong">{formatDocumentMoney(so.total, so.currency, false)}</td><td>{canOperate && so.lifecycle.toLowerCase() === "confirmed" && so.reserved > 0 ? <button className="row-action" onClick={() => onShip(so)}>Post shipment</button> : <button className="row-action" onClick={() => onOpen(so.id)}>View</button>}</td></tr>)}{!orders.length ? <tr><td colSpan={9}><div className="empty-inline">No sales order matches this filter.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
-function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onConfirm }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onConfirm: (reason: string) => Promise<void> }) {
+function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onOpenCustomerBilling, onOpenDropShip, onCreateLinkedPurchaseOrder, onOpenLinkedPurchaseOrder, onConfirm }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onOpenCustomerBilling: () => void; onOpenDropShip: () => void; onCreateLinkedPurchaseOrder: () => void; onOpenLinkedPurchaseOrder: () => void; onConfirm: (reason: string) => Promise<void> }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   // Confirmation is an audited decision, so the note is typed rather than defaulted — a
@@ -1961,12 +2106,18 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   const isDraft = so.lifecycle.toLowerCase() === "draft";
   const hasDedicatedSupply = so.lines?.some((line) => Boolean(line.linkedPurchaseOrderLineId)) ?? false;
   const confirmed = so.lifecycle.toLowerCase() === "confirmed";
+  const openDedicatedLines = so.lines?.filter((line) => line.fulfillmentRoute !== "stock" && line.open > 0) ?? [];
+  const missingDedicatedSupply = confirmed && openDedicatedLines.some((line) => !line.linkedPurchaseOrderLineId);
+  const linkedSupplyAwaitingApproval = confirmed && openDedicatedLines.some((line) => line.linkedPurchaseOrderLineId && line.linkedPurchaseOrderLifecycle !== "approved");
+  const specialOrderAwaitingReceipt = confirmed && openDedicatedLines.some((line) => line.fulfillmentRoute === "special_order" && line.linkedPurchaseOrderLifecycle === "approved" && line.reserved <= 0);
   const canImmediateSale = confirmed && (so.lines?.some((line) => line.fulfillmentRoute === "stock" && line.open > line.reserved && line.productAvailable > 0) ?? false);
   // Actions that cannot apply are not offered: a fully shipped order showed three live-looking
   // buttons that did nothing. Whatever remains that is blocked says why.
   const fulfillmentOpen = confirmed && so.open > 0;
-  const canShip = confirmed && so.reserved > 0;
-  const canReserve = fulfillmentOpen && so.open > so.reserved;
+  const canShip = confirmed && so.openToShip > 0 && so.reserved > 0;
+  const canReserve = confirmed && (so.lines?.some((line) => line.fulfillmentRoute === "stock" && line.open > line.reserved) ?? false);
+  const canPostDropShipDelivery = confirmed && (so.lines?.some((line) => line.fulfillmentRoute === "drop_ship" && line.open > 0 && line.linkedPurchaseOrderLifecycle === "approved") ?? false);
+  const invoiceable = Math.max(so.fulfilled - (so.invoiced ?? 0), 0);
   const reserveBlocked = canReserve && so.availableNow <= 0;
   const confirm = async (event: FormEvent) => {
     event.preventDefault();
@@ -1978,12 +2129,12 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   const totals = documentTotals(lines.map((line) => ({ quantity: line.ordered, unitAmount: line.unitPrice, discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps })), so);
   const lineTable = useLocalTableSort(lines, { line: (row) => lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, route: (row) => `${row.fulfillmentRoute} ${row.projectReference ?? ""}`, ordered: (row) => row.ordered, reserved: (row) => row.reserved, shipped: (row) => row.shipped, returned: (row) => row.returned, open: (row) => row.open, unitPrice: (row) => row.unitPrice, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitPrice, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitPrice, row.discountCents) });
   const shipmentTable = useLocalTableSort(so.shipments, { number: (row) => row.number, posted: (row) => row.postedAt, status: (row) => row.status, carrier: (row) => row.carrier, service: (row) => row.serviceLevel, tracking: (row) => row.trackingNumber, billOfLading: (row) => row.billOfLadingNumber });
-  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm} noValidate><label><span>Confirmation note{requiredMark}</span><input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" required aria-required="true" /><small className="field-hint">{confirmNote.trim() ? "" : "Required before the order can be confirmed."}</small></label><button className="button primary" type="submit" disabled={activating || !confirmNote.trim()}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions"><EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton>{canPostFinancial && fulfillmentOpen ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale} title={canImmediateSale ? undefined : "No unreserved stock line has usable inventory to ship and invoice now."}>Ship &amp; invoice now</button> : null}{canShip ? <button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip}>Post shipment</button> : null}{canReserve ? <button className="button secondary" onClick={onReserve} disabled={reserveBlocked} title={reserveBlocked ? "No usable stock is available to reserve right now." : undefined}>Reserve available stock</button> : null}{!fulfillmentOpen && !canShip ? <span className="read-only-label">{confirmed ? "Fully shipped: no fulfillment actions remain." : `No fulfillment actions while the order is ${so.lifecycle.toLowerCase()}.`}</span> : null}</div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
+  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{invoiceable > 0 ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>{invoiceable} fulfilled unit{invoiceable === 1 ? " is" : "s are"} ready to invoice</strong><p>Create the customer receivable from posted fulfillment. Inventory will not move again.</p></div><button className="button primary" type="button" onClick={onOpenCustomerBilling}>Open customer invoicing</button></div> : missingDedicatedSupply ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>Dedicated supplier supply is required</strong><p>Create a linked purchase order for the open special-order or drop-ship quantity before attempting fulfillment.</p></div><button className="button primary" type="button" onClick={onCreateLinkedPurchaseOrder}>Create linked purchase order</button></div> : linkedSupplyAwaitingApproval ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>Approve the linked purchase order</strong><p>Supplier fulfillment remains unavailable until the purchasing commitment is approved.</p></div><button className="button primary" type="button" onClick={onOpenLinkedPurchaseOrder}>Open linked purchase order</button></div> : specialOrderAwaitingReceipt ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>Receive the linked special-order supply</strong><p>A usable warehouse receipt will reserve the dedicated quantity automatically for this customer order.</p></div><button className="button primary" type="button" onClick={onOpenLinkedPurchaseOrder}>Open linked purchase order</button></div> : null}{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm} noValidate><label><span>Confirmation note{requiredMark}</span><input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" required aria-required="true" /><small className="field-hint">{confirmNote.trim() ? "" : "Required before the order can be confirmed."}</small></label><button className="button primary" type="submit" disabled={activating || !confirmNote.trim()}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions">{confirmed ? <EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton> : null}{canPostFinancial && so.openToShip > 0 ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale} title={canImmediateSale ? undefined : "No unreserved stock line has usable inventory to ship and invoice now."}>Ship &amp; invoice now</button> : null}{canShip ? <button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip}>Post shipment</button> : null}{canReserve ? <button className="button secondary" onClick={onReserve} disabled={reserveBlocked} title={reserveBlocked ? "No usable stock is available to reserve right now." : undefined}>Reserve available stock</button> : null}{canPostDropShipDelivery ? <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button> : null}{!fulfillmentOpen && !canShip ? <span className="read-only-label">{confirmed ? "Fully fulfilled: no fulfillment actions remain." : `No fulfillment actions while the order is ${so.lifecycle.toLowerCase()}.`}</span> : null}</div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
     <section className="panel availability-panel"><PanelHeading title="Availability for requested date" detail={`Requested ${formatDate(so.requestedDate)}`} /><div className="availability-grid"><MetricDisplay label="Required" value={so.open} /><MetricDisplay label="Available now" value={so.availableNow} tone="success" /><MetricDisplay label="Incoming before date" value={so.incomingBeforeDate} tone="info" /><MetricDisplay label="Shortage" value={so.shortage} tone={so.shortage > 0 ? "danger" : "neutral"} /></div>{so.linkedPo && <div className="linked-supply"><span className="section-kicker">Linked supply</span><strong>{so.linkedPo}</strong><p>{so.incomingBeforeDate} units expected before the customer&apos;s requested date.</p></div>}</section>
     {/* The lines are the order. Without them this page showed a total for goods it never named,
         so nobody could check what the customer actually bought. */}
     <section className="panel"><PanelHeading title="Order lines" detail={`${lines.length} line${lines.length === 1 ? "" : "s"} · amounts in ${so.currency}`} />
-      <div className="responsive-table"><table><caption className="sr-only">Sales order lines, fulfillment quantities, and extended amounts</caption><thead><tr><SortableHeader label="#" column="line" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" /><SortableHeader label="Product" column="product" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Route / project" column="route" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Ordered" column="ordered" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reserved" column="reserved" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Shipped" column="shipped" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Returned" column="returned" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Unit price" column="unitPrice" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Discount" column="discount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Amount" column="amount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{lineTable.rows.map((line) => <tr key={line.id}><td className="numeric muted">{lines.indexOf(line) + 1}</td><td><strong>{line.product}</strong><small>{line.sku}</small></td><td>{titleCase(line.fulfillmentRoute)}{line.projectReference ? <small>{line.projectReference}</small> : null}</td><td className="numeric">{line.ordered}{line.orderedUomCode ? <small>{line.orderedUomCode}</small> : null}</td><td className="numeric">{line.reserved}</td><td className="numeric strong">{line.shipped}</td><td className="numeric">{line.returned}</td><td className="numeric strong">{line.open}</td><td className="numeric">{formatDocumentMoney(line.unitPrice, so.currency)}</td><td className="numeric">{line.discountCents ? `−${formatDocumentMoney(line.discountCents / 100, so.currency)}` : "—"}</td><td className="numeric">{line.taxable ? formatDocumentMoney(lineTaxAmount(line.ordered, line.unitPrice, line.discountCents, line.taxable, line.taxRateBps), so.currency) : "Exempt"}</td><td className="numeric strong">{formatDocumentMoney(lineNetAmount(line.ordered, line.unitPrice, line.discountCents), so.currency)}</td></tr>)}{!lines.length ? <tr><td colSpan={12}><div className="empty-inline">This order has no lines recorded.</div></td></tr> : null}</tbody></table></div>
+      <div className="responsive-table"><table><caption className="sr-only">Sales order lines, fulfillment quantities, and extended amounts</caption><thead><tr><SortableHeader label="#" column="line" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" /><SortableHeader label="Product" column="product" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Route / project" column="route" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Ordered" column="ordered" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reserved" column="reserved" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Fulfilled" column="shipped" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Returned" column="returned" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Unit price" column="unitPrice" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Discount" column="discount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Amount" column="amount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{lineTable.rows.map((line) => <tr key={line.id}><td className="numeric muted">{lines.indexOf(line) + 1}</td><td><strong>{line.product}</strong><small>{line.sku}</small></td><td>{titleCase(line.fulfillmentRoute)}{line.projectReference ? <small>{line.projectReference}</small> : null}</td><td className="numeric">{line.ordered}{line.orderedUomCode ? <small>{line.orderedUomCode}</small> : null}</td><td className="numeric">{line.reserved}</td><td className="numeric strong">{line.fulfilled}</td><td className="numeric">{line.returned}</td><td className="numeric strong">{line.open}</td><td className="numeric">{formatDocumentMoney(line.unitPrice, so.currency)}</td><td className="numeric">{line.discountCents ? `−${formatDocumentMoney(line.discountCents / 100, so.currency)}` : "—"}</td><td className="numeric">{line.taxable ? formatDocumentMoney(lineTaxAmount(line.ordered, line.unitPrice, line.discountCents, line.taxable, line.taxRateBps), so.currency) : "Exempt"}</td><td className="numeric strong">{formatDocumentMoney(lineNetAmount(line.ordered, line.unitPrice, line.discountCents), so.currency)}</td></tr>)}{!lines.length ? <tr><td colSpan={12}><div className="empty-inline">This order has no lines recorded.</div></td></tr> : null}</tbody></table></div>
     </section>
     <div className="detail-columns">
       <DocumentFacts title="Order details" facts={[
@@ -1997,7 +2148,7 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
       ]} />
       <DocumentTotalsPanel totals={totals} currency={so.currency} />
     </div>
-    <div className="detail-columns"><section className="panel"><PanelHeading title="Fulfillment quantities" /><dl className="definition-list"><div><dt>Ordered</dt><dd>{so.ordered}</dd></div><div><dt>Reserved</dt><dd>{so.reserved}</dd></div><div><dt>Net shipped</dt><dd>{so.shipped}</dd></div><div><dt>Open to ship</dt><dd>{so.open}</dd></div></dl></section><section className="panel"><PanelHeading title="Customer delivery" /><dl className="definition-list"><div><dt>Method</dt><dd>{so.route}</dd></div><div><dt>Requested</dt><dd>{formatDocumentDate(so.requestedDate)}</dd></div><div><dt>Ship to</dt><dd>{so.shipToName ?? so.customer}<br />{[so.shipToAddressLine1, so.shipToAddressLine2, so.shipToCity, so.shipToRegion, so.shipToPostalCode, so.shipToCountry].filter(Boolean).join(", ") || "Address required before confirmation"}</dd></div><div><dt>Instructions</dt><dd>{so.deliveryInstructions ?? "None"}</dd></div></dl></section></div>
+    <div className="detail-columns"><section className="panel"><PanelHeading title="Fulfillment quantities" /><dl className="definition-list"><div><dt>Ordered</dt><dd>{so.ordered}</dd></div><div><dt>Reserved for shipment</dt><dd>{so.reserved}</dd></div><div><dt>Supplier / warehouse fulfilled</dt><dd>{so.fulfilled}</dd></div><div><dt>Open fulfillment</dt><dd>{so.open}</dd></div></dl></section><section className="panel"><PanelHeading title="Customer delivery" /><dl className="definition-list"><div><dt>Method</dt><dd>{so.route}</dd></div><div><dt>Requested</dt><dd>{formatDocumentDate(so.requestedDate)}</dd></div><div><dt>Ship to</dt><dd>{so.shipToName ?? so.customer}<br />{[so.shipToAddressLine1, so.shipToAddressLine2, so.shipToCity, so.shipToRegion, so.shipToPostalCode, so.shipToCountry].filter(Boolean).join(", ") || "Address required before confirmation"}</dd></div><div><dt>Instructions</dt><dd>{so.deliveryInstructions ?? "None"}</dd></div></dl></section></div>
     {/* Carrier paperwork was required at posting and then invisible, so "where is my order"
         had no answer on any screen. */}
     <section className="panel"><PanelHeading title="Shipments" detail={so.shipments.length ? `${so.shipments.length} posted` : undefined} />
@@ -2617,17 +2768,17 @@ function PartnerEditor({ partner, onClose, onSaved }: { partner: Partner | "new"
 
 
 
-function VendorBillsView({ bills, sort, setSort }: { bills: Bill[] } & WorklistSortProps) {
+function VendorBillsView({ bills, sort, setSort, onOpenPurchaseOrder }: { bills: Bill[]; onOpenPurchaseOrder: (bill: Bill) => void } & WorklistSortProps) {
   // Exact amounts here: a variance is an exception precisely because it is small, and rounding
   // one to the dollar prints "$0" beside a row that is demanding review.
   const today = localDateString();
   return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Vendor bills, matching variance, and settlement</caption><thead><tr><SortableHeader label="Bill" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Vendor invoice" column="vendorInvoice" sort={sort} setSort={setSort} /><SortableHeader label="Vendor" column="vendor" sort={sort} setSort={setSort} /><SortableHeader label="Purchase order" column="purchaseOrder" sort={sort} setSort={setSort} /><SortableHeader label="Invoiced" column="invoiced" sort={sort} setSort={setSort} /><SortableHeader label="Due" column="due" sort={sort} setSort={setSort} /><SortableHeader label="Authorized line value" column="authorized" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Billed line value" column="billed" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Line variance" column="variance" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Bill total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Outstanding" column="outstanding" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Match" column="match" sort={sort} setSort={setSort} /><SortableHeader label="Settlement" column="settlement" sort={sort} setSort={setSort} /></tr></thead><tbody>{bills.map((bill) => {
     const overdue = bill.outstanding > 0 && Boolean(bill.dueDate) && bill.dueDate < today;
     return <tr key={bill.id}>
-      <td><strong>{bill.number}</strong>{bill.holdReason ? <small>{bill.holdReason}</small> : null}</td>
+      <td><a className="table-link" href={`/api/documents/pdf?documentType=vendor_bill&documentId=${encodeURIComponent(bill.id)}`} target="_blank" rel="noreferrer" title={`Open ${bill.number} PDF`}>{bill.number}</a>{bill.holdReason ? <small>{bill.holdReason}</small> : null}</td>
       {/* AP reconciles against the supplier's own document number, not ours. */}
       <td>{bill.vendorInvoiceNumber ?? <span className="muted">Not recorded</span>}</td>
-      <td>{bill.vendor}</td><td>{bill.po}</td>
+      <td>{bill.vendor}</td><td>{bill.purchaseOrderId ? <button className="table-link" type="button" onClick={() => onOpenPurchaseOrder(bill)}>{bill.po}</button> : bill.po}</td>
       <td>{formatDocumentDate(bill.invoiceDate, "—")}</td>
       <td>{overdue ? <StatusBadge tone="danger">{formatDocumentDate(bill.dueDate, "—")}</StatusBadge> : formatDocumentDate(bill.dueDate, "—")}</td>
       <td className="numeric">{formatDocumentMoney(bill.receivedValue, bill.currency)}</td>
@@ -2643,8 +2794,8 @@ function VendorBillsView({ bills, sort, setSort }: { bills: Bill[] } & WorklistS
   })}{!bills.length ? <tr><td colSpan={14}><div className="empty-inline">No vendor bills match this view.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
-function InvoicesView({ salesOrders, sort, setSort }: { salesOrders: SalesOrder[] } & WorklistSortProps) {
-  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Customer invoice eligibility</caption><thead><tr><SortableHeader label="Sales order" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Customer" column="customer" sort={sort} setSort={setSort} /><SortableHeader label="Ordered" column="ordered" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Posted shipment" column="shipped" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Already invoiced" column="invoiced" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Available to invoice" column="availableToInvoice" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="State" column="billing" sort={sort} setSort={setSort} /></tr></thead><tbody>{salesOrders.map((so) => { const invoiced = so.invoiced ?? 0; const available = Math.max(so.shipped - invoiced, 0); return <tr key={so.id}><td><strong>{so.number}</strong></td><td>{so.customer}</td><td className="numeric">{so.ordered}</td><td className="numeric">{so.shipped}</td><td className="numeric">{invoiced}</td><td className="numeric strong">{available}</td><td><StatusBadge>{so.billing}</StatusBadge></td></tr>; })}{!salesOrders.length ? <tr><td colSpan={7}><div className="empty-inline">No sales orders match this view.</div></td></tr> : null}</tbody></table></div></section>;
+function InvoicesView({ salesOrders, sort, setSort, onOpenSalesOrder }: { salesOrders: SalesOrder[]; onOpenSalesOrder: (so: SalesOrder) => void } & WorklistSortProps) {
+  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Customer invoice eligibility</caption><thead><tr><SortableHeader label="Sales order" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Customer" column="customer" sort={sort} setSort={setSort} /><SortableHeader label="Ordered" column="ordered" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Posted fulfillment" column="shipped" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Already invoiced" column="invoiced" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Available to invoice" column="availableToInvoice" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="State" column="billing" sort={sort} setSort={setSort} /></tr></thead><tbody>{salesOrders.map((so) => { const invoiced = so.invoiced ?? 0; const available = Math.max(so.fulfilled - invoiced, 0); return <tr key={so.id}><td><button className="table-link" type="button" onClick={() => onOpenSalesOrder(so)}>{so.number}</button></td><td>{so.customer}</td><td className="numeric">{so.ordered}</td><td className="numeric">{so.fulfilled}</td><td className="numeric">{invoiced}</td><td className="numeric strong">{available}</td><td><StatusBadge>{so.billing}</StatusBadge></td></tr>; })}{!salesOrders.length ? <tr><td colSpan={7}><div className="empty-inline">Nothing is waiting to be invoiced.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
 type ReportKey = "ar-aging" | "open-orders" | "replenishment" | "customer-statement";
@@ -2818,7 +2969,7 @@ function WarehouseView({ snapshot, source, canOperate, onReceive, navigate }: { 
 }
 
 
-function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locationId, quantity = 1, warehouseId, currency, exchangeRateToBase, value, initialOptions, onSelect, placeholder, quickCreate }: { kind: LookupKind; role?: string; partnerId?: string; productId?: string; lineId?: string; locationId?: string; quantity?: number; warehouseId?: string; currency?: string; exchangeRateToBase?: number; value: string; initialOptions: LookupOption[]; onSelect: (option: LookupOption) => void; placeholder: string; quickCreate?: QuickCreateKind }) {
+function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locationId, quantity = 1, warehouseId, currency, exchangeRateToBase, value, initialOptions, onSelect, placeholder, quickCreate, required = false }: { kind: LookupKind; role?: string; partnerId?: string; productId?: string; lineId?: string; locationId?: string; quantity?: number; warehouseId?: string; currency?: string; exchangeRateToBase?: number; value: string; initialOptions: LookupOption[]; onSelect: (option: LookupOption) => void; placeholder: string; quickCreate?: QuickCreateKind; required?: boolean }) {
   const mapItem = (item: Record<string, unknown>): LookupOption => kind === "partnerAddresses" ? {
     id: text(item.id),
     label: text(item.label),
@@ -2913,6 +3064,7 @@ function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locat
     placeholder={placeholder}
     initialOptions={initialOptions}
     quickCreate={quickCreate}
+    required={required}
     mapItem={mapItem}
     onSelect={(option) => onSelect(option as LookupOption)}
   />;
@@ -3715,12 +3867,12 @@ function CommandFields({ receiptDate, setReceiptDate, packingSlipNumber, setPack
   const salesPolicy = so?.lines?.[0]?.trackingPolicy ?? "quantity";
   const purchaseLineSelector = eligiblePurchaseLines.length > 1 ? <SearchableSelect label="Purchase order line" value={selectedPoLineId} setValue={setSelectedPoLineId} options={eligiblePurchaseLines.map((line) => ({ id: line.id, label: `${line.sku} · ${line.product}`, detail: kind === "reverse" ? `${line.latestReceiptReversible} reversible on latest receipt` : `${line.open} open` }))} /> : null;
   const salesLineSelector = salesLines.length > 1 ? <SearchableSelect label="Sales order line" value={selectedSoLineId} setValue={setSelectedSoLineId} options={salesLines.map((line) => ({ id: line.id, label: `${line.sku} · ${line.product}`, detail: kind === "customer-return" ? `${Math.max(line.shipped - line.returned, 0)} returnable` : kind === "ship" ? `${line.reserved} reserved to ship` : kind === "immediate-sale" ? `${Math.max(line.open - line.reserved, 0)} unreserved open` : `${line.open} open` }))} /> : null;
-  const usableLocationField = <label>Usable destination<ReferenceSearchSelect kind="locations" role="usable" warehouseId={warehouseId} value={postingLocationId} initialOptions={usableLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} quickCreate="location" onSelect={(option) => setPostingLocationId(option.id)} placeholder="Search every usable location" /></label>;
+  const usableLocationField = <label><span>Usable destination{requiredMark}</span><ReferenceSearchSelect kind="locations" role="usable" warehouseId={warehouseId} value={postingLocationId} initialOptions={usableLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} quickCreate="location" required onSelect={(option) => setPostingLocationId(option.id)} placeholder="Search every usable location" />{postingLocationId ? null : <small className="field-hint">Required before inventory can be posted.</small>}</label>;
   // "stocked" rather than "usable": goods going back to the vendor are as likely to be sitting
   // in quarantine or a damaged location as on a usable shelf.
-  const vendorSourceLocationField = <label>Source inventory location<ReferenceSearchSelect kind="locations" role="stocked" warehouseId={warehouseId} value={postingLocationId} initialOptions={[...usableLocations, ...quarantineLocations].filter((location) => !warehouseId || location.warehouseId === warehouseId).map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: `${titleCase(location.inventoryStatus)} inventory` }))} onSelect={(option) => { setPostingLocationId(option.id); setLotId(""); setInventoryUnitId(""); }} placeholder="Search any location holding the returned stock" /></label>;
+  const vendorSourceLocationField = <label><span>Source inventory location{requiredMark}</span><ReferenceSearchSelect kind="locations" role="stocked" warehouseId={warehouseId} value={postingLocationId} initialOptions={[...usableLocations, ...quarantineLocations].filter((location) => !warehouseId || location.warehouseId === warehouseId).map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: `${titleCase(location.inventoryStatus)} inventory` }))} required onSelect={(option) => { setPostingLocationId(option.id); setLotId(""); setInventoryUnitId(""); }} placeholder="Search any location holding the returned stock" />{postingLocationId ? null : <small className="field-hint">Required for a physical vendor return.</small>}</label>;
   const immediateSourceLocationField = <label>Source inventory location {salesPolicy === "quantity" ? <small>(optional)</small> : null}<ReferenceSearchSelect kind="locations" role="usable" warehouseId={warehouseId} value={postingLocationId} initialOptions={usableLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => { setPostingLocationId(option.id); setLotId(""); setInventoryUnitId(""); }} placeholder={salesPolicy === "quantity" ? "Best free-stock location is selected automatically" : "Select the location holding this identity"} /></label>;
-  const quarantineLocationField = <label>Quarantine destination<ReferenceSearchSelect kind="locations" role="non_usable" warehouseId={warehouseId} value={quarantineLocationId} initialOptions={quarantineLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: titleCase(location.inventoryStatus) }))} quickCreate="location" onSelect={(option) => setQuarantineLocationId(option.id)} placeholder="Search every quarantine or damaged location" /></label>;
+  const quarantineLocationField = <label><span>Quarantine destination{requiredMark}</span><ReferenceSearchSelect kind="locations" role="non_usable" warehouseId={warehouseId} value={quarantineLocationId} initialOptions={quarantineLocations.map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: titleCase(location.inventoryStatus) }))} quickCreate="location" required onSelect={(option) => setQuarantineLocationId(option.id)} placeholder="Search every quarantine or damaged location" />{quarantineLocationId ? null : <small className="field-hint">Required when quantity is quarantined or damaged.</small>}</label>;
   // Vendor paperwork for a receipt: which day the goods landed, and the slip they came with.
   const receiptPaperworkFields = <><label>Received on<input type="date" max={localDateString()} value={receiptDate} onChange={(event) => setReceiptDate(event.target.value)} /></label><label>Packing slip / delivery note<input value={packingSlipNumber} onChange={(event) => setPackingSlipNumber(event.target.value)} placeholder="Vendor's document number" /></label></>;
   const incomingIdentityFields = purchasePolicy === "lot" ? <label><span>Received lot number{requiredMark}</span><input value={lotNumber} onChange={(event) => setLotNumber(event.target.value)} placeholder="Required lot number" required aria-required="true" /></label> : purchasePolicy === "serial" ? <label><span>Received serial number{requiredMark}</span><input value={serialNumber} onChange={(event) => setSerialNumber(event.target.value)} placeholder="One serial per receipt posting" required aria-required="true" /></label> : null;
@@ -3759,7 +3911,7 @@ function commandDefaults(kind: CommandKind, po?: PurchaseOrder, so?: SalesOrder)
 }
 
 function commandTitle(kind: CommandKind) {
-  return ({ receive: "Post receipt", close: "Close unreceived quantity", reopen: "Reopen quantity to receive", reverse: "Reverse incorrect receipt", "vendor-return": "Return to vendor", reserve: "Reserve available stock", ship: "Post shipment", "immediate-sale": "Ship and invoice now", "customer-return": "Post customer return", count: "Approve inventory adjustment" } as Record<CommandKind, string>)[kind];
+  return ({ receive: "Post receipt", close: "Close unfulfilled quantity", reopen: "Reopen stock-receipt quantity", reverse: "Reverse incorrect receipt", "vendor-return": "Return to vendor", reserve: "Reserve available stock", ship: "Post shipment", "immediate-sale": "Ship and invoice now", "customer-return": "Post customer return", count: "Approve inventory adjustment" } as Record<CommandKind, string>)[kind];
 }
 
 function finalCommandLabel(kind: CommandKind, quantity: number) {
@@ -3894,9 +4046,12 @@ function normalizeSnapshot(input: unknown): Snapshot {
       ordered: enteredOrdered,
       received: number(line.grossReceivedQuantity, number(line.netReceivedQuantity)) / factor,
       returned: number(line.returnedQuantity) / factor,
+      fulfilled: number(line.supplierFulfilledQuantity, number(line.netReceivedQuantity)) / factor,
       latestReceiptReversible: number(line.latestReceiptReversibleQuantity) / factor,
       closed: number(line.closedWithoutReceiptQuantity) / factor,
-      open: number(line.openToReceiveQuantity) / factor,
+      open: number(line.openToFulfillQuantity, number(line.openToReceiveQuantity)) / factor,
+      openToReceive: number(line.openToReceiveQuantity) / factor,
+      openToDeliver: number(line.openToDeliverQuantity) / factor,
       unitCost: number(line.orderedUomUnitCostCents, number(line.unitCostCents)) / 100,
       orderedUomId: text(line.orderedUomId) || undefined,
       orderedUomCode: text(line.orderedUomCode) || undefined,
@@ -3915,7 +4070,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
     });
     // Empty when the order has none: a fabricated date a week out read as a real promise.
     const expectedDate = text(item.expectedDate);
-    const open = number(item.openToReceiveQuantity);
+    const open = number(item.openToFulfillQuantity, number(item.openToReceiveQuantity));
+    const fulfilled = number(item.supplierFulfilledQuantity, number(item.netReceivedQuantity));
     const closed = number(item.closedWithoutReceiptQuantity);
     const billingStatus = text(item.billingStatus, "not_billed");
     const late = expectedDate && expectedDate < localDateString() && open > 0 ? calendarDaysLate(expectedDate) : 0;
@@ -3934,15 +4090,20 @@ function normalizeSnapshot(input: unknown): Snapshot {
       ordered: number(item.orderedQuantity),
       received: number(item.grossReceivedQuantity || item.netReceivedQuantity),
       returned: number(item.vendorReturnedQuantity) + number(item.receiptReversedQuantity),
+      fulfilled,
       closed,
       open,
-      billed: number(item.netReceivedQuantity),
+      openToReceive: number(item.openToReceiveQuantity),
+      openToDeliver: number(item.openToDeliverQuantity),
+      billed: fulfilled,
       total: number(item.totalCents) / 100,
       currency: text(item.currency, "CAD"),
       exchangeRateToBase: number(item.exchangeRateToBase, 1),
       paymentTerms: text(item.paymentTerms) || undefined,
       dueDate: text(item.dueDate) || undefined,
       projectReference: text(item.projectReference) || undefined,
+      supplierQuoteNumber: text(item.supplierQuoteNumber) || undefined,
+      supplierReference: text(item.supplierReference) || undefined,
       freightCents: number(item.freightCents),
       freightTaxRateBps: number(item.freightTaxRateBps),
       feeCents: number(item.feeCents),
@@ -3977,6 +4138,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
       const factor = enteredOrdered > 0 ? ordered / enteredOrdered : 1;
       const canceled = number(line.canceledQuantity);
       const shipped = number(line.shippedQuantity);
+      const fulfilled = number(line.fulfilledQuantity, shipped);
       const returned = number(line.returnedQuantity);
       return {
         id: text(line.id, `${text(item.id)}-line-${lineIndex}`),
@@ -3988,7 +4150,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
         reserved: number(line.reservedQuantity) / factor,
         shipped: shipped / factor,
         returned: returned / factor,
-        open: Math.max(ordered - canceled - shipped, 0) / factor,
+        fulfilled: fulfilled / factor,
+        open: Math.max(ordered - canceled - fulfilled, 0) / factor,
         unitPrice: number(line.orderedUomUnitPriceCents, number(line.unitPriceCents)) / 100,
         orderedUomId: text(line.orderedUomId) || undefined,
         orderedUomCode: text(line.orderedUomCode) || undefined,
@@ -3997,6 +4160,9 @@ function normalizeSnapshot(input: unknown): Snapshot {
         trackingPolicy: text(line.trackingPolicy, "quantity"),
         reservationLocationId: text(line.reservationLocationId) || undefined,
         linkedPurchaseOrderLineId: text(line.linkedPurchaseOrderLineId) || undefined,
+        linkedPurchaseOrderId: text(line.linkedPurchaseOrderId) || undefined,
+        linkedPurchaseOrderNumber: text(line.linkedPurchaseOrderNumber) || undefined,
+        linkedPurchaseOrderLifecycle: text(line.linkedPurchaseOrderLifecycle) || undefined,
         projectReference: text(line.projectReference) || undefined,
         discountCents: number(line.discountCents),
         taxable: number(line.taxable, 1) !== 0,
@@ -4006,7 +4172,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
       };
     });
     const firstLine = rawLines[0];
-    const open = number(item.openToShipQuantity);
+    const open = number(item.openToFulfillQuantity, number(item.openToShipQuantity));
     // Availability now comes from the server, which sees every line and the whole catalog. The
     // old first-line-and-current-page guess reported "0 available" for every order on any view
     // that ships no products, so the entire sales worklist read as short.
@@ -4034,8 +4200,11 @@ function normalizeSnapshot(input: unknown): Snapshot {
       reserved: number(item.reservedQuantity),
       shipped: number(item.shippedQuantity),
       returned: number(item.returnedQuantity),
+      fulfilled: number(item.fulfilledQuantity, number(item.shippedQuantity)),
       invoiced: number(item.invoicedQuantity),
       open,
+      openToShip: number(item.openToShipQuantity),
+      openToDeliver: number(item.openToDeliverQuantity),
       availableNow,
       incomingBeforeDate,
       shortage,
@@ -4058,7 +4227,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
       shipToCountry: text(item.shipToCountry) || undefined,
       deliveryInstructions: text(item.deliveryInstructions) || undefined,
       route: titleCase(text(firstLine?.fulfillmentRoute, "stock")),
-      linkedPo: text(firstLine?.linkedPurchaseOrderLineId) || undefined,
+      linkedPo: text(firstLine?.linkedPurchaseOrderNumber) || undefined,
       exception: shortage > 0 ? `${shortage} unit${shortage === 1 ? "" : "s"} short for requested date` : undefined,
       orderDate: text(item.orderDate).slice(0, 10),
       owner: text(item.ownerName, "Unassigned"),
@@ -4088,17 +4257,20 @@ function normalizeSnapshot(input: unknown): Snapshot {
 
   const bills: Bill[] = asRows(raw.bills).map((item, index) => {
     const isException = text(item.matchStatus) !== "matched";
+    const outstanding = number(item.outstandingCents) / 100;
+    const rawStatus = text(item.status, "draft");
     return {
       id: text(item.id, `bill-${index}`),
       number: text(item.number, "Vendor bill"),
       vendor: text(item.vendorName, "Vendor"),
       po: text(item.purchaseOrderNumber, "Unlinked"),
+      purchaseOrderId: text(item.purchaseOrderId) || undefined,
       receivedValue: number(item.authorizedLineValueCents) / 100,
       billedValue: number(item.billedLineValueCents) / 100,
       variance: (number(item.billedLineValueCents) - number(item.authorizedLineValueCents)) / 100,
       currency: text(item.currency, "CAD"),
       status: titleCase(text(item.matchStatus, text(item.status, "draft"))),
-      settlementStatus: titleCase(text(item.status, "draft")),
+      settlementStatus: rawStatus === "on_hold" ? "On hold" : outstanding <= 0 ? "Settled" : rawStatus === "partially_paid" ? "Partially paid" : rawStatus === "draft" ? "Draft" : "Outstanding",
       vendorInvoiceNumber: text(item.vendorInvoiceNumber) || undefined,
       invoiceDate: text(item.invoiceDate),
       dueDate: text(item.dueDate),
@@ -4106,9 +4278,9 @@ function normalizeSnapshot(input: unknown): Snapshot {
       tax: number(item.taxCents) / 100,
       total: number(item.totalCents) / 100,
       paid: number(item.paidCents) / 100,
-      outstanding: number(item.outstandingCents) / 100,
+      outstanding,
       paymentTerms: text(item.paymentTerms) || undefined,
-      holdReason: text(item.holdReason) || undefined,
+      holdReason: humanHoldReason(item.holdReason),
       reason: isException ? "Price or quantity differs from the authorized PO and posted receipt." : undefined,
     };
   });
@@ -4221,6 +4393,14 @@ function normalizeSnapshot(input: unknown): Snapshot {
       name: text(asRecord(raw.viewer).name),
       email: text(asRecord(raw.viewer).email),
       role: text(asRecord(raw.viewer).role),
+      tenant: {
+        id: text(asRecord(asRecord(raw.viewer).tenant).id),
+        slug: text(asRecord(asRecord(raw.viewer).tenant).slug),
+        name: text(asRecord(asRecord(raw.viewer).tenant).name),
+      },
+      tenants: asRows(asRecord(raw.viewer).tenants).map((tenant) => ({
+        id: text(tenant.id), slug: text(tenant.slug), name: text(tenant.name), role: text(tenant.role), isDefault: tenant.isDefault === true,
+      })),
       permissions: {
         canRead: asRecord(asRecord(raw.viewer).permissions).canRead === true,
         canExport: asRecord(asRecord(raw.viewer).permissions).canExport === true,
@@ -4264,6 +4444,21 @@ function number(value: unknown, fallback = 0) {
 
 function titleCase(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function humanHoldReason(value: unknown) {
+  const raw = text(value);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const reasons = asRows(parsed).map((reason) => text(reason.message) || titleCase(text(reason.code).toLowerCase())).filter(Boolean);
+    if (reasons.length) return reasons.join(" · ");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const reason = parsed as Record<string, unknown>;
+      return text(reason.message) || titleCase(text(reason.code).toLowerCase()) || raw;
+    }
+  } catch { /* Legacy rows may already contain operator-facing prose. */ }
+  return raw;
 }
 
 /** Shipments arrive as a JSON array built by the snapshot query rather than a joined child row. */

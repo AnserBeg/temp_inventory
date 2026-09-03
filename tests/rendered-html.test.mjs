@@ -26,8 +26,8 @@ test("exposes the required operational language and impact previews", async () =
   ])).join("\n");
 
   for (const required of [
-    "Reopen quantity to receive",
-    "Close unreceived quantity",
+    "Reopen stock-receipt quantity",
+    "Close unfulfilled quantity",
     "Post receipt",
     "Reverse incorrect receipt",
     "Return to vendor",
@@ -36,7 +36,7 @@ test("exposes the required operational language and impact previews", async () =
     "Create purchase order",
     "Create sales order",
     "approved purchase order",
-    "Sales order with invoiceable delivery",
+    "Sales order with invoiceable fulfillment",
     "Physical inventory",
     "Commercial commitment",
     "Financial effect",
@@ -44,6 +44,11 @@ test("exposes the required operational language and impact previews", async () =
     "No change",
     "Warehouse mode",
     "Three-way match exception",
+    "Company connections",
+    "Sign in & choose company",
+    "Helcim merchant connection",
+    "Verify & connect",
+    "Do not enter a Helcim username or password",
   ]) {
     assert.match(source, new RegExp(required, "i"), `missing UI contract: ${required}`);
   }

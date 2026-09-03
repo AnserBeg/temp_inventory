@@ -1,5 +1,5 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
-import { DocumentEmailError, getDocumentPdf, isEmailDocumentType } from "@/lib/server/document-email";
+import { DocumentEmailError, getDocumentPdf, isPrintableDocumentType } from "@/lib/server/document-email";
 
 function errorResponse(error: unknown) {
   if (error instanceof AuthorizationError) return authorizationResponse(error);
@@ -16,7 +16,7 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const documentType = url.searchParams.get("documentType") ?? "";
     const documentId = url.searchParams.get("documentId")?.trim() ?? "";
-    if (!isEmailDocumentType(documentType) || !documentId) {
+    if (!isPrintableDocumentType(documentType) || !documentId) {
       return Response.json({ error: { code: "INVALID_DOCUMENT", message: "A supported documentType and documentId are required." } }, { status: 400 });
     }
     const pdf = await getDocumentPdf(documentType, documentId);

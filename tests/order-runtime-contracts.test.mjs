@@ -26,5 +26,5 @@ test("invoice eligibility is cumulative and comes from posted invoice lines", ()
   assert.match(inventorySource, /AS invoicedQuantity/);
   assert.match(inventorySource, /ci\.status<>'void'/);
   assert.match(uiSource, /so\.invoiced \?\? 0/);
-  assert.match(uiSource, /Math\.max\(so\.shipped - invoiced, 0\)/);
+  assert.match(uiSource, /Math\.max\(so\.fulfilled - invoiced, 0\)/);
 });

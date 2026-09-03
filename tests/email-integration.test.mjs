@@ -50,6 +50,8 @@ before(async () => {
   await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,discount_cents,taxable,tax_rate_bps) VALUES ('email-sol','email-so','email-product',2,15000,'uom-each',2,15000,0,1,500)");
   await run("INSERT INTO customer_invoices (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) VALUES ('email-invoice','INV-EMAIL','email-customer','email-so','posted','2026-08-24','2026-09-23',30000,1500,31500,0,'CAD',1,31500,500,'GST','Net 30',?,'Email Accountant',1)", now);
   await run("INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,quantity,unit_price_cents,line_total_cents) VALUES ('email-cil','email-invoice','email-sol','email-product',2,15000,30000)");
+  await run("INSERT INTO vendor_bills (id,number,vendor_invoice_number,vendor_id,purchase_order_id,status,match_status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,version,posted_at) VALUES ('email-bill','VB-EMAIL','SUP-EMAIL','email-vendor','email-po','approved','matched','2026-08-24','2026-09-23',20000,1000,21000,0,'CAD',1,21000,1,?)", now);
+  await run("INSERT INTO vendor_bill_lines (id,vendor_bill_id,purchase_order_line_id,product_id,quantity,unit_cost_cents,line_total_cents,match_status,match_details_json) VALUES ('email-vbl','email-bill','email-pol','email-product',2,10000,20000,'matched','{}')");
 });
 
 after(() => db.close());
@@ -104,6 +106,9 @@ test("authoritative previews default to partner email and reject unapproved docu
   const printable = await documentEmail.getDocumentPdf("customer_invoice", "email-invoice");
   assert.equal(printable.fileName, "INV-EMAIL.pdf");
   assert.match(Buffer.from(printable.body).subarray(0, 12).toString("ascii"), /^%PDF-1\.4/);
+  const vendorBill = await documentEmail.getDocumentPdf("vendor_bill", "email-bill");
+  assert.equal(vendorBill.fileName, "VB-EMAIL.pdf");
+  assert.match(Buffer.from(vendorBill.body).subarray(0, 12).toString("ascii"), /^%PDF-1\.4/);
   await run("UPDATE purchase_orders SET lifecycle_status='draft' WHERE id='email-po'");
   await assert.rejects(documentEmail.getDocumentEmailPreview("purchase_order", "email-po"), /Only an approved purchase order/);
   await run("UPDATE purchase_orders SET lifecycle_status='approved' WHERE id='email-po'");

@@ -1,4 +1,5 @@
-import { ensureDatabase, first, getD1 } from "./inventory-db";
+import { ensureDatabase, first, getD1, getRootD1 } from "./inventory-db";
+import { runWithTenant } from "./tenancy";
 import { qboConfig } from "./qbo-client";
 import { constantTimeEqual, hmacSha256Base64, sha256Hex } from "./qbo-crypto";
 import { recordQboExternalConflict } from "./qbo-sync";
@@ -72,11 +73,16 @@ export async function recordQboWebhook(request: Request) {
   const payloadHash = await sha256Hex(bytes);
   let accepted = 0;
   for (const realmId of new Set(notifications.map((notification) => notification.realmId))) {
-    const connection = await first<{ id: string }>("SELECT id FROM qbo_connections WHERE realm_id=? AND status='connected'", realmId);
-    const result = await getD1().prepare(`INSERT OR IGNORE INTO qbo_webhook_events
-      (id,connection_id,realm_id,payload_sha256,payload_json,status,attempts,created_at) VALUES (?,?,?,?,?,'pending',0,?)`)
-      .bind(`qbo-webhook-${crypto.randomUUID()}`, connection?.id ?? null, realmId, payloadHash, payloadJson, new Date().toISOString()).run();
-    accepted += Number(result.meta?.changes ?? 0);
+    const matches = await getRootD1().prepare("SELECT tenant_id AS tenantId,id FROM qbo_connections WHERE realm_id=? AND status='connected'").bind(realmId).all<{ tenantId: string; id: string }>();
+    for (const connection of matches.results ?? []) {
+      const changes = await runWithTenant({ tenantId: connection.tenantId }, async () => {
+        const result = await getD1().prepare(`INSERT OR IGNORE INTO qbo_webhook_events
+          (id,connection_id,realm_id,payload_sha256,payload_json,status,attempts,created_at) VALUES (?,?,?,?,?,'pending',0,?)`)
+          .bind(`qbo-webhook-${crypto.randomUUID()}`, connection.id, realmId, payloadHash, payloadJson, new Date().toISOString()).run();
+        return Number(result.meta?.changes ?? 0);
+      });
+      accepted += changes;
+    }
   }
   return Response.json({ accepted }, { status: 200 });
 }

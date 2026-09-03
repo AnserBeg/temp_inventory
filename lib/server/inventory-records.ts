@@ -42,6 +42,9 @@ export type CreateOrderInput = {
   actorId?: string;
   actorEmail?: string;
   projectReference?: string;
+  supplierQuoteNumber?: string;
+  supplierReference?: string;
+  sourceDocumentHash?: string;
   currency?: string;
   exchangeRateToBase?: number;
   paymentTerms?: string;
@@ -395,6 +398,20 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     const expectedDate = validDate(input.expectedDate, "expectedDate");
     const vendor = await first("SELECT id FROM business_partners WHERE id = ? AND partner_type IN ('vendor','both') AND active=1", vendorId);
     if (!vendor) throw new RecordValidationError("INVALID_VENDOR", "Select a valid vendor.", 404);
+    const supplierQuoteNumber = typeof input.supplierQuoteNumber === "string" && input.supplierQuoteNumber.trim() ? input.supplierQuoteNumber.trim() : null;
+    const supplierReference = typeof input.supplierReference === "string" && input.supplierReference.trim() ? input.supplierReference.trim() : null;
+    const sourceDocumentHash = typeof input.sourceDocumentHash === "string" && input.sourceDocumentHash.trim() ? input.sourceDocumentHash.trim().toLowerCase() : null;
+    if (supplierQuoteNumber && supplierQuoteNumber.length > 80) throw new RecordValidationError("VALIDATION_ERROR", "supplierQuoteNumber must be 80 characters or fewer.");
+    if (supplierReference && supplierReference.length > 240) throw new RecordValidationError("VALIDATION_ERROR", "supplierReference must be 240 characters or fewer.");
+    if (sourceDocumentHash && !/^[a-f0-9]{64}$/.test(sourceDocumentHash)) throw new RecordValidationError("VALIDATION_ERROR", "sourceDocumentHash must be a SHA-256 hash.");
+    const duplicate = supplierQuoteNumber
+      ? await first<{ number: string }>(`SELECT number FROM purchase_orders
+          WHERE (vendor_id=? AND supplier_quote_number=?) OR source_document_hash=? OR (vendor_id=? AND project_reference LIKE ?)
+          ORDER BY created_at DESC LIMIT 1`, vendorId, supplierQuoteNumber, sourceDocumentHash, vendorId, `%Source quote ${supplierQuoteNumber}%`)
+      : sourceDocumentHash
+        ? await first<{ number: string }>(`SELECT number FROM purchase_orders WHERE source_document_hash=? ORDER BY created_at DESC LIMIT 1`, sourceDocumentHash)
+        : null;
+    if (duplicate) throw new RecordValidationError("DUPLICATE_SUPPLIER_QUOTE", `${duplicate.number} already records supplier quote ${supplierQuoteNumber ?? "from this PDF"}.`, 409);
     const number = await nextDocumentNumber("PO");
     result = {
       recordId,
@@ -417,9 +434,9 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     statements = [
       db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
         SELECT ?, 'create_purchase_order', ?, ?, ?, ?, ? WHERE 1=1${allocationClaims}`).bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now, ...allocationClaimValues),
-      db.prepare(`INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,buyer_name,project_reference,revision_number,version,created_at)
-        SELECT ?,?,?,?,'not_billed',?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-        .bind(recordId, number, vendorId, fastTrack ? "approved" : "draft", expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, now, idempotencyKey, recordId, claimToken),
+      db.prepare(`INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,buyer_name,project_reference,supplier_quote_number,supplier_reference,source_document_hash,revision_number,version,created_at)
+        SELECT ?,?,?,?,'not_billed',?,?,?,?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(recordId, number, vendorId, fastTrack ? "approved" : "draft", expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, supplierQuoteNumber, supplierReference, sourceDocumentHash, now, idempotencyKey, recordId, claimToken),
     ];
     const purchaseLines = items.map((line) => ({ line, lineId: newId("po-line") }));
     purchaseLines.forEach(({ line, lineId }) => {
@@ -439,7 +456,7 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     });
     statements.push(db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
       SELECT ?,?,1,?,?,?, ?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("revision"), recordId, fastTrack ? "approved" : "draft", JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase }), fastTrackApprovalReason ?? "Initial draft", actor, now, idempotencyKey, recordId, claimToken));
+      .bind(newId("revision"), recordId, fastTrack ? "approved" : "draft", JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase, supplierQuoteNumber, supplierReference, sourceDocumentHash }), fastTrackApprovalReason ?? "Initial draft", actor, now, idempotencyKey, recordId, claimToken));
     if (fastTrack) statements.push(db.prepare(`INSERT INTO approvals
       (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,decided_by,decision_reason,decided_at,metadata_json,version)
       SELECT ?,'purchase_order',?,'purchase_order_fast_track','approved',?,?,?,?,?,?,?,1
@@ -516,7 +533,7 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
   statements.push(
     db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
       SELECT ?,?,?,?, ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("audit"), input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, fastTrack ? input.type === "purchaseOrder" ? "purchase_order_fast_track_approved" : "sales_order_fast_track_confirmed" : input.type === "purchaseOrder" ? "purchase_order_draft_created" : "sales_order_draft_created", result.message, actor, actorId, actorEmail, JSON.stringify({ items, charges, totalCents, taxCents, projectReference, currency, exchangeRateToBase, paymentTerms, dueDate, fastTrack, approvalReason: fastTrackApprovalReason }), now, idempotencyKey, recordId, claimToken),
+      .bind(newId("audit"), input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, fastTrack ? input.type === "purchaseOrder" ? "purchase_order_fast_track_approved" : "sales_order_fast_track_confirmed" : input.type === "purchaseOrder" ? "purchase_order_draft_created" : "sales_order_draft_created", result.message, actor, actorId, actorEmail, JSON.stringify({ items, charges, totalCents, taxCents, projectReference, supplierQuoteNumber: input.supplierQuoteNumber, supplierReference: input.supplierReference, sourceDocumentHash: input.sourceDocumentHash, currency, exchangeRateToBase, paymentTerms, dueDate, fastTrack, approvalReason: fastTrackApprovalReason }), now, idempotencyKey, recordId, claimToken),
     db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
       SELECT ?,?,?,?,?,'pending',0,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(newId("outbox"), fastTrack ? input.type === "purchaseOrder" ? "purchase_order.approved" : "sales_order.confirmed" : input.type === "purchaseOrder" ? "purchase_order.draft_created" : "sales_order.draft_created", input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, JSON.stringify({ recordId, itemCount: items.length, totalCents, fastTrack }), now, now, idempotencyKey, recordId, claimToken)

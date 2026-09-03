@@ -3,6 +3,8 @@ import handler from "vinext/server/app-router-entry";
 import { processOutboxBatch } from "@/lib/server/outbox";
 import { processQboSyncBatch } from "@/lib/server/qbo-sync";
 import { processQboWebhookBatch } from "@/lib/server/qbo-webhook";
+import { processHelcimIntegrationBatch } from "@/lib/server/helcim-payments";
+import { runWithTenant, tenantContextForRequest } from "@/lib/server/tenancy";
 
 interface Env {
   ASSETS: Fetcher;
@@ -16,6 +18,14 @@ interface Env {
   QBO_REDIRECT_URI?: string;
   QBO_WEBHOOK_VERIFIER_TOKEN?: string;
   QBO_MINOR_VERSION?: string;
+  HELCIM_API_TOKEN?: string;
+  HELCIM_WEBHOOK_VERIFIER_TOKEN?: string;
+  HELCIM_TOKEN_ENCRYPTION_KEY?: string;
+  HELCIM_CHECKOUT_PAYMENT_METHODS?: string;
+  HELCIM_PAYMENT_LINK_TTL_DAYS?: string;
+  HELCIM_CHECKOUT_MODE?: string;
+  HELCIM_INVOICE_HOST?: string;
+  ALLOW_LOCAL_DEV_AUTH?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -51,14 +61,21 @@ const worker = {
       }, allowedWidths);
     }
 
-    return handler.fetch(request, env, ctx);
+    const tenant = await tenantContextForRequest(request, env.DB, String(env.ALLOW_LOCAL_DEV_AUTH ?? "").toLowerCase() === "true");
+    return runWithTenant(tenant, () => handler.fetch(request, env, ctx));
   },
-  async scheduled(): Promise<void> {
-    const results = await Promise.allSettled([
-      processOutboxBatch({ limit: 100 }),
-      processQboWebhookBatch(100),
-      processQboSyncBatch({ limit: 100 }),
-    ]);
+  async scheduled(_controller: unknown, environment: Env): Promise<void> {
+    const rows = await environment.DB.prepare("SELECT id FROM tenants WHERE status='active' ORDER BY id").all<{ id: string }>();
+    const results = await Promise.allSettled((rows.results ?? []).map((tenant) => runWithTenant({ tenantId: tenant.id }, async () => {
+      const tenantResults = await Promise.allSettled([
+        processOutboxBatch({ limit: 100 }),
+        processQboWebhookBatch(100),
+        processQboSyncBatch({ limit: 100 }),
+        processHelcimIntegrationBatch(100),
+      ]);
+      const tenantFailures = tenantResults.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (tenantFailures.length) throw new AggregateError(tenantFailures, `Scheduled processing failed for tenant ${tenant.id}.`);
+    })));
     const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
     if (failures.length) {
       console.error("Scheduled integration processing failed.", ...failures);

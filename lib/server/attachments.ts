@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import type { ActorIdentity } from "./auth";
 import { all, ensureDatabase, first, getD1, newId } from "./inventory-db";
+import { requireTenant } from "./tenancy";
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "application/pdf"]);
@@ -63,9 +64,9 @@ export async function uploadAttachment(actor: ActorIdentity, form: FormData) {
   if(detected!==file.type) throw new AttachmentError("CONTENT_MISMATCH","File bytes do not match the declared content type.",415);
   const safeName = file.name.replaceAll(/[^a-zA-Z0-9._ -]/g, "_").slice(0, 160) || "attachment";
   const id = newId("attachment");
-  const objectKey = `${documentType}/${documentId}/${id}/${safeName}`;
+  const objectKey = `tenants/${requireTenant().tenantId}/${documentType}/${documentId}/${id}/${safeName}`;
   const when = new Date().toISOString();
-  await bucket().put(objectKey, bytes, { httpMetadata: { contentType: file.type }, customMetadata: { ownerId: actor.id, documentType, documentId } });
+  await bucket().put(objectKey, bytes, { httpMetadata: { contentType: file.type }, customMetadata: { tenantId: actor.tenantId, ownerId: actor.id, documentType, documentId } });
   try {
     const db = getD1();
     await db.batch([

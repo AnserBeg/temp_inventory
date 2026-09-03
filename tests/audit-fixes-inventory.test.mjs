@@ -386,7 +386,7 @@ test("a long multi-line truck receipt claims its lines with one JSON parameter a
     lines: lines.map(([lineId]) => ({ lineId, lineVersion: 1, quantity: 4, locationId: "loc-aud-usable" })),
   } });
   assert.match(result.message, /25 lines/);
-  const claim = db.preparedSql.slice(before).find((sql) => sql.includes("INSERT OR IGNORE INTO command_log") && sql.includes("json_each"));
+  const claim = db.preparedSql.slice(before).find((sql) => sql.includes("command_log") && sql.includes("INSERT OR IGNORE INTO") && sql.includes("json_each"));
   assert.ok(claim, "the batch claim binds its line preconditions through json_each");
   const widest = Math.max(...db.preparedSql.slice(before).map(placeholders));
   assert.ok(widest <= 100, `widest statement binds ${widest} parameters`);

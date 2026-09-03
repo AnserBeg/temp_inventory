@@ -1,4 +1,5 @@
 import { env } from "cloudflare:workers";
+import { currentTenant, DEFAULT_TENANT_ID, scopeTenantSql } from "./tenancy";
 
 type SqlValue = string | number | null;
 
@@ -11,11 +12,66 @@ const commandGuardTag = "/* paneflow-command-claim */";
 
 let ready: Promise<void> | undefined;
 
-export function getD1(): D1Database {
+const statementTargets = new WeakMap<object, D1PreparedStatement>();
+const databaseCache = new WeakMap<D1Database, Map<string, D1Database>>();
+
+function stripTenantColumn<T>(value: T): T {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const row = { ...(value as Record<string, unknown>) };
+  delete row.tenant_id;
+  delete row.tenantId;
+  return row as T;
+}
+
+function wrapStatement(statement: D1PreparedStatement): D1PreparedStatement {
+  const wrapped = new Proxy(statement, {
+    get(target, property) {
+      if (property === "bind") return (...values: unknown[]) => wrapStatement(target.bind(...values));
+      if (property === "first") return async (...args: unknown[]) => stripTenantColumn(await (target.first as (...values: unknown[]) => Promise<unknown>)(...args));
+      if (property === "all") return async (...args: unknown[]) => {
+        const result = await (target.all as (...values: unknown[]) => Promise<D1Result<unknown>>)(...args);
+        return { ...result, results: (result.results ?? []).map(stripTenantColumn) };
+      };
+      if (property === "run") return async (...args: unknown[]) => {
+        const result = await (target.run as (...values: unknown[]) => Promise<D1Result<unknown>>)(...args);
+        return { ...result, results: (result.results ?? []).map(stripTenantColumn) };
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  statementTargets.set(wrapped, statement);
+  return wrapped;
+}
+
+function tenantDatabase(database: D1Database, tenantId: string): D1Database {
+  let tenantDatabases = databaseCache.get(database);
+  if (!tenantDatabases) { tenantDatabases = new Map(); databaseCache.set(database, tenantDatabases); }
+  const cached = tenantDatabases.get(tenantId);
+  if (cached) return cached;
+  const scoped = new Proxy(database, {
+    get(target, property) {
+      if (property === "prepare") return (sql: string) => wrapStatement(target.prepare(scopeTenantSql(sql, tenantId)));
+      if (property === "batch") return (statements: D1PreparedStatement[]) => target.batch(statements.map((statement) => statementTargets.get(statement as object) ?? statement));
+      if (property === "exec") return (sql: string) => target.exec(scopeTenantSql(sql, tenantId));
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as D1Database;
+  tenantDatabases.set(tenantId, scoped);
+  return scoped;
+}
+
+/** Root access is reserved for identity lookup, tenant discovery, and cross-tenant schedulers. */
+export function getRootD1(): D1Database {
   if (!env.DB) {
     throw new Error("Cloudflare D1 binding `DB` is unavailable. The logical D1 binding must be configured as DB.");
   }
   return env.DB;
+}
+
+export function getD1(): D1Database {
+  return tenantDatabase(getRootD1(), currentTenant()?.tenantId ?? DEFAULT_TENANT_ID);
 }
 
 export function commandGuardSql() {
@@ -292,7 +348,7 @@ async function seedAdvancedDatabase(db: D1Database) {
 export async function ensureDatabase() {
   if (!ready) {
     ready = (async () => {
-      const db = getD1();
+      const db = getRootD1();
       await db.prepare("SELECT source_sales_order_line_id FROM purchase_order_lines LIMIT 0").run();
       await db.prepare("SELECT allocated_qty,received_qty,status,version FROM supply_allocations LIMIT 0").run();
       await db.prepare("SELECT supply_allocation_id,receipt_movement_id,reservation_id,reversed_qty FROM supply_allocation_receipts LIMIT 0").run();
@@ -309,7 +365,7 @@ export async function ensureDatabase() {
 }
 
 export function newId(prefix: string) {
-  return `${prefix}-${crypto.randomUUID()}`;
+  return `${prefix}-${currentTenant()?.tenantId ?? DEFAULT_TENANT_ID}-${crypto.randomUUID()}`;
 }
 
 /**

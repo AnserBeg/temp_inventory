@@ -1,5 +1,8 @@
 import { completeEmailAuthorization, EmailConfigurationError, EmailProviderError } from "@/lib/server/email-client";
 import type { EmailProvider } from "@/lib/server/email-types";
+import { sha256Hex } from "@/lib/server/email-crypto";
+import { ensureDatabase, getRootD1 } from "@/lib/server/inventory-db";
+import { runWithTenant } from "@/lib/server/tenancy";
 
 export async function GET(request: Request, context: { params: Promise<{ provider: string }> }) {
   const { provider: rawProvider } = await context.params;
@@ -17,7 +20,11 @@ export async function GET(request: Request, context: { params: Promise<{ provide
   const code = url.searchParams.get("code") ?? "";
   if (!state || !code) return Response.json({ error: { code: "INVALID_CALLBACK", message: "Email callback is missing state or code." } }, { status: 400 });
   try {
-    const result = await completeEmailAuthorization(request.url, { provider, state, code });
+    await ensureDatabase();
+    const stateHash = await sha256Hex(state);
+    const owner = await getRootD1().prepare("SELECT tenant_id AS tenantId FROM email_oauth_states WHERE state_hash=? AND consumed_at IS NULL LIMIT 1").bind(stateHash).first<{ tenantId: string }>();
+    if (!owner) throw new EmailProviderError("This email authorization expired or was already used.", "EMAIL_OAUTH_STATE_INVALID", 400);
+    const result = await runWithTenant({ tenantId: owner.tenantId }, () => completeEmailAuthorization(request.url, { provider, state, code }));
     const target = new URL(result.returnTo, url.origin);
     target.searchParams.set("email", "connected");
     target.searchParams.set("mailbox", result.emailAddress);
@@ -29,4 +36,3 @@ export async function GET(request: Request, context: { params: Promise<{ provide
     return Response.redirect(target, 302);
   }
 }
-

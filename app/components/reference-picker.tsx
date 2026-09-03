@@ -120,7 +120,7 @@ function useListboxKeys({ open, setOpen, count, choose, preferred }: { open: boo
  * filterable listbox once the list can realistically outgrow a glance. Both forms can
  * offer an inline "create new" action so a missing record never dead-ends the task.
  */
-export function SearchableSelect({ label, value, options, setValue, disabled = false, quickCreate, onCreated, placeholder, hideLabel = false, className, allowCustom = false, permissions }: {
+export function SearchableSelect({ label, value, options, setValue, disabled = false, quickCreate, onCreated, placeholder, hideLabel = false, className, allowCustom = false, required = allowCustom, permissions }: {
   label: string;
   value: string;
   options: PickerOption[];
@@ -134,6 +134,8 @@ export function SearchableSelect({ label, value, options, setValue, disabled = f
   className?: string;
   /** Keeps a typed value that matches no option. Reason lists can never enumerate a real day. */
   allowCustom?: boolean;
+  /** Makes required choices visible and exposes their requirement to assistive technology. Typed custom values are reasons in this app and therefore required by default. */
+  required?: boolean;
   /** The viewer's capabilities; defaults to the PickerPermissionsContext set at the app root. */
   permissions?: PickerPermissions;
 }) {
@@ -177,7 +179,7 @@ export function SearchableSelect({ label, value, options, setValue, disabled = f
   const { active, setActive, listRef, onKeyDown } = useListboxKeys({ open, setOpen, count: rows, choose, preferred: custom ? filtered.length : undefined });
 
   if (!searchable) {
-    return <label className={className}>{hideLabel ? <span className="sr-only">{label}</span> : <span>{label}</span>}<select value={value} onChange={(event) => setValue(event.target.value, options.find((option) => option.id === event.target.value))} disabled={disabled} required>
+    return <label className={className}>{hideLabel ? <span className="sr-only">{label}</span> : <span>{label}{required ? <span className="required-mark" aria-hidden="true"> *</span> : null}</span>}<select value={value} onChange={(event) => setValue(event.target.value, options.find((option) => option.id === event.target.value))} disabled={disabled} required={required} aria-required={required || undefined}>
       {/* Only prompt when nothing is chosen yet. Controls that always carry a value — a
           sort order, a filter defaulting to "All" — would otherwise show a dead first row. */}
       {selected ? null : <option value="" disabled>{options.length ? `Select ${label.toLowerCase()}` : "No records available"}</option>}
@@ -193,7 +195,7 @@ export function SearchableSelect({ label, value, options, setValue, disabled = f
     onMouseEnter={() => setActive(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => choose(index)}
   >{children}</button>;
 
-  return <><label className={`reference-search ${className ?? ""}`}>{hideLabel ? <span className="sr-only">{label}</span> : <span>{label}</span>}
+  return <><label className={`reference-search ${className ?? ""}`}>{hideLabel ? <span className="sr-only">{label}</span> : <span>{label}{required ? <span className="required-mark" aria-hidden="true"> *</span> : null}</span>}
     <input
       role="combobox"
       value={open ? query : selected?.label ?? (allowCustom ? value : "")}
@@ -204,6 +206,8 @@ export function SearchableSelect({ label, value, options, setValue, disabled = f
       aria-expanded={open}
       aria-autocomplete="list"
       aria-activedescendant={open && rows ? `${listboxId}-row-${active}` : undefined}
+      required={required}
+      aria-required={required || undefined}
       onFocus={() => { setQuery(""); setOpen(true); }}
       onBlur={() => { commitTyped(); window.setTimeout(() => setOpen(false), 140); }}
       onKeyDown={(event) => { if (event.key === "Escape") commitTyped(); onKeyDown(event); }}
@@ -223,7 +227,7 @@ export function SearchableSelect({ label, value, options, setValue, disabled = f
  * Server-backed picker for the tables too large to ship to the browser. Opening it always
  * lists the first page rather than re-searching whatever is already selected.
  */
-export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, locationId, quantity, warehouseId, currency, exchangeRateToBase, label, placeholder, value, valueLabel, initialOptions, onSelect, quickCreate, mapItem, hideLabel, onCreated, permissions }: {
+export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, locationId, quantity, warehouseId, currency, exchangeRateToBase, label, placeholder, value, valueLabel, initialOptions, onSelect, quickCreate, mapItem, hideLabel, required = false, onCreated, permissions }: {
   kind: LookupKind;
   role?: string;
   partnerId?: string;
@@ -244,6 +248,7 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
   quickCreate?: QuickCreateKind;
   mapItem: (item: Record<string, unknown>) => PickerOption;
   hideLabel?: boolean;
+  required?: boolean;
   onCreated?: () => void | Promise<void>;
   /** The viewer's capabilities; defaults to the PickerPermissionsContext set at the app root. */
   permissions?: PickerPermissions;
@@ -325,6 +330,8 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
       aria-autocomplete="list"
       aria-activedescendant={open && rows ? `${listboxId}-row-${active}` : undefined}
       aria-label={hideLabel ? label : undefined}
+      required={required}
+      aria-required={required || undefined}
       onFocus={() => { setQuery(""); setOpen(true); }}
       onBlur={() => window.setTimeout(() => setOpen(false), 140)}
       onKeyDown={onKeyDown}
@@ -338,7 +345,7 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
     </div> : null}
   </div>;
 
-  return <>{label && !hideLabel ? <label className="reference-field"><span>{label}</span>{field}</label> : field}
+  return <>{label && !hideLabel ? <label className="reference-field"><span>{label}{required ? <span className="required-mark" aria-hidden="true"> *</span> : null}</span>{field}</label> : field}
     {creating && offerCreate ? <QuickCreateDialog kind={offerCreate} onClose={() => setCreating(false)} onCreated={async (option) => { choose(option); setCreating(false); await onCreated?.(); }} /> : null}</>;
 }
 

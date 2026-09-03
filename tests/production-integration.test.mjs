@@ -63,7 +63,7 @@ test("a clean migration chain boots the production database contract", async () 
   assert.equal(db.sqlite.prepare("SELECT target_margin_bps FROM margin_rules WHERE id='margin-default-32'").get().target_margin_bps, 3200);
   assert.ok(db.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='product_cost_history'").get());
   assert.ok(db.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='catalog_price_history'").get());
-  await assert.rejects(run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('missing-product','missing-location',1,0,1)"), /FOREIGN KEY constraint failed/);
+  await assert.rejects(run("INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) VALUES ('missing-product','missing-location',1,0,1)"), /FOREIGN KEY constraint failed|CROSS_TENANT_REFERENCE/);
 });
 
 test("the pricing migration backfills the latest approved PO without overwriting today's catalog price", async () => {
@@ -269,6 +269,28 @@ test("document numbers are sequential, unique, and never reused", async () => {
   const concurrent = await Promise.all(Array.from({ length: 40 }, () => inventoryDb.nextDocumentNumber("SHP")));
   assert.equal(new Set(concurrent).size, concurrent.length);
   assert.equal(await inventoryDb.nextDocumentNumber("INV"), "INV-000001");
+});
+
+test("imported supplier quotes retain external references while PaneFlow generates the PO number", async () => {
+  await run("INSERT INTO business_partners (id,code,name,partner_type,currency,active,version,created_at) VALUES ('vendor-ply-import','PLY-TEST','Ply Gem Test','vendor','CAD',1,1,'2026-08-01')");
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('product-ply-import','PLY-3030','Ply Gem 3030 Casement','Window','Vinyl','760 x 760 mm','White','quantity','stocked',10000,15000,0,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
+  const actor = { id: "ply-import-operator", email: "ply-import@example.com", name: "Ply Import Operator", role: "operator", label: "Ply Import Operator <ply-import@example.com>", localDevelopment: false };
+  const payload = {
+    vendorId: "vendor-ply-import", expectedDate: "2026-09-09", currency: "CAD", exchangeRateToBase: 1,
+    supplierQuoteNumber: "993389", supplierReference: "UNKNOWN-UNTIL-PANEFLOW", sourceDocumentHash: "a".repeat(64),
+    projectReference: "Source quote 993389 · UNKNOWN-UNTIL-PANEFLOW",
+    lines: [{ kind: "item", productId: "product-ply-import", quantity: 2, unitCostCents: 10000, taxable: true, taxCode: "GST", taxRateBps: 500, fulfillmentRoute: "stock" }],
+  };
+  const created = await advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", idempotencyKey: "ply-import-first", actor, payload });
+  assert.match(created.number, /^PO-\d{6}$/);
+  assert.notEqual(created.number, payload.supplierReference);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT number,supplier_quote_number,supplier_reference,source_document_hash,lifecycle_status FROM purchase_orders WHERE id=?").get(created.recordId) }, {
+    number: created.number, supplier_quote_number: "993389", supplier_reference: "UNKNOWN-UNTIL-PANEFLOW", source_document_hash: "a".repeat(64), lifecycle_status: "draft",
+  });
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", idempotencyKey: "ply-import-duplicate-quote", actor, payload: { ...payload, sourceDocumentHash: "b".repeat(64) } }), (error) => error?.code === "DUPLICATE_SUPPLIER_QUOTE");
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "createPurchaseOrderDraft", idempotencyKey: "ply-import-duplicate-file", actor, payload: { ...payload, supplierQuoteNumber: "993390", sourceDocumentHash: "a".repeat(64) } }), (error) => error?.code === "DUPLICATE_SUPPLIER_QUOTE");
+  const found = await inventoryDomain.getInventorySnapshot({ page: 1, pageSize: 10, scope: "purchase-orders", search: "UNKNOWN-UNTIL-PANEFLOW" });
+  assert.deepEqual(found.purchaseOrders.map((order) => order.id), [created.recordId]);
 });
 
 test("host headers cannot enable local auth and email mappings cannot transfer roles", async () => {
@@ -1009,11 +1031,12 @@ test("accounting exports reject base-total plugs and emit tax from the tax compo
   await exportsModule.buildExport("quickbooks", actor, { from: "2026-08-01", to: "2026-08-31" });
 });
 
-test("inventory exports block orphaned locations until the original location ID is restored", async () => {
+test("tenant integrity blocks orphaned locations and exports accept a valid location", async () => {
   const administrator = { id: "administrator", email: "admin@example.com", name: "Administrator", role: "administrator", label: "Administrator <admin@example.com>", localDevelopment: false };
-  await run("INSERT INTO stock_movements (id,movement_type,product_id,quantity,from_location_id,inventory_status,source_document_type,source_document_id,posted_at,posted_by,idempotency_key) VALUES ('movement-orphan','legacy_adjustment','prod-a',-1,'loc-restored-legacy','usable','legacy_import','legacy-1','2026-08-01T00:00:00Z','Legacy import','legacy-orphan')");
-  await assert.rejects(exportsModule.buildExport("inventory", administrator), /Export blocked:.*loc-restored-legacy/);
-  await advancedDomain.executeWorkflow({ command: "restoreLegacyLocation", entityId: "loc-restored-legacy", idempotencyKey: "restore-orphan-location", actor: administrator, payload: { warehouseId: "wh-test", code: "LEGACY-A", name: "Restored legacy A", inventoryStatus: "usable", locationType: "storage" } });
+  const legacyMovement = "INSERT INTO stock_movements (id,movement_type,product_id,quantity,from_location_id,inventory_status,source_document_type,source_document_id,posted_at,posted_by,idempotency_key) VALUES ('movement-orphan','legacy_adjustment','prod-a',-1,'loc-restored-legacy','usable','legacy_import','legacy-1','2026-08-01T00:00:00Z','Legacy import','legacy-orphan')";
+  await assert.rejects(run(legacyMovement), /CROSS_TENANT_REFERENCE/);
+  await run("INSERT INTO locations (id,code,name,location_type,inventory_status,warehouse_id,active,version) VALUES ('loc-restored-legacy','LEGACY-A','Restored legacy A','storage','usable','wh-test',1,1)");
+  await run(legacyMovement);
   const exported = await exportsModule.buildExport("inventory", administrator);
   assert.ok(exported.rowCount > 0);
   assert.equal(db.sqlite.prepare("SELECT code FROM locations WHERE id='loc-restored-legacy'").get().code, "LEGACY-A");

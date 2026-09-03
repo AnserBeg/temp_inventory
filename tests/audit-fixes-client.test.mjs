@@ -117,7 +117,7 @@ test("a fully shipped sales order offers no dead fulfillment buttons (#20)", () 
   assert.match(sources.app, /const fulfillmentOpen = confirmed && so\.open > 0;/);
   assert.match(sources.app, /\{canShip \? <button className=\{canPostFinancial \? "button secondary" : "button primary"\} onClick=\{onShip\}>Post shipment<\/button> : null\}/);
   assert.match(sources.app, /\{canReserve \? <button className="button secondary" onClick=\{onReserve\} disabled=\{reserveBlocked\}/);
-  assert.match(sources.app, /Fully shipped: no fulfillment actions remain\./);
+  assert.match(sources.app, /Fully fulfilled: no fulfillment actions remain\./);
 });
 
 test("multi-line receipts start at zero with a fill-all action (#22)", () => {
@@ -170,4 +170,49 @@ test("posted customer invoices expose their printable document", () => {
   assert.match(sources.suite, /recordHref=\{\(record\) => `\/api\/documents\/pdf\?documentType=customer_invoice&documentId=\$\{encodeURIComponent\(record\.id\)\}`\}/);
   assert.match(sources.suite, /title=\{`Open \$\{record\.number\} PDF`\}/);
   assert.match(sources.suite, /Paid invoices remain here as completed records\./);
+});
+
+test("sales progression only offers actions whose supply prerequisite is ready", () => {
+  assert.match(sources.app, /Dedicated supplier supply is required/);
+  assert.match(sources.app, /Create linked purchase order/);
+  assert.match(sources.app, /Approve the linked purchase order/);
+  assert.match(sources.app, /Receive the linked special-order supply/);
+  assert.match(sources.app, /line\.fulfillmentRoute === "drop_ship" && line\.open > 0 && line\.linkedPurchaseOrderLifecycle === "approved"/);
+  assert.match(sources.app, /line\.fulfillmentRoute === "stock" && line\.open > line\.reserved/);
+  assert.match(sources.app, /Canceled with shipment history/);
+  assert.match(sources.suite, /Confirm \/ cancel/);
+  assert.match(sources.suite, /kind: "voidVendorBill"/);
+  assert.match(sources.suite, /Void an entirely unpaid and uncredited vendor bill/);
+});
+
+test("core workflows show their cross-page handoffs and continue after invoice posting", () => {
+  assert.match(sources.app, /const purchasingWorkflow: WorkflowGuideStep\[\]/);
+  assert.match(sources.app, /Purchase to payment/);
+  assert.match(sources.app, /Order to cash/);
+  assert.match(sources.app, /Match vendor bill/);
+  assert.match(sources.app, /Collect or credit/);
+  assert.match(sources.app, /Financial action stays separate/);
+  assert.match(sources.app, /<WorkflowGuide view=\{view\} workspaceTab=\{workspaceTab\} onNavigate=\{navigate\} \/>/);
+  assert.match(sources.app, /aria-current=\{index === active \? "step" : undefined\}/);
+  assert.match(sources.suite, /if \(kind === "createCustomerInvoice"\) selectTab\("billing-actions"\);/);
+  assert.match(sources.css, /\.process-guide li\.current/);
+});
+
+test("required operational choices are visible before posting", () => {
+  assert.match(sources.picker, /required = allowCustom/);
+  assert.match(sources.picker, /aria-required=\{required \|\| undefined\}/);
+  assert.match(sources.app, /Usable destination\{requiredMark\}/);
+  assert.match(sources.app, /Required before inventory can be posted\./);
+  assert.match(sources.app, /Source inventory location\{requiredMark\}/);
+  assert.match(sources.app, /Required for a physical vendor return\./);
+  assert.match(sources.suite, /Reason \/ audit note<span className="required-mark"/);
+  assert.match(sources.suite, /label=\{label\}\s+required/);
+  assert.match(sources.suite, /Customer invoice date/);
+  assert.match(sources.suite, /Due date<span className="required-mark"/);
+});
+
+test("billing actions use explicit business verbs", () => {
+  assert.match(sources.suite, />Post vendor credit<\/ActionButton>/);
+  assert.match(sources.suite, />Record payment<\/ActionButton>/);
+  assert.match(sources.suite, />Issue credit<\/ActionButton>/);
 });

@@ -58,6 +58,8 @@ export async function GET(request: Request) {
       name: actor.name,
       email: actor.email,
       role: actor.role,
+      tenant: { id: actor.tenantId, slug: actor.tenantSlug, name: actor.tenantName },
+      tenants: actor.tenants,
       permissions: {
         canRead: hasCapability(actor, "read"),
         canExport: hasCapability(actor, "export"),
