@@ -260,6 +260,7 @@ const tabs: Record<OperationsWorkspaceKind, Array<{ key: string; label: string }
     { key: "receive", label: "Receive" },
     { key: "create-bill", label: "Create bill" },
     { key: "send-qbo", label: "Send to QBO" },
+    { key: "closed", label: "Closed" },
   ],
   sales: [{ key: "overview", label: "Orders" }, { key: "lifecycle", label: "Confirm / cancel" }, { key: "reservations", label: "Reservations" }, { key: "drop-ship", label: "Drop-ship deliveries" }, { key: "shipment-corrections", label: "Shipment corrections" }, { key: "send-qbo", label: "Send to QBO" }],
   inventory: [{ key: "overview", label: "Balances" }, { key: "transfers", label: "Transfers & status" }, { key: "approvals", label: "Inventory approvals" }, { key: "traceability", label: "Traceability" }, { key: "valuation", label: "Valuation" }, { key: "returnables", label: "Returnables" }],
@@ -393,7 +394,7 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
 function WorkflowTab({ workspace, tab, state, canAction, openAction, refresh, onImportComplete, onCreateOrder, onOpenOrder, onOpenQbo }: { workspace: OperationsWorkspaceKind; tab: string; state: WorkflowState; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void; refresh: () => Promise<void>; onImportComplete: () => void | Promise<void>; onCreateOrder?: () => void; onOpenOrder?: (record: { id: string; number: string }) => void; onOpenQbo?: () => void }) {
   if (workspace === "purchasing" && tab === "drafts") return <PurchaseDrafts state={state} canAction={canAction} openAction={openAction} onImportComplete={onImportComplete} onCreateOrder={onCreateOrder} onOpenOrder={onOpenOrder} />;
   if (workspace === "purchasing" && tab === "approvals") return <ApprovalQueue records={purchaseQueueRecords(state.purchaseOrders, "approvals")} canAction={canAction} openAction={openAction} onOpenOrder={onOpenOrder} />;
-  if (workspace === "purchasing" && ["awaiting-order", "receive", "create-bill", "send-qbo"].includes(tab)) return <PurchaseStageQueue stage={tab as PurchaseQueueStage} records={purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage)} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />;
+  if (workspace === "purchasing" && ["awaiting-order", "receive", "create-bill", "send-qbo", "closed"].includes(tab)) return <PurchaseStageQueue stage={tab as PurchaseQueueStage} records={purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage)} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />;
   if (workspace === "sales" && tab === "reservations") return <Reservations records={state.reservations} canAction={canAction} openAction={openAction} />;
   if (workspace === "sales" && tab === "lifecycle") return <SalesLifecycle records={state.salesOrders} canAction={canAction} openAction={openAction} />;
   if (workspace === "sales" && tab === "shipment-corrections") return <ShipmentCorrections records={state.shipments} canAction={canAction} openAction={openAction} />;
@@ -1012,6 +1013,7 @@ function PurchaseStageQueue({ stage, records, onOpenOrder, onOpenQbo }: { stage:
     receive: { title: "POs awaiting supplier fulfillment", detail: "Ordered and partially received POs stay here until supplier fulfillment is complete.", action: "Open & receive" },
     "create-bill": { title: "Received POs ready for a bill", detail: "Only fully received or fulfilled POs with quantity left to bill appear here.", action: "Open & create bill" },
     "send-qbo": { title: "Bills ready for QuickBooks Online", detail: "Only fully billed POs whose supplier bills still need a successful QBO handoff appear here.", action: "Open PO" },
+    closed: { title: "Closed purchase orders", detail: "Fully billed POs move here after every connected supplier bill reaches QuickBooks Online.", action: "Open PO" },
   };
   if (stage === "drafts" || stage === "approvals") return null;
   const copy = content[stage];
@@ -1257,7 +1259,7 @@ function workflowStatusIs(status: string, ...expected: string[]) {
   return expected.some((value) => normalize(value) === normalize(status));
 }
 
-type PurchaseQueueStage = "drafts" | "approvals" | "awaiting-order" | "receive" | "create-bill" | "send-qbo";
+type PurchaseQueueStage = "drafts" | "approvals" | "awaiting-order" | "receive" | "create-bill" | "send-qbo" | "closed";
 
 function purchaseBills(record: WorkflowRecord) {
   const input = record.data?.vendorBillsJson;
@@ -1267,7 +1269,7 @@ function purchaseBills(record: WorkflowRecord) {
   } catch { return []; }
 }
 
-/** A PO belongs to at most one queue. Canceled and fully synced records remain in All POs. */
+/** A PO belongs to at most one queue. Canceled records remain only in All POs. */
 function purchaseQueueStage(record: WorkflowRecord): PurchaseQueueStage | null {
   const data = record.data ?? {};
   const lifecycle = String(data.lifecycleStatus ?? record.status);
@@ -1278,7 +1280,7 @@ function purchaseQueueStage(record: WorkflowRecord): PurchaseQueueStage | null {
   if (Number(data.openToFulfillQuantity ?? 0) > 0) return "receive";
   const bills = purchaseBills(record);
   if (!workflowStatusIs(String(data.billingStatus ?? "not_billed"), "fully_billed") || !bills.length) return "create-bill";
-  if (bills.every((bill) => workflowStatusIs(String(bill.qboStatus ?? ""), "succeeded"))) return null;
+  if (bills.every((bill) => workflowStatusIs(String(bill.qboStatus ?? ""), "succeeded"))) return "closed";
   return "send-qbo";
 }
 
@@ -1294,6 +1296,7 @@ function purchaseQueueRecord(record: WorkflowRecord, stage: PurchaseQueueStage):
     const status = qboStatuses.some((value) => value === "failed") ? "QBO needs attention" : qboStatuses.some((value) => ["pending", "processing"].includes(value)) ? "QBO sync queued" : "Ready for QBO";
     return { ...record, status, detail: "Supplier bill created; accounting handoff is next" };
   }
+  if (stage === "closed") return { ...record, status: "Closed", detail: "Supplier bill sent to QBO; purchasing lifecycle complete" };
   return record;
 }
 
@@ -1763,7 +1766,7 @@ function filterWorkflowState(state: WorkflowState, filterReference: string): Wor
 }
 
 function tabCount(workspace: OperationsWorkspaceKind, tab: string, state: WorkflowState) {
-  if (workspace === "purchasing" && ["drafts", "approvals", "awaiting-order", "receive", "create-bill", "send-qbo"].includes(tab)) return purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage).length;
+  if (workspace === "purchasing" && ["drafts", "approvals", "awaiting-order", "receive", "create-bill", "send-qbo", "closed"].includes(tab)) return purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage).length;
   if (workspace === "sales" && tab === "send-qbo") return salesQboQueueRecords(state.salesOrders).length;
   if (workspace === "vendor-billing" && tab === "match") return state.vendorBills.filter((record) => record.exception).length;
   if (workspace === "inventory" && tab === "returnables") return state.assets.filter((record) => !/closed/i.test(record.status)).length;

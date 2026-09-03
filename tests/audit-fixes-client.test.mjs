@@ -232,7 +232,7 @@ test("each order keeps its connected documents and next action in one progressio
 });
 
 test("purchase orders have one ordered set of mutually exclusive stage queues", () => {
-  const tabLabels = ["All POs", "Draft", "Approval queue", "Awaiting order", "Receive", "Create bill", "Send to QBO"];
+  const tabLabels = ["All POs", "Draft", "Approval queue", "Awaiting order", "Receive", "Create bill", "Send to QBO", "Closed"];
   let lastTab = -1;
   for (const label of tabLabels) {
     const position = sources.suite.indexOf(`label: "${label}"`, lastTab + 1);
@@ -241,10 +241,12 @@ test("purchase orders have one ordered set of mutually exclusive stage queues", 
   }
   assert.match(sources.suite, /const drafts = purchaseQueueRecords\(state\.purchaseOrders, "drafts"\)/);
   assert.doesNotMatch(sources.suite, /Approved orders awaiting vendor placement/);
-  assert.match(sources.suite, /function purchaseQueueStage[\s\S]*return "drafts";[\s\S]*return "approvals";[\s\S]*return "awaiting-order";[\s\S]*return "receive";[\s\S]*return "create-bill";[\s\S]*return "send-qbo";/);
+  assert.match(sources.suite, /function purchaseQueueStage[\s\S]*return "drafts";[\s\S]*return "approvals";[\s\S]*return "awaiting-order";[\s\S]*return "receive";[\s\S]*return "create-bill";[\s\S]*return "closed";[\s\S]*return "send-qbo";/);
+  assert.match(sources.app, /return "Closed";/);
+  assert.match(sources.app, /title: "Purchase order closed"/);
   assert.match(sources.suite, /visibleTab === "overview" \|\| detailOpen/);
   assert.match(sources.app, /detailOpen=\{Boolean\(selectedPo\)\}/);
-  for (const tab of ["drafts", "approvals", "awaiting-order", "receive", "create-bill", "send-qbo"]) {
+  for (const tab of ["drafts", "approvals", "awaiting-order", "receive", "create-bill", "send-qbo", "closed"]) {
     assert.match(sources.app, new RegExp(`view: "purchase-orders", tab: "${tab}"`));
   }
 });

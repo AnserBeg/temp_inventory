@@ -943,6 +943,7 @@ const purchasingWorkflow: WorkflowGuideStep[] = [
   { label: "Receive", detail: "Post supplier fulfillment", view: "purchase-orders", tab: "receive" },
   { label: "Create bill", detail: "Prefill from PO receipts", view: "purchase-orders", tab: "create-bill" },
   { label: "Send to QBO", detail: "Accounting owns payment", view: "purchase-orders", tab: "send-qbo" },
+  { label: "Closed", detail: "Purchasing lifecycle complete", view: "purchase-orders", tab: "closed" },
 ];
 
 const salesWorkflow: WorkflowGuideStep[] = [
@@ -2125,7 +2126,7 @@ function purchaseOrderStage(po: PurchaseOrder) {
   if (po.open > 0) return "Partially received";
   const activeBills = po.vendorBills.filter((bill) => bill.status.toLowerCase() !== "void");
   if (!activeBills.length) return "Received";
-  if (activeBills.every((bill) => bill.qboStatus?.toLowerCase() === "succeeded")) return "Sent to QBO";
+  if (activeBills.every((bill) => bill.qboStatus?.toLowerCase() === "succeeded")) return "Closed";
   return "Bill created";
 }
 
@@ -2186,7 +2187,7 @@ function WorkflowGuide({ view, workspaceTab, onNavigate }: { view: ViewKey; work
   if (["purchase-orders", "expected-receipts", "vendor-bills"].includes(view)) {
     title = "Purchase to accounting";
     steps = purchasingWorkflow;
-    const purchaseTabStep: Record<string, number> = { drafts: 0, approvals: 1, "awaiting-order": 2, receive: 3, "create-bill": 4, "send-qbo": 5 };
+    const purchaseTabStep: Record<string, number> = { drafts: 0, approvals: 1, "awaiting-order": 2, receive: 3, "create-bill": 4, "send-qbo": 5, closed: 6 };
     active = view === "purchase-orders" ? purchaseTabStep[workspaceTab] ?? 0 : view === "expected-receipts" ? 3 : workspaceTab === "billing-actions" ? 5 : 4;
   } else if (["sales-orders", "fulfillment", "customer-invoices"].includes(view)) {
     title = "Order to cash";
@@ -2319,6 +2320,7 @@ function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBac
     { label: "Received", state: stopped ? "stopped" : po.orderedAt && po.open <= 0 ? "complete" : po.orderedAt && po.fulfilled > 0 ? "current" : "upcoming", summary: po.fulfilled > 0 ? `${po.fulfilled} of ${po.ordered} received${po.open > 0 ? " · partial" : ""}` : "No quantity received yet", documents: fulfillmentDocuments },
     { label: "Bill created", state: stopped ? "stopped" : billNeedsAttention || (billingSaysComplete && !activeVendorBills.length) ? "attention" : activeVendorBills.length ? "complete" : po.orderedAt && po.open <= 0 ? "current" : "upcoming", summary: activeVendorBills.length ? `${activeVendorBills.length} supplier invoice${activeVendorBills.length === 1 ? "" : "s"} connected · ${po.billing}` : billableLines.length ? "Received lines are ready to become a bill" : "Begins after receiving", documents: billDocuments },
     { label: "Sent to QBO", state: stopped ? "stopped" : qboFailed ? "attention" : qboComplete ? "complete" : activeVendorBills.length ? "current" : "upcoming", summary: qboComplete ? "Accounting handoff complete" : qboFailed ? "QBO needs attention" : qboPending ? "Queued for automatic QBO delivery" : "Accounting pays the bill in QuickBooks" },
+    { label: "Closed", state: stopped ? "stopped" : qboComplete ? "complete" : "upcoming", summary: qboComplete ? "Purchase and accounting lifecycle complete" : "Closes after every connected bill reaches QuickBooks Online" },
   ];
   const nextAction: RecordNextAction = lifecycle === "canceled"
     ? { title: "No action — order canceled", detail: "This progression is retained as history.", tone: "success" }
@@ -2345,7 +2347,7 @@ function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBac
                     : qboPending
                       ? { title: "Sending bill to QBO", detail: "The accounting handoff runs automatically. No duplicate entry is needed.", label: "View QBO status", onClick: onOpenQbo }
                       : activeVendorBills.length
-                        ? { title: "Sent to QBO", detail: "Accounting now owns payment in QuickBooks Online.", tone: "success" }
+                        ? { title: "Purchase order closed", detail: "The supplier bill is in QuickBooks Online and the purchasing lifecycle is complete.", tone: "success" }
                         : { title: "Nothing to bill yet", detail: "Receiving must be completed before the bill can be created.", tone: "warning" };
   return <div className="object-page">
     <button className="back-button" onClick={onBack}>← Back to purchase orders</button>
