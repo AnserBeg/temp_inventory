@@ -181,7 +181,7 @@ test("sales progression only offers actions whose supply prerequisite is ready",
   assert.match(sources.app, /line\.fulfillmentRoute === "drop_ship" && line\.open > 0 && line\.linkedPurchaseOrderLifecycle === "approved"/);
   assert.match(sources.app, /line\.fulfillmentRoute === "stock" && line\.open > line\.reserved/);
   assert.match(sources.app, /Canceled with shipment history/);
-  assert.match(sources.suite, /Confirm \/ cancel/);
+  assert.match(sources.suite, /title: "Draft sales orders"/);
   assert.match(sources.suite, /kind: "voidVendorBill"/);
   assert.match(sources.suite, /Void an entirely unpaid and uncredited vendor bill/);
 });
@@ -192,22 +192,43 @@ test("core workflows show their cross-page handoffs and continue after invoice p
   assert.match(sources.app, /Order to cash/);
   assert.match(sources.app, /Create bill/);
   assert.match(sources.app, /Send to QBO/);
-  assert.match(sources.app, /Collect or credit/);
-  assert.match(sources.app, /Financial action stays separate/);
+  assert.match(sources.app, /label: "Collect"/);
+  assert.match(sources.app, /Adjust the connected invoice/);
   assert.match(sources.app, /<WorkflowGuide view=\{view\} workspaceTab=\{workspaceTab\} onNavigate=\{navigate\} \/>/);
   assert.match(sources.app, /aria-current=\{index === active \? "step" : undefined\}/);
-  assert.match(sources.suite, /if \(kind === "createCustomerInvoice"\) selectTab\("billing-actions"\);/);
+  assert.match(sources.suite, /if \(kind === "createCustomerInvoice"\) selectTab\("send-qbo"\);/);
   assert.match(sources.css, /\.process-guide li\.current/);
 });
 
 test("sales orders expose the connected invoice QBO handoff", () => {
   assert.match(sources.suite, /\{ key: "send-qbo", label: "Send to QBO" \}/);
-  assert.match(sources.suite, /function SalesQboQueue/);
-  assert.match(sources.suite, /salesQboQueueRecords\(state\.salesOrders\)/);
+  assert.match(sources.suite, /title: "Customer invoices ready for QuickBooks Online"/);
+  assert.match(sources.suite, /salesQueueRecords\(state\.salesOrders, tab as SalesQueueStage\)/);
   assert.match(sources.app, /\{ label: "Send to QBO", detail: "Push the connected invoice", view: "sales-orders", tab: "send-qbo" \}/);
   assert.match(sources.app, /\{ label: "Sent to QBO"/);
   assert.match(sources.app, /QBO invoice delivery needs attention/);
   assert.match(sources.app, /Begins after the invoice reaches QBO/);
+});
+
+test("sales orders use one linear queue and keep customer invoices inside it", () => {
+  const tabLabels = ["All Sales", "Draft", "Fulfill", "Create invoice", "Send to QBO", "Collect", "Closed"];
+  let lastTab = sources.suite.indexOf("sales: [");
+  for (const label of tabLabels) {
+    const position = sources.suite.indexOf(`label: "${label}"`, lastTab + 1);
+    assert.ok(position > lastTab, `${label} must appear after the preceding sales tab`);
+    lastTab = position;
+  }
+  assert.match(sources.suite, /function salesQueueStage[\s\S]*return "drafts";[\s\S]*return "fulfill";[\s\S]*return "create-invoice";[\s\S]*return "send-qbo";[\s\S]*return "collect";[\s\S]*return "closed";/);
+  assert.match(sources.suite, /salesInvoiceRecordsForStage\(state, "collect"\)/);
+  assert.match(sources.suite, /workflowStatusIs\(String\(\(shipment as Record<string, unknown>\)\.serviceLevel \?\? ""\), "counter sale"\)/);
+  assert.match(sources.app, /navigate\("sales-orders", undefined, "send-qbo"\)/);
+  assert.match(sources.app, /Confirmation note \(optional\)/);
+  assert.doesNotMatch(sources.app, /disabled=\{activating \|\| !confirmNote\.trim\(\)\}/);
+  assert.doesNotMatch(sources.app, /\{ key: "customer-invoices", label: "Customer invoices"/);
+  assert.doesNotMatch(sources.app, /\{ key: "fulfillment", label: "Ready to fulfill"/);
+  for (const tab of ["drafts", "fulfill", "create-invoice", "send-qbo", "collect", "closed"]) {
+    assert.match(sources.app, new RegExp(`view: "sales-orders", tab: "${tab}"`));
+  }
 });
 
 test("remote dropdown loading does not flash stale states or lose a newer request", () => {

@@ -291,6 +291,7 @@ type SalesOrder = {
   shipToPostalCode?: string;
   shipToCountry?: string;
   deliveryInstructions?: string;
+  counterSale: boolean;
   route: string;
   linkedPo?: string;
   exception?: string;
@@ -738,7 +739,6 @@ const navGroups: Array<{ label?: string; items: NavItem[] }> = [
       { key: "counter-sales", label: "Counter sale", glyph: "$" },
       { key: "crm", label: "CRM", glyph: "C" },
       { key: "sales-orders", label: "Sales orders", glyph: "SO" },
-      { key: "fulfillment", label: "Ready to fulfill", glyph: "✓" },
       { key: "customer-returns", label: "Customer returns", glyph: "↙" },
     ],
   },
@@ -756,7 +756,6 @@ const navGroups: Array<{ label?: string; items: NavItem[] }> = [
     label: "Billing",
     items: [
       { key: "vendor-bills", label: "Vendor bills", glyph: "$" },
-      { key: "customer-invoices", label: "Customer invoices", glyph: "$" },
     ],
   },
   {
@@ -858,7 +857,7 @@ const operationsWorkspaceByView = {
   stock: "inventory",
   counts: "inventory",
   "vendor-bills": "vendor-billing",
-  "customer-invoices": "customer-billing",
+  "customer-invoices": "sales",
   reports: "controls",
 } as const;
 
@@ -947,12 +946,12 @@ const purchasingWorkflow: WorkflowGuideStep[] = [
 ];
 
 const salesWorkflow: WorkflowGuideStep[] = [
-  { label: "Commit order", detail: "Confirm customer demand", view: "sales-orders" },
-  { label: "Allocate supply", detail: "Reserve or link supplier supply", view: "sales-orders", tab: "reservations" },
-  { label: "Post fulfillment", detail: "Shipment or supplier delivery", view: "fulfillment" },
-  { label: "Create invoice", detail: "Only fulfilled quantity", view: "customer-invoices" },
+  { label: "Draft", detail: "Confirm customer demand", view: "sales-orders", tab: "drafts" },
+  { label: "Fulfill", detail: "Ship or post supplier delivery", view: "sales-orders", tab: "fulfill" },
+  { label: "Create invoice", detail: "Invoice fulfilled quantity", view: "sales-orders", tab: "create-invoice" },
   { label: "Send to QBO", detail: "Push the connected invoice", view: "sales-orders", tab: "send-qbo" },
-  { label: "Collect or credit", detail: "Close the receivable", view: "customer-invoices", tab: "billing-actions" },
+  { label: "Collect", detail: "Receive payment or issue credit", view: "sales-orders", tab: "collect" },
+  { label: "Closed", detail: "QBO synced and settled", view: "sales-orders", tab: "closed" },
 ];
 
 const vendorReturnWorkflow: WorkflowGuideStep[] = [
@@ -965,8 +964,8 @@ const vendorReturnWorkflow: WorkflowGuideStep[] = [
 const customerReturnWorkflow: WorkflowGuideStep[] = [
   { label: "Select shipment", detail: "Choose eligible net shipped quantity", view: "customer-returns" },
   { label: "Receive and inspect", detail: "Available, quarantine, or damaged", view: "customer-returns" },
-  { label: "Issue credit", detail: "Financial action stays separate", view: "customer-invoices", tab: "billing-actions" },
-  { label: "Close balance", detail: "Record refund or remaining payment", view: "customer-invoices", tab: "billing-actions" },
+  { label: "Issue credit", detail: "Adjust the connected invoice", view: "sales-orders", tab: "collect" },
+  { label: "Close balance", detail: "Record refund or remaining payment", view: "sales-orders", tab: "collect" },
 ];
 
 // Reason lists are suggestions, not an enumeration: every one of these pickers accepts a typed
@@ -998,7 +997,8 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
   initialView?: string; initialTab?: string; initialPurchaseOrderId?: string; initialWorklistQuery?: string;
 }) {
   const requestedInitialView = initialView as ViewKey | undefined;
-  const normalizedInitialView = requestedInitialView && viewTitles[requestedInitialView] ? requestedInitialView : "home";
+  const normalizedInitialView = requestedInitialView === "customer-invoices" || requestedInitialView === "fulfillment" ? "sales-orders" : requestedInitialView && viewTitles[requestedInitialView] ? requestedInitialView : "home";
+  const normalizedInitialTab = requestedInitialView === "customer-invoices" ? (initialTab === "billing-actions" ? "collect" : "create-invoice") : requestedInitialView === "fulfillment" ? "fulfill" : initialTab;
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [view, setView] = useState<ViewKey>(normalizedInitialView);
   const [selectedPoId, setSelectedPoId] = useState<string | null>(initialPurchaseOrderId ?? null);
@@ -1027,7 +1027,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
   const [source, setSource] = useState<"loading" | "server" | "unavailable">("loading");
   const [sourceError, setSourceError] = useState("");
   const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
-  const [workspaceTab, setWorkspaceTab] = useState(initialTab);
+  const [workspaceTab, setWorkspaceTab] = useState(normalizedInitialTab);
   const [workflowRefreshToken, setWorkflowRefreshToken] = useState(0);
   const [page, setPage] = useState(1);
   const [query, setQuery] = useState("");
@@ -1158,9 +1158,10 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
     const handlePop = () => {
       const next = new URLSearchParams(window.location.search).get("view") as ViewKey | null;
       const nextTab = new URLSearchParams(window.location.search).get("tab") ?? "overview";
-      const restored = next && viewTitles[next] ? next : "home";
+      const restored = next === "customer-invoices" || next === "fulfillment" ? "sales-orders" : next && viewTitles[next] ? next : "home";
+      const restoredTab = next === "customer-invoices" ? (nextTab === "billing-actions" ? "collect" : "create-invoice") : next === "fulfillment" ? "fulfill" : nextTab;
       setView(restored);
-      setWorkspaceTab(nextTab);
+      setWorkspaceTab(restoredTab);
       setWorklistStatus(defaultWorklistStatus[restored] ?? "");
       // Reset the same worklist state that navigate() does. Without this, going Back out of a
       // view carried its search into the next one — landing on Sales orders still filtered to
@@ -1497,7 +1498,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
     setSource("server");
     setToast(result.message || `${entityNumber} was updated.`);
     setActiveCommand(null);
-    if (kind === "immediate-sale") navigate("customer-invoices", undefined, "billing-actions");
+    if (kind === "immediate-sale") navigate("sales-orders", undefined, "send-qbo");
   };
 
   const countApprovalFromResponse = (response: unknown, approvalId: string): CountApproval => {
@@ -1734,7 +1735,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               {view === "purchase-orders" && (
                 <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={(tab) => { setSelectedPoId(null); changeWorkspaceTab(tab); }} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} detailOpen={Boolean(selectedPo)}>
                 {selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1742,7 +1743,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               )}
               {view === "expected-receipts" && (
                 selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} receivingOnly />
                 )
@@ -1752,12 +1753,12 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
                 warehouseId={warehouseId}
                 taxDefaultRateBps={snapshot.configuration.taxDefaultRateBps}
                 canPost={snapshot.viewer.permissions.canOperate && snapshot.viewer.permissions.canPostFinancial}
-                onComplete={(message) => { setToast(message); navigate("customer-invoices", undefined, "billing-actions"); }}
+                onComplete={(message) => { setToast(message); navigate("sales-orders", undefined, "send-qbo"); }}
               />}
               {view === "sales-orders" && (
                 <OperationsWorkspace workspace="sales" initialTab={workspaceTab} onTabChange={(tab) => { setSelectedSoId(null); changeWorkspaceTab(tab); }} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("salesOrder")} onOpenOrder={(record) => { setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedSoId(record.id); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} detailOpen={Boolean(selectedSo)}>
                 {selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("customer-invoices", undefined, tab); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("sales-orders", undefined, tab === "billing-actions" ? "collect" : "create-invoice"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1765,7 +1766,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               )}
               {view === "fulfillment" && (
                 selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("customer-invoices", undefined, tab); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("sales-orders", undefined, tab === "billing-actions" ? "collect" : "create-invoice"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )
@@ -1790,7 +1791,6 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               }} />}
               {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InventoryCountSessions warehouseId={warehouseId} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} canAdminister={snapshot.viewer.permissions.canAdminister} onDurableRefresh={loadSnapshot} /></OperationsWorkspace>}
               {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenPurchaseOrder={(bill) => { if (!bill.purchaseOrderId) return; navigate("purchase-orders"); setWorklistQuery(bill.po); setAppliedWorklistQuery(bill.po); setSelectedPoId(bill.purchaseOrderId); }} /></OperationsWorkspace>}
-              {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenSalesOrder={(so) => { navigate("sales-orders"); setWorklistQuery(so.number); setAppliedWorklistQuery(so.number); setSelectedSoId(so.id); }} /></OperationsWorkspace>}
               {view === "crm" && <CustomerCrmView
                 customers={snapshot.partners}
                 totalCustomers={pageTotal}
@@ -1994,7 +1994,7 @@ function Dashboard({ snapshot, navigate, openPo }: { snapshot: Snapshot; navigat
 
       <section className="metric-row" aria-label="Today's work">
         <MetricCard label="Receipts due" value={snapshot.summary.dueReceipts} detail={`${snapshot.summary.openReceiptUnits} total units open`} tone="info" onClick={() => navigate("expected-receipts")} />
-        <MetricCard label="Ready to ship" value={snapshot.summary.readyToShip} detail={`${snapshot.summary.readyToShipUnits} reserved units ready`} tone="success" onClick={() => navigate("fulfillment")} />
+        <MetricCard label="Ready to ship" value={snapshot.summary.readyToShip} detail={`${snapshot.summary.readyToShipUnits} reserved units ready`} tone="success" onClick={() => navigate("sales-orders", undefined, "fulfill")} />
         {/* Replaced a "Customer pickups" tile that counted a `pickup` fulfillment route the
             schema never defines, so it could only ever read zero. */}
         <MetricCard label="Open warehouse demand" value={snapshot.summary.openDemand} detail="Confirmed stock and special-order units not yet shipped" tone="neutral" onClick={() => navigate("sales-orders")} />
@@ -2192,7 +2192,8 @@ function WorkflowGuide({ view, workspaceTab, onNavigate }: { view: ViewKey; work
   } else if (["sales-orders", "fulfillment", "customer-invoices"].includes(view)) {
     title = "Order to cash";
     steps = salesWorkflow;
-    active = view === "sales-orders" ? (workspaceTab === "reservations" ? 1 : workspaceTab === "drop-ship" || workspaceTab === "shipment-corrections" ? 2 : workspaceTab === "send-qbo" ? 4 : 0) : view === "fulfillment" ? 2 : workspaceTab === "billing-actions" ? 5 : 3;
+    const salesTabStep: Record<string, number> = { drafts: 0, fulfill: 1, "create-invoice": 2, "send-qbo": 3, collect: 4, closed: 5 };
+    active = view === "sales-orders" ? salesTabStep[workspaceTab] ?? 0 : view === "fulfillment" ? 1 : workspaceTab === "billing-actions" ? 4 : 2;
   } else if (view === "vendor-returns") {
     title = "Vendor return";
     steps = vendorReturnWorkflow;
@@ -2491,8 +2492,8 @@ function SalesOrdersView({ orders, canOperate, onOpen, onShip, sort, setSort }: 
 function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onOpenCustomerBilling, onOpenQbo, onOpenDropShip, onCreateLinkedPurchaseOrder, onOpenLinkedPurchaseOrder, onConfirm }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onOpenCustomerBilling: (tab?: string) => void; onOpenQbo: () => void; onOpenDropShip: () => void; onCreateLinkedPurchaseOrder: () => void; onOpenLinkedPurchaseOrder: () => void; onConfirm: (reason: string) => Promise<void> }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
-  // Confirmation is an audited decision, so the note is typed rather than defaulted — a
-  // generated one would fill the trail with a sentence nobody wrote.
+  // Confirmation comments are optional. When supplied they remain part of the audit trail,
+  // but the order can advance without making a routine note into a blocking field.
   const [confirmNote, setConfirmNote] = useState("");
   const isDraft = so.lifecycle.toLowerCase() === "draft";
   const hasDedicatedSupply = so.lines?.some((line) => Boolean(line.linkedPurchaseOrderLineId)) ?? false;
@@ -2579,7 +2580,7 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
                         : reserveBlocked
                           ? { title: "Resolve the supply shortage", detail: "Review incoming supply or create a purchasing commitment before reserving stock.", tone: "warning" }
                           : { title: "Order-to-cash complete", detail: "The order, fulfillment, invoice, and settlement are complete.", tone: "success" };
-  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm} noValidate><label><span>Confirmation note{requiredMark}</span><input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" required aria-required="true" /><small className="field-hint">{confirmNote.trim() ? "" : "Required before the order can be confirmed."}</small></label><button className="button primary" type="submit" disabled={activating || !confirmNote.trim()}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions">{confirmed ? <DocumentDownloadLink documentType="sales_order" documentId={so.id} documentNumber={so.number}>Download sales order</DocumentDownloadLink> : null}{confirmed ? <EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton> : null}{canPostFinancial && so.openToShip > 0 ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale} title={canImmediateSale ? undefined : "No unreserved stock line has usable inventory to ship and invoice now."}>Ship &amp; invoice now</button> : null}{canShip ? <button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip}>Post shipment</button> : null}{canReserve ? <button className="button secondary" onClick={onReserve} disabled={reserveBlocked} title={reserveBlocked ? "No usable stock is available to reserve right now." : undefined}>Reserve available stock</button> : null}{canPostDropShipDelivery ? <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button> : null}{!fulfillmentOpen && !canShip ? <span className="read-only-label">{confirmed ? "Fully fulfilled: no fulfillment actions remain." : `No fulfillment actions while the order is ${so.lifecycle.toLowerCase()}.`}</span> : null}</div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
+  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm} noValidate><label><span>Confirmation note (optional)</span><input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" /><small className="field-hint">Included in the audit trail when provided.</small></label><button className="button primary" type="submit" disabled={activating}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions">{confirmed ? <DocumentDownloadLink documentType="sales_order" documentId={so.id} documentNumber={so.number}>Download sales order</DocumentDownloadLink> : null}{confirmed ? <EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton> : null}{canPostFinancial && so.openToShip > 0 ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale} title={canImmediateSale ? undefined : "No unreserved stock line has usable inventory to ship and invoice now."}>Ship &amp; invoice now</button> : null}{canShip ? <button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip}>Post shipment</button> : null}{canReserve ? <button className="button secondary" onClick={onReserve} disabled={reserveBlocked} title={reserveBlocked ? "No usable stock is available to reserve right now." : undefined}>Reserve available stock</button> : null}{canPostDropShipDelivery ? <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button> : null}{!fulfillmentOpen && !canShip ? <span className="read-only-label">{confirmed ? "Fully fulfilled: no fulfillment actions remain." : `No fulfillment actions while the order is ${so.lifecycle.toLowerCase()}.`}</span> : null}</div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
     <RecordProgress title={`Order to cash for ${so.number}`} steps={salesProgress} next={nextAction} />
     <section className="panel availability-panel"><PanelHeading title="Availability for requested date" detail={`Requested ${formatDate(so.requestedDate)}`} /><div className="availability-grid"><MetricDisplay label="Required" value={so.open} /><MetricDisplay label="Available now" value={so.availableNow} tone="success" /><MetricDisplay label="Incoming before date" value={so.incomingBeforeDate} tone="info" /><MetricDisplay label="Shortage" value={so.shortage} tone={so.shortage > 0 ? "danger" : "neutral"} /></div>{so.linkedPo && <div className="linked-supply"><span className="section-kicker">Linked supply</span><strong>{so.linkedPo}</strong><p>{so.incomingBeforeDate} units expected before the customer&apos;s requested date.</p></div>}</section>
     {/* The lines are the order. Without them this page showed a total for goods it never named,
@@ -3352,10 +3353,6 @@ function VendorBillsView({ bills, sort, setSort, onOpenPurchaseOrder }: { bills:
   })}{!bills.length ? <tr><td colSpan={14}><div className="empty-inline">No vendor bills match this view.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
-function InvoicesView({ salesOrders, sort, setSort, onOpenSalesOrder }: { salesOrders: SalesOrder[]; onOpenSalesOrder: (so: SalesOrder) => void } & WorklistSortProps) {
-  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Customer invoice eligibility</caption><thead><tr><SortableHeader label="Sales order" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Customer" column="customer" sort={sort} setSort={setSort} /><SortableHeader label="Ordered" column="ordered" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Posted fulfillment" column="shipped" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Already invoiced" column="invoiced" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Available to invoice" column="availableToInvoice" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="State" column="billing" sort={sort} setSort={setSort} /></tr></thead><tbody>{salesOrders.map((so) => { const invoiced = so.invoiced ?? 0; const available = Math.max(so.fulfilled - invoiced, 0); return <tr key={so.id}><td><button className="table-link" type="button" onClick={() => onOpenSalesOrder(so)}>{so.number}</button></td><td>{so.customer}</td><td className="numeric">{so.ordered}</td><td className="numeric">{so.fulfilled}</td><td className="numeric">{invoiced}</td><td className="numeric strong">{available}</td><td><StatusBadge>{so.billing}</StatusBadge></td></tr>; })}{!salesOrders.length ? <tr><td colSpan={7}><div className="empty-inline">Nothing is waiting to be invoiced.</div></td></tr> : null}</tbody></table></div></section>;
-}
-
 type ReportKey = "ar-aging" | "open-orders" | "replenishment" | "customer-statement";
 
 type ReportRow = Record<string, unknown>;
@@ -3517,7 +3514,7 @@ function WarehouseView({ snapshot, source, canOperate, onReceive, navigate }: { 
   const tasks: Array<{ label: string; count: number; glyph: string; view: ViewKey; tab?: string }> = [
     { label: "Receive", count: snapshot.summary.dueReceipts, glyph: "↓", view: "expected-receipts" },
     { label: "Put away", count: snapshot.summary.receivingBalances, glyph: "↳", view: "stock", tab: "transfers" },
-    { label: "Pick / ship", count: snapshot.summary.readyToShip, glyph: "→", view: "fulfillment" },
+    { label: "Pick / ship", count: snapshot.summary.readyToShip, glyph: "→", view: "sales-orders", tab: "fulfill" },
     { label: "Count locations", count: snapshot.summary.countableBalances, glyph: "#", view: "counts" },
   ];
   const selected = scanned ? scanMatch : next;
@@ -4756,6 +4753,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
       number(item.availableNowQuantity),
       number(item.incomingSupplyQuantity),
     );
+    const shipments = parseShipments(item.shipmentsJson);
+    const counterSale = shipments.some((shipment) => shipment.serviceLevel.toLowerCase() === "counter sale");
     return {
       id: text(item.id, `so-${index}`),
       number: text(item.number, "Sales order"),
@@ -4800,12 +4799,13 @@ function normalizeSnapshot(input: unknown): Snapshot {
       shipToPostalCode: text(item.shipToPostalCode) || undefined,
       shipToCountry: text(item.shipToCountry) || undefined,
       deliveryInstructions: text(item.deliveryInstructions) || undefined,
-      route: titleCase(text(firstLine?.fulfillmentRoute, "stock")),
+      counterSale,
+      route: counterSale ? "Counter sale" : titleCase(text(firstLine?.fulfillmentRoute, "stock")),
       linkedPo: text(firstLine?.linkedPurchaseOrderNumber) || undefined,
       exception: shortage > 0 ? `${shortage} unit${shortage === 1 ? "" : "s"} short for requested date` : undefined,
       orderDate: text(item.orderDate).slice(0, 10),
       owner: text(item.ownerName, "Unassigned"),
-      shipments: parseShipments(item.shipmentsJson),
+      shipments,
       supplierDeliveries: parseSupplierDeliveries(item.salesDeliveriesJson),
       invoices: parseFinancialDocuments(item.customerInvoicesJson),
       settlements: parseSettlementDocuments(item.customerSettlementsJson),

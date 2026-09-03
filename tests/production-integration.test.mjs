@@ -1027,6 +1027,9 @@ test("counter sale creates its hidden order, shipment, invoice, and full payment
   const accountant = { id: "accountant", email: "accountant@example.com", name: "Accountant", role: "accounting", label: "Accountant <accountant@example.com>", localDevelopment: false };
   const postedInvoices = await advancedDomain.getAdvancedSnapshot(accountant, { scope: "customer-billing", page: 1, pageSize: 100 });
   assert.equal(postedInvoices.customerInvoices.find((invoice) => invoice.id === result.invoiceId)?.status, "paid", "paid counter-sale invoices remain in the posted register");
+  const sellingWorkspace = await advancedDomain.getWorkflowSnapshot(accountant, { scope: "sales", search: result.salesOrderNumber, page: 1, pageSize: 100 });
+  assert.equal(sellingWorkspace.snapshot.salesOrders.find((order) => order.id === result.salesOrderId)?.number, result.salesOrderNumber, "counter sales feed the shared sales-order workflow");
+  assert.equal(sellingWorkspace.advanced.customerInvoices.find((invoice) => invoice.id === result.invoiceId)?.status, "paid", "the Sales workspace carries its connected customer invoice");
 
   const repeated = await inventoryDomain.executeInventoryCommand(command);
   assert.equal(repeated.invoiceId, result.invoiceId);

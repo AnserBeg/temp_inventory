@@ -13,7 +13,7 @@ import { AlertIcon, CheckIcon, InfoIcon } from "./icons";
 import { AddressAutocomplete } from "./address-autocomplete";
 import { workflowCommandEnvelope, workflowCommandForAction, workflowSnapshotParts } from "@/lib/domain/workflow-envelope";
 
-export type OperationsWorkspaceKind = "purchasing" | "sales" | "inventory" | "vendor-billing" | "customer-billing" | "controls";
+export type OperationsWorkspaceKind = "purchasing" | "sales" | "inventory" | "vendor-billing" | "controls";
 
 type Tone = "neutral" | "info" | "success" | "warning" | "danger";
 type WorkflowActionKind =
@@ -262,20 +262,23 @@ const tabs: Record<OperationsWorkspaceKind, Array<{ key: string; label: string }
     { key: "send-qbo", label: "Send to QBO" },
     { key: "closed", label: "Closed" },
   ],
-  sales: [{ key: "overview", label: "Orders" }, { key: "lifecycle", label: "Confirm / cancel" }, { key: "reservations", label: "Reservations" }, { key: "drop-ship", label: "Drop-ship deliveries" }, { key: "shipment-corrections", label: "Shipment corrections" }, { key: "send-qbo", label: "Send to QBO" }],
+  sales: [
+    { key: "overview", label: "All Sales" },
+    { key: "drafts", label: "Draft" },
+    { key: "fulfill", label: "Fulfill" },
+    { key: "create-invoice", label: "Create invoice" },
+    { key: "send-qbo", label: "Send to QBO" },
+    { key: "collect", label: "Collect" },
+    { key: "closed", label: "Closed" },
+  ],
   inventory: [{ key: "overview", label: "Balances" }, { key: "transfers", label: "Transfers & status" }, { key: "approvals", label: "Inventory approvals" }, { key: "traceability", label: "Traceability" }, { key: "valuation", label: "Valuation" }, { key: "returnables", label: "Returnables" }],
   "vendor-billing": [{ key: "overview", label: "All bills" }, { key: "match", label: "Match exceptions" }, { key: "billing-actions", label: "Open bill actions" }],
-  // The overview lists sales orders and what is still invoiceable on them; the posted invoices
-  // themselves live on the other tab. Labelling the first one "Invoices" sent anyone looking
-  // for an invoice to the tab that has none, so each label now names what the tab shows.
-  "customer-billing": [{ key: "overview", label: "Ready to invoice" }, { key: "billing-actions", label: "Posted invoices" }],
   controls: [{ key: "overview", label: "Reports" }, { key: "approvals", label: "Approvals" }, { key: "audit", label: "Audit timeline" }, { key: "policies", label: "System policies" }, { key: "periods-access", label: "Periods & access" }, { key: "integrations", label: "Company connections" }, { key: "reconciliation", label: "Reconciliation" }, { key: "pricing", label: "Pricing" }, { key: "units", label: "Units & conversions" }, { key: "master-data", label: "Master data" }],
 };
 
 /** Create actions offered above a workspace's main list, alongside the records they add to. */
 const overviewCreateActions: Partial<Record<OperationsWorkspaceKind, ActionDefinition>> = {
   "vendor-billing": { kind: "createVendorBill", title: "Create vendor bill", description: "Record and post the financial obligation against a PO and posted receipt. Inventory does not move.", finalLabel: "Create & post vendor bill" },
-  "customer-billing": { kind: "createCustomerInvoice", title: "Create customer invoice", description: "Post eligible fulfilled quantities as a customer receivable. Inventory does not move again.", finalLabel: "Create & post customer invoice" },
 };
 
 export function OperationsWorkspace({ workspace, children, initialTab = "overview", onTabChange, onDurableRefresh, refreshToken = 0, filterReference = "", onCreateOrder, onOpenOrder, onOpenQbo, detailOpen = false }: { workspace: OperationsWorkspaceKind; children: ReactNode; initialTab?: string; onTabChange?: (tab: string) => void; onDurableRefresh?: () => void | Promise<void>; refreshToken?: number; filterReference?: string; onCreateOrder?: () => void; /** Opens a listed order's own page, where the next PO action and connected documents stay together. */ onOpenOrder?: (record: { id: string; number: string }) => void; onOpenQbo?: () => void; /** Keeps a selected record in the stage it was opened from; choosing a tab closes it in the parent. */ detailOpen?: boolean }) {
@@ -353,9 +356,10 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
     if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "The workflow could not be completed.");
     await load();
     await onDurableRefresh?.();
-    // Posting an invoice removes its source order from Ready to invoice. Land on the posted
-    // document register so the next visible actions are email, payment link, credit, or payment.
-    if (kind === "createCustomerInvoice") selectTab("billing-actions");
+    // A posted customer invoice is the next stage of the same order-to-cash journey. Keep the
+    // user in Sales and advance the record to the QBO handoff instead of opening a detached AR
+    // register.
+    if (kind === "createCustomerInvoice") selectTab("send-qbo");
     const recordSuffix = result.recordId && kind === "requestOverReceiptApproval" ? ` Approval ID: ${result.recordId}` : "";
     setToast(`${result.message ?? `${actionTitle(kind)} completed.`}${recordSuffix}`);
   };
@@ -368,9 +372,8 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
     const button = (event.target as HTMLElement).closest("button");
     const label = button?.textContent?.trim().toLowerCase() ?? "";
     const next = workspace === "inventory" && label.includes("transfer inventory") ? "transfers"
-      : workspace === "sales" && label.includes("resolve shortage") ? "reservations"
+      : workspace === "sales" && label.includes("resolve shortage") ? "fulfill"
       : workspace === "vendor-billing" && /request purchasing approval|hold vendor bill|correct bill draft/.test(label) ? "match"
-      : workspace === "customer-billing" && label.includes("create invoice") ? "billing-actions"
       : null;
     if (next) { event.preventDefault(); selectTab(next); }
   };
@@ -395,11 +398,8 @@ function WorkflowTab({ workspace, tab, state, canAction, openAction, refresh, on
   if (workspace === "purchasing" && tab === "drafts") return <PurchaseDrafts state={state} canAction={canAction} openAction={openAction} onImportComplete={onImportComplete} onCreateOrder={onCreateOrder} onOpenOrder={onOpenOrder} />;
   if (workspace === "purchasing" && tab === "approvals") return <ApprovalQueue records={purchaseQueueRecords(state.purchaseOrders, "approvals")} canAction={canAction} openAction={openAction} onOpenOrder={onOpenOrder} />;
   if (workspace === "purchasing" && ["awaiting-order", "receive", "create-bill", "send-qbo", "closed"].includes(tab)) return <PurchaseStageQueue stage={tab as PurchaseQueueStage} records={purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage)} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />;
-  if (workspace === "sales" && tab === "reservations") return <Reservations records={state.reservations} canAction={canAction} openAction={openAction} />;
-  if (workspace === "sales" && tab === "lifecycle") return <SalesLifecycle records={state.salesOrders} canAction={canAction} openAction={openAction} />;
-  if (workspace === "sales" && tab === "shipment-corrections") return <ShipmentCorrections records={state.shipments} canAction={canAction} openAction={openAction} />;
-  if (workspace === "sales" && tab === "drop-ship") return <DropShipDeliveries records={state.dropShipDeliveries} canAction={canAction} openAction={openAction} />;
-  if (workspace === "sales" && tab === "send-qbo") return <SalesQboQueue records={salesQboQueueRecords(state.salesOrders)} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />;
+  if (workspace === "sales" && ["drafts", "fulfill", "create-invoice", "send-qbo", "closed"].includes(tab)) return <SalesStageQueue stage={tab as SalesQueueStage} records={salesQueueRecords(state.salesOrders, tab as SalesQueueStage)} canAction={canAction} openAction={openAction} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />;
+  if (workspace === "sales" && tab === "collect") return <CustomerBilling records={salesInvoiceRecordsForStage(state, "collect")} canAction={canAction} openAction={openAction} title="Customer invoices awaiting collection" detail="Only QBO-synced invoices with an outstanding customer balance appear here." />;
   if (workspace === "inventory" && tab === "transfers") return <InventoryTransfers records={state.transfers} canAction={canAction} openAction={openAction} />;
   if ((workspace === "inventory" || workspace === "controls") && tab === "approvals") return <CountApprovalInbox records={state.approvals.filter((record) => ["inventory_count_variance", "over_receipt"].includes(String(record.data?.requestType ?? "")))} canAction={canAction} openAction={openAction} />;
   if (workspace === "inventory" && tab === "traceability") return <Traceability units={state.traceUnits} state={state} canAction={canAction} openAction={openAction} />;
@@ -407,7 +407,6 @@ function WorkflowTab({ workspace, tab, state, canAction, openAction, refresh, on
   if (workspace === "inventory" && tab === "returnables") return <Returnables records={state.assets} canAction={canAction} openAction={openAction} />;
   if (workspace === "vendor-billing" && tab === "match") return <VendorMatching records={state.vendorBills} canAction={canAction} openAction={openAction} />;
   if (workspace === "vendor-billing" && tab === "billing-actions") return <VendorBillingActions records={state.vendorBills} canAction={canAction} openAction={openAction} />;
-  if (workspace === "customer-billing" && tab === "billing-actions") return <CustomerBilling records={state.customerInvoices} canAction={canAction} openAction={openAction} />;
   if (workspace === "controls" && tab === "audit") return <AuditTimeline state={state} />;
   if (workspace === "controls" && tab === "policies") return <div className="workflow-stack"><AccessNotice /><Policies records={state.policies} user={state.currentUser} canAction={canAction} openAction={openAction} /></div>;
   if (workspace === "controls" && tab === "periods-access") return <PeriodsAndAccess state={state} canAction={canAction} openAction={openAction} />;
@@ -1020,8 +1019,26 @@ function PurchaseStageQueue({ stage, records, onOpenOrder, onOpenQbo }: { stage:
   return <Section title={copy.title} detail={copy.detail}><RecordTable records={records} columns={["number", "party", "quantity", "amount", "status", "detail"]} actions={(record) => <>{onOpenOrder ? <ActionButton kind={stage === "send-qbo" ? "quiet" : "primary"} onClick={() => onOpenOrder({ id: record.id, number: record.number })}>{copy.action}</ActionButton> : null}{stage === "send-qbo" && onOpenQbo ? <ActionButton kind="primary" onClick={onOpenQbo}>Open QBO</ActionButton> : null}</>} /></Section>;
 }
 
-function SalesQboQueue({ records, onOpenOrder, onOpenQbo }: { records: WorkflowRecord[]; onOpenOrder?: (record: { id: string; number: string }) => void; onOpenQbo?: () => void }) {
-  return <Section title="Customer invoices ready for QuickBooks Online" detail="Posted invoices stay connected to their sales order while the automatic QBO handoff is pending or needs attention."><RecordTable records={records} columns={["number", "party", "reference", "amount", "status", "detail"]} actions={(record) => <>{onOpenOrder ? <ActionButton kind="quiet" onClick={() => onOpenOrder({ id: record.id, number: record.number })}>Open sales order</ActionButton> : null}{onOpenQbo ? <ActionButton kind="primary" onClick={onOpenQbo}>Open QBO</ActionButton> : null}</>} /></Section>;
+function SalesStageQueue({ stage, records, canAction, openAction, onOpenOrder, onOpenQbo }: { stage: SalesQueueStage; records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void; onOpenOrder?: (record: { id: string; number: string }) => void; onOpenQbo?: () => void }) {
+  const content: Record<Exclude<SalesQueueStage, "collect">, { title: string; detail: string; action: string }> = {
+    drafts: { title: "Draft sales orders", detail: "Only unconfirmed customer orders appear here. Confirming one advances it to Fulfill.", action: "Open" },
+    fulfill: { title: "Sales orders awaiting fulfillment", detail: "Confirmed and partially fulfilled orders stay here until every remaining unit is shipped or supplier-delivered.", action: "Open & fulfill" },
+    "create-invoice": { title: "Fulfilled orders ready to invoice", detail: "Only fully fulfilled orders with uninvoiced quantity appear here. Create the customer invoice directly from its sales order.", action: "Open order" },
+    "send-qbo": { title: "Customer invoices ready for QuickBooks Online", detail: "Posted invoices stay connected to their sales order until the automatic QBO handoff succeeds.", action: "Open sales order" },
+    closed: { title: "Closed sales", detail: "Fully invoiced and settled sales move here after every connected customer invoice reaches QuickBooks Online.", action: "Open sales order" },
+  };
+  if (stage === "collect") return null;
+  const copy = content[stage];
+  return <div className="workflow-stack">
+    {stage === "fulfill" ? <section className="workflow-action-grid"><ActionCard title="Post supplier delivery" impact="Customer fulfillment increases · internal on-hand unchanged" action="Post drop-ship delivery" disabled={!canAction("postDropShipDelivery")} onClick={() => openAction({ kind: "postDropShipDelivery", title: "Post drop-ship delivery", description: "Record proof that the supplier delivered to the customer. No internal warehouse inventory is created.", finalLabel: "Post drop-ship delivery" })} /></section> : null}
+    <Section title={copy.title} detail={copy.detail}><RecordTable records={records} columns={["number", "party", "reference", "quantity", "amount", "status", "detail"]} actions={(record) => <>
+      {onOpenOrder ? <ActionButton kind={stage === "drafts" || stage === "send-qbo" ? "quiet" : "primary"} onClick={() => onOpenOrder({ id: record.id, number: record.number })}>{copy.action}</ActionButton> : null}
+      {stage === "drafts" ? <ActionButton kind="primary" disabled={!canAction("confirmSalesOrder")} onClick={() => openAction({ kind: "confirmSalesOrder", title: `Confirm ${record.number}`, description: "Activate this customer order and advance it to fulfillment. Inventory and invoicing remain unchanged.", finalLabel: "Confirm sales order", record })}>Confirm</ActionButton> : null}
+      {stage === "drafts" ? <ActionButton kind="quiet" disabled={!canAction("cancelSalesOrder")} onClick={() => openAction({ kind: "cancelSalesOrder", title: `Cancel ${record.number}`, description: "Cancel this draft without reserving, fulfilling, or invoicing stock.", finalLabel: "Cancel sales order", record })}>Cancel</ActionButton> : null}
+      {stage === "create-invoice" ? <ActionButton kind="primary" disabled={!canAction("createCustomerInvoice")} onClick={() => openAction({ kind: "createCustomerInvoice", title: `Create invoice for ${record.number}`, description: "Post the fulfilled, not-yet-invoiced quantity as a customer receivable connected to this sales order.", finalLabel: "Create & post customer invoice", record })}>Create invoice</ActionButton> : null}
+      {stage === "send-qbo" && onOpenQbo ? <ActionButton kind="primary" onClick={onOpenQbo}>Open QBO</ActionButton> : null}
+    </>} /></Section>
+  </div>;
 }
 
 function CountApprovalInbox({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
@@ -1058,24 +1075,6 @@ function Valuation({ records, policies, totals, canAction, openAction }: { recor
   return <div className="workflow-stack"><div className="workflow-metrics"><article><span>Inventory value</span><strong>{cad.format(totals.inventoryValueCents / 100)}</strong><small>All posted value entries</small></article><article><span>Landed cost allocated</span><strong>{cad.format(totals.landedCostAllocatedCents / 100)}</strong><small>{plural(totals.landedCostAllocationCount, "allocation")}</small></article><article><span>Scrap this month</span><strong>{cad.format(totals.scrapValueCents / 100)}</strong><small>{plural(totals.scrapEntryCount, "posted adjustment")}</small></article></div><Section title="Valuation policy" action={<ActionButton kind="primary" disabled={!canAction("setValuationPolicy")} onClick={() => openAction({ kind: "setValuationPolicy", title: "Set product valuation policy", description: "Create or update the valuation method used by future receipts and consumption. Existing immutable value entries do not change.", finalLabel: "Save valuation policy" })}>Set product policy</ActionButton>}><RecordTable records={policies} columns={["number", "status", "amount", "detail"]} actions={(record) => <ActionButton disabled={!canAction("setValuationPolicy")} onClick={() => openAction({ kind: "setValuationPolicy", title: `Set valuation policy for ${record.number}`, description: "Change how future receipts and consumption value this product. Existing immutable value entries do not change.", finalLabel: "Save valuation policy", record })}>Change policy</ActionButton>} /></Section><Section title="Inventory valuation" action={<ActionButton kind="primary" disabled={!canAction("allocateLandedCost")} onClick={() => openAction({ kind: "allocateLandedCost", title: "Allocate landed cost", description: "Allocate freight or duty across received inventory without moving physical stock.", finalLabel: "Post landed-cost allocation" })}>Allocate landed cost</ActionButton>}><RecordTable records={records} columns={["number", "status", "quantity", "amount", "detail"]} /></Section></div>;
 }
 
-function Reservations({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
-  return <Section title="Reservation ledger"><RecordTable records={records} columns={["number", "party", "reference", "quantity", "status"]} actions={(record) => workflowStatusIs(record.status, "active") ? <><ActionButton disabled={!canAction("releaseReservation")} onClick={() => openAction({ kind: "releaseReservation", title: `Release ${record.number}`, description: "Return reserved quantity to availability. On hand and financial balances do not change.", finalLabel: "Release reservation", record })}>Release</ActionButton><ActionButton kind="quiet" disabled={!canAction("reallocateReservation")} onClick={() => openAction({ kind: "reallocateReservation", title: `Reallocate ${record.number}`, description: "Move this allocation to another demand line with a recorded reason.", finalLabel: "Reallocate inventory", record })}>Reallocate</ActionButton></> : <span className="read-only-label">No active quantity</span>} /></Section>;
-}
-
-function SalesLifecycle({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
-  // The optimistic-lock version is a concurrency detail the server enforces, not something a
-  // rep reads off a worklist. What they need is the customer and what the order is worth.
-  return <Section title="Sales-order lifecycle"><RecordTable records={records.filter((record) => workflowStatusIs(record.status, "draft", "confirmed"))} columns={["number", "party", "quantity", "amount", "status"]} actions={(record) => workflowStatusIs(record.status, "draft") ? <><ActionButton kind="primary" disabled={!canAction("confirmSalesOrder")} onClick={() => openAction({ kind: "confirmSalesOrder", title: `Confirm ${record.number}`, description: "Activate the order lines as customer demand without reserving, fulfilling, or invoicing them.", finalLabel: "Confirm sales order", record })}>Confirm</ActionButton><ActionButton kind="quiet" disabled={!canAction("cancelSalesOrder")} onClick={() => openAction({ kind: "cancelSalesOrder", title: `Cancel ${record.number}`, description: "Cancel remaining demand; no stock movement or invoice is created.", finalLabel: "Cancel sales order", record })}>Cancel</ActionButton></> : <ActionButton kind="quiet" disabled={!canAction("cancelSalesOrder")} onClick={() => openAction({ kind: "cancelSalesOrder", title: `Cancel ${record.number}`, description: "Release remaining demand and active reservations without moving physical stock.", finalLabel: "Cancel remaining demand", record })}>Cancel remaining</ActionButton>} /></Section>;
-}
-
-function ShipmentCorrections({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
-  return <Section title="Posted shipments"><RecordTable records={records} columns={["number", "party", "reference", "quantity", "status"]} actions={(record) => (record.quantity ?? 0) > 0 ? <ActionButton disabled={!canAction("reverseShipment")} onClick={() => openAction({ kind: "reverseShipment", title: `Reverse ${record.number}`, description: "Create a linked correction that returns physical quantity to a controlled internal status.", finalLabel: "Post shipment reversal", record })}>Reverse shipment line</ActionButton> : <span className="read-only-label">Fully reversed</span>} /></Section>;
-}
-
-function DropShipDeliveries({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
-  return <div className="workflow-stack"><section className="workflow-action-grid"><ActionCard title="Post supplier delivery" impact="Customer fulfillment increases · internal on-hand unchanged" action="Post delivery" disabled={!canAction("postDropShipDelivery")} onClick={() => openAction({ kind: "postDropShipDelivery", title: "Post drop-ship delivery", description: "Record proof that the supplier delivered to the customer. No internal warehouse inventory is created.", finalLabel: "Post drop-ship delivery" })} /></section><Section title="Drop-ship delivery ledger"><RecordTable records={records} columns={["number", "reference", "quantity", "status", "detail"]} actions={(record) => <ActionButton disabled={!canAction("reverseDropShipDelivery") || !workflowStatusIs(record.status, "posted", "partially reversed") || (record.quantity ?? 0) <= 0} onClick={() => openAction({ kind: "reverseDropShipDelivery", title: `Reverse ${record.number}`, description: "Correct externally delivered quantity without changing internal inventory.", finalLabel: "Post delivery reversal", record })}>Reverse delivery</ActionButton>} /></Section></div>;
-}
-
 function VendorMatching({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
   // The tab is named after exceptions, so it holds exceptions. It used to list every bill in the
   // workspace, which meant paging through hundreds of "Matched · no action needed" cards that
@@ -1100,8 +1099,8 @@ function VendorBillingActions({ records, canAction, openAction }: { records: Wor
   }} /></Section>;
 }
 
-function CustomerBilling({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
-  return <Section title="Posted invoice register" detail="Download any invoice number as a PDF. Paid invoices remain here as completed records."><RecordTable records={records} columns={["number", "party", "reference", "issuedOn", "dueOn", "amount", "status", "detail"]} recordHref={(record) => `/api/documents/pdf?documentType=customer_invoice&documentId=${encodeURIComponent(record.id)}`} actions={(record) => <>
+function CustomerBilling({ records, canAction, openAction, title = "Posted invoice register", detail = "Download any invoice number as a PDF. Paid invoices remain here as completed records." }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void; title?: string; detail?: string }) {
+  return <Section title={title} detail={detail}><RecordTable records={records} columns={["number", "party", "reference", "issuedOn", "dueOn", "amount", "status", "detail"]} recordHref={(record) => `/api/documents/pdf?documentType=customer_invoice&documentId=${encodeURIComponent(record.id)}`} actions={(record) => <>
     <DocumentDownloadLink documentType="customer_invoice" documentId={record.id} documentNumber={record.number} className="workflow-action secondary">Download invoice</DocumentDownloadLink>
     <EmailDocumentButton documentType="customer_invoice" documentId={record.id} documentNumber={record.number} disabled={!canAction("recordCustomerPayment")} className="workflow-action secondary">Email invoice</EmailDocumentButton>
     {!documentStatusIsSettled(record.status) ? <><HelcimPaymentLinkButton invoiceId={record.id} invoiceNumber={record.number} disabled={!canAction("recordCustomerPayment")} /><ActionButton disabled={!canAction("issueCustomerCredit")} onClick={() => openAction({ kind: "issueCustomerCredit", title: `Credit ${record.number}`, description: "Reduce the outstanding receivable. This command does not return stock.", finalLabel: "Issue customer credit", record })}>Issue credit</ActionButton><ActionButton disabled={!canAction("recordCustomerPayment")} onClick={() => openAction({ kind: "recordCustomerPayment", title: `Record payment for ${record.number}`, description: "Apply a payment to this invoice with an auditable reference.", finalLabel: "Record payment", record })}>Record payment</ActionButton><ActionButton kind="quiet" disabled={!canAction("addDocumentCharge")} onClick={() => openAction({ kind: "addDocumentCharge", title: `Add charge to ${record.number}`, description: "Add a durable fee, discount, freight, or deposit and recalculate the invoice.", finalLabel: "Add invoice charge", record: { ...record, data: { ...record.data, documentType: "customer_invoice" } } })}>Add charge</ActionButton><ActionButton kind="quiet" disabled={documentHasSettlement(record) || !canAction("voidCustomerInvoice")} onClick={() => openAction({ kind: "voidCustomerInvoice", title: `Void ${record.number}`, description: "Void an entirely unpaid and uncredited invoice. Its source quantities become invoiceable again.", finalLabel: "Void customer invoice", record })}>Void</ActionButton></> : <span className="read-only-label">Settled</span>}
@@ -1312,14 +1311,67 @@ function salesInvoices(record: WorkflowRecord) {
   } catch { return []; }
 }
 
-function salesQboQueueRecords(records: WorkflowRecord[]) {
-  return records.flatMap((record) => {
-    const pending = salesInvoices(record).filter((invoice) => !workflowStatusIs(String(invoice.qboStatus ?? ""), "succeeded"));
-    if (!pending.length) return [];
-    const statuses = pending.map((invoice) => String(invoice.qboStatus ?? "").toLowerCase());
+type SalesQueueStage = "drafts" | "fulfill" | "create-invoice" | "send-qbo" | "collect" | "closed";
+
+function salesInvoiceOutstandingCents(invoice: Record<string, unknown>) {
+  return Math.max(Number(invoice.amountCents ?? invoice.totalCents ?? invoice.total_cents ?? 0) - Number(invoice.paidCents ?? invoice.paid_cents ?? 0) - Number(invoice.creditedCents ?? invoice.credited_cents ?? 0), 0);
+}
+
+function isCounterSale(record: WorkflowRecord) {
+  const input = record.data?.shipmentsJson;
+  try {
+    const parsed = typeof input === "string" ? JSON.parse(input) : input;
+    return Array.isArray(parsed) && parsed.some((shipment) => shipment && typeof shipment === "object" && workflowStatusIs(String((shipment as Record<string, unknown>).serviceLevel ?? ""), "counter sale"));
+  } catch { return false; }
+}
+
+/** Every live sales order belongs to at most one forward-moving queue. Canceled orders remain
+ * visible in All Sales for history, but never re-enter an operational stage. */
+function salesQueueStage(record: WorkflowRecord): SalesQueueStage | null {
+  const data = record.data ?? {};
+  const lifecycle = String(data.lifecycleStatus ?? record.status);
+  if (workflowStatusIs(lifecycle, "draft")) return "drafts";
+  if (!workflowStatusIs(lifecycle, "confirmed")) return null;
+  if (Number(data.openToFulfillQuantity ?? 0) > 0) return "fulfill";
+  const invoices = salesInvoices(record);
+  if (!workflowStatusIs(String(data.billingStatus ?? "not_invoiced"), "invoiced", "fully_invoiced") || !invoices.length) return "create-invoice";
+  if (invoices.some((invoice) => !workflowStatusIs(String(invoice.qboStatus ?? ""), "succeeded"))) return "send-qbo";
+  if (invoices.some((invoice) => salesInvoiceOutstandingCents(invoice) > 0)) return "collect";
+  return "closed";
+}
+
+function salesQueueRecord(record: WorkflowRecord, stage: SalesQueueStage): WorkflowRecord {
+  const data = record.data ?? {};
+  const ordered = Number(data.orderedQuantity ?? record.quantity ?? 0);
+  const fulfilled = Number(data.fulfilledQuantity ?? 0);
+  const invoices = salesInvoices(record);
+  const reference = invoices.map((invoice) => String(invoice.number ?? "Invoice")).join(", ") || record.reference;
+  const journey = isCounterSale(record) ? "Counter sale · " : "";
+  if (stage === "drafts") return { ...record, status: "Draft", detail: "Unconfirmed customer order" };
+  if (stage === "fulfill") return { ...record, status: fulfilled > 0 ? "Partially fulfilled" : "Ready to fulfill", detail: `${journey}${fulfilled} of ${ordered} customer units fulfilled` };
+  if (stage === "create-invoice") return { ...record, status: workflowStatusIs(String(data.billingStatus ?? ""), "partially_invoiced") ? "Partially invoiced" : "Ready to invoice", detail: `${journey}Fulfillment complete; create the connected customer invoice` };
+  if (stage === "send-qbo") {
+    const statuses = invoices.map((invoice) => String(invoice.qboStatus ?? "").toLowerCase());
     const failed = statuses.some((status) => ["failed", "conflict"].includes(status));
-    const amountCents = pending.reduce((sum, invoice) => sum + Number(invoice.amountCents ?? 0), 0);
-    return [{ ...record, reference: pending.map((invoice) => String(invoice.number ?? "Invoice")).join(", "), amount: amountCents / 100, status: failed ? "QBO needs attention" : statuses.some((status) => ["pending", "processing"].includes(status)) ? "QBO sync queued" : "Ready for QBO", detail: `${pending.length} connected invoice${pending.length === 1 ? "" : "s"} awaiting successful QBO delivery` }];
+    const amountCents = invoices.reduce((sum, invoice) => sum + Number(invoice.amountCents ?? 0), 0);
+    return { ...record, reference, amount: amountCents / 100, status: failed ? "QBO needs attention" : statuses.some((status) => ["pending", "processing"].includes(status)) ? "QBO sync queued" : "Ready for QBO", detail: `${journey}${invoices.length} connected invoice${invoices.length === 1 ? "" : "s"} awaiting successful QBO delivery` };
+  }
+  if (stage === "collect") {
+    const outstandingCents = invoices.reduce((sum, invoice) => sum + salesInvoiceOutstandingCents(invoice), 0);
+    return { ...record, reference, amount: outstandingCents / 100, status: "Payment due", detail: `${journey}${formatWorkflowMoney(outstandingCents / 100, record.currency)} outstanding across ${invoices.length} connected invoice${invoices.length === 1 ? "" : "s"}` };
+  }
+  return { ...record, reference, status: "Closed", detail: `${journey}Customer invoices sent to QBO and settled in full` };
+}
+
+function salesQueueRecords(records: WorkflowRecord[], stage: SalesQueueStage) {
+  return records.filter((record) => salesQueueStage(record) === stage).map((record) => salesQueueRecord(record, stage));
+}
+
+function salesInvoiceRecordsForStage(state: WorkflowState, stage: SalesQueueStage) {
+  const orderIds = new Set(state.salesOrders.filter((record) => salesQueueStage(record) === stage).map((record) => record.id));
+  return state.customerInvoices.filter((invoice) => {
+    const salesOrderId = String(invoice.data?.sales_order_id ?? invoice.data?.salesOrderId ?? "");
+    return orderIds.has(salesOrderId) && (stage !== "collect" || documentOutstandingAmount(invoice) > 0);
   });
 }
 
@@ -1473,7 +1525,7 @@ function WorkflowFields(props: FieldProps) {
   if (action.kind === "updatePolicy") return <div className="workflow-form-grid"><label className="full"><span>Current value</span><input value={(action.record as PolicyRecord).value} disabled /></label>{action.record?.id === "security.defaultRole" ? <label className="full"><span>New default role</span><select value={props.policyValue} onChange={(event) => props.setPolicyValue(event.target.value)}><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="accounting">Accounting</option></select></label> : <label className="full"><span>New value</span><input value={props.policyValue} onChange={(event) => props.setPolicyValue(event.target.value)} required /></label>}<ReasonField value={props.reason} setValue={props.setReason} /></div>;
   if (action.kind === "amendPurchaseOrder") return <div className="workflow-form-grid"><div className="workflow-record-context full"><span>{action.record?.number}</span><strong>Revision {(action.record?.revision ?? 1) + 1}</strong><small>The server will reject a quantity below net received.</small></div><LookupField kind="purchaseOrderLines" partnerId={action.record?.id ?? ""} label="Purchase-order line" value={props.reference} setValue={props.setReference} onSelect={(option) => props.setQuantity(Number(option.data?.orderedQuantity ?? props.quantity))} /><label><span>Revised ordered quantity</span><NumberField min="1" value={props.quantity} onChange={props.setQuantity} required /></label><label><span>Revised unit cost (optional)</span><NumberField min="0" step="0.01" value={props.amount} onChange={props.setAmount} /></label><ReasonField value={props.reason} setValue={props.setReason} /></div>;
   if (action.kind === "createVendorBill") return <VendorBillFields {...props} />;
-  if (action.kind === "createCustomerInvoice") return <div className="workflow-form-grid"><LookupField kind="salesOrders" label="Sales order with invoiceable fulfillment" value={props.reference} setValue={props.setReference} onSelect={(option) => { props.onReferenceSelect(option as SelectOption); props.setAmount(Number(option.data?.invoiceableCents ?? 0) / 100); const terms = String(option.data?.paymentTerms ?? "Net 30"); props.setFinancial({ ...props.financial, currency: String(option.data?.currency ?? "CAD"), exchangeRate: Number(option.data?.exchangeRateToBase ?? 1), terms, dueDate: dueDateFromTerms(props.financial.postingDate, terms) }); }} /><FinancialDetails value={props.financial} onChange={props.setFinancial} items={props.amount} currencyLocked postingDateLabel="Customer invoice date" taxIncluded /></div>;
+  if (action.kind === "createCustomerInvoice") return <div className="workflow-form-grid">{action.record ? <div className="workflow-record-context full"><span>{action.record.number}</span><strong>{action.record.party}</strong><small>Fulfilled, uninvoiced quantity will be calculated from this connected sales order.</small></div> : <LookupField kind="salesOrders" label="Sales order with invoiceable fulfillment" value={props.reference} setValue={props.setReference} onSelect={(option) => { props.onReferenceSelect(option as SelectOption); props.setAmount(Number(option.data?.invoiceableCents ?? 0) / 100); const terms = String(option.data?.paymentTerms ?? "Net 30"); props.setFinancial({ ...props.financial, currency: String(option.data?.currency ?? "CAD"), exchangeRate: Number(option.data?.exchangeRateToBase ?? 1), terms, dueDate: dueDateFromTerms(props.financial.postingDate, terms) }); }} />}<FinancialDetails value={props.financial} onChange={props.setFinancial} items={props.amount} currencyLocked postingDateLabel="Customer invoice date" taxIncluded /></div>;
   if (action.kind === "allocateLandedCost") return <div className="workflow-form-grid"><LookupField kind="costLayers" label="Cost layer" value={props.reference} setValue={props.setReference} /><LookupField kind="vendorBills" label="Source vendor bill" value={props.externalReference} setValue={props.setExternalReference} /><label><span>Amount (CAD)</span><NumberField min="0.01" step="0.01" value={props.amount} onChange={props.setAmount} required /></label><PostingDateField value={props.financial} onChange={props.setFinancial} /></div>;
   if (action.kind === "issueReturnableAsset") return <div className="workflow-form-grid"><LookupField kind="partners" role="customer" label="Customer" value={props.reference} setValue={props.setReference} quickCreate="customer" /><LookupField kind="assetTypes" label="Asset type" value={props.resolution} setValue={props.setResolution} initialOptions={state.options.assetTypes} quickCreate="assetType" onSelect={(option) => props.setAmount(Number(option.data?.unitDepositCents ?? 0) / 100)} /><label><span>Quantity</span><NumberField min="1" step="1" value={props.quantity} onChange={props.setQuantity} required /></label><PostingDateField value={props.financial} onChange={props.setFinancial} /><div className="workflow-record-context"><span>Refundable deposit collected (CAD)</span><strong>{formatWorkflowMoney(props.amount * props.quantity, "CAD")}</strong><small>Calculated from the selected asset type and posted with this issuance</small></div>{props.amount * props.quantity > 0 ? <><label><span>Deposit method</span><select value={props.source} onChange={(event) => props.setSource(event.target.value)}><option value="bank_transfer">Bank transfer</option><option value="credit_card">Credit card</option><option value="cheque">Cheque</option><option value="cash">Cash</option></select></label><label><span>Deposit reference</span><input value={props.externalReference} onChange={(event) => props.setExternalReference(event.target.value)} required /></label></> : null}<ReasonField value={props.reason} setValue={props.setReason} /></div>;
   if (action.kind === "refundAssetDeposit") return <div className="workflow-form-grid"><div className="workflow-record-context full"><span>{action.record?.number}</span><strong>{action.record?.party}</strong><small>{action.record?.detail}</small></div><label><span>Refund amount (CAD)</span><NumberField min="0.01" max={action.record?.amount} step="0.01" value={props.amount} onChange={props.setAmount} required /></label><PostingDateField value={props.financial} onChange={props.setFinancial} label="Refund date" /><ReasonField value={props.reason} setValue={props.setReason} /></div>;
@@ -1767,7 +1819,7 @@ function filterWorkflowState(state: WorkflowState, filterReference: string): Wor
 
 function tabCount(workspace: OperationsWorkspaceKind, tab: string, state: WorkflowState) {
   if (workspace === "purchasing" && ["drafts", "approvals", "awaiting-order", "receive", "create-bill", "send-qbo", "closed"].includes(tab)) return purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage).length;
-  if (workspace === "sales" && tab === "send-qbo") return salesQboQueueRecords(state.salesOrders).length;
+  if (workspace === "sales" && ["drafts", "fulfill", "create-invoice", "send-qbo", "collect", "closed"].includes(tab)) return salesQueueRecords(state.salesOrders, tab as SalesQueueStage).length;
   if (workspace === "vendor-billing" && tab === "match") return state.vendorBills.filter((record) => record.exception).length;
   if (workspace === "inventory" && tab === "returnables") return state.assets.filter((record) => !/closed/i.test(record.status)).length;
   if ((workspace === "inventory" || workspace === "controls") && tab === "approvals") return state.approvals.filter((record) => /pending/i.test(record.status) && ["inventory_count_variance", "over_receipt"].includes(String(record.data?.requestType ?? ""))).length;
@@ -1775,7 +1827,7 @@ function tabCount(workspace: OperationsWorkspaceKind, tab: string, state: Workfl
 }
 
 function requiresReason(kind: WorkflowActionKind) {
-  return ["amendPurchaseOrder", "cancelPurchaseOrder", "confirmSalesOrder", "cancelSalesOrder", "requestOverReceiptApproval", "transferInventory", "changeInventoryStatus", "scrapInventory", "releaseReservation", "reallocateReservation", "reverseShipment", "reverseDropShipDelivery", "resolveMatchException", "createVendorCredit", "voidVendorBill", "issueCustomerCredit", "voidCustomerInvoice", "issueReturnableAsset", "returnReturnableAsset", "forfeitReturnableAsset", "refundAssetDeposit", "updatePolicy", "lockPeriod", "unlockPeriod", "updateUserRole"].includes(kind);
+  return ["amendPurchaseOrder", "cancelPurchaseOrder", "cancelSalesOrder", "requestOverReceiptApproval", "transferInventory", "changeInventoryStatus", "scrapInventory", "releaseReservation", "reallocateReservation", "reverseShipment", "reverseDropShipDelivery", "resolveMatchException", "createVendorCredit", "voidVendorBill", "issueCustomerCredit", "voidCustomerInvoice", "issueReturnableAsset", "returnReturnableAsset", "forfeitReturnableAsset", "refundAssetDeposit", "updatePolicy", "lockPeriod", "unlockPeriod", "updateUserRole"].includes(kind);
 }
 
 function allowsOptionalApprovalComment(kind: WorkflowActionKind) {
