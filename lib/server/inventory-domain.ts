@@ -3860,27 +3860,25 @@ export async function getProductOperationalDetail(productId: string, page = 1, p
     FROM products p LEFT JOIN units_of_measure bu ON bu.id=p.base_uom_id LEFT JOIN units_of_measure pu ON pu.id=p.purchase_uom_id LEFT JOIN units_of_measure su ON su.id=p.sales_uom_id
     WHERE p.id=?`, productId);
   if (!product) throw new DomainError("NOT_FOUND", "Product was not found.", 404);
-  const [balances, movements, movementTotal, aliases, defaultLocations] = await Promise.all([
-    all<Record<string, unknown>>(`SELECT ib.product_id AS productId,ib.location_id AS locationId,ib.on_hand_qty AS recordedQuantity,ib.reserved_qty AS reservedQuantity,ib.version,
+  const balances = await all<Record<string, unknown>>(`SELECT ib.product_id AS productId,ib.location_id AS locationId,ib.on_hand_qty AS recordedQuantity,ib.reserved_qty AS reservedQuantity,ib.version,
       l.code AS locationCode,l.name AS locationName,l.inventory_status AS inventoryStatus,w.code AS warehouseCode,w.name AS warehouseName
       FROM inventory_balances ib LEFT JOIN locations l ON l.id=ib.location_id LEFT JOIN warehouses w ON w.id=l.warehouse_id
-      WHERE ib.product_id=? ORDER BY CASE WHEN l.id IS NULL THEN 0 ELSE 1 END,w.code,l.code`, productId),
-    all<Record<string, unknown>>(`SELECT sm.id,sm.movement_type AS type,sm.quantity,sm.inventory_status AS inventoryStatus,
+      WHERE ib.product_id=? ORDER BY CASE WHEN l.id IS NULL THEN 0 ELSE 1 END,w.code,l.code`, productId);
+  const movements = await all<Record<string, unknown>>(`SELECT sm.id,sm.movement_type AS type,sm.quantity,sm.inventory_status AS inventoryStatus,
       sm.source_document_type AS sourceDocumentType,sm.source_document_id AS sourceDocumentId,sm.posted_at AS postedAt,sm.posted_by AS postedBy,
       fl.code AS fromLocationCode,tl.code AS toLocationCode FROM stock_movements sm
       LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id
       WHERE sm.product_id=? OR sm.product_id IN (
         SELECT source_id FROM master_record_merges WHERE entity_type='product' AND target_id=?
-      ) ORDER BY sm.posted_at DESC,sm.id DESC LIMIT ? OFFSET ?`, productId, productId, normalized.pageSize, normalized.offset),
-    first<{ count: number }>(`SELECT COUNT(*) AS count FROM stock_movements WHERE product_id=? OR product_id IN (
-      SELECT source_id FROM master_record_merges WHERE entity_type='product' AND target_id=?)`, productId, productId),
-    all<Record<string, unknown>>(`SELECT id,alias,alias_type AS aliasType,created_at AS createdAt,created_by AS createdBy
-      FROM product_aliases WHERE product_id=? ORDER BY alias COLLATE NOCASE`, productId),
-    all<Record<string, unknown>>(`SELECT w.id AS warehouseId,w.code AS warehouseCode,w.name AS warehouseName,
+      ) ORDER BY sm.posted_at DESC,sm.id DESC LIMIT ? OFFSET ?`, productId, productId, normalized.pageSize, normalized.offset);
+  const movementTotal = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM stock_movements WHERE product_id=? OR product_id IN (
+      SELECT source_id FROM master_record_merges WHERE entity_type='product' AND target_id=?)`, productId, productId);
+  const aliases = await all<Record<string, unknown>>(`SELECT id,alias,alias_type AS aliasType,created_at AS createdAt,created_by AS createdBy
+      FROM product_aliases WHERE product_id=? ORDER BY alias COLLATE NOCASE`, productId);
+  const defaultLocations = await all<Record<string, unknown>>(`SELECT w.id AS warehouseId,w.code AS warehouseCode,w.name AS warehouseName,
       pdl.location_id AS locationId,l.code AS locationCode,l.name AS locationName,pdl.version
       FROM warehouses w LEFT JOIN product_default_locations pdl ON pdl.warehouse_id=w.id AND pdl.product_id=?
-      LEFT JOIN locations l ON l.id=pdl.location_id WHERE w.active=1 ORDER BY w.code`, productId),
-  ]);
+      LEFT JOIN locations l ON l.id=pdl.location_id WHERE w.active=1 ORDER BY w.code`, productId);
   return { product, balances, movements, aliases, defaultLocations, pagination: { page: normalized.page, pageSize: normalized.pageSize, total: Number(movementTotal?.count ?? 0) } };
 }
 
