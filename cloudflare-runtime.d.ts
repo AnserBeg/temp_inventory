@@ -42,6 +42,7 @@ declare module "cloudflare:workers" {
     ALLOW_LOCAL_DEV_AUTH?: string;
     BOOTSTRAP_DEMO_DATA?: string;
     ENVIRONMENT?: string;
+    GOOGLE_MAPS_API_KEY?: string;
     [key: string]: unknown;
   };
 }

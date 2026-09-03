@@ -597,6 +597,23 @@ a.button.disabled { opacity: .5; pointer-events: none; }
 .command-form { display: grid; gap: 13px; }
 .command-form > label, .form-grid > label { display: grid; gap: 5px; color: #48534f; font-size: 12px; font-weight: 680; }
 .command-form input:not([type="radio"]):not([type="checkbox"]), .command-form select, .form-grid input:not([type="checkbox"]), .form-grid select { width: 100%; min-height: 40px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: #fff; color: var(--ink); }
+.address-autocomplete { display: grid; min-width: 0; gap: 4px; }
+.address-autocomplete-widget { min-width: 0; }
+.address-autocomplete-widget[hidden] { display: none; }
+.address-autocomplete gmp-place-autocomplete {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background-color: #fff;
+  color: var(--ink);
+  font: inherit;
+}
+.address-autocomplete gmp-place-autocomplete::part(input) { min-height: 38px; padding: 8px 10px; color: var(--ink); font: inherit; }
+.address-autocomplete gmp-place-autocomplete::part(focus-ring) { border-radius: 6px; }
+.address-autocomplete gmp-place-autocomplete[aria-invalid="true"] { border-color: var(--danger); }
+.address-autocomplete-note { color: var(--ink-soft); font-size: 11px; font-weight: 450; line-height: 1.35; }
 .command-form fieldset { display: grid; gap: 6px; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 7px; }
 .command-form legend { padding: 0 5px; font-size: 12px; font-weight: 700; }
 .batch-receipt-lines { display: grid; gap: 7px; }
@@ -1224,6 +1241,8 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .master-data-form label { display: grid; gap: 5px; }
 .master-data-form label > span { color: var(--ink-soft); font-size: 11px; font-weight: 750; }
 .master-data-form input, .master-data-form select { min-height: 36px; border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; background: #fff; color: var(--ink); }
+.master-data-form .address-autocomplete gmp-place-autocomplete { min-height: 36px; border-color: var(--line); }
+.master-data-form .address-autocomplete gmp-place-autocomplete::part(input) { min-height: 34px; padding: 7px 9px; }
 .master-data-form [role="status"], .master-data-form .read-only-label { grid-column: 1 / -1; }
 
 /* Pricing is a working surface with several related forms. It needs its own layout instead

@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { NumberField } from "./number-field";
+import { AddressAutocomplete } from "./address-autocomplete";
 import { useDialogDismiss } from "./use-dialog-dismiss";
 
 export type PickerOption = {
@@ -367,6 +368,7 @@ export function QuickCreateDialog({ kind, companyReorderPercent, submitLabel = "
   const [email, setEmail] = useState("");
   const [phone, setPhone] = useState("");
   const [addressLine1, setAddressLine1] = useState("");
+  const [addressLine2, setAddressLine2] = useState("");
   const [city, setCity] = useState("");
   const [region, setRegion] = useState("");
   const [postalCode, setPostalCode] = useState("");
@@ -427,7 +429,7 @@ export function QuickCreateDialog({ kind, companyReorderPercent, submitLabel = "
       : kind === "assetType" ? "createReturnableAssetType"
       : "createLocation";
     const payload = isPartner
-      ? { code, name, partnerType, email, phone, currency, paymentTerms, addressLine1, city, region, postalCode, country, creditLimitCents: 0, creditHold: false }
+      ? { code, name, partnerType, email, phone, currency, paymentTerms, addressLine1, addressLine2, city, region, postalCode, country, creditLimitCents: 0, creditHold: false }
       : kind === "product"
         ? { sku: code, manufacturerSku, name, category, material, dimensions, finish, trackingPolicy, inventoryPolicy, standardCostCents: Math.round(cost * 100), sellingPriceCents: Math.round(price * 100), reorderPoint: effectiveReorderPoint, maxStockLevel, reorderRuleMode, reorderRulePercent: reorderRuleMode === "custom" ? reorderRulePercent : undefined, baseUomId: uomId, purchaseUomId: uomId, salesUomId: uomId }
       : kind === "uom" ? { code, name, dimension, precision }
@@ -438,7 +440,7 @@ export function QuickCreateDialog({ kind, companyReorderPercent, submitLabel = "
       const response = await fetch("/api/workflows", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": idempotencyKey }, body: JSON.stringify({ command, idempotencyKey, payload }) });
       const result = await response.json() as { recordId?: string; error?: string | { message?: string } };
       if (!response.ok || !result.recordId) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "The record could not be created.");
-      await onCreated({ id: result.recordId, label: kind === "product" || isSimpleMaster ? `${code} · ${name}` : name, detail: isPartner ? `${code} · ${partnerType}` : code, ...(isPartner ? { addressLine1, city, region, postalCode, country, currency, paymentTerms } : {}) });
+      await onCreated({ id: result.recordId, label: kind === "product" || isSimpleMaster ? `${code} · ${name}` : name, detail: isPartner ? `${code} · ${partnerType}` : code, ...(isPartner ? { addressLine1, addressLine2, city, region, postalCode, country, currency, paymentTerms } : {}) });
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The record could not be created."); }
     finally { setBusy(false); }
   };
@@ -461,11 +463,12 @@ export function QuickCreateDialog({ kind, companyReorderPercent, submitLabel = "
             {field("Payment terms", <select value={paymentTerms} onChange={(event) => setPaymentTerms(event.target.value)}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select>)}
             {field("Email", <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} />)}
             {field("Phone", <input value={phone} onChange={(event) => setPhone(event.target.value)} />)}
-            {field("Address", <input value={addressLine1} onChange={(event) => setAddressLine1(event.target.value)} />)}
-            {field("City", <input value={city} onChange={(event) => setCity(event.target.value)} />)}
-            {field("Province / region", <input value={region} onChange={(event) => setRegion(event.target.value)} />)}
-            {field("Postal code", <input value={postalCode} onChange={(event) => setPostalCode(event.target.value)} />)}
-            {field("Country", <input value={country} onChange={(event) => setCountry(event.target.value.toUpperCase())} />)}
+            {field("Street address", <AddressAutocomplete value={addressLine1} country={country} onChange={setAddressLine1} onAddressSelected={(selected) => { setAddressLine1(selected.addressLine1); setAddressLine2(selected.addressLine2); setCity(selected.city); setRegion(selected.region); setPostalCode(selected.postalCode); setCountry(selected.country || country); }} />)}
+            {field("Address line 2", <input value={addressLine2} onChange={(event) => setAddressLine2(event.target.value)} autoComplete="address-line2" />)}
+            {field("City", <input value={city} onChange={(event) => setCity(event.target.value)} autoComplete="address-level2" />)}
+            {field("Province / region", <input value={region} onChange={(event) => setRegion(event.target.value)} autoComplete="address-level1" />)}
+            {field("Postal code", <input value={postalCode} onChange={(event) => setPostalCode(event.target.value)} autoComplete="postal-code" />)}
+            {field("Country", <input value={country} onChange={(event) => setCountry(event.target.value.toUpperCase())} autoComplete="country" />)}
           </> : null}
           {kind === "product" ? <>
             {/* Routed through the picker rather than a bare select: both tables grow with the

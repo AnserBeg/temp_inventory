@@ -113,6 +113,12 @@ The same screen supports manual sync, retry, disconnect/revocation, delivery ins
 
 The Reports workspace still provides an accounting control export and balanced QuickBooks journal CSV as an audited fallback and reconciliation artifact.
 
+## Google address autocomplete
+
+Customer, vendor, saved ship-to, and sales-order street-address fields use the current Google Places Autocomplete widget. Choosing a suggestion fills street line 1, address line 2 when Google returns a unit or floor, city, province/state, postal code, and the two-letter country code. Manual entry remains available if Google is not configured or cannot be reached.
+
+Set `GOOGLE_MAPS_API_KEY` in `.dev.vars` for local development and as a hosted Worker secret for production. In the associated Google Cloud project, enable **Maps JavaScript API** and **Places API (New)**, enable billing, and restrict the browser key to the exact localhost and hosted HTTPS referrers that run PaneFlow. The key is delivered only to authenticated PaneFlow sessions, but it is a browser credential and must still use HTTP-referrer and API restrictions.
+
 ## Local development
 
 Requirements: Node.js 22.13 or later.
