@@ -69,6 +69,20 @@ test("QuickBooks boundaries require administrators, one-use OAuth state, encrypt
   }
 });
 
+test("Helcim company connection requires administrators and stores only an encrypted API token", async () => {
+  const [route, payments, migration] = await Promise.all([
+    read("app/api/integrations/helcim/route.ts"), read("lib/server/helcim-payments.ts"), read("drizzle/0029_fantastic_carlie_cooper.sql"),
+  ]);
+  assert.match(route, /resolveActor/);
+  assert.match(route, /requireCapability\(actor,\s*"administer"\)/);
+  assert.match(route, /connectHelcimCompany/);
+  assert.match(payments, /encryptHelcimSecret\(apiToken/);
+  assert.match(payments, /\/connection-test/);
+  assert.match(payments, /\/invoices\?limit=1&page=1/);
+  assert.doesNotMatch(migration, /\n\s*`api_token`/u);
+  assert.match(migration, /encrypted_api_token/);
+});
+
 test("runtime storage preserves inventory, upload, and onboarding invariants", async () => {
   const [database, migration, auth, attachments] = await Promise.all([
     read("lib/server/inventory-db.ts"), read("drizzle/0006_runtime-integrity.sql"), read("lib/server/auth.ts"), read("lib/server/attachments.ts"),

@@ -953,6 +953,23 @@ export const payments = sqliteTable(
   ]
 );
 
+/** The single Helcim merchant connected to this PaneFlow company. The API token is AES-GCM encrypted. */
+export const helcimConnections = sqliteTable("helcim_connections", {
+  id: text("id").primaryKey(),
+  encryptedApiToken: text("encrypted_api_token").notNull(),
+  invoiceHost: text("invoice_host").notNull(),
+  paymentMethod: text("payment_method").notNull().default("cc-ach"),
+  connectedBy: text("connected_by").notNull(),
+  connectedById: text("connected_by_id"),
+  connectedByEmail: text("connected_by_email"),
+  connectedAt: text("connected_at").notNull(),
+  verifiedAt: text("verified_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  check("helcim_connection_id_check", sql`${table.id} = 'primary'`),
+  check("helcim_connection_payment_method_check", sql`${table.paymentMethod} IN ('cc','ach','cc-ach')`),
+]);
+
 /** Bearer links sent to customers. Only the SHA-256 digest is persisted. */
 export const invoicePaymentLinks = sqliteTable(
   "invoice_payment_links",

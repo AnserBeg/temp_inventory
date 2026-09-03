@@ -8,6 +8,7 @@ import { D1SqliteDatabase } from "./d1-sqlite.mjs";
 const db = new D1SqliteDatabase();
 const now = "2026-09-02T18:00:00.000Z";
 const accountant = { id: "helcim-accountant", email: "billing@paneflow.test", name: "Billing", role: "accounting", label: "Billing <billing@paneflow.test>", localDevelopment: false };
+const administrator = { id: "helcim-admin", email: "admin@paneflow.test", name: "Administrator", role: "administrator", label: "Administrator <admin@paneflow.test>", localDevelopment: false };
 let helcim;
 let helcimCrypto;
 let qboTransform;
@@ -46,7 +47,7 @@ after(() => db.close());
 
 test("Helcim migration creates constrained durable collection tables", () => {
   const tables = db.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%helcim%' OR name='invoice_payment_links' ORDER BY name").all().map((row) => row.name);
-  assert.deepEqual(tables, ["helcim_checkout_sessions", "helcim_invoice_mirrors", "helcim_webhook_events", "invoice_payment_links"]);
+  assert.deepEqual(tables, ["helcim_checkout_sessions", "helcim_connections", "helcim_invoice_mirrors", "helcim_webhook_events", "invoice_payment_links"]);
   assert.throws(() => db.sqlite.prepare("INSERT INTO invoice_payment_links (id,customer_invoice_id,token_hash,status,created_by,created_at,expires_at) VALUES ('bad','helcim-invoice','bad','unknown','test','2026-01-01','2027-01-01')").run(), /CHECK constraint failed/u);
 });
 
@@ -177,7 +178,7 @@ test("card posts once, ACH waits for clearing, and QBO uses Helcim clearing", as
     env.HELCIM_WEBHOOK_VERIFIER_TOKEN = "";
     const polledLink = await helcim.createInvoicePaymentLink("helcim-polled-invoice", accountant, "https://private-paneflow.example.test/api/payments/helcim/links");
     assert.equal(polledLink.url, "https://paneflow-tests.myhelcim.com/order/?token=polled-invoice-token");
-    assert.equal(helcim.getHelcimConfigurationStatus().configured, true);
+    assert.equal((await helcim.getHelcimConfigurationStatus()).configured, true);
     const polled = await helcim.processHelcimIntegrationBatch(10);
     assert.equal(polled.mirrors, 1);
     const polledInvoice = db.sqlite.prepare("SELECT status,paid_cents AS paid FROM customer_invoices WHERE id='helcim-polled-invoice'").get();
@@ -185,4 +186,49 @@ test("card posts once, ACH waits for clearing, and QBO uses Helcim clearing", as
     assert.equal(polledInvoice.paid, 3150);
     assert.equal(db.sqlite.prepare("SELECT method FROM payments WHERE document_id='helcim-polled-invoice'").get().method, "helcim_card");
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test("company admin can verify, encrypt, use, and disconnect a Helcim connection", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalApiToken = env.HELCIM_API_TOKEN;
+  const originalInvoiceHost = env.HELCIM_INVOICE_HOST;
+  const companyToken = "company-specific-helcim-api-token";
+  const requests = [];
+  try {
+    env.HELCIM_API_TOKEN = "";
+    env.HELCIM_INVOICE_HOST = "";
+    globalThis.fetch = async (input, init = {}) => {
+      const url = new URL(String(input));
+      requests.push({ path: `${url.pathname}${url.search}`, token: new Headers(init.headers).get("api-token") });
+      if (url.pathname === "/v2/connection-test") return new Response("Connected Successfully", { status: 200 });
+      if (url.pathname === "/v2/invoices") return Response.json({ invoices: [] });
+      throw new Error(`Unexpected Helcim fetch ${url}`);
+    };
+
+    const connected = await helcim.connectHelcimCompany({ apiToken: companyToken, invoiceHost: "https://acme.myhelcim.com/", paymentMethod: "cc-ach" }, administrator);
+    assert.equal(connected.invoiceAccess, true);
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every((request) => request.token === companyToken));
+    const stored = db.sqlite.prepare("SELECT encrypted_api_token AS token,invoice_host AS host FROM helcim_connections WHERE id='primary'").get();
+    assert.match(stored.token, /^v1\./u);
+    assert.doesNotMatch(stored.token, /company-specific/u);
+    assert.equal(stored.host, "acme.myhelcim.com");
+
+    const status = await helcim.getHelcimConfigurationStatus();
+    assert.equal(status.configured, true);
+    assert.equal(status.source, "company");
+    assert.equal(status.invoiceHost, "acme.myhelcim.com");
+    assert.equal(JSON.stringify(status).includes(companyToken), false);
+    await helcim.verifyHelcimCompanyConnection();
+    assert.equal(requests.length, 4);
+
+    const disconnected = await helcim.disconnectHelcimCompany(administrator, true);
+    assert.equal(disconnected.disconnected, true);
+    assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM helcim_connections").get().count, 0);
+    assert.equal((await helcim.getHelcimConfigurationStatus()).configured, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.HELCIM_API_TOKEN = originalApiToken;
+    env.HELCIM_INVOICE_HOST = originalInvoiceHost;
+  }
 });

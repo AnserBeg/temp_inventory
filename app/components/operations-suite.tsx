@@ -386,13 +386,13 @@ function CopyableSetting({ label, value, onCopy }: { label: string; value: strin
 
 function CompanyConnectionsIntro() {
   return <section className="integration-hub-intro">
-    <div><span className="integration-eyebrow">Company connections</span><h2>Connect accounting and customer payments</h2><p>QuickBooks uses a company-admin login. Helcim uses a merchant API connection. Complete each card in order; credentials are stored as protected deployment settings, never in customer or invoice records.</p></div>
-    <div className="integration-models"><span><strong>QBO</strong>OAuth company authorization</span><span><strong>Helcim</strong>Merchant API credentials</span></div>
+    <div><span className="integration-eyebrow">Company connections</span><h2>Connect accounting and customer payments</h2><p>A company administrator can connect both services here. QuickBooks opens an Intuit login. Helcim does not offer that login flow, so its administrator creates a dedicated API token once and PaneFlow stores it encrypted.</p></div>
+    <div className="integration-models"><span><strong>QBO</strong>Sign in with Intuit</span><span><strong>Helcim</strong>Verify an API token</span></div>
   </section>;
 }
 
 type HelcimAdminState = {
-  configuration: { configured: boolean; message: string; missing: string[]; paymentMethod: string; checkoutMode: string; invoiceHost: string; webhookConfigured: boolean };
+  configuration: { configured: boolean; message: string; missing: string[]; paymentMethod: string; checkoutMode: string; invoiceHost: string; webhookConfigured: boolean; source: "company" | "deployment" | "none"; connectedBy: string | null; connectedByEmail: string | null; connectedAt: string | null; verifiedAt: string | null };
   webhookUrl: string;
   activeLinks: number;
   counts: Record<string, number>;
@@ -402,8 +402,11 @@ type HelcimAdminState = {
 
 function HelcimIntegration({ canAdminister }: { canAdminister: boolean }) {
   const [data, setData] = useState<HelcimAdminState | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
+  const [apiToken, setApiToken] = useState("");
+  const [invoiceHost, setInvoiceHost] = useState("");
+  const [paymentMethod, setPaymentMethod] = useState("cc-ach");
   const load = useCallback(async () => {
     const response = await fetch("/api/integrations/helcim", { cache: "no-store" });
     const result = await response.json() as HelcimAdminState;
@@ -415,43 +418,67 @@ function HelcimIntegration({ canAdminister }: { canAdminister: boolean }) {
     const timer = window.setTimeout(() => void load().catch((error) => setMessage(error instanceof Error ? error.message : "Helcim integration state could not be loaded.")), 0);
     return () => window.clearTimeout(timer);
   }, [canAdminister, load]);
-  const reconcile = async () => {
-    setBusy(true); setMessage("");
+  const postAction = async (action: "connect" | "verify" | "reconcile", extra: Record<string, unknown> = {}) => {
+    setBusy(action); setMessage("");
     try {
-      const response = await fetch("/api/integrations/helcim", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "reconcile" }) });
+      const response = await fetch("/api/integrations/helcim", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, ...extra }) });
       const result = await response.json() as HelcimAdminState;
-      if (!response.ok) throw new Error(result.error?.message ?? "Helcim reconciliation failed.");
+      if (!response.ok) throw new Error(result.error?.message ?? "Helcim connection request failed.");
       setData((current) => ({ ...result, webhookUrl: current?.webhookUrl ?? "" }));
-      setMessage("Helcim transactions reconciled.");
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Helcim reconciliation failed."); }
-    finally { setBusy(false); }
+      if (action === "connect") { setApiToken(""); setMessage("Helcim connected. The API token was verified and encrypted."); }
+      else if (action === "verify") setMessage("Helcim API and invoice access verified.");
+      else setMessage("Helcim transactions reconciled.");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Helcim connection request failed."); }
+    finally { setBusy(""); }
+  };
+  const connect = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await postAction("connect", { apiToken, invoiceHost, paymentMethod });
+  };
+  const disconnect = async () => {
+    if (!window.confirm("Disconnect Helcim from this PaneFlow company? Any active PaneFlow payment links will be revoked. For hosted Helcim links, also disable open invoices in Helcim.")) return;
+    setBusy("disconnect"); setMessage("");
+    try {
+      const response = await fetch("/api/integrations/helcim", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ acknowledgeActiveLinks: true }) });
+      const result = await response.json() as HelcimAdminState;
+      if (!response.ok) throw new Error(result.error?.message ?? "Helcim could not be disconnected.");
+      setData((current) => ({ ...result, webhookUrl: current?.webhookUrl ?? "" }));
+      setMessage("Helcim disconnected and active PaneFlow payment links revoked.");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Helcim could not be disconnected."); }
+    finally { setBusy(""); }
   };
   if (!canAdminister) return <Section title="Helcim payments"><div className="workflow-banner"><strong>Administrator access required</strong><span>Only administrators can inspect payment-processor configuration and reconciliation.</span></div></Section>;
   const counts = data?.counts ?? {};
   if (!data) return <Section title="Helcim payments"><div className="workflow-empty">{message || "Loading Helcim integration…"}</div></Section>;
   const missing = new Set(data.configuration.missing);
-  const apiReady = !missing.has("HELCIM_API_TOKEN");
-  const hostReady = !missing.has("HELCIM_INVOICE_HOST");
+  const apiReady = data.configuration.configured || !missing.has("HELCIM_API_TOKEN");
+  const hostReady = Boolean(data.configuration.invoiceHost);
   const encryptionReady = !missing.has("HELCIM_TOKEN_ENCRYPTION_KEY");
-  const setupRequest = data.configuration.missing.length
-    ? data.configuration.missing.map((key) => `${key}=${key.includes("TOKEN") || key.includes("KEY") ? "<store as secret>" : "<value>"}`).join("\n")
-    : "Helcim is configured in PaneFlow.";
-  const copy = (value: string, label: string) => void navigator.clipboard.writeText(value).then(() => setMessage(`${label} copied.`)).catch(() => setMessage(`Could not copy ${label.toLowerCase()}.`));
+  const companyConnected = data.configuration.source === "company" && data.configuration.configured;
+  const deploymentManaged = data.configuration.source === "deployment" && data.configuration.configured;
   return <Section title="Helcim payments" detail="Connect one Helcim merchant account to collect customer invoice payments.">
     <div className="integration-provider-card helcim">
       <div className="integration-provider-heading"><span className="integration-provider-mark">H</span><div><span className="integration-eyebrow">Payment processor</span><h3>Helcim merchant connection</h3><p>PaneFlow creates the invoice link; the customer enters card or bank details on Helcim&apos;s hosted payment page.</p></div><span className={`integration-state ${data.configuration.configured ? "ready" : "attention"}`}>{data.configuration.configured ? "Ready" : "Setup required"}</span></div>
       <ol className="integration-step-list">
-        <ConnectionStep number={1} title="Open or approve the merchant account" detail="Sign in to the business's Helcim account and confirm its deposit bank account is approved, especially for ACH." status="next" />
-        <ConnectionStep number={2} title="Create dedicated API access" detail={apiReady ? "The protected Helcim API token is stored." : "In Helcim, open All Tools → Integrations and create an API Access Configuration for invoice and transaction access."} status={apiReady ? "complete" : "action"} />
-        <ConnectionStep number={3} title="Identify the invoice host" detail={hostReady ? `Using ${data.configuration.invoiceHost}.` : "Open any Helcim invoice, choose Actions → View Online, and copy the business.myhelcim.com hostname."} status={hostReady ? "complete" : "action"} />
+        <ConnectionStep number={1} title="Use the company's merchant account" detail="The company must have its own approved Helcim merchant account and settlement bank account. Never connect another business through your merchant account." status={data.configuration.configured ? "complete" : "next"} />
+        <ConnectionStep number={2} title="Create dedicated API access" detail={apiReady ? "A protected Helcim API token is available." : "In Helcim, open All Tools → Integrations and create API access with invoice read/write and transaction read permissions."} status={apiReady ? "complete" : "action"} />
+        <ConnectionStep number={3} title="Identify the invoice host" detail={hostReady ? `Using ${data.configuration.invoiceHost}.` : "Open a Helcim invoice, choose Actions → View Online, and copy only the business.myhelcim.com hostname."} status={hostReady ? "complete" : "action"} />
         <ConnectionStep number={4} title="Test payment collection" detail={data.configuration.configured ? `Hosted checkout is ready for ${data.configuration.paymentMethod === "cc-ach" ? "cards and ACH" : data.configuration.paymentMethod}. PaneFlow checks Helcim every five minutes.` : "This becomes available after the protected settings above are stored."} status={data.configuration.configured ? "complete" : "next"} />
       </ol>
+      {!data.configuration.configured ? <form className="helcim-connect-form" onSubmit={(event) => void connect(event)}>
+        <div className="helcim-connect-copy"><strong>Connect this company&apos;s Helcim account</strong><p>Helcim does not provide “Sign in with Helcim.” A Helcim administrator signs in on Helcim, creates a dedicated API token, then pastes it here once. Do not enter a Helcim username or password.</p></div>
+        <label><span>Helcim API token</span><input type="password" value={apiToken} onChange={(event) => setApiToken(event.target.value)} autoComplete="new-password" spellCheck={false} placeholder="Paste the dedicated API token" required /></label>
+        <label><span>Online invoice hostname</span><input type="text" value={invoiceHost} onChange={(event) => setInvoiceHost(event.target.value)} autoComplete="off" spellCheck={false} placeholder="company.myhelcim.com" required /></label>
+        <label><span>Customer payment methods</span><select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}><option value="cc-ach">Cards and ACH</option><option value="cc">Cards only</option><option value="ach">ACH only</option></select></label>
+        <button className="workflow-action primary" type="submit" disabled={Boolean(busy) || !encryptionReady}>{busy === "connect" ? "Verifying…" : "Verify & connect"}</button>
+        {!encryptionReady ? <p className="helcim-connect-blocked">A PaneFlow deployer must add the protected HELCIM_TOKEN_ENCRYPTION_KEY before company self-service connection is available.</p> : null}
+      </form> : null}
       <div className="integration-setup-footer">
-        <div><strong>{data.configuration.configured ? "Connection ready" : "Settings still needed"}</strong><p>{data.configuration.message}</p>{!encryptionReady ? <small>The encryption key must be at least 32 characters and remain stable across deployments.</small> : null}</div>
-        <div className="integration-actions"><a className="workflow-action" href="https://www.helcim.com/login/" target="_blank" rel="noreferrer">Open Helcim</a><a className="workflow-action" href="https://devdocs.helcim.com/docs/authentication-with-the-helcim-api-and-helcimpayjs" target="_blank" rel="noreferrer">API setup guide</a>{data.configuration.missing.length ? <button className="workflow-action" type="button" onClick={() => copy(setupRequest, "Setup request")}>Copy setup request</button> : <button className="workflow-action primary" type="button" disabled={busy} onClick={() => void reconcile()}>{busy ? "Testing…" : "Test connection"}</button>}</div>
+        <div><strong>{companyConnected ? "Company connection ready" : deploymentManaged ? "Deployment connection ready" : "Company connection needed"}</strong><p>{data.configuration.message}</p>{companyConnected && data.configuration.connectedBy ? <small>Connected by {data.configuration.connectedBy}{data.configuration.verifiedAt ? ` · verified ${new Date(data.configuration.verifiedAt).toLocaleString()}` : ""}</small> : null}</div>
+        <div className="integration-actions"><a className="workflow-action" href="https://www.helcim.com/login/" target="_blank" rel="noreferrer">Open Helcim</a><a className="workflow-action" href="https://devdocs.helcim.com/docs/authentication-with-the-helcim-api-and-helcimpayjs" target="_blank" rel="noreferrer">API setup guide</a>{data.configuration.configured ? <><button className="workflow-action" type="button" disabled={Boolean(busy)} onClick={() => void postAction("verify")}>{busy === "verify" ? "Verifying…" : "Verify access"}</button><button className="workflow-action" type="button" disabled={Boolean(busy)} onClick={() => void postAction("reconcile")}>{busy === "reconcile" ? "Reconciling…" : "Reconcile payments"}</button>{companyConnected ? <button className="workflow-action danger" type="button" disabled={Boolean(busy)} onClick={() => void disconnect()}>{busy === "disconnect" ? "Disconnecting…" : "Disconnect"}</button> : null}</> : null}</div>
       </div>
     </div>
-    {data.configuration.missing.length ? <div className="integration-missing-list" aria-label="Missing Helcim settings">{data.configuration.missing.map((key) => <span key={key}>{key}</span>)}</div> : <div className="qbo-connection-summary"><div><span>Collection</span><strong>{data.activeLinks} active links</strong><small>{Number(counts.settled ?? 0)} settled · {Number(counts.pending ?? 0)} pending</small></div><div><span>Exceptions</span><strong>{Number(counts.review ?? 0)} need review</strong><small>{Number(counts.failed ?? 0)} failed · {Number(counts.expired ?? 0)} expired sessions</small></div><div><span>Recovery</span><strong>5-minute polling</strong><small>Signed webhook ingress is optional, not required.</small></div></div>}
+    {data.configuration.missing.length ? <div className="integration-missing-list" aria-label="Missing Helcim requirements">{data.configuration.missing.map((key) => <span key={key}>{key}</span>)}</div> : <div className="qbo-connection-summary"><div><span>Collection</span><strong>{data.activeLinks} active links</strong><small>{Number(counts.settled ?? 0)} settled · {Number(counts.pending ?? 0)} pending</small></div><div><span>Exceptions</span><strong>{Number(counts.review ?? 0)} need review</strong><small>{Number(counts.failed ?? 0)} failed · {Number(counts.expired ?? 0)} expired sessions</small></div><div><span>Recovery</span><strong>5-minute polling</strong><small>Signed webhook ingress is optional, not required.</small></div></div>}
     {data.recent.length ? <div className="workflow-stack integration-exceptions">{data.recent.map((item) => <div className="workflow-banner" key={String(item.id)}><strong>{String(item.invoiceNumber)} · {String(item.status)}</strong><span>{String(item.transactionId || "No transaction id")}{item.lastError ? ` · ${String(item.lastError)}` : ""}</span></div>)}</div> : null}
     {message ? <p className="workflow-banner integration-message" role="status">{message}</p> : null}
   </Section>;

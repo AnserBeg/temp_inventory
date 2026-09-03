@@ -1,5 +1,12 @@
 import { AuthorizationError, authorizationResponse, requireCapability, resolveActor } from "@/lib/server/auth";
-import { getHelcimAdminState, HelcimPaymentError, processHelcimIntegrationBatch } from "@/lib/server/helcim-payments";
+import {
+  connectHelcimCompany,
+  disconnectHelcimCompany,
+  getHelcimAdminState,
+  HelcimPaymentError,
+  processHelcimIntegrationBatch,
+  verifyHelcimCompanyConnection,
+} from "@/lib/server/helcim-payments";
 
 export const dynamic = "force-dynamic";
 
@@ -23,8 +30,21 @@ export async function POST(request: Request) {
     const actor = await resolveActor(request);
     requireCapability(actor, "administer");
     const input = await request.json().catch(() => ({})) as Record<string, unknown>;
-    if (input.action !== "reconcile") return Response.json({ error: { code: "INVALID_ACTION", message: "action must be reconcile." } }, { status: 400 });
-    const result = await processHelcimIntegrationBatch(100);
+    let result: unknown;
+    if (input.action === "connect") result = await connectHelcimCompany(input, actor);
+    else if (input.action === "verify") result = await verifyHelcimCompanyConnection();
+    else if (input.action === "reconcile") result = await processHelcimIntegrationBatch(100);
+    else return Response.json({ error: { code: "INVALID_ACTION", message: "action must be connect, verify, or reconcile." } }, { status: 400 });
+    return Response.json({ result, ...(await getHelcimAdminState()) }, { headers: { "Cache-Control": "no-store" } });
+  } catch (error) { return errorResponse(error); }
+}
+
+export async function DELETE(request: Request) {
+  try {
+    const actor = await resolveActor(request);
+    requireCapability(actor, "administer");
+    const input = await request.json().catch(() => ({})) as Record<string, unknown>;
+    const result = await disconnectHelcimCompany(actor, input.acknowledgeActiveLinks === true);
     return Response.json({ result, ...(await getHelcimAdminState()) }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) { return errorResponse(error); }
 }

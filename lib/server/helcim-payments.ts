@@ -13,6 +13,8 @@ import {
 } from "./helcim-crypto";
 
 const HELCIM_API_BASE = "https://api.helcim.com/v2";
+const HELCIM_CONNECTION_ID = "primary";
+const HELCIM_CONNECTION_AAD = "paneflow:helcim:merchant:primary";
 const checkoutLifetimeMs = 60 * 60 * 1_000;
 const webhookClockToleranceSeconds = 24 * 60 * 60;
 
@@ -51,6 +53,17 @@ type CheckoutSession = {
   expiresAt: string;
 };
 
+type StoredHelcimConnection = {
+  encryptedApiToken: string;
+  invoiceHost: string;
+  paymentMethod: string;
+  connectedBy: string;
+  connectedById: string | null;
+  connectedByEmail: string | null;
+  connectedAt: string;
+  verifiedAt: string;
+};
+
 export class HelcimPaymentError extends Error {
   constructor(public code: string, message: string, public status = 400, public retryable = false) {
     super(message);
@@ -62,45 +75,103 @@ function runtimeEnv() {
   return env as unknown as Record<string, string | undefined>;
 }
 
-export function getHelcimConfigurationStatus() {
+function text(value: unknown) {
+  return value == null ? "" : String(value).trim();
+}
+
+function normalizedInvoiceHost(value: unknown) {
+  const configured = text(value).replace(/^https?:\/\//iu, "").replace(/\/+$/u, "").toLowerCase();
+  return /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.myhelcim\.com$/u.test(configured) ? configured : "";
+}
+
+function normalizedPaymentMethod(value: unknown) {
+  const requested = text(value).toLowerCase();
+  return requested === "cc" || requested === "ach" || requested === "cc-ach" ? requested : "cc-ach";
+}
+
+async function storedHelcimConnection() {
+  await ensureDatabase();
+  return first<StoredHelcimConnection>(`SELECT encrypted_api_token AS encryptedApiToken,invoice_host AS invoiceHost,
+    payment_method AS paymentMethod,connected_by AS connectedBy,connected_by_id AS connectedById,
+    connected_by_email AS connectedByEmail,connected_at AS connectedAt,verified_at AS verifiedAt
+    FROM helcim_connections WHERE id=? LIMIT 1`, HELCIM_CONNECTION_ID);
+}
+
+async function resolvedConfiguration() {
   const runtime = runtimeEnv();
+  const stored = await storedHelcimConnection();
   const checkoutMode = runtime.HELCIM_CHECKOUT_MODE?.trim().toLowerCase() === "embedded" ? "embedded" : "hosted";
-  const configuredInvoiceHost = text(runtime.HELCIM_INVOICE_HOST).replace(/^https?:\/\//iu, "").replace(/\/+$/u, "").toLowerCase();
-  const invoiceHost = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.myhelcim\.com$/u.test(configuredInvoiceHost) ? configuredInvoiceHost : "";
+  const encryptionKey = text(runtime.HELCIM_TOKEN_ENCRYPTION_KEY);
+  const source = stored ? "company" as const : text(runtime.HELCIM_API_TOKEN) ? "deployment" as const : "none" as const;
+  const invoiceHost = normalizedInvoiceHost(stored?.invoiceHost ?? runtime.HELCIM_INVOICE_HOST);
+  const paymentMethod = normalizedPaymentMethod(stored?.paymentMethod ?? runtime.HELCIM_CHECKOUT_PAYMENT_METHODS);
+  let apiToken = stored ? "" : text(runtime.HELCIM_API_TOKEN);
+  let connectionError = "";
+  if (stored && encryptionKey) {
+    try { apiToken = await decryptHelcimSecret(stored.encryptedApiToken, encryptionKey, HELCIM_CONNECTION_AAD); }
+    catch (error) { connectionError = error instanceof Error ? error.message : "The stored Helcim token could not be decrypted."; }
+  }
   const missing = [
-    ["HELCIM_API_TOKEN", runtime.HELCIM_API_TOKEN],
-    ["HELCIM_TOKEN_ENCRYPTION_KEY", runtime.HELCIM_TOKEN_ENCRYPTION_KEY],
+    ["HELCIM_API_TOKEN", apiToken],
+    ["HELCIM_TOKEN_ENCRYPTION_KEY", encryptionKey],
     ...(checkoutMode === "hosted" ? [["HELCIM_INVOICE_HOST", invoiceHost]] : []),
   ].filter(([, value]) => !value?.trim()).map(([name]) => name);
-  const requestedMethod = runtime.HELCIM_CHECKOUT_PAYMENT_METHODS?.trim().toLowerCase();
-  const paymentMethod = requestedMethod === "cc" || requestedMethod === "ach" || requestedMethod === "cc-ach" ? requestedMethod : "cc-ach";
+  const configured = missing.length === 0 && !connectionError;
   return {
-    configured: missing.length === 0,
+    apiToken,
+    verifierToken: text(runtime.HELCIM_WEBHOOK_VERIFIER_TOKEN),
+    encryptionKey,
+    configured,
     missing,
     paymentMethod,
     checkoutMode,
     invoiceHost,
     webhookConfigured: Boolean(runtime.HELCIM_WEBHOOK_VERIFIER_TOKEN?.trim()),
-    message: missing.length ? `Add ${missing.join(", ")} before issuing live payment links.` : "Helcim payment collection is configured.",
+    source,
+    connectedBy: stored?.connectedBy ?? null,
+    connectedByEmail: stored?.connectedByEmail ?? null,
+    connectedAt: stored?.connectedAt ?? null,
+    verifiedAt: stored?.verifiedAt ?? null,
+    message: connectionError
+      ? connectionError
+      : missing.length
+        ? `Add ${missing.join(", ")} before issuing live payment links.`
+        : source === "company"
+          ? "This PaneFlow company is connected to Helcim."
+          : "Helcim payment collection is configured by the deployment.",
   };
 }
 
-function requiredConfiguration() {
-  const status = getHelcimConfigurationStatus();
-  if (!status.configured) throw new HelcimPaymentError("HELCIM_NOT_CONFIGURED", status.message, 503);
-  const runtime = runtimeEnv();
+export async function getHelcimConfigurationStatus() {
+  const status = await resolvedConfiguration();
   return {
-    apiToken: runtime.HELCIM_API_TOKEN!,
-    verifierToken: runtime.HELCIM_WEBHOOK_VERIFIER_TOKEN?.trim() ?? "",
-    encryptionKey: runtime.HELCIM_TOKEN_ENCRYPTION_KEY!,
+    configured: status.configured,
+    missing: status.missing,
     paymentMethod: status.paymentMethod,
     checkoutMode: status.checkoutMode,
     invoiceHost: status.invoiceHost,
+    webhookConfigured: status.webhookConfigured,
+    source: status.source,
+    connectedBy: status.connectedBy,
+    connectedByEmail: status.connectedByEmail,
+    connectedAt: status.connectedAt,
+    verifiedAt: status.verifiedAt,
+    message: status.message,
   };
 }
 
-function text(value: unknown) {
-  return value == null ? "" : String(value).trim();
+async function requiredConfiguration() {
+  const status = await resolvedConfiguration();
+  if (!status.configured) throw new HelcimPaymentError("HELCIM_NOT_CONFIGURED", status.message, 503);
+  return {
+    apiToken: status.apiToken,
+    verifierToken: status.verifierToken,
+    encryptionKey: status.encryptionKey,
+    paymentMethod: status.paymentMethod,
+    checkoutMode: status.checkoutMode,
+    invoiceHost: status.invoiceHost,
+    source: status.source,
+  };
 }
 
 function cents(value: unknown) {
@@ -128,28 +199,103 @@ function providerErrorMessage(payload: unknown, fallback: string) {
   return text(body.message || body.error).slice(0, 500) || fallback;
 }
 
-async function helcimRequest(path: string, init: RequestInit = {}, idempotencyKey?: string) {
-  const config = requiredConfiguration();
+async function requestWithApiToken(apiToken: string, path: string, init: RequestInit = {}, idempotencyKey?: string) {
   const response = await fetch(`${HELCIM_API_BASE}${path}`, {
     ...init,
     headers: {
       accept: "application/json",
-      "api-token": config.apiToken,
+      "api-token": apiToken,
       ...(init.body ? { "content-type": "application/json" } : {}),
       ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
       ...init.headers,
     },
   });
-  const payload = await response.json().catch(() => ({})) as unknown;
+  const rawBody = await response.text();
+  let payload: unknown = {};
+  if (rawBody) {
+    try { payload = JSON.parse(rawBody) as unknown; }
+    catch { payload = { message: rawBody }; }
+  }
   if (!response.ok) {
     throw new HelcimPaymentError(
       response.status === 401 || response.status === 403 ? "HELCIM_AUTHORIZATION_FAILED" : "HELCIM_API_ERROR",
       providerErrorMessage(payload, `Helcim returned HTTP ${response.status}.`),
-      response.status === 429 || response.status >= 500 ? 503 : 502,
+      response.status === 401 || response.status === 403 ? 400 : response.status === 429 || response.status >= 500 ? 503 : 502,
       response.status === 429 || response.status >= 500,
     );
   }
   return payload as Row;
+}
+
+async function helcimRequest(path: string, init: RequestInit = {}, idempotencyKey?: string) {
+  const config = await requiredConfiguration();
+  return requestWithApiToken(config.apiToken, path, init, idempotencyKey);
+}
+
+async function verifyCredentials(apiToken: string) {
+  await requestWithApiToken(apiToken, "/connection-test");
+  await requestWithApiToken(apiToken, "/invoices?limit=1&page=1");
+  return { connected: true, invoiceAccess: true, verifiedAt: new Date().toISOString() };
+}
+
+export async function connectHelcimCompany(input: { apiToken?: unknown; invoiceHost?: unknown; paymentMethod?: unknown }, actor: ActorIdentity) {
+  await ensureDatabase();
+  const apiToken = text(input.apiToken);
+  const invoiceHost = normalizedInvoiceHost(input.invoiceHost);
+  const paymentMethod = normalizedPaymentMethod(input.paymentMethod);
+  const encryptionKey = text(runtimeEnv().HELCIM_TOKEN_ENCRYPTION_KEY);
+  if (apiToken.length < 12 || apiToken.length > 1_000) throw new HelcimPaymentError("INVALID_HELCIM_TOKEN", "Paste the API token from the company's Helcim API Access Configuration.");
+  if (!invoiceHost) throw new HelcimPaymentError("INVALID_HELCIM_INVOICE_HOST", "Enter the company's hostname ending in .myhelcim.com, without a path.");
+  if (!encryptionKey) throw new HelcimPaymentError("HELCIM_ENCRYPTION_NOT_CONFIGURED", "PaneFlow must have HELCIM_TOKEN_ENCRYPTION_KEY configured before a company can connect Helcim.", 503);
+  const existing = await storedHelcimConnection();
+  if (existing) throw new HelcimPaymentError("HELCIM_ALREADY_CONNECTED", "Disconnect the existing company Helcim account before connecting a different one.", 409);
+  const verified = await verifyCredentials(apiToken);
+  const encryptedApiToken = await encryptHelcimSecret(apiToken, encryptionKey, HELCIM_CONNECTION_AAD);
+  const timestamp = verified.verifiedAt;
+  await getD1().batch([
+    getD1().prepare(`INSERT INTO helcim_connections
+      (id,encrypted_api_token,invoice_host,payment_method,connected_by,connected_by_id,connected_by_email,connected_at,verified_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .bind(HELCIM_CONNECTION_ID, encryptedApiToken, invoiceHost, paymentMethod, actor.label, actor.id, actor.email, timestamp, timestamp, timestamp),
+    getD1().prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
+      VALUES (?,'helcim_connection',?,'helcim_connected','Helcim merchant account connected and invoice access verified.',?,?,?,?,?)`)
+      .bind(newId("audit"), HELCIM_CONNECTION_ID, actor.label, actor.id, actor.email, JSON.stringify({ invoiceHost, paymentMethod }), timestamp),
+  ]);
+  return { ...verified, invoiceHost, paymentMethod };
+}
+
+export async function verifyHelcimCompanyConnection() {
+  const configuration = await requiredConfiguration();
+  const verified = await verifyCredentials(configuration.apiToken);
+  if (configuration.source === "company") {
+    await getD1().prepare("UPDATE helcim_connections SET verified_at=?,updated_at=? WHERE id=?")
+      .bind(verified.verifiedAt, verified.verifiedAt, HELCIM_CONNECTION_ID).run();
+  }
+  return verified;
+}
+
+export async function disconnectHelcimCompany(actor: ActorIdentity, acknowledgeActiveLinks = false) {
+  await ensureDatabase();
+  const existing = await storedHelcimConnection();
+  if (!existing) {
+    const configuration = await resolvedConfiguration();
+    if (configuration.source === "deployment") throw new HelcimPaymentError("HELCIM_DEPLOYMENT_MANAGED", "This Helcim connection is managed by protected deployment settings and cannot be disconnected here.", 409);
+    throw new HelcimPaymentError("HELCIM_NOT_CONNECTED", "No company Helcim account is connected.", 404);
+  }
+  const active = await first<{ count: number }>("SELECT COUNT(*) AS count FROM invoice_payment_links WHERE status='active' AND expires_at>?", new Date().toISOString());
+  const activeLinks = Number(active?.count ?? 0);
+  if (activeLinks > 0 && !acknowledgeActiveLinks) {
+    throw new HelcimPaymentError("HELCIM_ACTIVE_LINKS", `${activeLinks} active payment link${activeLinks === 1 ? "" : "s"} will be revoked. Confirm the disconnect to continue.`, 409);
+  }
+  const timestamp = new Date().toISOString();
+  await getD1().batch([
+    getD1().prepare("DELETE FROM helcim_connections WHERE id=?").bind(HELCIM_CONNECTION_ID),
+    getD1().prepare("UPDATE invoice_payment_links SET status='revoked' WHERE status='active'") ,
+    getD1().prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
+      VALUES (?,'helcim_connection',?,'helcim_disconnected','Helcim merchant account disconnected.',?,?,?,?,?)`)
+      .bind(newId("audit"), HELCIM_CONNECTION_ID, actor.label, actor.id, actor.email, JSON.stringify({ invoiceHost: existing.invoiceHost, revokedLinks: activeLinks }), timestamp),
+  ]);
+  return { disconnected: true, revokedLinks: activeLinks };
 }
 
 async function invoiceById(invoiceId: string): Promise<InvoiceForPayment | null> {
@@ -184,9 +330,8 @@ function publicOrigin(requestUrl: string) {
 
 export async function createInvoicePaymentLink(invoiceId: string, actor: ActorIdentity, requestUrl: string, source = "staff") {
   await ensureDatabase();
-  requiredConfiguration();
   const invoice = assertCollectible(await invoiceById(invoiceId));
-  const configuration = requiredConfiguration();
+  const configuration = await requiredConfiguration();
   const token = randomUrlSafeString(32);
   const mirror = configuration.checkoutMode === "hosted" ? await ensureHelcimInvoice(invoice) : null;
   if (configuration.checkoutMode === "hosted" && !mirror?.helcimInvoiceToken) {
@@ -211,7 +356,7 @@ export async function createInvoicePaymentLink(invoiceId: string, actor: ActorId
 }
 
 export async function maybeCreateInvoicePaymentLink(invoiceId: string, actor: ActorIdentity, requestUrl: string, source = "invoice_email") {
-  if (!getHelcimConfigurationStatus().configured) return null;
+  if (!(await getHelcimConfigurationStatus()).configured) return null;
   try { return await createInvoicePaymentLink(invoiceId, actor, requestUrl, source); }
   catch (error) {
     if (error instanceof HelcimPaymentError && ["INVOICE_SETTLED", "INVOICE_NOT_FOUND"].includes(error.code)) return null;
@@ -240,7 +385,7 @@ export async function getPublicInvoiceForPayment(token: string) {
     return { available: false as const, reason: "paid" as const, invoiceNumber: link.number, customerName: link.customerName };
   }
   if (/^void/iu.test(link.status)) return { available: false as const, reason: "void" as const };
-  const configuration = getHelcimConfigurationStatus();
+  const configuration = await getHelcimConfigurationStatus();
   return {
     available: configuration.configured,
     reason: configuration.configured ? null : "configuration" as const,
@@ -322,7 +467,7 @@ async function ensureHelcimInvoice(invoice: InvoiceForPayment) {
 
 export async function createHelcimCheckout(input: { paymentLinkToken: string; amountCents?: unknown }) {
   await ensureDatabase();
-  const config = requiredConfiguration();
+  const config = await requiredConfiguration();
   const link = await paymentLinkByToken(input.paymentLinkToken);
   if (!link || link.linkStatus !== "active" || link.expiresAt <= new Date().toISOString()) throw new HelcimPaymentError("PAYMENT_LINK_INVALID", "This payment link is invalid or has expired.", 404);
   const invoice = assertCollectible(await invoiceById(link.id));
@@ -492,7 +637,7 @@ async function recordTransaction(session: CheckoutSession, transaction: Row) {
 
 export async function completeHelcimCheckout(input: { paymentLinkToken: string; checkoutToken: string; eventMessage: unknown }) {
   await ensureDatabase();
-  const config = requiredConfiguration();
+  const config = await requiredConfiguration();
   const session = await checkoutSession(input.checkoutToken, input.paymentLinkToken);
   if (!session) throw new HelcimPaymentError("CHECKOUT_NOT_FOUND", "This checkout session does not match the payment link.", 404);
   if (session.status === "settled") return { status: "paid" as const, paymentId: session.paymentId };
@@ -553,7 +698,7 @@ async function hostedInvoiceSession(transaction: Row, method: HelcimMethod) {
   if (!source) return null;
   const sessionId = newId("helcim-hosted");
   const checkoutToken = `hosted-${method}-${id}`;
-  const encryptedSecret = await encryptHelcimSecret("hosted-invoice-view", requiredConfiguration().encryptionKey, sessionId);
+  const encryptedSecret = await encryptHelcimSecret("hosted-invoice-view", (await requiredConfiguration()).encryptionKey, sessionId);
   const createdAt = new Date();
   await getD1().prepare(`INSERT OR IGNORE INTO helcim_checkout_sessions
     (id,payment_link_id,customer_invoice_id,checkout_token,encrypted_secret_token,amount_cents,currency,status,created_at,expires_at)
@@ -564,7 +709,7 @@ async function hostedInvoiceSession(transaction: Row, method: HelcimMethod) {
 
 export async function recordHelcimWebhook(request: Request) {
   await ensureDatabase();
-  const config = requiredConfiguration();
+  const config = await requiredConfiguration();
   if (!config.verifierToken) throw new HelcimPaymentError("HELCIM_WEBHOOK_NOT_CONFIGURED", "Helcim webhook verification is not configured for this deployment.", 503);
   const webhookId = text(request.headers.get("webhook-id"));
   const timestamp = text(request.headers.get("webhook-timestamp"));
@@ -627,7 +772,7 @@ type HostedInvoiceMirror = {
 };
 
 async function pollHostedInvoiceMirror(mirror: HostedInvoiceMirror) {
-  const configuration = requiredConfiguration();
+  const configuration = await requiredConfiguration();
   const transactions: Array<{ transaction: Row; method: HelcimMethod }> = [];
   if (configuration.paymentMethod.includes("cc")) {
     const payload = await helcimRequest(`/card-transactions?invoiceNumber=${encodeURIComponent(mirror.helcimInvoiceNumber)}&limit=100&page=1`);
@@ -652,7 +797,7 @@ async function pollHostedInvoiceMirror(mirror: HostedInvoiceMirror) {
 }
 
 export async function processHelcimIntegrationBatch(limit = 50) {
-  const configuration = getHelcimConfigurationStatus();
+  const configuration = await getHelcimConfigurationStatus();
   if (!configuration.configured) return { configured: false, webhooks: 0, mirrors: 0, sessions: 0 };
   await ensureDatabase();
   const bounded = Math.max(1, Math.min(100, Math.floor(limit)));
@@ -726,7 +871,7 @@ export async function getHelcimAdminState() {
       WHERE s.status IN ('pending','review','failed') ORDER BY COALESCE(s.reconciled_at,s.created_at) DESC LIMIT 25`).all<Row>(),
   ]);
   return {
-    configuration: getHelcimConfigurationStatus(),
+    configuration: await getHelcimConfigurationStatus(),
     activeLinks: Number(activeLinks?.count ?? 0),
     counts: Object.fromEntries(sessionCounts.results.map((item) => [item.status, Number(item.count)])),
     recent: recent.results,

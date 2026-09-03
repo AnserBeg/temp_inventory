@@ -657,6 +657,8 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 }
 
 @media (max-width: 900px) {
+  .helcim-connect-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .helcim-connect-form > button { min-height: 40px; }
   .qbo-connect-grid, .qbo-connection-summary, .qbo-mapping-grid { grid-template-columns: 1fr; }
   .qbo-connection-summary .qbo-actions { grid-column: auto; }
   .integration-hub-intro { grid-template-columns: 1fr; }
@@ -682,6 +684,7 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 }
 
 @media (max-width: 640px) {
+  .helcim-connect-form { grid-template-columns: 1fr; }
   .next-step-banner { align-items: stretch; flex-direction: column; }
   .next-step-banner .button { width: 100%; }
   body { font-size: 13px; }
@@ -965,6 +968,13 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .integration-setting button { min-height: 30px; padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 5px; background: #fff; color: var(--ink); font-size: 10px; font-weight: 760; }
 .integration-missing-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 14px 14px; }
 .integration-missing-list span { padding: 5px 7px; border: 1px solid #e0c07f; border-radius: 5px; background: var(--warning-soft); color: #704a10; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9.5px; }
+.helcim-connect-form { display: grid; grid-template-columns: minmax(220px, 1.2fr) minmax(220px, 1fr) minmax(170px, .7fr) auto; gap: 12px; align-items: end; padding: 16px; border-bottom: 1px solid var(--line); background: #f7f9ff; }
+.helcim-connect-copy { grid-column: 1 / -1; }
+.helcim-connect-copy strong { display: block; font-size: 12px; }
+.helcim-connect-copy p { max-width: 800px; margin: 4px 0 0; color: var(--ink-soft); font-size: 10.5px; line-height: 1.5; }
+.helcim-connect-form label { display: grid; gap: 5px; color: var(--ink-soft); font-size: 10.5px; font-weight: 700; }
+.helcim-connect-form input, .helcim-connect-form select { width: 100%; min-height: 40px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: #fff; color: var(--ink); }
+.helcim-connect-blocked { grid-column: 1 / -1; margin: 0; color: var(--danger); font-size: 10.5px; }
 .integration-connection-locked { display: flex; align-items: flex-start; gap: 10px; margin: 0 14px 14px; padding: 12px; border: 1px dashed var(--line-strong); border-radius: 7px; background: var(--surface-soft); }
 .integration-connection-locked svg { width: 18px; flex: 0 0 auto; color: var(--ink-soft); }
 .integration-connection-locked strong { display: block; font-size: 11px; }
@@ -985,6 +995,8 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .workflow-action:hover:not(:disabled) { border-color: #91b8ae; background: #f5faf8; }
 .workflow-action.primary { border-color: var(--brand); background: var(--brand); color: #fff; }
 .workflow-action.primary:hover:not(:disabled) { background: var(--brand-dark); }
+.workflow-action.danger { border-color: #d4a49e; background: #fff; color: var(--danger); }
+.workflow-action.danger:hover:not(:disabled) { border-color: var(--danger); background: var(--danger-soft); }
 .workflow-action.quiet { border-color: transparent; background: transparent; color: var(--brand); }
 .read-only-label { display: inline-flex; align-items: center; min-height: 34px; color: var(--success); font-size: 11px; font-weight: 700; }
 .workflow-muted { color: var(--ink-soft); }

@@ -47,7 +47,8 @@ test("exposes the required operational language and impact previews", async () =
     "Company connections",
     "Sign in & choose company",
     "Helcim merchant connection",
-    "Copy setup request",
+    "Verify & connect",
+    "Do not enter a Helcim username or password",
   ]) {
     assert.match(source, new RegExp(required, "i"), `missing UI contract: ${required}`);
   }
