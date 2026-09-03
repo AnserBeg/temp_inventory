@@ -607,7 +607,7 @@ async function cancelPurchaseOrder(command: WorkflowCommand) {
 
 async function submitPurchaseOrder(command: WorkflowCommand) {
   const id = textValue({ entityId: command.entityId }, "entityId");
-  const reason = textValue(command.payload ?? {}, "reason");
+  const reason = optionalText(command.payload ?? {}, "reason") ?? "";
   const version = command.version ?? 0;
   const current = await first<{ lifecycleStatus: string; version: number; number: string }>("SELECT lifecycle_status AS lifecycleStatus, version, number FROM purchase_orders WHERE id=?", id);
   if (!current) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
@@ -645,7 +645,7 @@ async function submitPurchaseOrder(command: WorkflowCommand) {
 
 async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved" | "rejected") {
   const id = textValue({ entityId: command.entityId }, "entityId");
-  const reason = textValue(command.payload ?? {}, "reason");
+  const reason = optionalText(command.payload ?? {}, "reason") ?? "";
   const version = command.version ?? 0;
   const current = await first<{ version: number; status: string; revision: number; number: string }>("SELECT version, lifecycle_status AS status, revision_number AS revision, number FROM purchase_orders WHERE id=?", id);
   if (!current) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
@@ -876,7 +876,7 @@ async function requestApproval(command: WorkflowCommand) {
 
 async function decideApproval(command: WorkflowCommand, decision: "approved" | "rejected") {
   const id = textValue({ entityId: command.entityId }, "entityId");
-  const reason = textValue(command.payload ?? {}, "reason");
+  const reason = optionalText(command.payload ?? {}, "reason") ?? "";
   const version = command.version ?? 0;
   const approval = await first<{ version: number; status: string; entityType: string; entityId: string }>("SELECT version,status,entity_type AS entityType,entity_id AS entityId FROM approvals WHERE id=?", id);
   if (!approval) throw new WorkflowError("NOT_FOUND", "Approval was not found.", 404);
@@ -1590,7 +1590,7 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
 
 async function approveVendorBill(command: WorkflowCommand) {
   const id = textValue({ entityId: command.entityId }, "entityId");
-  const reason = textValue(command.payload ?? {}, "reason");
+  const reason = optionalText(command.payload ?? {}, "reason") ?? "";
   const version = command.version ?? 0;
   const bill = await first<{ version: number; status: string; holdReason: string | null }>("SELECT version,status,hold_reason AS holdReason FROM vendor_bills WHERE id=?", id);
   if (!bill) throw new WorkflowError("NOT_FOUND", "Vendor bill not found.", 404);

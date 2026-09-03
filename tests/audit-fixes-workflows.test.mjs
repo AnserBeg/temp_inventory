@@ -202,7 +202,7 @@ test("a rejected variance approval releases the line for recount and a new appro
   // A pending request pins the line.
   await assert.rejects(countSessions.saveCountLine(operator, { sessionId, lineId: line.id, version: line.version, countedQuantity: 29, reason: "Recount" }), rejectsWithCode("APPROVAL_ALREADY_REQUESTED"));
 
-  await advancedDomain.executeWorkflow({ command: "rejectApproval", entityId: requested.approvalId, version: 1, idempotencyKey: "audit-count-rejected-decision", actor: manager, payload: { reason: "Recount before I sign this" } });
+  await advancedDomain.executeWorkflow({ command: "rejectApproval", entityId: requested.approvalId, version: 1, idempotencyKey: "audit-count-rejected-decision", actor: manager });
   workspace = await countSessions.getCountSessionWorkspace({ sessionId });
   line = workspace.lines[0];
   assert.equal(line.approvalStatus, "rejected");
@@ -300,7 +300,7 @@ test("a vendor bill ahead of the receipt posts on hold and is released only once
   // The hold is blocking until the receipt exists.
   await assert.rejects(advancedDomain.executeWorkflow({ command: "approveVendorBill", entityId: bill.id, version: bill.version, idempotencyKey: "audit-bill-approve-early", actor: manager, payload: { reason: "Pay it anyway" } }), rejectsWithCode("RECEIPT_REQUIRED"));
   await receive("po-audit-bill", "pol-audit-bill", 4, "audit-bill-receipt");
-  await advancedDomain.executeWorkflow({ command: "approveVendorBill", entityId: bill.id, version: bill.version, idempotencyKey: "audit-bill-approve", actor: manager, payload: { reason: "Goods received" } });
+  await advancedDomain.executeWorkflow({ command: "approveVendorBill", entityId: bill.id, version: bill.version, idempotencyKey: "audit-bill-approve", actor: manager });
   assert.deepEqual(row("SELECT status,match_status,hold_reason FROM vendor_bills WHERE id=?", bill.id), { status: "approved", match_status: "approved_variance", hold_reason: null });
   assert.equal(row("SELECT status FROM approvals WHERE entity_id=? AND request_type='vendor_bill_match_exception'", bill.id).status, "approved");
 
