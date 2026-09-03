@@ -275,9 +275,12 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
 
   useEffect(() => {
     if (!open) return;
+    let current = true;
     const controller = new AbortController();
+    // Enter the pending state before the debounce elapses. Otherwise the list paints its old
+    // rows (or an empty message), flashes to "Searching…", and then paints the response.
+    setLoading(true);
     const timer = window.setTimeout(async () => {
-      setLoading(true);
       try {
         const params = new URLSearchParams({ lookup: kind, q: query, limit: "25" });
         if (role) params.set("role", role);
@@ -295,20 +298,30 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
         const raw = await response.json() as { items?: Array<Record<string, unknown>>; error?: { message?: string } };
         if (!response.ok) throw new Error(raw.error?.message ?? "Reference lookup unavailable.");
         const mapped = (raw.items ?? []).map((item) => mapRef.current(item));
-        setOptions(mapped);
-        setLookupError("");
-        setKnown((current) => ({ ...current, ...Object.fromEntries(mapped.map((option) => [option.id, option])) }));
+        if (current) {
+          setOptions(mapped);
+          setLookupError("");
+          setKnown((knownOptions) => ({ ...knownOptions, ...Object.fromEntries(mapped.map((option) => [option.id, option])) }));
+        }
       } catch (error) {
-        if (!(error instanceof DOMException && error.name === "AbortError")) {
+        if (current && !(error instanceof DOMException && error.name === "AbortError")) {
           setOptions(fallbackRef.current.slice(0, 25));
           setLookupError(error instanceof Error ? error.message : "Reference lookup unavailable.");
         }
       } finally {
-        setLoading(false);
+        // A superseded request must not clear the pending state of the newer query.
+        if (current) setLoading(false);
       }
     }, 180);
-    return () => { controller.abort(); window.clearTimeout(timer); };
+    return () => { current = false; controller.abort(); window.clearTimeout(timer); };
   }, [currency, exchangeRateToBase, kind, lineId, locationId, open, partnerId, productId, quantity, query, role, warehouseId]);
+
+  const beginLookup = (nextQuery: string) => {
+    setQuery(nextQuery);
+    setLookupError("");
+    setLoading(true);
+    setOpen(true);
+  };
 
   const choose = (option: PickerOption) => { setKnown((current) => ({ ...current, [option.id]: option })); onSelect(option); setOpen(false); };
   const rows = loading ? 0 : options.length + (offerCreate ? 1 : 0);
@@ -333,12 +346,12 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
       aria-label={hideLabel ? label : undefined}
       required={required}
       aria-required={required || undefined}
-      onFocus={() => { setQuery(""); setOpen(true); }}
+      onFocus={() => beginLookup("")}
       onBlur={() => window.setTimeout(() => setOpen(false), 140)}
       onKeyDown={onKeyDown}
-      onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
+      onChange={(event) => beginLookup(event.target.value)}
     />
-    {open ? <div id={listboxId} ref={listRef} className="reference-results" role="listbox" aria-label={label ?? placeholder}>
+    {open ? <div id={listboxId} ref={listRef} className="reference-results" role="listbox" aria-label={label ?? placeholder} aria-busy={loading}>
       {loading ? <span className="reference-status">Searching…</span> : options.map((option, index) => row(index, option.id, "", <><strong>{option.label}</strong>{option.detail ? <small>{option.detail}</small> : null}</>, option.id === value, optionName(option.label, option.detail)))}
       {!loading && lookupError ? <span className="reference-status" role="alert">{lookupError} Type again to retry.</span> : null}
       {!loading && !lookupError && !options.length ? <span className="reference-status">No matching active records</span> : null}

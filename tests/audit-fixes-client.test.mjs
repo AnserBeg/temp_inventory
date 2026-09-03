@@ -199,6 +199,13 @@ test("core workflows show their cross-page handoffs and continue after invoice p
   assert.match(sources.css, /\.process-guide li\.current/);
 });
 
+test("remote dropdown loading does not flash stale states or lose a newer request", () => {
+  assert.match(sources.picker, /const beginLookup = \(nextQuery: string\) => \{\s*setQuery\(nextQuery\);\s*setLookupError\(""\);\s*setLoading\(true\);\s*setOpen\(true\);/);
+  assert.match(sources.picker, /let current = true;[\s\S]*if \(current\) setLoading\(false\);[\s\S]*current = false; controller\.abort\(\);/);
+  assert.match(sources.picker, /aria-busy=\{loading\}/);
+  assert.match(sources.css, /\.reference-results \{[^}]*scrollbar-gutter: stable;/);
+});
+
 test("each order keeps its connected documents and next action in one progression", () => {
   assert.match(sources.app, /function RecordProgress/);
   assert.match(sources.app, /Purchase to payment for \$\{po\.number\}/);
