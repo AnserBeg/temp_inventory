@@ -351,7 +351,7 @@ function PeriodsAndAccess({ state, canAction, openAction }: { state: WorkflowSta
 }
 
 type QboAdminState = {
-  configuration: { configured: boolean; message?: string; missing?: string[]; redirectUri?: string; expectedRedirectUri?: string; redirectMatchesSite?: boolean; webhookConfigured?: boolean; minorVersion?: string };
+  configuration: { configured: boolean; credentialsConfigured?: boolean; tokenEncryptionConfigured?: boolean; message?: string; missing?: string[]; redirectUri?: string; expectedRedirectUri?: string; redirectMatchesSite?: boolean; webhookConfigured?: boolean; minorVersion?: string };
   connections: Array<Record<string, unknown>>;
   selectedConnectionId: string | null;
   accountRoles: Array<{ key: string; label: string; types: readonly string[] }>;
@@ -573,6 +573,7 @@ function QuickBooksIntegration({ canAdminister }: { canAdminister: boolean }) {
   }));
   const counts = data?.summary?.counts ?? {};
   const qboMissing = data?.configuration.missing ?? [];
+  const credentialsReady = data?.configuration.credentialsConfigured === true;
   const platformReady = data?.configuration.configured === true;
   const companyReady = connected;
   const mappingsReady = Boolean(selectedConnection && data && data.accountMappings.length > 0 && data.referenceMappings.length > 0);
@@ -583,14 +584,15 @@ function QuickBooksIntegration({ canAdminister }: { canAdminister: boolean }) {
   return <div className="workflow-stack">
     <Section title="QuickBooks Online" detail="Authorize one QBO company, then map PaneFlow's accounting roles before the first sync.">
       <div className="integration-provider-card qbo">
-        <div className="integration-provider-heading"><span className="integration-provider-mark">qb</span><div><span className="integration-eyebrow">Accounting system</span><h3>QuickBooks company connection</h3><p>A QuickBooks company administrator signs in through Intuit and chooses the company PaneFlow may access.</p></div><span className={`integration-state ${companyReady ? "ready" : platformReady ? "available" : "attention"}`}>{companyReady ? "Connected" : platformReady ? "Ready to connect" : "Setup required"}</span></div>
+        <div className="integration-provider-heading"><span className="integration-provider-mark">qb</span><div><span className="integration-eyebrow">Accounting system</span><h3>QuickBooks company connection</h3><p>A QuickBooks company administrator signs in through Intuit and chooses the company PaneFlow may access.</p></div><span className={`integration-state ${companyReady ? "ready" : platformReady || credentialsReady ? "available" : "attention"}`}>{companyReady ? "Connected" : platformReady ? "Ready to connect" : credentialsReady ? "Credentials present" : "Setup required"}</span></div>
         <ol className="integration-step-list">
-          <ConnectionStep number={1} title="Configure the PaneFlow Intuit app" detail={platformReady ? "The client ID, protected client secret, encryption key, and production callback are ready." : "Create or open the PaneFlow app in Intuit Developer and store its client ID and client secret in the deployment."} status={platformReady ? "complete" : "action"} />
-          <ConnectionStep number={2} title="Authorize a QuickBooks company" detail={companyReady ? `${String(selectedConnection?.companyName)} is authorized for ${String(selectedConnection?.environment)} access.` : platformReady ? "Choose sandbox or production below, then sign in with a QuickBooks company administrator." : "Company login unlocks after the platform settings are complete."} status={companyReady ? "complete" : platformReady ? "action" : "next"} />
-          <ConnectionStep number={3} title="Map and verify accounting" detail={mappingsReady ? `${data?.accountMappings.length ?? 0} account roles and ${data?.referenceMappings.length ?? 0} tax, term, or payment-method values are mapped.` : companyReady ? "Load the QBO lists, map the chart of accounts and tax values, then run a sandbox sync." : "Mapping becomes available after company authorization."} status={mappingsReady ? "complete" : companyReady ? "action" : "next"} />
+          <ConnectionStep number={1} title="Add Intuit app credentials" detail={credentialsReady ? "The Intuit client ID and protected client secret are present in this deployment." : "Create or open the PaneFlow app in Intuit Developer and store its client ID and client secret in the deployment."} status={credentialsReady ? "complete" : "action"} />
+          <ConnectionStep number={2} title="Verify OAuth protection and callback" detail={platformReady ? "The token-encryption key and exact callback for this PaneFlow site are ready." : credentialsReady ? "Finish the remaining protected setting or callback item shown below." : "OAuth verification starts after the Intuit app credentials are stored."} status={platformReady ? "complete" : credentialsReady ? "action" : "next"} />
+          <ConnectionStep number={3} title="Authorize a QuickBooks company" detail={companyReady ? `${String(selectedConnection?.companyName)} is authorized for ${String(selectedConnection?.environment)} access.` : platformReady ? "Choose sandbox or production below, then sign in with a QuickBooks company administrator." : "Company login unlocks after all OAuth settings are ready."} status={companyReady ? "complete" : platformReady ? "action" : "next"} />
+          <ConnectionStep number={4} title="Map and verify accounting" detail={mappingsReady ? `${data?.accountMappings.length ?? 0} account roles and ${data?.referenceMappings.length ?? 0} tax, term, or payment-method values are mapped.` : companyReady ? "Load the QBO lists, map the chart of accounts and tax values, then run a sandbox sync." : "Mapping becomes available after company authorization."} status={mappingsReady ? "complete" : companyReady ? "action" : "next"} />
         </ol>
         <div className="integration-setup-footer">
-          <div><strong>{companyReady ? "Company connected" : platformReady ? "Ready for company login" : "Platform settings still needed"}</strong><p>{data?.configuration.message ?? "Add the QuickBooks deployment settings before connecting."}</p><small>PaneFlow supports one active QBO company at a time. Use QBO Plus or Advanced when purchase orders must be pushed.</small></div>
+          <div><strong>{companyReady ? "Company connected" : platformReady ? "Ready for company login" : credentialsReady ? "Credentials present — finish OAuth setup" : "Platform credentials still needed"}</strong><p>{data?.configuration.message ?? "Add the QuickBooks deployment settings before connecting."}</p><small>PaneFlow supports one active QBO company at a time. Use QBO Plus or Advanced when purchase orders must be pushed.</small></div>
           <div className="integration-actions"><a className="workflow-action" href="https://developer.intuit.com/dashboard" target="_blank" rel="noreferrer">Open Intuit Developer</a>{qboMissing.length ? <button className="workflow-action" type="button" onClick={() => copy(qboSetupRequest, "Setup request")}>Copy setup request</button> : null}</div>
         </div>
         {callbackUrl ? <CopyableSetting label="OAuth callback to register in Intuit" value={callbackUrl} onCopy={copy} /> : null}

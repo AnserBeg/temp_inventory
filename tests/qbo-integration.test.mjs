@@ -51,6 +51,51 @@ test("QBO migration tables and constraints boot on a clean database", () => {
   assert.throws(() => db.sqlite.prepare("INSERT INTO qbo_connections (id,realm_id,environment,status,company_name,country,home_currency,scopes,encrypted_access_token,encrypted_refresh_token,access_token_expires_at,sync_from,initial_sync_status,connected_by,connected_at,updated_at) VALUES ('bad','bad','live','connected','Bad','CA','CAD','scope','a','b','2099-01-01','2026-01-01','queued','test','2026-01-01','2026-01-01')").run(), /CHECK constraint failed/);
 });
 
+test("QBO configuration status reports credential presence separately from OAuth readiness", () => {
+  const requestUrl = "https://paneflow.example.test/api/integrations/qbo";
+  const ready = qboClient.qboConfigurationStatus(requestUrl);
+  assert.equal(ready.configured, true);
+  assert.equal(ready.credentialsConfigured, true);
+  assert.equal(ready.tokenEncryptionConfigured, true);
+  assert.deepEqual(ready.missing, []);
+  assert.equal(ready.message, "QuickBooks credentials and OAuth settings are ready.");
+  assert.equal(ready.redirectUri, "https://paneflow.example.test/api/integrations/qbo/callback");
+  assert.equal(ready.expectedRedirectUri, ready.redirectUri);
+  assert.equal(ready.redirectMatchesSite, true);
+  assert.equal(ready.webhookConfigured, true);
+
+  const encryptionKey = env.QBO_TOKEN_ENCRYPTION_KEY;
+  const redirectUri = env.QBO_REDIRECT_URI;
+  try {
+    delete env.QBO_TOKEN_ENCRYPTION_KEY;
+    const incomplete = qboClient.qboConfigurationStatus(requestUrl);
+    assert.equal(incomplete.configured, false);
+    assert.equal(incomplete.credentialsConfigured, true);
+    assert.equal(incomplete.tokenEncryptionConfigured, false);
+    assert.deepEqual(incomplete.missing, ["QBO_TOKEN_ENCRYPTION_KEY"]);
+    assert.match(incomplete.message, /credentials are present/);
+
+    env.QBO_TOKEN_ENCRYPTION_KEY = encryptionKey;
+    env.QBO_REDIRECT_URI = "https://different.example.test/api/integrations/qbo/callback";
+    assert.throws(() => qboClient.qboConfig(requestUrl), /must exactly match/);
+    const mismatchedCallback = qboClient.qboConfigurationStatus(requestUrl);
+    assert.equal(mismatchedCallback.configured, false);
+    assert.equal(mismatchedCallback.credentialsConfigured, true);
+    assert.deepEqual(mismatchedCallback.missing, ["QBO_REDIRECT_URI"]);
+    assert.match(mismatchedCallback.message, /credentials are present/);
+  } finally {
+    env.QBO_TOKEN_ENCRYPTION_KEY = encryptionKey;
+    env.QBO_REDIRECT_URI = redirectUri;
+  }
+});
+
+test("QBO company-connection UI shows credentials present before full OAuth readiness", async () => {
+  const source = await readFile(new URL("../app/components/operations-suite.tsx", import.meta.url), "utf8");
+  assert.match(source, /credentialsReady \? "Credentials present"/);
+  assert.match(source, /status=\{credentialsReady \? "complete" : "action"\}/);
+  assert.match(source, /credentialsReady \? "Credentials present — finish OAuth setup"/);
+});
+
 test("OAuth state is one-use and QBO tokens are encrypted at rest", async () => {
   const actor = { id: "admin-qbo", email: "admin@example.test", name: "Admin", role: "administrator", label: "Admin <admin@example.test>", localDevelopment: false };
   const authorization = await qboClient.createQboAuthorizationUrl(actor, "https://paneflow.example.test/api/integrations/qbo/connect", {

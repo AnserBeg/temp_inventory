@@ -50,8 +50,7 @@ function runtimeValue(name: string) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-export function qboConfig(_requestUrl?: string): QboRuntimeConfig {
-  void _requestUrl;
+export function qboConfig(requestUrl?: string): QboRuntimeConfig {
   const config = {
     clientId: runtimeValue("QBO_CLIENT_ID"),
     clientSecret: runtimeValue("QBO_CLIENT_SECRET"),
@@ -60,9 +59,12 @@ export function qboConfig(_requestUrl?: string): QboRuntimeConfig {
     webhookVerifierToken: runtimeValue("QBO_WEBHOOK_VERIFIER_TOKEN") || undefined,
     minorVersion: runtimeValue("QBO_MINOR_VERSION") || "75",
   };
-  const missing = Object.entries(config)
-    .filter(([key, value]) => ["clientId", "clientSecret", "tokenEncryptionKey", "redirectUri"].includes(key) && !value)
-    .map(([key]) => key);
+  const missing = [
+    !config.clientId ? "QBO_CLIENT_ID" : "",
+    !config.clientSecret ? "QBO_CLIENT_SECRET" : "",
+    !config.tokenEncryptionKey ? "QBO_TOKEN_ENCRYPTION_KEY" : "",
+    !config.redirectUri ? "QBO_REDIRECT_URI" : "",
+  ].filter(Boolean);
   if (missing.length) throw new QboConfigurationError(`QuickBooks is not configured. Missing: ${missing.join(", ")}.`);
   if (config.tokenEncryptionKey.length < 32) throw new QboConfigurationError("QBO_TOKEN_ENCRYPTION_KEY must be at least 32 characters.");
   let redirect: URL;
@@ -71,6 +73,10 @@ export function qboConfig(_requestUrl?: string): QboRuntimeConfig {
   const localRedirect = ["localhost", "127.0.0.1", "[::1]"].includes(redirect.hostname);
   if (redirect.protocol !== "https:" && !(localRedirect && redirect.protocol === "http:")) {
     throw new QboConfigurationError("QBO_REDIRECT_URI must use HTTPS except for localhost development.");
+  }
+  if (requestUrl) {
+    const expectedRedirectUri = `${new URL(requestUrl).origin}/api/integrations/qbo/callback`;
+    if (config.redirectUri !== expectedRedirectUri) throw new QboConfigurationError(`QBO_REDIRECT_URI must exactly match ${expectedRedirectUri}.`);
   }
   if (!/^\d+$/u.test(config.minorVersion)) throw new QboConfigurationError("QBO_MINOR_VERSION must be a numeric Intuit minor version.");
   return config;
@@ -83,15 +89,27 @@ export function qboConfigurationStatus(requestUrl?: string) {
     QBO_TOKEN_ENCRYPTION_KEY: runtimeValue("QBO_TOKEN_ENCRYPTION_KEY"),
     QBO_REDIRECT_URI: runtimeValue("QBO_REDIRECT_URI"),
   };
-  const missing = Object.entries(runtime).filter(([, value]) => !value).map(([name]) => name);
+  const credentialsConfigured = Boolean(runtime.QBO_CLIENT_ID && runtime.QBO_CLIENT_SECRET);
+  const tokenEncryptionConfigured = runtime.QBO_TOKEN_ENCRYPTION_KEY.length >= 32;
   const expectedRedirectUri = requestUrl ? `${new URL(requestUrl).origin}/api/integrations/qbo/callback` : "";
+  const missing = new Set(Object.entries(runtime).filter(([, value]) => !value).map(([name]) => name));
+  if (!tokenEncryptionConfigured) missing.add("QBO_TOKEN_ENCRYPTION_KEY");
+  let redirectIsValid = false;
+  try {
+    const redirect = new URL(runtime.QBO_REDIRECT_URI);
+    const localRedirect = ["localhost", "127.0.0.1", "[::1]"].includes(redirect.hostname);
+    redirectIsValid = redirect.protocol === "https:" || (localRedirect && redirect.protocol === "http:");
+  } catch { redirectIsValid = false; }
+  const redirectMatchesSite = redirectIsValid && (!expectedRedirectUri || runtime.QBO_REDIRECT_URI === expectedRedirectUri);
+  if (!redirectMatchesSite) missing.add("QBO_REDIRECT_URI");
   try {
     const config = qboConfig(requestUrl);
-    const redirectMatchesSite = !expectedRedirectUri || config.redirectUri === expectedRedirectUri;
     return {
       configured: redirectMatchesSite,
+      credentialsConfigured,
+      tokenEncryptionConfigured,
       missing: redirectMatchesSite ? [] : ["QBO_REDIRECT_URI"],
-      message: redirectMatchesSite ? "QuickBooks platform credentials are ready." : `QBO_REDIRECT_URI must exactly match ${expectedRedirectUri}.`,
+      message: redirectMatchesSite ? "QuickBooks credentials and OAuth settings are ready." : `QuickBooks credentials are present. QBO_REDIRECT_URI must exactly match ${expectedRedirectUri}.`,
       redirectUri: config.redirectUri,
       expectedRedirectUri,
       redirectMatchesSite,
@@ -99,13 +117,21 @@ export function qboConfigurationStatus(requestUrl?: string) {
       minorVersion: config.minorVersion,
     };
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const message = credentialsConfigured && errorMessage.startsWith("QuickBooks is not configured. Missing:")
+      ? `QuickBooks credentials are present. Complete the remaining OAuth settings: ${[...missing].join(", ")}.`
+      : credentialsConfigured
+        ? `QuickBooks credentials are present, but OAuth setup is incomplete. ${errorMessage}`
+        : errorMessage;
     return {
       configured: false,
-      missing,
-      message: error instanceof Error ? error.message : String(error),
+      credentialsConfigured,
+      tokenEncryptionConfigured,
+      missing: [...missing],
+      message,
       redirectUri: runtime.QBO_REDIRECT_URI || expectedRedirectUri,
       expectedRedirectUri,
-      redirectMatchesSite: !runtime.QBO_REDIRECT_URI || runtime.QBO_REDIRECT_URI === expectedRedirectUri,
+      redirectMatchesSite,
       webhookConfigured: Boolean(runtimeValue("QBO_WEBHOOK_VERIFIER_TOKEN")),
       minorVersion: runtimeValue("QBO_MINOR_VERSION") || "75",
     };
