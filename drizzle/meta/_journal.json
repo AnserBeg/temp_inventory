@@ -225,6 +225,20 @@
       "when": 1788416275382,
       "tag": "0031_tenant-integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1788420000000,
+      "tag": "0032_reorder_rules",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1788423000000,
+      "tag": "0033_company_email",
+      "breakpoints": true
     }
   ]
 }

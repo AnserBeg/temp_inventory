@@ -157,7 +157,13 @@ function emptyWorkflowOptions(): WorkflowState["options"] {
   return { products: [], warehouses: [], locations: [], uoms: [], priceLists: [], salesOrderLines: [], purchaseOrderLines: [], purchaseOrders: [], salesOrders: [], partners: [], costLayers: [], assetTypes: [], vendorBills: [], customerInvoices: [] };
 }
 
-async function loadWorkflowState(workspace: OperationsWorkspaceKind) {
+// Long enough for a hover prefetch to be consumed without a duplicate request; short enough
+// that revisiting a workspace normally revalidates against other users' changes.
+const WORKFLOW_CACHE_TTL_MS = 1_000;
+const workflowCache = new Map<OperationsWorkspaceKind, { state: WorkflowState; loadedAt: number }>();
+const workflowLoads = new Map<OperationsWorkspaceKind, Promise<WorkflowState>>();
+
+async function requestWorkflowState(workspace: OperationsWorkspaceKind) {
   const pageSize = 100;
   // Workflow tabs are action queues, while the surrounding register is the paginated system of
   // record. Loading every historical workflow page before showing the first one turned 10,000
@@ -173,6 +179,35 @@ async function loadWorkflowState(workspace: OperationsWorkspaceKind) {
   }
   const parts = workflowSnapshotParts(body);
   return normalizeLiveWorkflowState(parts.advanced, parts.core);
+}
+
+const REORDER_POINT_RULE_KEY = "inventory.reorderPointRule";
+
+function reorderPointRule(record?: ActionRecord | PolicyRecord) {
+  const raw = record?.data?.value;
+  const value = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const percent = typeof value.percent === "number" && Number.isFinite(value.percent) ? value.percent : 70;
+  return { percent, applyToAllStocked: value.applyToAllStocked === true };
+}
+
+function loadWorkflowState(workspace: OperationsWorkspaceKind, force = false) {
+  const cached = workflowCache.get(workspace);
+  if (!force && cached && Date.now() - cached.loadedAt < WORKFLOW_CACHE_TTL_MS) return Promise.resolve(cached.state);
+  const existing = workflowLoads.get(workspace);
+  if (existing) return existing;
+  const pending = requestWorkflowState(workspace)
+    .then((state) => {
+      workflowCache.set(workspace, { state, loadedAt: Date.now() });
+      return state;
+    })
+    .finally(() => workflowLoads.delete(workspace));
+  workflowLoads.set(workspace, pending);
+  return pending;
+}
+
+/** Starts the route's workflow read during hover/navigation, before this large chunk renders. */
+export function preloadOperationsWorkspace(workspace: OperationsWorkspaceKind) {
+  void loadWorkflowState(workspace).catch(() => undefined);
 }
 
 function emptyWorkflowState(): WorkflowState {
@@ -203,12 +238,13 @@ const overviewCreateActions: Partial<Record<OperationsWorkspaceKind, ActionDefin
   "customer-billing": { kind: "createCustomerInvoice", title: "Create customer invoice", description: "Post eligible fulfilled quantities as a customer receivable. Inventory does not move again.", finalLabel: "Create & post customer invoice" },
 };
 
-export function OperationsWorkspace({ workspace, children, initialTab = "overview", onTabChange, onDurableRefresh, refreshToken = 0, onCreateOrder, onOpenOrder }: { workspace: OperationsWorkspaceKind; children: ReactNode; initialTab?: string; onTabChange?: (tab: string) => void; onDurableRefresh?: () => void | Promise<void>; refreshToken?: number; onCreateOrder?: () => void; /** Opens a listed order's own page, where a draft or rejected revision can be edited. */ onOpenOrder?: (record: { id: string; number: string }) => void }) {
+export function OperationsWorkspace({ workspace, children, initialTab = "overview", onTabChange, onDurableRefresh, refreshToken = 0, filterReference = "", onCreateOrder, onOpenOrder }: { workspace: OperationsWorkspaceKind; children: ReactNode; initialTab?: string; onTabChange?: (tab: string) => void; onDurableRefresh?: () => void | Promise<void>; refreshToken?: number; filterReference?: string; onCreateOrder?: () => void; /** Opens a listed order's own page, where a draft or rejected revision can be edited. */ onOpenOrder?: (record: { id: string; number: string }) => void }) {
   const validTab = tabs[workspace].some((tab) => tab.key === initialTab) ? initialTab : "overview";
   const requestedTab = `${workspace}:${initialTab}`;
   const [tabSelection, setTabSelection] = useState({ request: requestedTab, tab: validTab });
-  const [state, setState] = useState<WorkflowState>(emptyWorkflowState);
-  const [serviceState, setServiceState] = useState<"loading" | "live" | "unavailable">("loading");
+  const initiallyCached = workflowCache.get(workspace);
+  const [state, setState] = useState<WorkflowState>(() => initiallyCached?.state ?? emptyWorkflowState());
+  const [serviceState, setServiceState] = useState<"loading" | "live" | "unavailable">(initiallyCached ? "live" : "loading");
   const [serviceError, setServiceError] = useState("");
   /**
    * Which workspace the records in `state` actually answer for. Every tab's table reported
@@ -218,7 +254,7 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
    * and it deliberately does not reset on background refreshes, which would blank a tab the
    * user is reading every time a posted command reloads the workspace.
    */
-  const [loadedWorkspace, setLoadedWorkspace] = useState<OperationsWorkspaceKind | null>(null);
+  const [loadedWorkspace, setLoadedWorkspace] = useState<OperationsWorkspaceKind | null>(initiallyCached ? workspace : null);
   /**
    * Recording an ordinary vendor invoice had no route from the Bills tab: the only "Create
    * vendor bill" button lived on Match exceptions, so the everyday case was reached through a
@@ -229,11 +265,11 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
   const [toast, setToast] = useState("");
   const loadGeneration = useRef(0);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = true) => {
     const generation = ++loadGeneration.current;
-    setServiceState("loading");
+    if (force || !workflowCache.has(workspace)) setServiceState("loading");
     try {
-      const nextState = await loadWorkflowState(workspace);
+      const nextState = await loadWorkflowState(workspace, force);
       if (generation !== loadGeneration.current) return;
       setState(nextState);
       setLoadedWorkspace(workspace);
@@ -246,9 +282,10 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
     }
   }, [workspace]);
 
-  useEffect(() => { const timer = window.setTimeout(() => void load(), 0); return () => window.clearTimeout(timer); }, [load, refreshToken]);
+  useEffect(() => { const timer = window.setTimeout(() => void load(refreshToken > 0), 0); return () => window.clearTimeout(timer); }, [load, refreshToken]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(""), 5000); return () => window.clearTimeout(timer); }, [toast]);
   const visibleTab = tabSelection.request === requestedTab ? tabSelection.tab : validTab;
+  const visibleState = useMemo(() => filterWorkflowState(state, filterReference), [state, filterReference]);
 
   const selectTab = (tab: string) => {
     setTabSelection({ request: requestedTab, tab });
@@ -293,13 +330,13 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
   return (
     <div className="operations-workspace" onClickCapture={routeLegacyAction}>
       <div className="workspace-tabbar" role="tablist" aria-label={`${workspace} workspace views`}>
-        {tabs[workspace].map((tab) => <button key={tab.key} role="tab" aria-selected={visibleTab === tab.key} className={visibleTab === tab.key ? "active" : ""} onClick={() => selectTab(tab.key)}>{tab.label}{tabCount(workspace, tab.key, state) ? <span>{tabCount(workspace, tab.key, state)}</span> : null}</button>)}
+        {tabs[workspace].map((tab) => <button key={tab.key} role="tab" aria-selected={visibleTab === tab.key} className={visibleTab === tab.key ? "active" : ""} onClick={() => selectTab(tab.key)}>{tab.label}{tabCount(workspace, tab.key, visibleState) ? <span>{tabCount(workspace, tab.key, visibleState)}</span> : null}</button>)}
         <span className={`workflow-service ${serviceState}`} role="status" title={serviceError || undefined}>{serviceState === "live" ? "Durable workflows live" : serviceState === "loading" ? "Loading workflows…" : "Workflow service unavailable"}</span>
       </div>
       {serviceState === "unavailable" && visibleTab !== "overview" ? <div className="workflow-banner warning"><strong>Changes are temporarily unavailable.</strong><span>{serviceError || "Reference data is shown below. Reconnect before posting a business action so it can be durably recorded."}</span><button onClick={() => void load()}>Retry connection</button></div> : null}
       {visibleTab === "overview" ? <>{overviewCreate ? <div className="workspace-overview-actions"><ActionButton kind="primary" disabled={!canAction(overviewCreate.kind)} onClick={() => setAction(overviewCreate)}>{overviewCreate.finalLabel}</ActionButton></div> : null}{children}</>
         : loadedWorkspace !== workspace && serviceState === "loading" ? <div className="workflow-empty" role="status">Loading records…</div>
-        : <WorkflowTab workspace={workspace} tab={visibleTab} state={state} canAction={canAction} openAction={setAction} refresh={load} onImportComplete={async () => { await load(); await onDurableRefresh?.(); }} onCreateOrder={onCreateOrder} onOpenOrder={onOpenOrder} />}
+        : <WorkflowTab workspace={workspace} tab={visibleTab} state={visibleState} canAction={canAction} openAction={setAction} refresh={load} onImportComplete={async () => { await load(); await onDurableRefresh?.(); }} onCreateOrder={onCreateOrder} onOpenOrder={onOpenOrder} />}
       {action ? <WorkflowDialog action={action} state={state} onClose={() => setAction(null)} onSubmit={async (payload) => { await execute(action.kind, payload); setAction(null); }} /> : null}
       {toast ? <div className="workflow-toast" role="status"><span aria-hidden="true">✓</span>{toast}</div> : null}
     </div>
@@ -1020,7 +1057,7 @@ function AuditTimeline({ state }: { state: WorkflowState }) {
 }
 
 function Policies({ records, user, canAction, openAction }: { records: PolicyRecord[]; user: CurrentUser; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
-  return <div className="workflow-stack"><section className="current-user-card"><div className="user-avatar" aria-hidden="true">{user.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div><div><span className="workflow-kicker">Current user and role</span><h2>{user.name}</h2><p>{user.role}</p></div><ul aria-label="Granted permission groups">{user.permissions.map((permission) => <li key={permission}>✓ {permission}</li>)}</ul></section><Section title="System policies"><div className="policy-grid">{records.map((record) => <article key={record.id}><div><span className="workflow-kicker">{record.risk}</span><h3>{record.name}</h3><p>{record.description}</p></div><strong>{record.value}</strong><ActionButton disabled={!canAction("updatePolicy")} onClick={() => openAction({ kind: "updatePolicy", title: `Change ${record.name}`, description: `${record.description} Existing posted records will not be changed.`, finalLabel: "Save policy for future transactions", record })}>{canAction("updatePolicy") ? "Review change" : "Not permitted"}</ActionButton></article>)}</div></Section></div>;
+  return <div className="workflow-stack"><section className="current-user-card"><div className="user-avatar" aria-hidden="true">{user.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div><div><span className="workflow-kicker">Current user and role</span><h2>{user.name}</h2><p>{user.role}</p></div><ul aria-label="Granted permission groups">{user.permissions.map((permission) => <li key={permission}>✓ {permission}</li>)}</ul></section><Section title="System policies"><div className="policy-grid">{records.map((record) => { const reorderRule = record.id === REORDER_POINT_RULE_KEY; return <article key={record.id} className={reorderRule ? "featured-policy" : undefined}><div><span className="workflow-kicker">{record.risk}</span><h3>{record.name}</h3><p>{record.description}</p></div><strong>{record.value}</strong><ActionButton disabled={!canAction("updatePolicy")} onClick={() => openAction({ kind: "updatePolicy", title: reorderRule ? "Set company reorder rule" : `Change ${record.name}`, description: reorderRule ? "Choose the reorder percentage and whether to apply it to every stocked part or only parts already following the company rule." : `${record.description} Existing posted records will not be changed.`, finalLabel: reorderRule ? "Apply reorder rule" : "Save policy for future transactions", record })}>{canAction("updatePolicy") ? reorderRule ? "Set company rule" : "Review change" : "Not permitted"}</ActionButton></article>; })}</div></Section></div>;
 }
 
 function AttachmentsPanel({ records, state }: { records: AttachmentRecord[]; state?: WorkflowState }) {
@@ -1218,7 +1255,7 @@ export function buildWorkflowPayload(action: ActionDefinition, state: WorkflowSt
     case "issueReturnableAsset": return { partnerId: input.reference, assetTypeId: input.resolution, quantity: input.quantity, direction: "customer_holds", reason: input.reason, postingDate: input.financial.postingDate, paymentMethod: input.source, paymentReference: input.externalReference };
     case "returnReturnableAsset": case "forfeitReturnableAsset": return { quantity: input.quantity, reason: input.reason, postingDate: input.financial.postingDate };
     case "refundAssetDeposit": return { amountCents: cents, reason: input.reason, postingDate: input.financial.postingDate };
-    case "updatePolicy": return { key: action.record?.id, value: typedPolicyValue(action.record?.id ?? "", input.policyValue), reason: input.reason };
+    case "updatePolicy": return { key: action.record?.id, value: action.record?.id === REORDER_POINT_RULE_KEY ? { percent: Number(input.policyValue), applyToAllStocked: input.resolution === "all_stocked" } : typedPolicyValue(action.record?.id ?? "", input.policyValue), reason: input.reason };
     case "lockPeriod": return { module: input.resolution, lockedThrough: input.financial.dueDate, reason: input.reason };
     case "unlockPeriod": return { module: action.record?.data?.module, lockedThrough: action.record?.data?.lockedThrough, reason: input.reason };
     case "updateUserRole": return { role: input.resolution, active: input.policyValue !== "disabled", reason: input.reason };
@@ -1229,6 +1266,7 @@ export function buildWorkflowPayload(action: ActionDefinition, state: WorkflowSt
 function WorkflowDialog({ action, state, onClose, onSubmit }: { action: ActionDefinition; state: WorkflowState; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
   const titleId = useId();
   const descriptionId = useId();
+  const currentReorderRule = reorderPointRule(action.record);
   const closeRef = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1241,8 +1279,8 @@ function WorkflowDialog({ action, state, onClose, onSubmit }: { action: ActionDe
   const [externalReference, setExternalReference] = useState("");
   const [source, setSource] = useState(action.kind === "addDocumentCharge" ? "add" : action.kind === "issueReturnableAsset" ? "bank_transfer" : "");
   const [destination, setDestination] = useState("");
-  const [resolution, setResolution] = useState(["recordVendorPayment", "recordCustomerPayment"].includes(action.kind) ? "bank_transfer" : action.kind === "registerInventoryIdentity" ? "usable" : action.kind === "issueReturnableAsset" ? "" : action.kind === "resolveMatchException" ? state.permissions.approveVendorBill === true ? "approve-variance" : "request-credit" : action.kind === "setValuationPolicy" ? String(action.record?.data?.method ?? "fifo") : action.kind === "updateUserRole" ? String(action.record?.data?.role ?? "viewer") : action.kind === "lockPeriod" ? "accounting" : action.kind === "addDocumentCharge" ? "fee" : "");
-  const [policyValue, setPolicyValue] = useState(action.kind === "updateUserRole" ? Number(action.record?.data?.active ?? 1) ? "active" : "disabled" : (action.record as PolicyRecord | undefined)?.value ?? "");
+  const [resolution, setResolution] = useState(["recordVendorPayment", "recordCustomerPayment"].includes(action.kind) ? "bank_transfer" : action.kind === "registerInventoryIdentity" ? "usable" : action.kind === "issueReturnableAsset" ? "" : action.kind === "resolveMatchException" ? state.permissions.approveVendorBill === true ? "approve-variance" : "request-credit" : action.kind === "setValuationPolicy" ? String(action.record?.data?.method ?? "fifo") : action.kind === "updateUserRole" ? String(action.record?.data?.role ?? "viewer") : action.kind === "updatePolicy" && action.record?.id === REORDER_POINT_RULE_KEY ? currentReorderRule.applyToAllStocked ? "all_stocked" : "following" : action.kind === "lockPeriod" ? "accounting" : action.kind === "addDocumentCharge" ? "fee" : "");
+  const [policyValue, setPolicyValue] = useState(action.kind === "updateUserRole" ? Number(action.record?.data?.active ?? 1) ? "active" : "disabled" : action.kind === "updatePolicy" && action.record?.id === REORDER_POINT_RULE_KEY ? String(currentReorderRule.percent) : (action.record as PolicyRecord | undefined)?.value ?? "");
   const [fastTrack, setFastTrack] = useState(false);
   const [extraLines, setExtraLines] = useState<ExtraBillLine[]>([]);
   const [confirmedBillFingerprint, setConfirmedBillFingerprint] = useState("");
@@ -1301,6 +1339,7 @@ function WorkflowFields(props: FieldProps) {
   if (action.kind === "lockPeriod") return <div className="workflow-form-grid"><label><span>Module</span><select value={props.resolution} onChange={(event) => props.setResolution(event.target.value)}><option value="accounting">Accounting</option><option value="inventory">Inventory</option><option value="purchasing">Purchasing</option><option value="sales">Sales</option><option value="all">All posting modules</option></select></label><label><span>Lock postings through</span><input type="date" value={props.financial.dueDate} onChange={(event) => props.setFinancial({ ...props.financial, dueDate: event.target.value })} required /></label><ReasonField value={props.reason} setValue={props.setReason} /></div>;
   if (action.kind === "updateUserRole") return <div className="workflow-form-grid"><div className="workflow-record-context full"><span>{action.record?.number}</span><strong>{action.record?.party}</strong><small>Current access: {action.record?.detail} · {action.record?.status}</small></div><label><span>Role</span><select value={props.resolution} onChange={(event) => props.setResolution(event.target.value)}><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="accounting">Accounting</option><option value="manager">Manager</option><option value="administrator">Administrator</option></select></label><label><span>Account status</span><select value={props.policyValue} onChange={(event) => props.setPolicyValue(event.target.value)}><option value="active">Active</option><option value="disabled">Disabled</option></select></label><ReasonField value={props.reason} setValue={props.setReason} /></div>;
   if (action.kind === "postDropShipDelivery") return <div className="workflow-form-grid"><LookupField kind="salesOrderLines" role="drop_ship_linked" label="Linked drop-ship sales-order line" value={props.reference} setValue={props.setReference} onSelect={(option) => props.onReferenceSelect(option as SelectOption)} /><label><span>Delivered quantity</span><NumberField min="0.0001" step="0.0001" value={props.quantity} onChange={props.setQuantity} required /></label><label><span>Delivery date</span><input type="date" value={props.financial.dueDate} onChange={(event) => props.setFinancial({ ...props.financial, dueDate: event.target.value })} required /></label><label><span>Supplier proof / reference</span><input value={props.externalReference} onChange={(event) => props.setExternalReference(event.target.value)} required /></label></div>;
+  if (action.kind === "updatePolicy" && action.record?.id === REORDER_POINT_RULE_KEY) return <div className="workflow-form-grid reorder-policy-form"><div className="workflow-record-context full"><span>Current company rule</span><strong>{(action.record as PolicyRecord).value}</strong><small>Maximum stock remains editable on each part.</small></div><label><span>Reorder point percentage</span><NumberField min="0.1" max="100" step="0.1" value={Number(props.policyValue)} onChange={(value) => props.setPolicyValue(String(value))} required /><small>Example: 70 means reorder at 70% of maximum stock.</small></label><label><span>Apply this rule to</span><select value={props.resolution} onChange={(event) => props.setResolution(event.target.value)}><option value="following">Parts already following company rule</option><option value="all_stocked">All stocked parts</option></select><small>{props.resolution === "all_stocked" ? "Every stocked part will switch to the company rule." : "Manual and custom part rules stay unchanged."}</small></label><div className="reorder-policy-example full"><span>Example</span><strong>Max 100 → reorder at {Number.isFinite(Number(props.policyValue)) ? Number(props.policyValue) : 0}</strong><small>Each affected part is recalculated from its own maximum stock level.</small></div><ReasonField value={props.reason} setValue={props.setReason} /></div>;
   if (action.kind === "updatePolicy") return <div className="workflow-form-grid"><label className="full"><span>Current value</span><input value={(action.record as PolicyRecord).value} disabled /></label>{action.record?.id === "security.defaultRole" ? <label className="full"><span>New default role</span><select value={props.policyValue} onChange={(event) => props.setPolicyValue(event.target.value)}><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="accounting">Accounting</option></select></label> : <label className="full"><span>New value</span><input value={props.policyValue} onChange={(event) => props.setPolicyValue(event.target.value)} required /></label>}<ReasonField value={props.reason} setValue={props.setReason} /></div>;
   if (action.kind === "amendPurchaseOrder") return <div className="workflow-form-grid"><div className="workflow-record-context full"><span>{action.record?.number}</span><strong>Revision {(action.record?.revision ?? 1) + 1}</strong><small>The server will reject a quantity below net received.</small></div><LookupField kind="purchaseOrderLines" partnerId={action.record?.id ?? ""} label="Purchase-order line" value={props.reference} setValue={props.setReference} onSelect={(option) => props.setQuantity(Number(option.data?.orderedQuantity ?? props.quantity))} /><label><span>Revised ordered quantity</span><NumberField min="1" value={props.quantity} onChange={props.setQuantity} required /></label><label><span>Revised unit cost (optional)</span><NumberField min="0" step="0.01" value={props.amount} onChange={props.setAmount} /></label><ReasonField value={props.reason} setValue={props.setReason} /></div>;
   if (action.kind === "createVendorBill") return <VendorBillFields {...props} />;
@@ -1562,6 +1601,7 @@ function workflowImpact(kind: WorkflowActionKind, input: { quantity: number; amo
   if (kind === "forfeitReturnableAsset") return [none("Physical", "Window inventory"), { category: "Commercial", label: "Asset custody", effect: "Closed as not returned", tone: "warning" }, { category: "Financial", label: "Deposit", effect: "Recognized as forfeited", tone: "warning" }, { category: "Audit", label: "Forfeiture", effect: "Reason and customer recorded" }];
   if (kind === "refundAssetDeposit") return [none("Physical", "Asset custody"), none("Commercial", "Orders"), { category: "Financial", label: "Customer deposit liability", effect: `Decreases by ${money()}`, tone: "success" }, { category: "Audit", label: "Refund", effect: `Linked to ${record?.number}` }];
   if (["approveApproval", "rejectApproval"].includes(kind)) return [none("Physical", "Inventory"), { category: "Commercial", label: "Authorization", effect: kind === "approveApproval" ? "Approved for later use by the exact scoped command" : "Rejected; no command is authorized", tone: kind === "approveApproval" ? "success" : "warning" }, none("Financial", "Balances"), { category: "Audit", label: "Approval decision", effect: "Decision, actor, reason, and scope recorded" }];
+  if (kind === "updatePolicy" && record?.id === REORDER_POINT_RULE_KEY) return [none("Physical", "On-hand stock"), { category: "Commercial", label: input.resolution === "all_stocked" ? "All stocked parts" : "Company-rule parts", effect: `Reorder point becomes ${input.policyValue}% of each maximum`, tone: "warning" }, none("Financial", "Existing postings"), { category: "Audit", label: "Rule change", effect: "Percentage, scope, actor, and reason recorded" }];
   if (kind === "updatePolicy") return [none("Physical", "Existing inventory"), { category: "Commercial", label: "Future transactions", effect: `Policy changes to “${input.policyValue}”`, tone: "warning" }, none("Financial", "Existing postings"), { category: "Audit", label: "Policy version", effect: "Old value, new value, actor, and reason recorded" }];
   if (kind === "lockPeriod") return [none("Physical", "Existing inventory"), none("Commercial", "Existing documents"), { category: "Financial", label: "Posting control", effect: `${input.resolution} postings on or before the selected date will be rejected`, tone: "warning" }, { category: "Audit", label: "Period lock", effect: "Module, cutoff, actor, and reason recorded" }];
   if (kind === "unlockPeriod") return [none("Physical", "Existing inventory"), none("Commercial", "Existing documents"), { category: "Financial", label: "Posting control", effect: "The selected lock is removed; future back-dated posts are allowed subject to other controls", tone: "warning" }, { category: "Audit", label: "Period unlock", effect: "Actor and reason recorded" }];
@@ -1571,6 +1611,27 @@ function workflowImpact(kind: WorkflowActionKind, input: { quantity: number; amo
 
 function ImpactReview({ lines }: { lines: ImpactLine[] }) {
   return <section className="workflow-impact" aria-labelledby="workflow-impact-title"><header><span aria-hidden="true">⇄</span><div><h3 id="workflow-impact-title">Review business impact</h3><p>Server validation remains authoritative when you post.</p></div></header><div>{lines.map((line) => <div key={`${line.category}-${line.label}`} className={`workflow-impact-line ${line.tone ?? "neutral"}`}><span><small>{line.category}</small>{line.label}</span><strong>{line.effect}</strong></div>)}</div></section>;
+}
+
+function filterWorkflowState(state: WorkflowState, filterReference: string): WorkflowState {
+  const query = filterReference.trim().toLocaleLowerCase();
+  if (!query) return state;
+  const matches = (record: WorkflowRecord) => [record.number, record.status, record.party, record.reference, record.detail, record.exception, record.requester, record.note, JSON.stringify(record.data ?? {})]
+    .filter(Boolean)
+    .join(" ")
+    .toLocaleLowerCase()
+    .includes(query);
+  return {
+    ...state,
+    purchaseOrders: state.purchaseOrders.filter(matches),
+    revisions: state.revisions.filter(matches),
+    reservations: state.reservations.filter(matches),
+    shipments: state.shipments.filter(matches),
+    dropShipDeliveries: state.dropShipDeliveries.filter(matches),
+    vendorBills: state.vendorBills.filter(matches),
+    customerInvoices: state.customerInvoices.filter(matches),
+    approvals: state.approvals.filter(matches),
+  };
 }
 
 function tabCount(workspace: OperationsWorkspaceKind, tab: string, state: WorkflowState) {
@@ -1641,7 +1702,8 @@ function workflowValidationError(action: ActionDefinition, state: WorkflowState,
   if (action.kind === "issueReturnableAsset" && input.amount * input.quantity > 0 && (!input.source || !input.externalReference.trim())) return "Select the deposit method and enter its payment reference.";
   if (action.kind === "lockPeriod" && !input.financial.dueDate) return "Select the period-lock cutoff date.";
   if (action.kind === "updatePolicy" && !input.policyValue.trim()) return "Enter the new policy value.";
-  if (action.kind === "updatePolicy") { try { typedPolicyValue(action.record?.id ?? "", input.policyValue); } catch (caught) { return caught instanceof Error ? caught.message : "Enter a valid policy value."; } }
+  if (action.kind === "updatePolicy" && action.record?.id === REORDER_POINT_RULE_KEY && (!Number.isFinite(Number(input.policyValue)) || Number(input.policyValue) <= 0 || Number(input.policyValue) > 100)) return "Enter a percentage greater than 0 and no more than 100.";
+  if (action.kind === "updatePolicy" && action.record?.id !== REORDER_POINT_RULE_KEY) { try { typedPolicyValue(action.record?.id ?? "", input.policyValue); } catch (caught) { return caught instanceof Error ? caught.message : "Enter a valid policy value."; } }
   return null;
 }
 
@@ -1728,7 +1790,14 @@ function normalizeLiveWorkflowState(input: unknown, snapshotInput?: unknown): Wo
   const valuationRecords: WorkflowRecord[] = rows(raw.costLayers).map((row) => ({ id: text(row, "id"), number: text(row, "sku", "productId"), status: human(row.status ?? "open layer"), quantity: number(row, "remaining_qty", "remainingQty"), amount: number(row, "remaining_qty", "remainingQty") * (number(row, "unit_cost_cents", "unitCostCents") + number(row, "landed_cost_cents", "landedCostCents")) / 100, detail: text(row, "reference_id", "referenceId") }));
   const assetRecords: AssetRecord[] = rows(raw.returnableObligations).map((row) => { const refundable = number(row, "refundableDepositCents", "refundable_deposit_cents") / 100; return { id: text(row, "id"), number: text(row, "number", "id"), status: human(row.status), assetType: text(row, "assetName", "assetCode"), customer: text(row, "partnerName"), party: text(row, "partnerName"), deposit: number(row, "depositBalanceCents", "deposit_balance_cents") / 100, amount: refundable, issued: number(row, "issued_qty", "issuedQuantity"), returned: number(row, "returned_qty", "returnedQuantity"), quantity: number(row, "outstandingQuantity", "outstanding_quantity"), reference: text(row, "source_document_id", "sourceDocumentId"), detail: `${number(row, "outstandingQuantity", "outstanding_quantity")} outstanding · ${formatWorkflowMoney(refundable)} refundable now`, version: number(row, "version") || undefined, data: row }; });
   const approvalRecords: WorkflowRecord[] = rows(raw.approvals).map((row) => { const metadata = row.metadata && typeof row.metadata === "object" ? row.metadata as Record<string, unknown> : {}; const requestType = text(row, "requestType"); const product = products.find((item) => text(item, "id") === text(row, "entityId")); const count = requestType === "inventory_count_variance"; return { id: text(row, "id"), number: count ? `Count variance · ${text(product ?? {}, "sku", "name") || text(row, "entityId")}` : `${human(requestType)} · ${text(row, "entityId")}`, status: human(row.status), party: text(row, "requestedBy"), reference: `${text(metadata, "locationId", "purchaseOrderId")} · ${text(row, "requestedAt")}`, quantity: number(metadata, count ? "absoluteVariance" : "maxExcessQuantity"), version: number(row, "version") || undefined, detail: count ? `Book ${number(metadata, "recordedQuantity")} → counted ${number(metadata, "countedQuantity")} · ${text(row, "requestedReason")}` : `${text(row, "requestedReason")} · maximum excess ${number(metadata, "maxExcessQuantity")}`, data: row }; });
-  const policyRecords: PolicyRecord[] = rows(raw.settings).map((row) => ({ id: text(row, "key", "id"), name: text(row, "key"), value: typeof row.value === "string" ? row.value : JSON.stringify(row.value), description: text(row, "description"), risk: "Changes future transactions only", version: number(row, "version") || undefined, data: row }));
+  const policyRecords: PolicyRecord[] = rows(raw.settings).map((row) => {
+    const id = text(row, "key", "id");
+    if (id === REORDER_POINT_RULE_KEY) {
+      const rule = reorderPointRule({ id, data: row });
+      return { id, name: "Reorder point rule", value: `${rule.percent}% of max`, description: "Automatically calculates reorder points from each part’s maximum stock level.", risk: rule.applyToAllStocked ? "Company rule · all stocked parts" : "Company rule · opted-in parts", version: number(row, "version") || undefined, data: row };
+    }
+    return { id, name: id, value: typeof row.value === "string" ? row.value : JSON.stringify(row.value), description: text(row, "description"), risk: "Changes future transactions only", version: number(row, "version") || undefined, data: row };
+  }).sort((left, right) => left.id === REORDER_POINT_RULE_KEY ? -1 : right.id === REORDER_POINT_RULE_KEY ? 1 : left.name.localeCompare(right.name));
   const periodLockRecords: WorkflowRecord[] = rows(raw.periodLocks).map((row) => ({ id: text(row, "id"), number: human(row.module), status: number(row, "active") ? "Active" : "Unlocked", reference: `Through ${text(row, "lockedThrough")}`, detail: text(row, "reason"), version: number(row, "version") || undefined, data: row }));
   const valuationPolicyRecords: WorkflowRecord[] = rows(raw.valuationPolicies).map((row) => ({ id: text(row, "product_id", "productId"), number: `${text(row, "sku")} · ${text(row, "productName")}`, status: human(row.method), amount: number(row, "standard_cost_cents", "standardCostCents") / 100, detail: `Average ${money0(number(row, "average_cost_cents", "averageCostCents"))}`, version: number(row, "version") || undefined, data: row }));
   const userRecords: WorkflowRecord[] = rows(raw.users).map((row) => ({ id: text(row, "userId"), number: text(row, "fullName", "email"), party: text(row, "email"), status: number(row, "active") ? "Active" : "Disabled", detail: human(row.role), version: number(row, "version") || undefined, data: row }));

@@ -2,7 +2,9 @@
 
 import {
   FormEvent,
+  lazy,
   ReactNode,
+  Suspense,
   useCallback,
   useEffect,
   useId,
@@ -10,9 +12,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { OperationsWorkspace } from "./components/operations-suite";
 import { EmailConnectionManager, EmailDocumentButton } from "./components/email-documents";
-import { InventoryCountSessions } from "./components/inventory-count-sessions";
 import { actorName } from "./components/format";
 import { localDatePlusDays, localDateString } from "./components/local-date";
 import { NumberField } from "./components/number-field";
@@ -20,6 +20,14 @@ import { useDialogDismiss } from "./components/use-dialog-dismiss";
 import { PAYMENT_TERMS, PickerPermissionsContext, QuickCreateDialog, RemoteSearchSelect, SearchableSelect, type LookupKind, type QuickCreateKind } from "./components/reference-picker";
 import { calculateSalesAvailability } from "@/lib/domain/sales-availability";
 import { inventoryCountApprovalPayload, workflowSnapshotParts } from "@/lib/domain/workflow-envelope";
+
+let operationsWorkspaceModule: Promise<typeof import("./components/operations-suite")> | undefined;
+const loadOperationsWorkspaceModule = () => operationsWorkspaceModule ??= import("./components/operations-suite");
+const OperationsWorkspace = lazy(() => loadOperationsWorkspaceModule().then((module) => ({ default: module.OperationsWorkspace })));
+
+let inventoryCountSessionsModule: Promise<typeof import("./components/inventory-count-sessions")> | undefined;
+const loadInventoryCountSessionsModule = () => inventoryCountSessionsModule ??= import("./components/inventory-count-sessions");
+const InventoryCountSessions = lazy(() => loadInventoryCountSessionsModule().then((module) => ({ default: module.InventoryCountSessions })));
 
 type Severity = "neutral" | "info" | "success" | "warning" | "danger";
 type SortDirection = "asc" | "desc";
@@ -142,6 +150,9 @@ type PurchaseOrder = {
   latestReceiptNumber?: string;
   latestReceiptPostedAt?: string;
   latestReceiptPackingSlip?: string;
+  receipts: PurchaseReceiptRecord[];
+  supplierDeliveries: SupplierDeliveryRecord[];
+  vendorBills: FinancialDocumentRecord[];
   customerRef?: string;
   exception?: string;
   lines: PurchaseLine[];
@@ -164,6 +175,8 @@ type Product = {
   projected: number;
   reorderPoint: number;
   maxStockLevel: number;
+  reorderRuleMode: "manual" | "global" | "custom";
+  reorderRulePercent?: number;
   inventoryPolicy: string;
   standardCost: number;
   lastUnitCost?: number;
@@ -277,6 +290,8 @@ type SalesOrder = {
   orderDate: string;
   owner: string;
   shipments: ShipmentRecord[];
+  supplierDeliveries: SupplierDeliveryRecord[];
+  invoices: FinancialDocumentRecord[];
   version: number;
   lines?: SalesLine[];
 };
@@ -398,7 +413,7 @@ type Snapshot = {
   activities: Activity[];
   partners: Partner[];
   locations: LocationOption[];
-  configuration: { taxDefaultRateBps: number };
+  configuration: { taxDefaultRateBps: number; reorderPointPercent: number };
   viewer: {
     name: string;
     email: string;
@@ -427,7 +442,7 @@ const emptySnapshot: Snapshot = {
   activities: [],
   partners: [],
   locations: [],
-  configuration: { taxDefaultRateBps: 500 },
+  configuration: { taxDefaultRateBps: 500, reorderPointPercent: 70 },
   viewer: { name: "", email: "", role: "", tenant: { id: "", slug: "", name: "" }, tenants: [], permissions: { canRead: false, canExport: false, canOperate: false, canPostFinancial: false, canApprove: false, canAdminister: false } },
   pagination: { page: 1, pageSize: 50, totals: {}, filteredTotal: null },
 };
@@ -468,7 +483,7 @@ type CounterSaleLine = ComposerLine & {
   inventoryUnitId: string;
 };
 
-type ViewKey =
+export type ViewKey =
   | "home"
   | "purchase-orders"
   | "expected-receipts"
@@ -758,6 +773,118 @@ const viewTitles: Record<ViewKey, { title: string; description?: string }> = {
   warehouse: { title: "Warehouse mode" },
 };
 
+type PurchaseReceiptRecord = {
+  id: string;
+  number: string;
+  postedAt: string;
+  status: string;
+  packingSlipNumber?: string;
+  quantity: number;
+};
+
+type SupplierDeliveryRecord = {
+  id: string;
+  number: string;
+  postedAt: string;
+  deliveryDate: string;
+  status: string;
+  externalReference?: string;
+  quantity: number;
+};
+
+type FinancialDocumentRecord = {
+  id: string;
+  number: string;
+  status: string;
+  matchStatus?: string;
+  issuedOn: string;
+  dueOn?: string;
+  amount: number;
+  paid: number;
+  credited: number;
+  outstanding: number;
+  currency: string;
+  externalReference?: string;
+};
+
+const operationsWorkspaceByView = {
+  "purchase-orders": "purchasing",
+  "sales-orders": "sales",
+  stock: "inventory",
+  counts: "inventory",
+  "vendor-bills": "vendor-billing",
+  "customer-invoices": "customer-billing",
+  reports: "controls",
+} as const;
+
+/**
+ * The advanced workflow surface is intentionally a separate chunk. Start downloading and
+ * warming its first query as soon as intent is known, so clicking a sidebar item does not turn
+ * code, the core snapshot, and workflow data into three serial waits.
+ */
+function preloadViewCode(view: ViewKey) {
+  const workspace = operationsWorkspaceByView[view as keyof typeof operationsWorkspaceByView];
+  if (workspace) void loadOperationsWorkspaceModule().then((module) => module.preloadOperationsWorkspace(workspace));
+  if (view === "counts") void loadInventoryCountSessionsModule();
+}
+
+type SnapshotRequestInput = {
+  view: ViewKey;
+  page: number;
+  search: string;
+  status: string;
+  sort: string;
+  warehouseId: string;
+};
+
+function createSnapshotRequest(input: SnapshotRequestInput) {
+  const params = new URLSearchParams({
+    page: String(input.page),
+    pageSize: "50",
+    scope: input.view,
+    worklistQuery: input.search,
+    status: input.status,
+    sort: input.sort,
+    warehouseId: input.warehouseId,
+    asOf: localDateString(),
+  });
+  return { key: params.toString(), url: `/api/snapshot?${params}` };
+}
+
+type SnapshotCacheEntry = { snapshot: Snapshot; loadedAt: number };
+const snapshotCache = new Map<string, SnapshotCacheEntry>();
+const snapshotPrefetches = new Map<string, Promise<Snapshot>>();
+const SNAPSHOT_CACHE_LIMIT = 12;
+
+function rememberSnapshot(key: string, snapshot: Snapshot) {
+  snapshotCache.delete(key);
+  snapshotCache.set(key, { snapshot, loadedAt: Date.now() });
+  while (snapshotCache.size > SNAPSHOT_CACHE_LIMIT) {
+    const oldest = snapshotCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    snapshotCache.delete(oldest);
+  }
+}
+
+async function requestSnapshot(url: string, signal?: AbortSignal) {
+  const response = await fetch(url, { cache: "no-store", signal });
+  const data = await response.json() as Record<string, unknown>;
+  if (!response.ok) throw new Error(text(asRecord(data.error).message, "Snapshot unavailable"));
+  return normalizeSnapshot(data);
+}
+
+function prefetchSnapshot(request: ReturnType<typeof createSnapshotRequest>) {
+  if (snapshotCache.has(request.key) || snapshotPrefetches.has(request.key)) return;
+  const pending = requestSnapshot(request.url)
+    .then((snapshot) => {
+      rememberSnapshot(request.key, snapshot);
+      return snapshot;
+    })
+    .finally(() => snapshotPrefetches.delete(request.key));
+  snapshotPrefetches.set(request.key, pending);
+  void pending.catch(() => undefined);
+}
+
 type WorkflowGuideStep = { label: string; detail: string; view: ViewKey; tab?: string };
 
 const purchasingWorkflow: WorkflowGuideStep[] = [
@@ -813,9 +940,11 @@ const defaultWorklistStatus: Partial<Record<ViewKey, string>> = {
   "customer-returns": "shipped",
 };
 
-export function InventoryApp() {
+export function InventoryApp({ initialView, initialTab = "overview" }: { initialView?: string; initialTab?: string }) {
+  const requestedInitialView = initialView as ViewKey | undefined;
+  const normalizedInitialView = requestedInitialView && viewTitles[requestedInitialView] ? requestedInitialView : "home";
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
-  const [view, setView] = useState<ViewKey>("home");
+  const [view, setView] = useState<ViewKey>(normalizedInitialView);
   const [selectedPoId, setSelectedPoId] = useState<string | null>(null);
   const [selectedSoId, setSelectedSoId] = useState<string | null>(null);
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
@@ -828,7 +957,6 @@ export function InventoryApp() {
   const [editingPurchaseOrder, setEditingPurchaseOrder] = useState<PurchaseOrder | null>(null);
   const [editingSalesOrder, setEditingSalesOrder] = useState<SalesOrder | null>(null);
   const [loading, setLoading] = useState(true);
-  const [routeReady, setRouteReady] = useState(false);
   const [warehouseReady, setWarehouseReady] = useState(false);
   /**
    * Which request the snapshot on screen actually answers. Changing view, page, or filter keeps
@@ -842,13 +970,13 @@ export function InventoryApp() {
   const [source, setSource] = useState<"loading" | "server" | "unavailable">("loading");
   const [sourceError, setSourceError] = useState("");
   const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
-  const [workspaceTab, setWorkspaceTab] = useState("overview");
+  const [workspaceTab, setWorkspaceTab] = useState(initialTab);
   const [workflowRefreshToken, setWorkflowRefreshToken] = useState(0);
   const [page, setPage] = useState(1);
   const [query, setQuery] = useState("");
   const [worklistQuery, setWorklistQuery] = useState("");
   const [appliedWorklistQuery, setAppliedWorklistQuery] = useState("");
-  const [worklistStatus, setWorklistStatus] = useState("");
+  const [worklistStatus, setWorklistStatus] = useState(defaultWorklistStatus[normalizedInitialView] ?? "");
   const [worklistSort, setWorklistSort] = useState("priority");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchError, setSearchError] = useState("");
@@ -873,24 +1001,32 @@ export function InventoryApp() {
   const searchRef = useRef<HTMLInputElement>(null);
   const snapshotLoadGeneration = useRef(0);
   const snapshotLoadController = useRef<AbortController | null>(null);
+  const navPrefetchTimer = useRef<number | null>(null);
 
   const loadSnapshot = useCallback(async () => {
     const generation = ++snapshotLoadGeneration.current;
     snapshotLoadController.current?.abort();
     const controller = new AbortController();
     snapshotLoadController.current = controller;
-    const requestKey = [view, page, appliedWorklistQuery, worklistStatus, worklistSort, warehouseId].join("|");
+    const request = createSnapshotRequest({ view, page, search: appliedWorklistQuery, status: worklistStatus, sort: worklistSort, warehouseId });
+    const cached = snapshotCache.get(request.key);
+    if (cached) {
+      // Stale-while-revalidate makes Back, pagination revisits, and repeated worklist switches
+      // instantaneous without ever trusting cached operational data as the final answer.
+      setSnapshot(cached.snapshot);
+      setLoadedKey(request.key);
+      setSource("server");
+      setSourceError("");
+      setLastUpdatedAt(new Date(cached.loadedAt));
+      setLoading(false);
+    }
     try {
-      // asOf is the viewer's own calendar date: "late" is judged against the day they are in,
-      // not against UTC, which is already tomorrow through the working afternoon.
-      const params = new URLSearchParams({ page: String(page), pageSize: "50", scope: view, worklistQuery: appliedWorklistQuery, status: worklistStatus, sort: worklistSort, warehouseId, asOf: localDateString() });
-      const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store", signal: controller.signal });
-      const data = await response.json() as Record<string, unknown>;
-      if (!response.ok) throw new Error(text(asRecord(data.error).message, "Snapshot unavailable"));
-      if (generation !== snapshotLoadGeneration.current) return;
-      const normalized = normalizeSnapshot(data);
+      const prefetched = snapshotPrefetches.get(request.key);
+      const normalized = await (prefetched ?? requestSnapshot(request.url, controller.signal));
+      if (controller.signal.aborted || generation !== snapshotLoadGeneration.current) return;
+      rememberSnapshot(request.key, normalized);
       setSnapshot(normalized);
-      setLoadedKey(requestKey);
+      setLoadedKey(request.key);
       setSource("server");
       setSourceError("");
       setLastUpdatedAt(new Date());
@@ -946,27 +1082,19 @@ export function InventoryApp() {
   }, [warehouseLookupRefresh]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      const requested = new URLSearchParams(window.location.search).get("view") as ViewKey | null;
-      const requestedTab = new URLSearchParams(window.location.search).get("tab") ?? "overview";
-      const initial = requested && viewTitles[requested] ? requested : "home";
-      setView(initial);
-      setWorkspaceTab(requestedTab);
-      setWorklistStatus(defaultWorklistStatus[initial] ?? "");
-      setRouteReady(true);
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, []);
-
-  useEffect(() => {
-    if (!routeReady || !warehouseReady) return;
+    if (!warehouseReady) return;
     const timer = window.setTimeout(() => void loadSnapshot(), 0);
     return () => window.clearTimeout(timer);
-  }, [loadSnapshot, routeReady, warehouseReady]);
+  }, [loadSnapshot, warehouseReady]);
+
+  useEffect(() => {
+    preloadViewCode(view);
+  }, [view]);
 
   useEffect(() => () => {
     snapshotLoadGeneration.current += 1;
     snapshotLoadController.current?.abort();
+    if (navPrefetchTimer.current !== null) window.clearTimeout(navPrefetchTimer.current);
   }, []);
 
   useEffect(() => {
@@ -1054,6 +1182,7 @@ export function InventoryApp() {
   };
 
   const navigate = (next: ViewKey, status?: string, tab = "overview") => {
+    preloadViewCode(next);
     closeAllDialogs();
     setView(next);
     setPage(1);
@@ -1073,6 +1202,30 @@ export function InventoryApp() {
     else url.searchParams.set("tab", tab);
     window.history.pushState({}, "", url);
     document.getElementById("main-content")?.focus();
+  };
+  const prefetchView = (next: ViewKey, status?: string) => {
+    preloadViewCode(next);
+    prefetchSnapshot(createSnapshotRequest({
+      view: next,
+      page: 1,
+      search: "",
+      status: status ?? defaultWorklistStatus[next] ?? "",
+      sort: "priority",
+      warehouseId,
+    }));
+  };
+  const scheduleViewPrefetch = (next: ViewKey) => {
+    preloadViewCode(next);
+    if (navPrefetchTimer.current !== null) window.clearTimeout(navPrefetchTimer.current);
+    navPrefetchTimer.current = window.setTimeout(() => {
+      navPrefetchTimer.current = null;
+      prefetchView(next);
+    }, 80);
+  };
+  const cancelViewPrefetch = () => {
+    if (navPrefetchTimer.current === null) return;
+    window.clearTimeout(navPrefetchTimer.current);
+    navPrefetchTimer.current = null;
   };
   const changeWorkspaceTab = (tab: string) => {
     closeAllDialogs();
@@ -1158,6 +1311,7 @@ export function InventoryApp() {
   };
   const pageTotal = snapshot.pagination.filteredTotal ?? snapshot.pagination.totals[pageTotalKey[view] ?? ""] ?? 0;
   const pageCount = Math.max(1, Math.ceil(pageTotal / snapshot.pagination.pageSize));
+  const currentSnapshotKey = createSnapshotRequest({ view, page, search: appliedWorklistQuery, status: worklistStatus, sort: worklistSort, warehouseId }).key;
 
   const localSearchResults = useMemo(() => {
     const term = query.trim().toLowerCase();
@@ -1445,6 +1599,9 @@ export function InventoryApp() {
                 <button
                   key={`${item.key}:${item.tab ?? "overview"}`}
                   className={`nav-item ${view === item.key && (item.tab ? workspaceTab === item.tab : item.key !== "reports" || workspaceTab !== "pricing") ? "active" : ""}`}
+                  onPointerEnter={() => scheduleViewPrefetch(item.key)}
+                  onPointerLeave={cancelViewPrefetch}
+                  onFocus={() => preloadViewCode(item.key)}
                   onClick={() => navigate(item.key, undefined, item.tab ?? "overview")}
                   aria-current={view === item.key && (item.tab ? workspaceTab === item.tab : item.key !== "reports" || workspaceTab !== "pricing") ? "page" : undefined}
                   // Named explicitly, with the badge folded in: the glyph is decorative and the
@@ -1509,13 +1666,13 @@ export function InventoryApp() {
               described a list the reader was not looking at. */}
           {worklistNoun[view] ? <ServerWorklistControls view={view} query={worklistQuery} setQuery={setWorklistQuery} status={worklistStatus} setStatus={(value) => { setPage(1); setWorklistStatus(value); }} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} total={pageTotal} /> : null}
 
-          {loading || (source !== "unavailable" && loadedKey !== [view, page, appliedWorklistQuery, worklistStatus, worklistSort, warehouseId].join("|")) ? <LoadingState /> : (
-            <>
+          {loading || (source !== "unavailable" && loadedKey !== currentSnapshotKey) ? <LoadingState /> : (
+            <Suspense fallback={<LoadingState />}>
               {view === "home" && <Dashboard snapshot={snapshot} navigate={navigate} openPo={setSelectedPoId} />}
               {view === "purchase-orders" && (
-                <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { changeWorkspaceTab("overview"); setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }}>
+                <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { changeWorkspaceTab("overview"); setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }}>
                 {selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1523,7 +1680,7 @@ export function InventoryApp() {
               )}
               {view === "expected-receipts" && (
                 selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={() => navigate("vendor-bills")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} receivingOnly />
                 )
@@ -1536,9 +1693,9 @@ export function InventoryApp() {
                 onComplete={(message) => { setToast(message); navigate("customer-invoices", undefined, "billing-actions"); }}
               />}
               {view === "sales-orders" && (
-                <OperationsWorkspace workspace="sales" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} onCreateOrder={() => setCreateOrder("salesOrder")}>
+                <OperationsWorkspace workspace="sales" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("salesOrder")}>
                 {selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={() => { navigate("customer-invoices"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("customer-invoices", undefined, tab); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1546,7 +1703,7 @@ export function InventoryApp() {
               )}
               {view === "fulfillment" && (
                 selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={() => { navigate("customer-invoices"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("customer-invoices", undefined, tab); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )
@@ -1557,7 +1714,7 @@ export function InventoryApp() {
                   {selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="inventory" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canApprove ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <InventoryView snapshot={snapshot} onOpen={setSelectedProductId} warehouseId={warehouseId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
                 </OperationsWorkspace>
               )}
-              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="the catalog" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canApprove ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <CatalogView products={snapshot.products} onOpen={setSelectedProductId} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />)}
+              {view === "products" && (selectedProduct ? <ProductDetail product={selectedProduct} movements={snapshot.movements} backLabel="the catalog" onBack={() => setSelectedProductId(null)} onEdit={snapshot.viewer.permissions.canApprove ? () => setEditingProduct(selectedProduct) : undefined} canManagePictures={snapshot.viewer.permissions.canOperate} canConsolidate={snapshot.viewer.permissions.canAdminister} viewerEmail={snapshot.viewer.email} viewerRole={snapshot.viewer.role} onChanged={(message) => { setToast(message); void loadSnapshot(); }} /> : <CatalogView products={snapshot.products} onOpen={setSelectedProductId} onEdit={snapshot.viewer.permissions.canApprove ? setEditingProduct : undefined} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />)}
               {/* Jumping to the order a movement belongs to: navigate first, then select, since
                   navigate clears the current selection. The worklist is searched by the order
                   number so the target is on the page that loads. */}
@@ -1570,12 +1727,12 @@ export function InventoryApp() {
                 if (purchase) setSelectedPoId(movement.relatedOrderId); else setSelectedSoId(movement.relatedOrderId);
               }} />}
               {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InventoryCountSessions warehouseId={warehouseId} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} canAdminister={snapshot.viewer.permissions.canAdminister} onDurableRefresh={loadSnapshot} /></OperationsWorkspace>}
-              {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenPurchaseOrder={(bill) => { if (!bill.purchaseOrderId) return; navigate("purchase-orders"); setWorklistQuery(bill.po); setAppliedWorklistQuery(bill.po); setSelectedPoId(bill.purchaseOrderId); }} /></OperationsWorkspace>}
-              {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenSalesOrder={(so) => { navigate("sales-orders"); setWorklistQuery(so.number); setAppliedWorklistQuery(so.number); setSelectedSoId(so.id); }} /></OperationsWorkspace>}
+              {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenPurchaseOrder={(bill) => { if (!bill.purchaseOrderId) return; navigate("purchase-orders"); setWorklistQuery(bill.po); setAppliedWorklistQuery(bill.po); setSelectedPoId(bill.purchaseOrderId); }} /></OperationsWorkspace>}
+              {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenSalesOrder={(so) => { navigate("sales-orders"); setWorklistQuery(so.number); setAppliedWorklistQuery(so.number); setSelectedSoId(so.id); }} /></OperationsWorkspace>}
               {view === "partners" && <PartnersView partners={snapshot.partners} selectedId={selectedPartnerId} canApprove={snapshot.viewer.permissions.canApprove} canOperate={snapshot.viewer.permissions.canOperate} canAdminister={snapshot.viewer.permissions.canAdminister} onOpen={setSelectedPartnerId} onEdit={setEditingPartner} onChanged={(message) => { setToast(message); void loadSnapshot(); }} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
               {view === "reports" && <OperationsWorkspace workspace="controls" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><ReportsView snapshot={snapshot} warehouseId={warehouseId} /></OperationsWorkspace>}
               {view === "warehouse" && <WarehouseView snapshot={snapshot} source={source} canOperate={snapshot.viewer.permissions.canOperate} navigate={navigate} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} />}
-            </>
+            </Suspense>
           )}
           {/* Fifty rows a page over a catalog this size runs to dozens of pages, so Previous /
               Next alone made page 40 a forty-click journey.
@@ -1680,6 +1837,7 @@ export function InventoryApp() {
       {creatingProduct && (
         <QuickCreateDialog
           kind="product"
+          companyReorderPercent={snapshot.configuration.reorderPointPercent}
           onClose={() => setCreatingProduct(false)}
           onCreated={async (option) => { setCreatingProduct(false); setToast(`${option.label} added to the catalog.`); await loadSnapshot(); }}
         />
@@ -1696,6 +1854,7 @@ export function InventoryApp() {
       {editingProduct && (
         <EditProductDialog
           product={editingProduct}
+          companyReorderPercent={snapshot.configuration.reorderPointPercent}
           onClose={() => setEditingProduct(null)}
           onSaved={(message) => { setEditingProduct(null); setToast(message); void loadSnapshot(); }}
         />
@@ -1979,6 +2138,32 @@ function WorkflowGuide({ view, workspaceTab, onNavigate }: { view: ViewKey; work
   </nav>;
 }
 
+type RecordProgressState = "complete" | "current" | "upcoming" | "attention" | "stopped";
+type RecordProgressDocument = { number: string; detail: string; href?: string };
+type RecordProgressStep = { label: string; state: RecordProgressState; summary: string; documents?: RecordProgressDocument[] };
+type RecordNextAction = { title: string; detail: string; label?: string; onClick?: () => void; tone?: "info" | "success" | "warning" };
+
+/**
+ * The page-level workflow map explains the process. This record-level progression is the
+ * operational source of truth: it keeps the order, its fulfillment documents, its financial
+ * documents, and the single best next action together.
+ */
+function RecordProgress({ title, steps, next }: { title: string; steps: RecordProgressStep[]; next: RecordNextAction }) {
+  const headingId = useId();
+  return <section className="panel record-progress" aria-labelledby={headingId}>
+    <header className="record-progress-header"><div><span className="section-kicker">Record progression</span><h3 id={headingId}>{title}</h3></div><p>Connected documents and the next action stay with this order.</p></header>
+    <ol className="record-progress-steps">{steps.map((step, index) => <li key={step.label} className={step.state} aria-current={step.state === "current" || step.state === "attention" ? "step" : undefined}>
+      <span className="record-progress-marker" aria-hidden="true">{step.state === "complete" ? "✓" : step.state === "attention" ? "!" : index + 1}</span>
+      <div className="record-progress-copy"><span>{step.state === "attention" ? "Needs attention" : titleCase(step.state)}</span><strong>{step.label}</strong><p>{step.summary}</p>
+        {step.documents?.length ? <div className="record-progress-documents" aria-label={`${step.label} connected documents`}>{step.documents.map((document) => document.href
+          ? <a key={`${document.number}-${document.detail}`} href={document.href} target="_blank" rel="noreferrer"><strong>{document.number}</strong><small>{document.detail}</small></a>
+          : <span key={`${document.number}-${document.detail}`}><strong>{document.number}</strong><small>{document.detail}</small></span>)}</div> : null}
+      </div>
+    </li>)}</ol>
+    <div className={`record-next-action ${next.tone ?? "info"}`}><div><span className="section-kicker">Next action</span><strong>{next.title}</strong><p>{next.detail}</p></div>{next.label && next.onClick ? <button className="button primary" type="button" onClick={next.onClick}>{next.label}</button> : null}</div>
+  </section>;
+}
+
 function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSort, receivingOnly = false }: { orders: PurchaseOrder[]; canOperate: boolean; onOpen: (id: string) => void; onReceive: (po: PurchaseOrder) => void; receivingOnly?: boolean } & WorklistSortProps) {
   // Scoped server-side by the worklist status filter; see SalesOrdersView.
   return <section className="panel worklist">
@@ -2000,16 +2185,14 @@ function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSo
   </section>;
 }
 
-function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpenVendorBilling, onOpenDropShip, onSubmitForApproval, onChanged }: { po: PurchaseOrder; canOperate: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: () => void; onOpenDropShip: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void }) {
+function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpenVendorBilling, onOpenApprovalQueue, onOpenDropShip, onSubmitForApproval, onChanged }: { po: PurchaseOrder; canOperate: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: (tab?: string) => void; onOpenApprovalQueue: () => void; onOpenDropShip: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   const [submitNote, setSubmitNote] = useState("");
   const [mergeOpen, setMergeOpen] = useState(false);
   // A rejected revision is the buyer's to correct and resubmit, so it is edited like a draft.
+  const lifecycle = po.lifecycle.toLowerCase();
   const isDraft = ["draft", "rejected"].includes(po.lifecycle.toLowerCase());
-  const overallStage = purchaseOrderStage(po);
-  const billingIsNext = overallStage === "Awaiting vendor bill" || overallStage === "Partially billed";
-  const fullyFulfilled = po.fulfilled >= po.ordered && po.closed === 0;
   const hasStockLines = po.lines.some((line) => line.fulfillmentRoute === "stock");
   const hasDropShipLines = po.lines.some((line) => line.fulfillmentRoute === "drop_ship");
   const hasWarehouseLines = po.lines.some((line) => line.fulfillmentRoute !== "drop_ship");
@@ -2024,11 +2207,48 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
   };
   const totals = documentTotals(po.lines.map((line) => ({ quantity: line.ordered, unitAmount: line.unitCost, discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps })), po);
   const lineTable = useLocalTableSort(po.lines, { line: (row) => po.lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, customer: (row) => row.customerRef ?? "Stock", ordered: (row) => row.ordered, received: (row) => row.received - row.returned, returned: (row) => row.returned, closed: (row) => row.closed, open: (row) => row.open, unitCost: (row) => row.unitCost, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitCost, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitCost, row.discountCents) });
+  const activeVendorBills = po.vendorBills.filter((bill) => bill.status.toLowerCase() !== "void");
+  const vendorBillOutstanding = activeVendorBills.reduce((sum, bill) => sum + bill.outstanding, 0);
+  const billNeedsAttention = activeVendorBills.some((bill) => bill.status.toLowerCase().includes("hold") || bill.matchStatus?.toLowerCase().includes("exception"));
+  const billingSaysComplete = ["fully billed", "billed"].includes(po.billing.toLowerCase());
+  const fulfillmentDocuments: RecordProgressDocument[] = [
+    ...po.receipts.map((receipt) => ({ number: receipt.number, detail: `${receipt.quantity} received · ${formatDocumentDate(receipt.postedAt)}${receipt.packingSlipNumber ? ` · slip ${receipt.packingSlipNumber}` : ""}` })),
+    ...po.supplierDeliveries.map((delivery) => ({ number: delivery.number, detail: `${delivery.quantity} delivered · ${formatDocumentDate(delivery.deliveryDate)}${delivery.externalReference ? ` · ${delivery.externalReference}` : ""}` })),
+  ];
+  const billDocuments: RecordProgressDocument[] = activeVendorBills.map((bill) => ({
+    number: bill.number,
+    detail: `${bill.externalReference ? `Vendor ${bill.externalReference} · ` : ""}${bill.matchStatus ? `${bill.matchStatus} · ` : ""}${formatDocumentMoney(bill.amount, bill.currency)}${bill.outstanding > 0 ? ` · ${formatDocumentMoney(bill.outstanding, bill.currency)} outstanding` : " · settled"}`,
+    href: `/api/documents/pdf?documentType=vendor_bill&documentId=${encodeURIComponent(bill.id)}`,
+  }));
+  const purchaseProgress: RecordProgressStep[] = [
+    { label: "Purchase order", state: lifecycle === "canceled" ? "stopped" : lifecycle === "approved" ? "complete" : lifecycle.includes("pending") || lifecycle === "rejected" ? "attention" : "current", summary: `${po.lifecycle} · revision ${po.revision} · ${formatDocumentMoney(po.total, po.currency)}`, documents: [{ number: po.number, detail: `${po.vendor} · ordered ${formatDocumentDate(po.orderDate)}`, href: `/api/documents/pdf?documentType=purchase_order&documentId=${encodeURIComponent(po.id)}` }] },
+    { label: "Supplier fulfillment", state: lifecycle === "canceled" ? "stopped" : po.open <= 0 && lifecycle === "approved" ? "complete" : lifecycle === "approved" ? "current" : "upcoming", summary: `${po.fulfilled} of ${po.ordered} fulfilled · ${po.closed} closed · ${po.open} open`, documents: fulfillmentDocuments },
+    { label: "Vendor bill", state: lifecycle === "canceled" ? "stopped" : billNeedsAttention || (billingSaysComplete && !activeVendorBills.length) ? "attention" : billingSaysComplete && activeVendorBills.length > 0 ? "complete" : activeVendorBills.length > 0 || (lifecycle === "approved" && po.open <= 0) ? "current" : "upcoming", summary: activeVendorBills.length ? `${activeVendorBills.length} connected bill${activeVendorBills.length === 1 ? "" : "s"} · ${po.billing}` : billingSaysComplete ? "Billing status is complete, but no connected bill was found" : `${po.billing} · no vendor bill posted`, documents: billDocuments },
+    { label: "Payable settlement", state: lifecycle === "canceled" ? "stopped" : activeVendorBills.length && vendorBillOutstanding <= 0 ? "complete" : activeVendorBills.length ? "current" : "upcoming", summary: activeVendorBills.length ? `${formatDocumentMoney(vendorBillOutstanding, po.currency)} outstanding across connected bills` : "Begins after a vendor bill is posted" },
+  ];
+  const nextAction: RecordNextAction = lifecycle === "canceled"
+    ? { title: "No action — order canceled", detail: "This progression is retained as history.", tone: "success" }
+    : isDraft
+      ? { title: lifecycle === "rejected" ? "Correct and resubmit the order" : "Finish and submit the order", detail: "Review the lines and supporting note before sending it for approval.", label: "Edit draft", onClick: onEdit }
+      : lifecycle.includes("pending")
+        ? { title: "Purchasing approval is required", detail: "An approver must accept or reject the commercial commitment before fulfillment.", label: "Open approval queue", onClick: onOpenApprovalQueue, tone: "warning" }
+        : po.openToReceive > 0
+          ? { title: `Receive ${po.openToReceive} remaining unit${po.openToReceive === 1 ? "" : "s"}`, detail: "Post the warehouse receipt against this order and capture the packing slip.", label: "Receive remaining", onClick: () => onCommand("receive") }
+          : po.openToDeliver > 0
+            ? { title: `Post ${po.openToDeliver} supplier-delivered unit${po.openToDeliver === 1 ? "" : "s"}`, detail: "Confirm the direct customer delivery without moving internal inventory.", label: "Post supplier delivery", onClick: onOpenDropShip }
+            : billNeedsAttention
+              ? { title: "Resolve the vendor bill exception", detail: "Review the three-way match or hold before approval and payment.", label: "Open match exceptions", onClick: () => onOpenVendorBilling("match"), tone: "warning" }
+              : billingSaysComplete && !activeVendorBills.length
+                ? { title: "Reconcile the missing bill link", detail: "The order says fully billed, but no vendor bill is connected to it.", label: "Review vendor billing", onClick: () => onOpenVendorBilling("overview"), tone: "warning" }
+                : !billingSaysComplete
+                  ? { title: "Record the vendor bill", detail: "Create the payable from this order and its posted fulfillment; inventory will not move again.", label: "Open vendor billing", onClick: () => onOpenVendorBilling("overview") }
+                  : vendorBillOutstanding > 0
+                    ? { title: `Settle ${formatDocumentMoney(vendorBillOutstanding, po.currency)}`, detail: "Record payment or apply a vendor credit to the connected bill.", label: "Open bill actions", onClick: () => onOpenVendorBilling("billing-actions") }
+                    : { title: "Purchase-to-payment complete", detail: "The commitment, fulfillment, bill, and settlement are complete.", tone: "success" };
   return <div className="object-page">
     <button className="back-button" onClick={onBack}>← Back to purchase orders</button>
     <section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Purchase order · Revision {po.revision}</span><h2>{po.number}</h2><p>{po.vendor} · {destinationSummary}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(po.total, po.currency)}</strong><small>{po.currency}</small></div></div>
       <div className="status-summary"><div><small>Commercial</small><StatusBadge>{po.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{po.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{po.billing}</StatusBadge></div></div>
-      {billingIsNext ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>{overallStage === "Partially billed" ? "Finish entering the vendor bill" : fullyFulfilled ? "Supplier fulfillment complete · vendor bill pending" : "Remaining quantity closed · vendor bill pending"}</strong><p>Record the supplier&apos;s invoice against this PO and its posted fulfillment. This creates the payable without moving inventory again.</p></div><button className="button primary" type="button" onClick={onOpenVendorBilling}>Open vendor billing</button></div> : null}
       {po.exception && <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Action needed</strong><p>{po.exception}</p></div></div>}
       {activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}
       {isDraft && canOperate ? <form className="draft-activation" onSubmit={submit} noValidate><label><span>Submission note{requiredMark}</span><input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required aria-required="true" /><small className="field-hint">{submitNote.trim() ? "" : "Required before the order can be submitted."}</small></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : po.lifecycle.toLowerCase() === "rejected" ? "Resubmit for approval" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button>{po.lifecycle.toLowerCase() === "draft" ? <button className="button secondary" type="button" onClick={() => setMergeOpen(true)}>Merge another draft</button> : null}</form> : null}
@@ -2042,6 +2262,7 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
         {po.received - po.returned > 0 && <button className="button ghost" onClick={() => onCommand("vendor-return")}>Return to vendor</button>}
       </div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}
     </section>
+    <RecordProgress title={`Purchase to payment for ${po.number}`} steps={purchaseProgress} next={nextAction} />
     <section className="metric-row object-metrics">
       <MetricDisplay label="Ordered" value={po.ordered} />
       {/* Same quantity the line table calls "Net received"; two names for one number sent
@@ -2097,7 +2318,7 @@ function SalesOrdersView({ orders, canOperate, onOpen, onShip, sort, setSort }: 
   return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Sales orders</caption><thead><tr><SortableHeader label="Exception" column="exception" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="SO" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Customer / project" column="customer" sort={sort} setSort={setSort} /><SortableHeader label="Requested" column="requested" sort={sort} setSort={setSort} /><SortableHeader label="Availability" column="availability" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="Fulfillment" column="fulfillment" sort={sort} setSort={setSort} /><SortableHeader label="Invoice" column="billing" sort={sort} setSort={setSort} /><SortableHeader label="Total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{orders.map((so) => <tr key={so.id}><td>{so.exception ? <span className={`exception-cell ${so.shortage > 0 ? "danger" : "warning"}`}>!</span> : "—"}</td><td><button className="table-link" onClick={() => onOpen(so.id)}>{so.number}</button><small>{so.route}</small></td><td><strong>{so.customer}</strong>{so.project ? <small>{so.project}</small> : null}</td><td>{formatDate(so.requestedDate)}</td><td><div className="availability-mini"><strong>{so.availableNow} now</strong><span>{so.incomingBeforeDate} incoming</span>{so.shortage > 0 && <b>{so.shortage} short</b>}</div></td><td><StatusBadge>{so.fulfillment}</StatusBadge></td><td><StatusBadge>{so.billing}</StatusBadge></td><td className="numeric strong">{formatDocumentMoney(so.total, so.currency, false)}</td><td>{canOperate && so.lifecycle.toLowerCase() === "confirmed" && so.reserved > 0 ? <button className="row-action" onClick={() => onShip(so)}>Post shipment</button> : <button className="row-action" onClick={() => onOpen(so.id)}>View</button>}</td></tr>)}{!orders.length ? <tr><td colSpan={9}><div className="empty-inline">No sales order matches this filter.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
-function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onOpenCustomerBilling, onOpenDropShip, onCreateLinkedPurchaseOrder, onOpenLinkedPurchaseOrder, onConfirm }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onOpenCustomerBilling: () => void; onOpenDropShip: () => void; onCreateLinkedPurchaseOrder: () => void; onOpenLinkedPurchaseOrder: () => void; onConfirm: (reason: string) => Promise<void> }) {
+function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onOpenCustomerBilling, onOpenDropShip, onCreateLinkedPurchaseOrder, onOpenLinkedPurchaseOrder, onConfirm }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onOpenCustomerBilling: (tab?: string) => void; onOpenDropShip: () => void; onCreateLinkedPurchaseOrder: () => void; onOpenLinkedPurchaseOrder: () => void; onConfirm: (reason: string) => Promise<void> }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   // Confirmation is an audited decision, so the note is typed rather than defaulted — a
@@ -2129,7 +2350,55 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   const totals = documentTotals(lines.map((line) => ({ quantity: line.ordered, unitAmount: line.unitPrice, discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps })), so);
   const lineTable = useLocalTableSort(lines, { line: (row) => lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, route: (row) => `${row.fulfillmentRoute} ${row.projectReference ?? ""}`, ordered: (row) => row.ordered, reserved: (row) => row.reserved, shipped: (row) => row.shipped, returned: (row) => row.returned, open: (row) => row.open, unitPrice: (row) => row.unitPrice, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitPrice, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitPrice, row.discountCents) });
   const shipmentTable = useLocalTableSort(so.shipments, { number: (row) => row.number, posted: (row) => row.postedAt, status: (row) => row.status, carrier: (row) => row.carrier, service: (row) => row.serviceLevel, tracking: (row) => row.trackingNumber, billOfLading: (row) => row.billOfLadingNumber });
-  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{invoiceable > 0 ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>{invoiceable} fulfilled unit{invoiceable === 1 ? " is" : "s are"} ready to invoice</strong><p>Create the customer receivable from posted fulfillment. Inventory will not move again.</p></div><button className="button primary" type="button" onClick={onOpenCustomerBilling}>Open customer invoicing</button></div> : missingDedicatedSupply ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>Dedicated supplier supply is required</strong><p>Create a linked purchase order for the open special-order or drop-ship quantity before attempting fulfillment.</p></div><button className="button primary" type="button" onClick={onCreateLinkedPurchaseOrder}>Create linked purchase order</button></div> : linkedSupplyAwaitingApproval ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>Approve the linked purchase order</strong><p>Supplier fulfillment remains unavailable until the purchasing commitment is approved.</p></div><button className="button primary" type="button" onClick={onOpenLinkedPurchaseOrder}>Open linked purchase order</button></div> : specialOrderAwaitingReceipt ? <div className="next-step-banner"><div><span className="section-kicker">Next step</span><strong>Receive the linked special-order supply</strong><p>A usable warehouse receipt will reserve the dedicated quantity automatically for this customer order.</p></div><button className="button primary" type="button" onClick={onOpenLinkedPurchaseOrder}>Open linked purchase order</button></div> : null}{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm} noValidate><label><span>Confirmation note{requiredMark}</span><input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" required aria-required="true" /><small className="field-hint">{confirmNote.trim() ? "" : "Required before the order can be confirmed."}</small></label><button className="button primary" type="submit" disabled={activating || !confirmNote.trim()}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions">{confirmed ? <EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton> : null}{canPostFinancial && so.openToShip > 0 ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale} title={canImmediateSale ? undefined : "No unreserved stock line has usable inventory to ship and invoice now."}>Ship &amp; invoice now</button> : null}{canShip ? <button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip}>Post shipment</button> : null}{canReserve ? <button className="button secondary" onClick={onReserve} disabled={reserveBlocked} title={reserveBlocked ? "No usable stock is available to reserve right now." : undefined}>Reserve available stock</button> : null}{canPostDropShipDelivery ? <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button> : null}{!fulfillmentOpen && !canShip ? <span className="read-only-label">{confirmed ? "Fully fulfilled: no fulfillment actions remain." : `No fulfillment actions while the order is ${so.lifecycle.toLowerCase()}.`}</span> : null}</div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
+  const lifecycle = so.lifecycle.toLowerCase();
+  const canceled = lifecycle === "canceled";
+  const activeInvoices = so.invoices.filter((invoice) => invoice.status.toLowerCase() !== "void");
+  const invoiceOutstanding = activeInvoices.reduce((sum, invoice) => sum + invoice.outstanding, 0);
+  const billingComplete = ["invoiced", "fully invoiced"].includes(so.billing.toLowerCase());
+  const fulfillmentDocuments: RecordProgressDocument[] = [
+    ...so.shipments.map((shipment) => ({ number: shipment.number, detail: `${formatDocumentDate(shipment.postedAt)}${shipment.trackingNumber ? ` · tracking ${shipment.trackingNumber}` : ""}` })),
+    ...so.supplierDeliveries.map((delivery) => ({ number: delivery.number, detail: `${delivery.quantity} supplier-delivered · ${formatDocumentDate(delivery.deliveryDate)}${delivery.externalReference ? ` · ${delivery.externalReference}` : ""}` })),
+  ];
+  const invoiceDocuments: RecordProgressDocument[] = activeInvoices.map((invoice) => ({
+    number: invoice.number,
+    detail: `${formatDocumentMoney(invoice.amount, invoice.currency)} · due ${formatDocumentDate(invoice.dueOn)}${invoice.outstanding > 0 ? ` · ${formatDocumentMoney(invoice.outstanding, invoice.currency)} outstanding` : " · settled"}`,
+    href: `/api/documents/pdf?documentType=customer_invoice&documentId=${encodeURIComponent(invoice.id)}`,
+  }));
+  const supplyAttention = missingDedicatedSupply || linkedSupplyAwaitingApproval || specialOrderAwaitingReceipt || reserveBlocked;
+  const salesProgress: RecordProgressStep[] = [
+    { label: "Sales order", state: canceled ? "stopped" : confirmed ? "complete" : "current", summary: `${so.lifecycle} · ${formatDocumentMoney(so.total, so.currency)}`, documents: [{ number: so.number, detail: `${so.customer} · ordered ${formatDocumentDate(so.orderDate)}`, href: `/api/documents/pdf?documentType=sales_order&documentId=${encodeURIComponent(so.id)}` }] },
+    { label: "Supply & allocation", state: canceled ? "stopped" : supplyAttention ? "attention" : !confirmed ? "upcoming" : so.open <= 0 || so.reserved >= so.open ? "complete" : "current", summary: missingDedicatedSupply ? "A linked purchase order is missing for dedicated supply" : linkedSupplyAwaitingApproval ? "Linked purchasing commitment is awaiting approval" : specialOrderAwaitingReceipt ? "Linked special-order supply must be received" : `${so.reserved} reserved · ${so.availableNow} available now · ${so.incomingBeforeDate} incoming` },
+    { label: "Customer fulfillment", state: canceled ? "stopped" : so.open <= 0 && confirmed ? "complete" : confirmed ? "current" : "upcoming", summary: `${so.fulfilled} of ${so.ordered} fulfilled · ${so.open} open`, documents: fulfillmentDocuments },
+    { label: "Customer invoice", state: canceled ? "stopped" : billingComplete && activeInvoices.length > 0 ? "complete" : billingComplete && !activeInvoices.length ? "attention" : invoiceable > 0 || activeInvoices.length > 0 ? "current" : "upcoming", summary: activeInvoices.length ? `${activeInvoices.length} connected invoice${activeInvoices.length === 1 ? "" : "s"} · ${so.billing}` : billingComplete ? "Billing status is complete, but no connected invoice was found" : `${invoiceable} fulfilled unit${invoiceable === 1 ? "" : "s"} ready to invoice`, documents: invoiceDocuments },
+    { label: "Payment / credit", state: canceled ? "stopped" : activeInvoices.length && invoiceOutstanding <= 0 ? "complete" : activeInvoices.length ? "current" : "upcoming", summary: activeInvoices.length ? `${formatDocumentMoney(invoiceOutstanding, so.currency)} outstanding across connected invoices` : "Begins after an invoice is posted" },
+  ];
+  const nextAction: RecordNextAction = canceled
+    ? { title: "No action — order canceled", detail: "This progression is retained as history.", tone: "success" }
+    : isDraft
+      ? { title: "Confirm the sales order", detail: "Review customer approval, delivery details, and lines before committing demand.", label: "Edit draft", onClick: onEdit }
+      : invoiceable > 0
+        ? { title: `Invoice ${invoiceable} fulfilled unit${invoiceable === 1 ? "" : "s"}`, detail: "Create the customer receivable from posted fulfillment; inventory will not move again.", label: "Open customer invoicing", onClick: () => onOpenCustomerBilling("overview") }
+        : missingDedicatedSupply
+          ? { title: "Dedicated supplier supply is required", detail: "Link a purchase order before attempting special-order or drop-ship fulfillment.", label: "Create linked purchase order", onClick: onCreateLinkedPurchaseOrder, tone: "warning" }
+          : linkedSupplyAwaitingApproval
+            ? { title: "Approve the linked purchase order", detail: "Supplier fulfillment remains unavailable until the purchasing commitment is approved.", label: "Open linked purchase order", onClick: onOpenLinkedPurchaseOrder, tone: "warning" }
+            : specialOrderAwaitingReceipt
+              ? { title: "Receive the linked special-order supply", detail: "A usable receipt will reserve the dedicated quantity for this customer order.", label: "Open linked purchase order", onClick: onOpenLinkedPurchaseOrder }
+              : canShip
+                ? { title: `Ship ${so.openToShip} reserved unit${so.openToShip === 1 ? "" : "s"}`, detail: "Post the customer shipment and capture carrier references.", label: "Post shipment", onClick: onShip }
+                : canPostDropShipDelivery
+                  ? { title: "Post the supplier delivery", detail: "Confirm direct delivery to the customer without moving internal inventory.", label: "Post supplier delivery", onClick: onOpenDropShip }
+                  : canReserve && !reserveBlocked
+                    ? { title: "Reserve available stock", detail: "Allocate usable stock to make the order ready for shipment.", label: "Reserve available stock", onClick: onReserve }
+                    : billingComplete && !activeInvoices.length
+                      ? { title: "Reconcile the missing invoice link", detail: "The order says invoiced, but no customer invoice is connected to it.", label: "Review customer billing", onClick: () => onOpenCustomerBilling("billing-actions"), tone: "warning" }
+                      : invoiceOutstanding > 0
+                        ? { title: `Collect ${formatDocumentMoney(invoiceOutstanding, so.currency)}`, detail: "Record payment or issue a credit against the connected invoice.", label: "Open invoice actions", onClick: () => onOpenCustomerBilling("billing-actions") }
+                        : reserveBlocked
+                          ? { title: "Resolve the supply shortage", detail: "Review incoming supply or create a purchasing commitment before reserving stock.", tone: "warning" }
+                          : { title: "Order-to-cash complete", detail: "The order, fulfillment, invoice, and settlement are complete.", tone: "success" };
+  return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm} noValidate><label><span>Confirmation note{requiredMark}</span><input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" required aria-required="true" /><small className="field-hint">{confirmNote.trim() ? "" : "Required before the order can be confirmed."}</small></label><button className="button primary" type="submit" disabled={activating || !confirmNote.trim()}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions">{confirmed ? <EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton> : null}{canPostFinancial && so.openToShip > 0 ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale} title={canImmediateSale ? undefined : "No unreserved stock line has usable inventory to ship and invoice now."}>Ship &amp; invoice now</button> : null}{canShip ? <button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip}>Post shipment</button> : null}{canReserve ? <button className="button secondary" onClick={onReserve} disabled={reserveBlocked} title={reserveBlocked ? "No usable stock is available to reserve right now." : undefined}>Reserve available stock</button> : null}{canPostDropShipDelivery ? <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button> : null}{!fulfillmentOpen && !canShip ? <span className="read-only-label">{confirmed ? "Fully fulfilled: no fulfillment actions remain." : `No fulfillment actions while the order is ${so.lifecycle.toLowerCase()}.`}</span> : null}</div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
+    <RecordProgress title={`Order to cash for ${so.number}`} steps={salesProgress} next={nextAction} />
     <section className="panel availability-panel"><PanelHeading title="Availability for requested date" detail={`Requested ${formatDate(so.requestedDate)}`} /><div className="availability-grid"><MetricDisplay label="Required" value={so.open} /><MetricDisplay label="Available now" value={so.availableNow} tone="success" /><MetricDisplay label="Incoming before date" value={so.incomingBeforeDate} tone="info" /><MetricDisplay label="Shortage" value={so.shortage} tone={so.shortage > 0 ? "danger" : "neutral"} /></div>{so.linkedPo && <div className="linked-supply"><span className="section-kicker">Linked supply</span><strong>{so.linkedPo}</strong><p>{so.incomingBeforeDate} units expected before the customer&apos;s requested date.</p></div>}</section>
     {/* The lines are the order. Without them this page showed a total for goods it never named,
         so nobody could check what the customer actually bought. */}
@@ -2177,10 +2446,16 @@ function InventoryView({ snapshot, onOpen, warehouseId, sort, setSort }: { snaps
  * screen. The catalog answers "what do we sell, at what cost, at what margin"; Stock answers
  * "how much is there and where".
  */
-function CatalogView({ products, onOpen, sort, setSort }: { products: Product[]; onOpen: (id: string) => void } & WorklistSortProps) {
+function reorderRuleLabel(product: Product) {
+  if (product.reorderRuleMode === "global") return `Company · ${product.reorderRulePercent ?? 70}% of max`;
+  if (product.reorderRuleMode === "custom") return `Custom · ${product.reorderRulePercent ?? 0}% of max`;
+  return "Manual quantity";
+}
+
+function CatalogView({ products, onOpen, onEdit, sort, setSort }: { products: Product[]; onOpen: (id: string) => void; onEdit?: (product: Product) => void } & WorklistSortProps) {
   return <section className="panel worklist"><div className="responsive-table"><table>
     <caption className="sr-only">Product catalog</caption>
-    <thead><tr><SortableHeader label="Product" column="product" sort={sort} setSort={setSort} /><SortableHeader label="Configuration" column="configuration" sort={sort} setSort={setSort} /><SortableHeader label="Policy" column="policy" sort={sort} setSort={setSort} /><SortableHeader label="Units · base / buy / sell" column="units" sort={sort} setSort={setSort} /><SortableHeader label="Standard cost" column="standardCost" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Last PO cost" column="lastUnitCost" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Selling price" column="sellingPrice" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Pricing" column="pricingMode" sort={sort} setSort={setSort} /><SortableHeader label="Margin" column="margin" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reorder point" column="reorderPoint" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reorder up to" column="maxStockLevel" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /></tr></thead>
+    <thead><tr><SortableHeader label="Product" column="product" sort={sort} setSort={setSort} /><SortableHeader label="Configuration" column="configuration" sort={sort} setSort={setSort} /><SortableHeader label="Policy" column="policy" sort={sort} setSort={setSort} /><SortableHeader label="Units · base / buy / sell" column="units" sort={sort} setSort={setSort} /><SortableHeader label="Standard cost" column="standardCost" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Last PO cost" column="lastUnitCost" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Selling price" column="sellingPrice" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Pricing" column="pricingMode" sort={sort} setSort={setSort} /><SortableHeader label="Margin" column="margin" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reorder point" column="reorderPoint" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Max stock" column="maxStockLevel" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th scope="col">Reorder rule</th></tr></thead>
     <tbody>{products.map((product) => {
       const costBasis = product.lastUnitCost ?? product.standardCost;
       const margin = product.sellingPrice > 0 ? (product.sellingPrice - costBasis) / product.sellingPrice * 100 : 0;
@@ -2201,8 +2476,9 @@ function CatalogView({ products, onOpen, sort, setSort }: { products: Product[];
         <td className={`numeric strong ${margin <= 0 ? "text-danger" : ""}`}>{product.sellingPrice > 0 ? `${margin.toFixed(1)}%` : "—"}</td>
         <td className="numeric">{product.reorderPoint}</td>
         <td className="numeric">{product.maxStockLevel}</td>
+        <td><span className={`reorder-rule-badge ${product.reorderRuleMode}`}>{reorderRuleLabel(product)}</span>{onEdit ? <button type="button" className="row-action reorder-rule-action" onClick={() => onEdit(product)}>Set max &amp; rule</button> : null}</td>
       </tr>;
-    })}{!products.length ? <tr><td colSpan={11}><div className="empty-inline">No products match this view.</div></td></tr> : null}</tbody>
+    })}{!products.length ? <tr><td colSpan={12}><div className="empty-inline">No products match this view.</div></td></tr> : null}</tbody>
   </table></div></section>;
 }
 
@@ -2264,6 +2540,7 @@ function ProductDetail({ product, movements, onBack, backLabel, onEdit, canManag
       <div className="object-actions">{onEdit ? <button className="button primary" onClick={onEdit}>Edit product</button> : null}{canConsolidate ? <><button className="button secondary" onClick={() => setAddingAlias(true)}>Add alias</button><button className="button secondary" onClick={() => setMerging(true)}>Merge duplicate</button></> : null}</div></section>
     {masterError ? <div className="error-summary" role="alert"><p>{masterError}</p></div> : null}
     <section className="metric-row object-metrics"><MetricDisplay label="On hand" value={product.onHand} /><MetricDisplay label="Usable" value={product.usable} /><MetricDisplay label="Reserved" value={product.reserved} tone="info" /><MetricDisplay label="Available now" value={product.available} tone="success" /><MetricDisplay label="Incoming" value={product.incoming} tone="info" /><MetricDisplay label="Projected" value={product.projected} tone={product.projected < 0 ? "danger" : "neutral"} /></section>
+    <section className="panel replenishment-summary"><div className="replenishment-summary-heading"><div><span className="section-kicker">Replenishment</span><h3>Max stock &amp; reorder point</h3><p>When projected stock reaches the reorder point, purchasing restores this part to its maximum.</p></div>{onEdit ? <button type="button" className="button primary" onClick={onEdit}>Set max &amp; reorder rule</button> : null}</div><div className="replenishment-values"><div><small>Maximum stock</small><strong>{product.maxStockLevel}</strong><span>{product.baseUomCode}</span></div><div><small>Reorder point</small><strong>{product.reorderPoint}</strong><span>{product.baseUomCode}</span></div><div><small>Rule</small><strong className="rule-value">{reorderRuleLabel(product)}</strong><span>{product.reorderRuleMode === "manual" ? "Set for this part" : "Recalculates when max changes"}</span></div></div></section>
     <ProductPictures product={product} canManage={canManagePictures} viewerEmail={viewerEmail} viewerRole={viewerRole} />
     {/* Cost, price, units and policy were visible in the catalog list and absent from the record
         the list links to, so the detail page could not answer what the product is or costs. */}
@@ -2277,8 +2554,6 @@ function ProductDetail({ product, movements, onBack, backLabel, onEdit, canManag
         ["Pricing", `${titleCase(product.pricingMode)}${product.appliedMarginRuleCode ? ` · ${product.appliedMarginRuleCode}` : ""}`],
         ["Gross margin on cost basis", margin],
         ...(product.manualPriceReason ? [["Manual override reason", product.manualPriceReason] as [string, string]] : []),
-        ["Reorder point", `${product.reorderPoint} ${product.baseUomCode}`],
-        ["Reorder up to", `${product.maxStockLevel} ${product.baseUomCode}`],
       ]} />
       <DocumentFacts title="Catalog" facts={[
         ["Inventory policy", titleCase(product.inventoryPolicy)],
@@ -2426,12 +2701,14 @@ function ProductPictures({ product, canManage, viewerEmail, viewerRole }: { prod
  * Editing a catalog row. `updateProduct` has always existed on the server; the catalog offered
  * only "Add product", so a typo in a SKU or a price change had no path through the interface.
  */
-function EditProductDialog({ product, onClose, onSaved }: { product: Product; onClose: () => void; onSaved: (message: string) => void }) {
+function EditProductDialog({ product, companyReorderPercent, onClose, onSaved }: { product: Product; companyReorderPercent: number; onClose: () => void; onSaved: (message: string) => void }) {
   const [form, setForm] = useState({
     sku: product.sku, name: product.name, manufacturerSku: product.manufacturerSku ?? "",
     category: product.category, material: product.material, dimensions: product.dimensions, finish: product.finish,
     trackingPolicy: product.trackingPolicy, inventoryPolicy: product.inventoryPolicy,
-    reorderPoint: product.reorderPoint, maxStockLevel: product.maxStockLevel, standardCost: product.standardCost, sellingPrice: product.sellingPrice,
+    reorderPoint: product.reorderPoint, maxStockLevel: product.maxStockLevel, reorderRuleMode: product.reorderRuleMode,
+    reorderRulePercent: product.reorderRuleMode === "custom" ? product.reorderRulePercent ?? 70 : companyReorderPercent,
+    standardCost: product.standardCost, sellingPrice: product.sellingPrice,
     pricingMode: product.pricingMode, manualPriceReason: product.manualPriceReason ?? "",
   });
   const [busy, setBusy] = useState(false);
@@ -2439,9 +2716,13 @@ function EditProductDialog({ product, onClose, onSaved }: { product: Product; on
   const [error, setError] = useState("");
   const set = (patch: Partial<typeof form>) => setForm((current) => ({ ...current, ...patch }));
   const missing = (["sku", "name", "category", "material", "dimensions", "finish"] as const).filter((key) => !form[key].trim());
+  const activeReorderPercent = form.reorderRuleMode === "global" ? companyReorderPercent : form.reorderRulePercent;
+  const effectiveReorderPoint = form.reorderRuleMode === "manual" ? form.reorderPoint : Math.round(form.maxStockLevel * activeReorderPercent * 10) / 1000;
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (missing.length) return setError(`Enter the ${missing.join(", ")} before saving.`);
+    if (form.inventoryPolicy === "stocked" && form.maxStockLevel < effectiveReorderPoint) return setError("Maximum stock must be at least the reorder point.");
+    if (form.reorderRuleMode === "custom" && (form.reorderRulePercent <= 0 || form.reorderRulePercent > 100)) return setError("Enter a custom percentage greater than 0 and no more than 100.");
     setBusy(true); setError("");
     const idempotencyKey = crypto.randomUUID();
     try {
@@ -2449,7 +2730,8 @@ function EditProductDialog({ product, onClose, onSaved }: { product: Product; on
         command: "updateProduct", entityId: product.id, version: product.productVersion, idempotencyKey,
         payload: { sku: form.sku.trim(), name: form.name.trim(), manufacturerSku: form.manufacturerSku.trim(),
           category: form.category.trim(), material: form.material.trim(), dimensions: form.dimensions.trim(), finish: form.finish.trim(),
-          trackingPolicy: form.trackingPolicy, inventoryPolicy: form.inventoryPolicy, reorderPoint: form.reorderPoint, maxStockLevel: form.maxStockLevel,
+          trackingPolicy: form.trackingPolicy, inventoryPolicy: form.inventoryPolicy, reorderPoint: effectiveReorderPoint, maxStockLevel: form.maxStockLevel,
+          reorderRuleMode: form.reorderRuleMode, reorderRulePercent: form.reorderRuleMode === "custom" ? form.reorderRulePercent : undefined,
           standardCostCents: Math.round(form.standardCost * 100), sellingPriceCents: Math.round(form.sellingPrice * 100),
           pricingMode: form.pricingMode, manualPriceReason: form.pricingMode === "manual" ? form.manualPriceReason.trim() || "Manual catalog price" : "",
           baseUomId: product.baseUomId, purchaseUomId: product.purchaseUomId, salesUomId: product.salesUomId },
@@ -2474,8 +2756,7 @@ function EditProductDialog({ product, onClose, onSaved }: { product: Product; on
         <label><span>Finish</span><input value={form.finish} onChange={(event) => set({ finish: event.target.value })} required /></label>
         <label><span>Tracking policy</span><select value={form.trackingPolicy} onChange={(event) => set({ trackingPolicy: event.target.value })}><option value="quantity">Quantity</option><option value="lot">Lot</option><option value="serial">Serial</option></select></label>
         <label><span>Inventory policy</span><select value={form.inventoryPolicy} onChange={(event) => set({ inventoryPolicy: event.target.value })}><option value="stocked">Stocked</option><option value="special_order">Special order</option><option value="drop_ship">Drop ship</option></select></label>
-        <label><span>Reorder point ({product.baseUomCode})</span><NumberField min="0" step="0.001" value={form.reorderPoint} onChange={(reorderPoint) => set({ reorderPoint })} /></label>
-        <label><span>Reorder up to ({product.baseUomCode})</span><NumberField min={form.reorderPoint} step="0.001" value={form.maxStockLevel} onChange={(maxStockLevel) => set({ maxStockLevel })} /></label>
+        <fieldset className="replenishment-editor full-field"><legend>Max stock &amp; reorder rule</legend><div className="replenishment-editor-intro"><strong>Set the ceiling first, then choose when to reorder.</strong><small>Purchasing suggests enough stock to return this part to its maximum.</small></div><label><span>Maximum stock level ({product.baseUomCode})</span><NumberField min="0" step="0.001" value={form.maxStockLevel} onChange={(maxStockLevel) => set({ maxStockLevel })} /><small>The target quantity after replenishment.</small></label><label><span>Reorder method</span><select value={form.reorderRuleMode} onChange={(event) => set({ reorderRuleMode: event.target.value as "manual" | "global" | "custom" })}><option value="manual">Enter a quantity manually</option><option value="global">Use company rule ({companyReorderPercent}% of max)</option><option value="custom">Use a custom percentage</option></select><small>Company-rule parts update when the setting changes.</small></label>{form.reorderRuleMode === "manual" ? <label><span>Reorder point ({product.baseUomCode})</span><NumberField min="0" max={form.maxStockLevel} step="0.001" value={form.reorderPoint} onChange={(reorderPoint) => set({ reorderPoint })} /><small>Start replenishment at or below this quantity.</small></label> : form.reorderRuleMode === "custom" ? <label><span>Custom percentage of max</span><NumberField min="0.1" max="100" step="0.1" value={form.reorderRulePercent} onChange={(reorderRulePercent) => set({ reorderRulePercent })} /><small>This rule applies only to this part.</small></label> : <div className="reorder-company-note"><span>Company rule</span><strong>{companyReorderPercent}% of maximum stock</strong><small>Change it for all following parts in Reports &amp; administration → System policies.</small></div>}<div className="reorder-preview"><span>Resulting reorder point</span><strong>{effectiveReorderPoint} {product.baseUomCode}</strong><small>{form.reorderRuleMode === "manual" ? "Manual quantity" : `${activeReorderPercent}% × ${form.maxStockLevel} maximum`}</small></div></fieldset>
         <label><span>Standard cost</span><NumberField min="0" step="0.01" value={form.standardCost} onChange={(standardCost) => set({ standardCost })} /></label>
         <label><span>Pricing mode</span><select value={form.pricingMode} onChange={(event) => set({ pricingMode: event.target.value as "automatic" | "manual" })}><option value="automatic">Automatic from margin matrix</option><option value="manual">Manual override</option></select></label>
         <label><span>Selling price</span><NumberField min="0" step="0.01" value={form.sellingPrice} onChange={(sellingPrice) => set({ sellingPrice })} disabled={form.pricingMode === "automatic"} /><small>{form.pricingMode === "automatic" ? `Will use the current suggestion (${exact.format(product.suggestedSellingPrice)}).` : `Current matrix suggestion: ${exact.format(product.suggestedSellingPrice)}.`}</small></label>
@@ -3979,6 +4260,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
       projected: number(item.projected, usable + incoming - demand),
       reorderPoint: number(item.reorderPoint),
       maxStockLevel: number(item.maxStockLevel, number(item.reorderPoint)),
+      reorderRuleMode: ["global", "custom"].includes(text(item.reorderRuleMode)) ? text(item.reorderRuleMode) as "global" | "custom" : "manual",
+      reorderRulePercent: item.reorderRulePercent == null ? undefined : number(item.reorderRulePercent),
       inventoryPolicy: text(item.inventoryPolicy, "stocked"),
       standardCost: number(item.standardCostCents) / 100,
       lastUnitCost: item.lastUnitCostCents == null ? undefined : number(item.lastUnitCostCents) / 100,
@@ -4122,6 +4405,9 @@ function normalizeSnapshot(input: unknown): Snapshot {
       latestReceiptNumber: text(item.latestReceiptNumber) || undefined,
       latestReceiptPostedAt: text(item.latestReceiptPostedAt) || undefined,
       latestReceiptPackingSlip: text(item.latestReceiptPackingSlip) || undefined,
+      receipts: parsePurchaseReceipts(item.receiptsJson),
+      supplierDeliveries: parseSupplierDeliveries(item.purchaseDeliveriesJson),
+      vendorBills: parseFinancialDocuments(item.vendorBillsJson),
       customerRef: text(item.projectReference) || undefined,
       exception: late > 0
         ? `${open} units are ${late} days late`
@@ -4232,6 +4518,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
       orderDate: text(item.orderDate).slice(0, 10),
       owner: text(item.ownerName, "Unassigned"),
       shipments: parseShipments(item.shipmentsJson),
+      supplierDeliveries: parseSupplierDeliveries(item.salesDeliveriesJson),
+      invoices: parseFinancialDocuments(item.customerInvoicesJson),
       version: number(item.version, 1),
       lines,
     };
@@ -4388,7 +4676,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
     activities,
     partners,
     locations,
-    configuration: { taxDefaultRateBps: number(asRecord(raw.configuration).taxDefaultRateBps, 500) },
+    configuration: { taxDefaultRateBps: number(asRecord(raw.configuration).taxDefaultRateBps, 500), reorderPointPercent: number(asRecord(raw.configuration).reorderPointPercent, 70) },
     viewer: {
       name: text(asRecord(raw.viewer).name),
       email: text(asRecord(raw.viewer).email),
@@ -4473,6 +4761,51 @@ function parseShipments(value: unknown): ShipmentRecord[] {
     trackingNumber: text(row.trackingNumber),
     billOfLadingNumber: text(row.billOfLadingNumber),
   }));
+}
+
+function parsePurchaseReceipts(value: unknown): PurchaseReceiptRecord[] {
+  return parseJsonRows(value).map((row) => ({
+    id: text(row.id),
+    number: text(row.number, "Receipt"),
+    postedAt: text(row.postedAt),
+    status: titleCase(text(row.status, "posted")),
+    packingSlipNumber: text(row.packingSlipNumber) || undefined,
+    quantity: number(row.quantity),
+  }));
+}
+
+function parseSupplierDeliveries(value: unknown): SupplierDeliveryRecord[] {
+  return parseJsonRows(value).map((row) => ({
+    id: text(row.id),
+    number: text(row.number, "Supplier delivery"),
+    postedAt: text(row.postedAt),
+    deliveryDate: text(row.deliveryDate),
+    status: titleCase(text(row.status, "posted")),
+    externalReference: text(row.externalReference) || undefined,
+    quantity: number(row.quantity),
+  }));
+}
+
+function parseFinancialDocuments(value: unknown): FinancialDocumentRecord[] {
+  return parseJsonRows(value).map((row) => {
+    const amount = number(row.amountCents) / 100;
+    const paid = number(row.paidCents) / 100;
+    const credited = number(row.creditedCents) / 100;
+    return {
+      id: text(row.id),
+      number: text(row.number, "Financial document"),
+      status: titleCase(text(row.status, "posted")),
+      matchStatus: text(row.matchStatus) ? titleCase(text(row.matchStatus)) : undefined,
+      issuedOn: text(row.issuedOn),
+      dueOn: text(row.dueOn) || undefined,
+      amount,
+      paid,
+      credited,
+      outstanding: Math.max(amount - paid - credited, 0),
+      currency: text(row.currency, "CAD"),
+      externalReference: text(row.externalReference) || undefined,
+    };
+  });
 }
 
 function configurationText(value: unknown) {

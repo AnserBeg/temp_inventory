@@ -1,5 +1,6 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
 import { disconnectEmail, EmailConfigurationError, EmailProviderError, getEmailConnectionState, listRecentEmailDeliveries } from "@/lib/server/email-client";
+import type { EmailSenderType } from "@/lib/server/email-types";
 
 function errorResponse(error: unknown) {
   if (error instanceof AuthorizationError) return authorizationResponse(error);
@@ -22,7 +23,8 @@ export async function GET(request: Request) {
 export async function DELETE(request: Request) {
   try {
     const actor = await resolveActor(request); requireCapability(actor, "read");
-    return Response.json(await disconnectEmail(actor));
+    const senderType = (new URL(request.url).searchParams.get("sender") ?? "personal") as EmailSenderType;
+    if (!["company", "personal"].includes(senderType)) return Response.json({ error: { code: "INVALID_EMAIL_SENDER", message: "sender must be company or personal." } }, { status: 400 });
+    return Response.json(await disconnectEmail(actor, senderType));
   } catch (error) { return errorResponse(error); }
 }
-

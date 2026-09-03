@@ -1262,3 +1262,26 @@ test("the margin matrix can become the catalog default without replacing specifi
   });
   assert.equal(db.sqlite.prepare("SELECT event_type FROM catalog_price_history WHERE product_id='product-catalog-matrix' ORDER BY created_at DESC LIMIT 1").get().event_type, "catalog_matrix_adopted");
 });
+
+test("reorder percentage rules support company followers, custom parts, and apply-to-all", async () => {
+  const administrator = { id: "reorder-admin", email: "reorder-admin@example.com", name: "Reorder Admin", role: "administrator", label: "Reorder Admin <reorder-admin@example.com>", localDevelopment: false };
+  const base = { category: "reorder-test", material: "test", dimensions: "test", finish: "test", trackingPolicy: "quantity", inventoryPolicy: "stocked", standardCostCents: 100, sellingPriceCents: 200, baseUomId: "uom-each", purchaseUomId: "uom-each", salesUomId: "uom-each" };
+  const follower = await advancedDomain.executeWorkflow({ command: "createProduct", idempotencyKey: "create-reorder-follower", actor: administrator, payload: { ...base, sku: "REORDER-FOLLOW", name: "Company reorder follower", maxStockLevel: 20, reorderRuleMode: "global" } });
+  const custom = await advancedDomain.executeWorkflow({ command: "createProduct", idempotencyKey: "create-reorder-custom", actor: administrator, payload: { ...base, sku: "REORDER-CUSTOM", name: "Custom reorder part", maxStockLevel: 20, reorderRuleMode: "custom", reorderRulePercent: 40 } });
+  const manual = await advancedDomain.executeWorkflow({ command: "createProduct", idempotencyKey: "create-reorder-manual", actor: administrator, payload: { ...base, sku: "REORDER-MANUAL", name: "Manual reorder part", maxStockLevel: 20, reorderPoint: 3, reorderRuleMode: "manual" } });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT reorder_point,reorder_rule_mode,reorder_rule_percent FROM products WHERE id=?").get(follower.recordId) }, { reorder_point: 14, reorder_rule_mode: "global", reorder_rule_percent: 70 });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT reorder_point,reorder_rule_mode,reorder_rule_percent FROM products WHERE id=?").get(custom.recordId) }, { reorder_point: 8, reorder_rule_mode: "custom", reorder_rule_percent: 40 });
+
+  const version = () => db.sqlite.prepare("SELECT version FROM system_settings WHERE key='inventory.reorderPointRule'").get().version;
+  await advancedDomain.executeWorkflow({ command: "updatePolicy", entityId: "inventory.reorderPointRule", version: version(), idempotencyKey: "update-following-reorder-rule", actor: administrator, payload: { key: "inventory.reorderPointRule", value: { percent: 65, applyToAllStocked: false }, reason: "Update opted-in parts" } });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT reorder_point,reorder_rule_mode,reorder_rule_percent FROM products WHERE id=?").get(follower.recordId) }, { reorder_point: 13, reorder_rule_mode: "global", reorder_rule_percent: 65 });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT reorder_point,reorder_rule_mode,reorder_rule_percent FROM products WHERE id=?").get(custom.recordId) }, { reorder_point: 8, reorder_rule_mode: "custom", reorder_rule_percent: 40 });
+  assert.equal(db.sqlite.prepare("SELECT reorder_point FROM products WHERE id=?").get(manual.recordId).reorder_point, 3);
+
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "updatePolicy", entityId: "inventory.reorderPointRule", version: version(), idempotencyKey: "invalid-reorder-rule", actor: administrator, payload: { key: "inventory.reorderPointRule", value: { percent: 101, applyToAllStocked: false }, reason: "Invalid percentage" } }), (error) => error?.code === "VALIDATION_ERROR");
+  await advancedDomain.executeWorkflow({ command: "updatePolicy", entityId: "inventory.reorderPointRule", version: version(), idempotencyKey: "apply-all-reorder-rule", actor: administrator, payload: { key: "inventory.reorderPointRule", value: { percent: 55, applyToAllStocked: true }, reason: "Standardize all stocked parts" } });
+  for (const productId of [follower.recordId, custom.recordId, manual.recordId]) {
+    assert.deepEqual({ ...db.sqlite.prepare("SELECT reorder_point,reorder_rule_mode,reorder_rule_percent FROM products WHERE id=?").get(productId) }, { reorder_point: 11, reorder_rule_mode: "global", reorder_rule_percent: 55 });
+  }
+  assert.equal((await inventoryDomain.getInventorySnapshot({ scope: "products", page: 1, pageSize: 5 })).configuration.reorderPointPercent, 55);
+});

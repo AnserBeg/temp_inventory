@@ -1,8 +1,10 @@
 import { env } from "cloudflare:workers";
-import type { ActorIdentity } from "./auth";
+import { hasCapability, type ActorIdentity } from "./auth";
 import { all, first, getD1 } from "./inventory-db";
 import { decryptEmailSecret, encryptEmailSecret, randomUrlSafeString, sha256Hex } from "./email-crypto";
-import type { EmailConnectionState, EmailProvider } from "./email-types";
+import type { EmailConnectionState, EmailConnectionSummary, EmailProvider, EmailSenderType } from "./email-types";
+
+const COMPANY_MAILBOX_OWNER = "__company__";
 
 type ProviderConfig = {
   provider: EmailProvider;
@@ -17,6 +19,7 @@ type ProviderConfig = {
 
 type StoredConnection = {
   userId: string;
+  senderType: EmailSenderType;
   provider: EmailProvider;
   emailAddress: string;
   status: string;
@@ -33,6 +36,7 @@ type OAuthState = {
   userEmail: string;
   userName: string;
   provider: EmailProvider;
+  connectionType: EmailSenderType;
   returnTo: string;
   expiresAt: string;
 };
@@ -110,7 +114,8 @@ function safeReturnTo(value: string) {
 }
 
 function connectionSql() {
-  return `SELECT user_id AS userId,provider,email_address AS emailAddress,status,scopes,
+  return `SELECT user_id AS userId,CASE WHEN user_id='${COMPANY_MAILBOX_OWNER}' THEN 'company' ELSE 'personal' END AS senderType,
+    provider,email_address AS emailAddress,status,scopes,
     encrypted_access_token AS encryptedAccessToken,encrypted_refresh_token AS encryptedRefreshToken,
     access_token_expires_at AS accessTokenExpiresAt,connected_at AS connectedAt,last_error AS lastError
     FROM email_connections WHERE user_id=? LIMIT 1`;
@@ -121,21 +126,39 @@ export async function getEmailConnectionState(actor: ActorIdentity, requestUrl: 
     try { const config = providerConfig(provider, requestUrl); return [{ provider, label: config.label }]; }
     catch { return []; }
   });
-  const row = await first<StoredConnection>(connectionSql(), actor.id);
+  const [companyRow, personalRow] = await Promise.all([
+    first<StoredConnection>(connectionSql(), COMPANY_MAILBOX_OWNER),
+    first<StoredConnection>(connectionSql(), actor.id),
+  ]);
+  const summary = (row: StoredConnection | null): EmailConnectionSummary | null => row ? {
+    senderType: row.senderType,
+    provider: row.provider,
+    providerLabel: providerLabel(row.provider),
+    emailAddress: row.emailAddress,
+    status: row.status,
+    connectedAt: row.connectedAt,
+    ...(row.lastError ? { lastError: row.lastError } : {}),
+  } : null;
+  const companyConnection = summary(companyRow);
+  const personalConnection = summary(personalRow);
+  const defaultSender: EmailSenderType | null = companyRow?.status === "connected"
+    ? "company"
+    : personalRow?.status === "connected" ? "personal" : null;
   return {
     configuredProviders,
-    connection: row ? {
-      provider: row.provider,
-      providerLabel: providerLabel(row.provider),
-      emailAddress: row.emailAddress,
-      status: row.status,
-      connectedAt: row.connectedAt,
-      ...(row.lastError ? { lastError: row.lastError } : {}),
-    } : null,
+    companyConnection,
+    personalConnection,
+    defaultSender,
+    canManageCompany: hasCapability(actor, "administer"),
+    connection: defaultSender === "company" ? companyConnection : defaultSender === "personal" ? personalConnection : null,
   };
 }
 
-export async function createEmailAuthorizationUrl(actor: ActorIdentity, requestUrl: string, input: { provider: EmailProvider; returnTo?: string }) {
+export async function createEmailAuthorizationUrl(actor: ActorIdentity, requestUrl: string, input: { provider: EmailProvider; senderType?: EmailSenderType; returnTo?: string }) {
+  const senderType = input.senderType ?? "personal";
+  if (senderType === "company" && !hasCapability(actor, "administer")) {
+    throw new EmailProviderError("Only a company administrator can connect the company email.", "COMPANY_EMAIL_FORBIDDEN", 403);
+  }
   const config = providerConfig(input.provider, requestUrl);
   const state = randomUrlSafeString(32);
   const stateHash = await sha256Hex(state);
@@ -144,8 +167,8 @@ export async function createEmailAuthorizationUrl(actor: ActorIdentity, requestU
   await getD1().batch([
     getD1().prepare("DELETE FROM email_oauth_states WHERE expires_at<=? OR consumed_at IS NOT NULL").bind(now.toISOString()),
     getD1().prepare(`INSERT INTO email_oauth_states
-      (state_hash,user_id,user_email,user_name,provider,return_to,created_at,expires_at)
-      VALUES (?,?,?,?,?,?,?,?)`).bind(stateHash, actor.id, actor.email, actor.name, input.provider, safeReturnTo(input.returnTo ?? "/"), now.toISOString(), expires.toISOString()),
+      (state_hash,user_id,user_email,user_name,provider,connection_type,return_to,created_at,expires_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`).bind(stateHash, actor.id, actor.email, actor.name, input.provider, senderType, safeReturnTo(input.returnTo ?? "/"), now.toISOString(), expires.toISOString()),
   ]);
   const url = new URL(config.authorizeUrl);
   url.searchParams.set("client_id", config.clientId);
@@ -153,7 +176,7 @@ export async function createEmailAuthorizationUrl(actor: ActorIdentity, requestU
   url.searchParams.set("response_type", "code");
   url.searchParams.set("scope", config.scopes);
   url.searchParams.set("state", state);
-  url.searchParams.set("login_hint", actor.email);
+  if (senderType === "personal") url.searchParams.set("login_hint", actor.email);
   if (input.provider === "google") {
     url.searchParams.set("access_type", "offline");
     url.searchParams.set("include_granted_scopes", "true");
@@ -198,7 +221,8 @@ async function mailboxAddress(provider: EmailProvider, accessToken: string) {
 export async function completeEmailAuthorization(requestUrl: string, input: { provider: EmailProvider; state: string; code: string }) {
   const stateHash = await sha256Hex(input.state);
   const now = new Date().toISOString();
-  const state = await first<OAuthState>(`SELECT user_id AS userId,user_email AS userEmail,user_name AS userName,provider,return_to AS returnTo,expires_at AS expiresAt
+  const state = await first<OAuthState>(`SELECT user_id AS userId,user_email AS userEmail,user_name AS userName,provider,
+    connection_type AS connectionType,return_to AS returnTo,expires_at AS expiresAt
     FROM email_oauth_states WHERE state_hash=? AND consumed_at IS NULL AND expires_at>? LIMIT 1`, stateHash, now);
   if (!state || state.provider !== input.provider) throw new EmailProviderError("This email authorization expired or was already used.", "EMAIL_OAUTH_STATE_INVALID", 400);
   const claim = await getD1().prepare("UPDATE email_oauth_states SET consumed_at=? WHERE state_hash=? AND consumed_at IS NULL").bind(now, stateHash).run();
@@ -208,11 +232,13 @@ export async function completeEmailAuthorization(requestUrl: string, input: { pr
   const tokens = await exchangeCode(config, input.code);
   if (!tokens.access_token || !tokens.refresh_token) throw new EmailProviderError("The provider did not issue the offline mailbox access required for sending. Reconnect and grant all requested permissions.", "EMAIL_REFRESH_TOKEN_MISSING", 409);
   const emailAddress = await mailboxAddress(input.provider, tokens.access_token);
-  const owner = await first<{ userId: string }>("SELECT user_id AS userId FROM email_connections WHERE provider=? AND email_address=? AND user_id<>? LIMIT 1", input.provider, emailAddress, state.userId);
-  if (owner) throw new EmailProviderError("That mailbox is already connected to another PaneFlow user.", "EMAIL_ALREADY_CONNECTED", 409);
+  const senderType = state.connectionType ?? "personal";
+  const ownerId = senderType === "company" ? COMPANY_MAILBOX_OWNER : state.userId;
+  const owner = await first<{ userId: string }>("SELECT user_id AS userId FROM email_connections WHERE provider=? AND email_address=? AND user_id<>? LIMIT 1", input.provider, emailAddress, ownerId);
+  if (owner) throw new EmailProviderError("That mailbox is already connected as another sender for this company.", "EMAIL_ALREADY_CONNECTED", 409);
   const secret = encryptionSecret();
-  const accessData = `email:${state.userId}:${input.provider}:access`;
-  const refreshData = `email:${state.userId}:${input.provider}:refresh`;
+  const accessData = `email:${ownerId}:${input.provider}:access`;
+  const refreshData = `email:${ownerId}:${input.provider}:refresh`;
   const encryptedAccess = await encryptEmailSecret(tokens.access_token, secret, accessData);
   const encryptedRefresh = await encryptEmailSecret(tokens.refresh_token, secret, refreshData);
   const expiresAt = new Date(Date.now() + Math.max(Number(tokens.expires_in ?? 3_600), 60) * 1_000).toISOString();
@@ -223,18 +249,18 @@ export async function completeEmailAuthorization(requestUrl: string, input: { pr
       (user_id,provider,email_address,status,scopes,encrypted_access_token,encrypted_refresh_token,access_token_expires_at,connected_at,updated_at,disconnected_at,last_error,version)
       VALUES (?,?,?,'connected',?,?,?,?,?,?,NULL,NULL,1)
       ON CONFLICT(user_id) DO UPDATE SET provider=excluded.provider,email_address=excluded.email_address,status='connected',scopes=excluded.scopes,
-        encrypted_access_token=excluded.encrypted_access_token,encrypted_refresh_token=excluded.encrypted_refresh_token,
-        access_token_expires_at=excluded.access_token_expires_at,connected_at=excluded.connected_at,updated_at=excluded.updated_at,
-        disconnected_at=NULL,last_error=NULL,version=email_connections.version+1`)
-      .bind(state.userId, input.provider, emailAddress, tokens.scope ?? config.scopes, encryptedAccess, encryptedRefresh, expiresAt, now, now),
+      encrypted_access_token=excluded.encrypted_access_token,encrypted_refresh_token=excluded.encrypted_refresh_token,
+      access_token_expires_at=excluded.access_token_expires_at,connected_at=excluded.connected_at,updated_at=excluded.updated_at,
+      disconnected_at=NULL,last_error=NULL,version=email_connections.version+1`)
+      .bind(ownerId, input.provider, emailAddress, tokens.scope ?? config.scopes, encryptedAccess, encryptedRefresh, expiresAt, now, now),
     db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
       VALUES (?,'email_connection',?,'email_connected',?,?,?,?,?,?)`)
-      .bind(`audit-email-${crypto.randomUUID()}`, state.userId, `${providerLabel(input.provider)} mailbox connected.`, actorLabel, state.userId, state.userEmail, JSON.stringify({ provider: input.provider, emailAddress }), now),
+      .bind(`audit-email-${crypto.randomUUID()}`, ownerId, `${senderType === "company" ? "Company" : "Personal"} ${providerLabel(input.provider)} mailbox connected.`, actorLabel, state.userId, state.userEmail, JSON.stringify({ provider: input.provider, emailAddress, senderType }), now),
     db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
       VALUES (?,'email.mailbox_connected','email_connection',?,?,'pending',0,?,?)`)
-      .bind(`outbox-email-${crypto.randomUUID()}`, state.userId, JSON.stringify({ userId: state.userId, provider: input.provider, emailAddress }), now, now),
+      .bind(`outbox-email-${crypto.randomUUID()}`, ownerId, JSON.stringify({ userId: state.userId, provider: input.provider, emailAddress, senderType }), now, now),
   ]);
-  return { returnTo: safeReturnTo(state.returnTo), emailAddress, provider: input.provider };
+  return { returnTo: safeReturnTo(state.returnTo), emailAddress, provider: input.provider, senderType };
 }
 
 async function refreshAccessToken(connection: StoredConnection) {
@@ -338,9 +364,30 @@ async function providerSend(connection: StoredConnection, token: string, input: 
   return { unauthorized: false as const, messageId: response.headers.get("request-id") ?? response.headers.get("client-request-id") ?? "" };
 }
 
-export async function sendWithConnectedMailbox(actor: ActorIdentity, input: { recipients: string[]; subject: string; htmlBody: string; fileName: string; pdf: Uint8Array }) {
-  const connection = await first<StoredConnection>(connectionSql(), actor.id);
-  if (!connection || connection.status !== "connected") throw new EmailProviderError("Connect your email account before sending a document.", "EMAIL_NOT_CONNECTED", 409);
+async function selectedConnection(actor: ActorIdentity, senderType?: EmailSenderType) {
+  const requestedOwner = senderType === "company" ? COMPANY_MAILBOX_OWNER : senderType === "personal" ? actor.id : "";
+  if (requestedOwner) {
+    const requested = await first<StoredConnection>(connectionSql(), requestedOwner);
+    if (!requested || requested.status !== "connected") {
+      const label = senderType === "company" ? "company email" : "personal email";
+      throw new EmailProviderError(`Connect the ${label} before sending a document.`, "EMAIL_NOT_CONNECTED", 409);
+    }
+    return requested;
+  }
+  const company = await first<StoredConnection>(connectionSql(), COMPANY_MAILBOX_OWNER);
+  if (company?.status === "connected") return company;
+  const personal = await first<StoredConnection>(connectionSql(), actor.id);
+  if (personal?.status === "connected") return personal;
+  throw new EmailProviderError("Set up a company or personal email before sending a document.", "EMAIL_NOT_CONNECTED", 409);
+}
+
+export async function getEmailSender(actor: ActorIdentity, senderType?: EmailSenderType) {
+  const connection = await selectedConnection(actor, senderType);
+  return { provider: connection.provider, senderEmail: connection.emailAddress, senderType: connection.senderType };
+}
+
+export async function sendWithConnectedMailbox(actor: ActorIdentity, input: { recipients: string[]; subject: string; htmlBody: string; fileName: string; pdf: Uint8Array }, senderType?: EmailSenderType) {
+  const connection = await selectedConnection(actor, senderType);
   let token = await accessToken(connection);
   let result = await providerSend(connection, token, input);
   if (result.unauthorized) {
@@ -349,14 +396,18 @@ export async function sendWithConnectedMailbox(actor: ActorIdentity, input: { re
   }
   if (result.unauthorized) {
     await getD1().prepare("UPDATE email_connections SET status='reauthorization_required',last_error='The provider rejected mailbox access.',updated_at=?,version=version+1 WHERE user_id=?")
-      .bind(new Date().toISOString(), actor.id).run();
-    throw new EmailProviderError("Your email connection needs to be authorized again.", "EMAIL_REAUTHORIZATION_REQUIRED", 401);
+      .bind(new Date().toISOString(), connection.userId).run();
+    throw new EmailProviderError(`${connection.senderType === "company" ? "The company email" : "Your email"} needs to be authorized again.`, "EMAIL_REAUTHORIZATION_REQUIRED", 401);
   }
-  return { provider: connection.provider, senderEmail: connection.emailAddress, messageId: result.messageId };
+  return { provider: connection.provider, senderEmail: connection.emailAddress, senderType: connection.senderType, messageId: result.messageId };
 }
 
-export async function disconnectEmail(actor: ActorIdentity) {
-  const connection = await first<StoredConnection>(connectionSql(), actor.id);
+export async function disconnectEmail(actor: ActorIdentity, senderType: EmailSenderType = "personal") {
+  if (senderType === "company" && !hasCapability(actor, "administer")) {
+    throw new EmailProviderError("Only a company administrator can disconnect the company email.", "COMPANY_EMAIL_FORBIDDEN", 403);
+  }
+  const ownerId = senderType === "company" ? COMPANY_MAILBOX_OWNER : actor.id;
+  const connection = await first<StoredConnection>(connectionSql(), ownerId);
   if (!connection) return { disconnected: true };
   if (connection.provider === "google") {
     try {
@@ -367,18 +418,17 @@ export async function disconnectEmail(actor: ActorIdentity) {
   const now = new Date().toISOString();
   const db = getD1();
   await db.batch([
-    db.prepare("DELETE FROM email_connections WHERE user_id=?").bind(actor.id),
+    db.prepare("DELETE FROM email_connections WHERE user_id=?").bind(ownerId),
     db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
       VALUES (?,'email_connection',?,'email_disconnected',?,?,?,?,?,?)`)
-      .bind(`audit-email-${crypto.randomUUID()}`, actor.id, `${providerLabel(connection.provider)} mailbox disconnected.`, actor.label, actor.id, actor.email, JSON.stringify({ provider: connection.provider, emailAddress: connection.emailAddress }), now),
+      .bind(`audit-email-${crypto.randomUUID()}`, ownerId, `${senderType === "company" ? "Company" : "Personal"} ${providerLabel(connection.provider)} mailbox disconnected.`, actor.label, actor.id, actor.email, JSON.stringify({ provider: connection.provider, emailAddress: connection.emailAddress, senderType }), now),
   ]);
   return { disconnected: true };
 }
 
 export async function listRecentEmailDeliveries(actor: ActorIdentity, limit = 20) {
-  return all<Record<string, unknown>>(`SELECT id,provider,sender_email AS senderEmail,document_type AS documentType,document_id AS documentId,
+  return all<Record<string, unknown>>(`SELECT id,provider,sender_type AS senderType,sender_email AS senderEmail,document_type AS documentType,document_id AS documentId,
     document_number AS documentNumber,recipients_json AS recipientsJson,subject,status,provider_message_id AS providerMessageId,
     last_error AS lastError,created_at AS createdAt,sent_at AS sentAt
     FROM document_email_deliveries WHERE user_id=? ORDER BY created_at DESC LIMIT ?`, actor.id, Math.min(Math.max(limit, 1), 100));
 }
-

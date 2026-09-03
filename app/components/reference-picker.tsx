@@ -350,7 +350,7 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
 }
 
 /** Minimal create form for the records people discover they are missing mid-task. */
-export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCreateKind; onClose: () => void; onCreated: (option: PickerOption) => void | Promise<void> }) {
+export function QuickCreateDialog({ kind, companyReorderPercent, onClose, onCreated }: { kind: QuickCreateKind; companyReorderPercent?: number; onClose: () => void; onCreated: (option: PickerOption) => void | Promise<void> }) {
   const isPartner = kind === "customer" || kind === "vendor" || kind === "partner";
   // Master records with no dependent lookups of their own; they need only their own fields.
   const isSimpleMaster = kind === "uom" || kind === "priceList" || kind === "assetType";
@@ -382,6 +382,8 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
   const [inventoryPolicy, setInventoryPolicy] = useState("stocked");
   const [reorderPoint, setReorderPoint] = useState(0);
   const [maxStockLevel, setMaxStockLevel] = useState(0);
+  const [reorderRuleMode, setReorderRuleMode] = useState<"manual" | "global" | "custom">(companyReorderPercent == null ? "manual" : "global");
+  const [reorderRulePercent, setReorderRulePercent] = useState(companyReorderPercent ?? 70);
   const [uomId, setUomId] = useState("");
   const [warehouseId, setWarehouseId] = useState("");
   const [inventoryStatus, setInventoryStatus] = useState("usable");
@@ -409,10 +411,13 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
     ] : []),
     ...(kind === "location" && !warehouseId ? ["warehouse"] : []),
   ];
+  const activeReorderPercent = reorderRuleMode === "global" ? companyReorderPercent ?? 70 : reorderRulePercent;
+  const effectiveReorderPoint = reorderRuleMode === "manual" ? reorderPoint : Math.round(maxStockLevel * activeReorderPercent * 10) / 1000;
 
   const submit = async () => {
     if (missingFields.length) return setError(`Enter the ${missingFields.join(", ")} before creating this record.`);
-    if (kind === "product" && inventoryPolicy === "stocked" && maxStockLevel < reorderPoint) return setError("Reorder up to must be at least the reorder point.");
+    if (kind === "product" && inventoryPolicy === "stocked" && maxStockLevel < effectiveReorderPoint) return setError("Maximum stock must be at least the reorder point.");
+    if (kind === "product" && reorderRuleMode === "custom" && (reorderRulePercent <= 0 || reorderRulePercent > 100)) return setError("Enter a custom percentage greater than 0 and no more than 100.");
     setError(""); setBusy(true);
     const idempotencyKey = crypto.randomUUID();
     const command = isPartner ? "createBusinessPartner"
@@ -424,7 +429,7 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
     const payload = isPartner
       ? { code, name, partnerType, email, phone, currency, paymentTerms, addressLine1, city, region, postalCode, country, creditLimitCents: 0, creditHold: false }
       : kind === "product"
-        ? { sku: code, manufacturerSku, name, category, material, dimensions, finish, trackingPolicy, inventoryPolicy, standardCostCents: Math.round(cost * 100), sellingPriceCents: Math.round(price * 100), reorderPoint, maxStockLevel, baseUomId: uomId, purchaseUomId: uomId, salesUomId: uomId }
+        ? { sku: code, manufacturerSku, name, category, material, dimensions, finish, trackingPolicy, inventoryPolicy, standardCostCents: Math.round(cost * 100), sellingPriceCents: Math.round(price * 100), reorderPoint: effectiveReorderPoint, maxStockLevel, reorderRuleMode, reorderRulePercent: reorderRuleMode === "custom" ? reorderRulePercent : undefined, baseUomId: uomId, purchaseUomId: uomId, salesUomId: uomId }
       : kind === "uom" ? { code, name, dimension, precision }
       : kind === "priceList" ? { code, name, currency, priority }
       : kind === "assetType" ? { code, name, assetClass: assetClass.trim() || name, unitDepositCents: Math.round(deposit * 100) }
@@ -473,8 +478,11 @@ export function QuickCreateDialog({ kind, onClose, onCreated }: { kind: QuickCre
             {field("Finish", <input value={finish} onChange={(event) => setFinish(event.target.value)} required />)}
             {field("Tracking policy", <select value={trackingPolicy} onChange={(event) => setTrackingPolicy(event.target.value)}><option value="quantity">Quantity</option><option value="lot">Lot</option><option value="serial">Serial</option></select>)}
             {field("Inventory policy", <select value={inventoryPolicy} onChange={(event) => setInventoryPolicy(event.target.value)}><option value="stocked">Stocked</option><option value="special_order">Special order</option><option value="drop_ship">Drop ship</option></select>)}
-            {field("Reorder point", <NumberField min="0" step="0.001" value={reorderPoint} onChange={(value) => { setReorderPoint(value); setMaxStockLevel((current) => Math.max(current, value)); }} />)}
-            {field("Reorder up to", <NumberField min={reorderPoint} step="0.001" value={maxStockLevel} onChange={setMaxStockLevel} />)}
+            <div className="replenishment-create-heading full-field"><strong>Max stock &amp; reorder point</strong><small>Set the target stock level, then choose when purchasing should reorder.</small></div>
+            {field("Maximum stock level", <NumberField min="0" step="0.001" value={maxStockLevel} onChange={setMaxStockLevel} />)}
+            {field("Reorder method", <select value={reorderRuleMode} onChange={(event) => setReorderRuleMode(event.target.value as "manual" | "global" | "custom")}><option value="manual">Enter a quantity manually</option>{companyReorderPercent != null ? <option value="global">Use company rule ({companyReorderPercent}% of max)</option> : null}<option value="custom">Use a custom percentage</option></select>)}
+            {reorderRuleMode === "manual" ? field("Reorder point", <NumberField min="0" max={maxStockLevel} step="0.001" value={reorderPoint} onChange={setReorderPoint} />) : reorderRuleMode === "custom" ? field("Custom percentage of max", <NumberField min="0.1" max="100" step="0.1" value={reorderRulePercent} onChange={setReorderRulePercent} />) : null}
+            <div className="reorder-preview compact full-field"><span>Resulting reorder point</span><strong>{effectiveReorderPoint}</strong><small>{reorderRuleMode === "manual" ? "Manual quantity" : `${activeReorderPercent}% of ${maxStockLevel} maximum`}</small></div>
             {field("Standard cost", <NumberField min="0" step="0.01" value={cost} onChange={setCost} />)}
             {field("Selling price", <NumberField min="0" step="0.01" value={price} onChange={setPrice} />)}
           </> : null}

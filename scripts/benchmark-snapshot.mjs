@@ -20,6 +20,12 @@ async function applyMigrations() {
 
 function seedScaledFixture() {
   db.exec(`
+    INSERT OR IGNORE INTO units_of_measure (id,code,name,dimension,precision,active)
+      VALUES ('uom-each','EA','Each','quantity',0,1);
+    INSERT OR IGNORE INTO warehouses (id,code,name,timezone,active)
+      VALUES ('warehouse-main','BENCH','Benchmark Warehouse','America/Edmonton',1);
+    INSERT OR IGNORE INTO locations (id,code,name,location_type,inventory_status,warehouse_id,active)
+      VALUES ('loc-a01','BENCH-A-01','Benchmark Aisle A','storage','usable','warehouse-main',1);
     INSERT INTO business_partners (id,code,name,partner_type,created_at)
       VALUES ('bench-vendor','BENCH-V','Benchmark Vendor','vendor','2026-01-01T00:00:00Z'),
              ('bench-customer','BENCH-C','Benchmark Customer','customer','2026-01-01T00:00:00Z');
@@ -104,7 +110,9 @@ try {
   await applyMigrations();
   env.DB = db;
   env.ALLOW_LOCAL_DEV_AUTH = "false";
-  env.BOOTSTRAP_DEMO_DATA = "true";
+  // The benchmark owns a deterministic fixture. Bootstrapping demo rows both distorts the
+  // measurements and can violate newer relationship guards before their prerequisite rows exist.
+  env.BOOTSTRAP_DEMO_DATA = "false";
   const inventoryDb = await import("../lib/server/inventory-db.ts");
   const inventoryDomain = await import("../lib/server/inventory-domain.ts");
   const advancedDomain = await import("../lib/server/advanced-domain.ts");
@@ -155,7 +163,8 @@ try {
       };
     }));
     if (!aggregatePlan && process.env.PANEFLOW_BENCH_PLAN === "true") {
-      const aggregateSql = queryTimings.find((entry) => entry.sql.trimStart().startsWith("WITH po_line_state AS"))?.sql;
+      // Tenant scoping prepends table CTEs, so the aggregate no longer begins with its own CTE.
+      const aggregateSql = queryTimings.find((entry) => entry.sql.includes("po_line_state AS MATERIALIZED"))?.sql;
       if (aggregateSql) aggregatePlan = db.sqlite.prepare(`EXPLAIN QUERY PLAN ${aggregateSql}`).all("", "");
     }
   }

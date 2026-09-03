@@ -1275,7 +1275,7 @@ async function registerIdentity(command: WorkflowCommand) {
 async function updatePolicy(command: WorkflowCommand) {
   const payload = command.payload ?? {}; const key = textValue(payload, "key"); const reason = textValue(payload, "reason");
   if (!("value" in payload)) throw new WorkflowError("VALIDATION_ERROR", "value is required.");
-  const allowedKeys = new Set(["receiving.overReceiptPolicy","inventory.countApprovalThreshold","inventory.scrapApprovalThresholdCents","matching.tolerances","tax.defaultRateBps","valuation.defaultMethod","inventory.negativeAllowed","security.defaultRole"]);
+  const allowedKeys = new Set(["receiving.overReceiptPolicy","inventory.countApprovalThreshold","inventory.scrapApprovalThresholdCents","inventory.reorderPointRule","matching.tolerances","tax.defaultRateBps","valuation.defaultMethod","inventory.negativeAllowed","security.defaultRole"]);
   if(!allowedKeys.has(key)) throw new WorkflowError("INVALID_SETTING","This setting is not supported by the transaction engine.",400);
   const value = payload.value;
   const policyObject = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -1287,6 +1287,7 @@ async function updatePolicy(command: WorkflowCommand) {
   if(["inventory.scrapApprovalThresholdCents"].includes(key)&&(!Number.isSafeInteger(payload.value)||Number(payload.value)<0)) throw new WorkflowError("VALIDATION_ERROR",`${key} must be a non-negative whole number.`);
   if (key === "receiving.overReceiptPolicy" && (!policyObject || !nonNegative(policyObject.tolerancePct) || policyObject.toleranceQuantity != null && !nonNegative(policyObject.toleranceQuantity))) throw new WorkflowError("VALIDATION_ERROR", "receiving.overReceiptPolicy requires a non-negative tolerancePct and optional toleranceQuantity.");
   if (key === "inventory.countApprovalThreshold" && (!policyObject || !nonNegative(policyObject.absoluteQuantity) || !Number.isSafeInteger(policyObject.absoluteValueCents) || Number(policyObject.absoluteValueCents) < 0)) throw new WorkflowError("VALIDATION_ERROR", "inventory.countApprovalThreshold requires non-negative absoluteQuantity and whole-cent absoluteValueCents values.");
+  if (key === "inventory.reorderPointRule" && (!policyObject || typeof policyObject.percent !== "number" || !Number.isFinite(policyObject.percent) || policyObject.percent <= 0 || policyObject.percent > 100 || typeof policyObject.applyToAllStocked !== "boolean")) throw new WorkflowError("VALIDATION_ERROR", "The reorder point rule requires a percentage greater than 0 and no more than 100, plus a valid application scope.");
   if (key === "matching.tolerances") {
     const kinds = policyObject?.allowedChargeKinds;
     if (!policyObject || !nonNegative(policyObject.quantity) || !Number.isSafeInteger(policyObject.unitPriceCents) || Number(policyObject.unitPriceCents) < 0 || !Number.isSafeInteger(policyObject.totalCents) || Number(policyObject.totalCents) < 0 || !Array.isArray(kinds) || kinds.some((kind) => typeof kind !== "string" || !supportedChargeTypes.has(kind))) throw new WorkflowError("VALIDATION_ERROR", "matching.tolerances requires non-negative quantity, whole-cent unitPriceCents/totalCents, and supported allowedChargeKinds.");
@@ -1294,18 +1295,25 @@ async function updatePolicy(command: WorkflowCommand) {
   const current = await first<{ version: number; description: string }>("SELECT version,description FROM system_settings WHERE key=?", key);
   const version = command.version ?? 0;
   if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Setting changed; refresh before updating.", 409, current.version);
-  const result: WorkflowResult = { message: `${key} updated for future transactions; existing posted records are unchanged.`, impact: { physical: "No immediate stock movement.", financial: "No posting.", onHandDelta: 0 }, recordId: key };
+  const isReorderRule = key === "inventory.reorderPointRule";
+  const applyToAllStocked = isReorderRule && policyObject!.applyToAllStocked === true;
+  const affected = isReorderRule ? Number((await first<{ count: number }>(`SELECT COUNT(*) AS count FROM products WHERE active=1 AND inventory_policy='stocked' AND (?=1 OR reorder_rule_mode='global')`, applyToAllStocked ? 1 : 0))?.count ?? 0) : 0;
+  const result: WorkflowResult = { message: isReorderRule ? `Company reorder rule updated; ${affected} stocked part${affected === 1 ? "" : "s"} now use ${policyObject!.percent}% of maximum stock.` : `${key} updated for future transactions; existing posted records are unchanged.`, impact: { physical: "No stock quantity moved.", financial: "No posting.", onHandDelta: 0, ...(isReorderRule ? { productMasterRecordsUpdated: affected } : {}) }, recordId: key };
   const db = commandD1(command); const when = new Date().toISOString();
-  await db.batch([
+  const statements: D1PreparedStatement[] = [
     current ? db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM system_settings WHERE key=? AND version=?").bind(...claimValues(command, result, key),key,version) : db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) VALUES (?,?,?,?,?,?,?)").bind(...claimValues(command, result, key)),
     current
       ? db.prepare(`UPDATE system_settings SET value_json=?,version=version+1,updated_by=?,updated_at=? WHERE key=? AND version=? AND ${marker(command)}`)
         .bind(JSON.stringify(value), command.actor.label, when, key, version)
       : db.prepare(`INSERT INTO system_settings (key,value_json,description,version,updated_by,updated_at) SELECT ?,?,?,1,?,? WHERE ${marker(command)}`)
         .bind(key, JSON.stringify(value), textValue(payload, "description", "Operational setting"), command.actor.label, when),
+  ];
+  if (isReorderRule) statements.push(db.prepare(`UPDATE products SET reorder_point=ROUND(max_stock_level*?/100,3),reorder_rule_mode='global',reorder_rule_percent=?,version=version+1 WHERE active=1 AND inventory_policy='stocked' AND (?=1 OR reorder_rule_mode='global') AND ${marker(command)}`).bind(policyObject!.percent, policyObject!.percent, applyToAllStocked ? 1 : 0));
+  statements.push(
     auditStatement(command, "system_setting", key, "setting_updated", result.message, { reason, value }, when),
     outboxStatement(command, "setting.updated", "system_setting", key, { reason }, when),
-  ]); return finish(command);
+  );
+  await db.batch(statements); return finish(command);
 }
 
 async function setPeriodLock(command: WorkflowCommand, active: boolean) {
@@ -2004,10 +2012,7 @@ async function saveProduct(command: WorkflowCommand) {
   if (!["quantity", "lot", "serial"].includes(tracking) || !["stocked", "special_order", "drop_ship"].includes(policy)) throw new WorkflowError("VALIDATION_ERROR", "Invalid trackingPolicy or inventoryPolicy.");
   const standard = numberValue(payload, "standardCostCents", { positive: false, integer: true });
   const enteredPrice = numberValue(payload, "sellingPriceCents", { positive: false, integer: true });
-  const reorder = payload.reorderPoint == null ? 0 : numberValue(payload, "reorderPoint", { positive: false });
-  const maxStock = payload.maxStockLevel == null ? reorder : numberValue(payload, "maxStockLevel", { positive: false });
-  if (standard < 0 || enteredPrice < 0 || reorder < 0 || maxStock < 0) throw new WorkflowError("VALIDATION_ERROR", "Costs and replenishment levels cannot be negative.");
-  if (policy === "stocked" && maxStock < reorder) throw new WorkflowError("VALIDATION_ERROR", "The reorder-up-to maximum must be at least the reorder point.");
+  if (standard < 0 || enteredPrice < 0) throw new WorkflowError("VALIDATION_ERROR", "Costs cannot be negative.");
 
   const baseUomId = optionalText(payload, "baseUomId");
   const purchaseUomId = optionalText(payload, "purchaseUomId") ?? baseUomId;
@@ -2021,10 +2026,27 @@ async function saveProduct(command: WorkflowCommand) {
   if (tracking === "serial" && base.precision !== 0) throw new WorkflowError("SERIAL_UOM_PRECISION", "Serial-tracked products require a whole-unit base UOM.", 409);
 
   const version = command.version ?? 0;
-  const current = creating ? null : await first<{ version: number; trackingPolicy: string; baseUomId: string | null; category: string; lastUnitCostCents: number | null; sellingPriceCents: number; pricingMode: string; manualPriceReason: string | null }>(
-    "SELECT version,tracking_policy AS trackingPolicy,base_uom_id AS baseUomId,category,last_unit_cost_cents AS lastUnitCostCents,selling_price_cents AS sellingPriceCents,pricing_mode AS pricingMode,manual_price_reason AS manualPriceReason FROM products WHERE id=?", id);
+  const current = creating ? null : await first<{ version: number; trackingPolicy: string; baseUomId: string | null; category: string; lastUnitCostCents: number | null; sellingPriceCents: number; pricingMode: string; manualPriceReason: string | null; reorderPoint: number; maxStockLevel: number; reorderRuleMode: string; reorderRulePercent: number | null }>(
+    "SELECT version,tracking_policy AS trackingPolicy,base_uom_id AS baseUomId,category,last_unit_cost_cents AS lastUnitCostCents,selling_price_cents AS sellingPriceCents,pricing_mode AS pricingMode,manual_price_reason AS manualPriceReason,reorder_point AS reorderPoint,max_stock_level AS maxStockLevel,reorder_rule_mode AS reorderRuleMode,reorder_rule_percent AS reorderRulePercent FROM products WHERE id=?", id);
   if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Product not found.", 404);
   if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Product changed.", 409, current.version);
+  const requestedReorder = payload.reorderPoint == null ? current?.reorderPoint ?? 0 : numberValue(payload, "reorderPoint", { positive: false });
+  const maxStock = payload.maxStockLevel == null ? current?.maxStockLevel ?? requestedReorder : numberValue(payload, "maxStockLevel", { positive: false });
+  const reorderRuleMode = optionalText(payload, "reorderRuleMode") ?? current?.reorderRuleMode ?? "manual";
+  if (!["manual", "global", "custom"].includes(reorderRuleMode)) throw new WorkflowError("VALIDATION_ERROR", "reorderRuleMode must be manual, global, or custom.");
+  let reorderRulePercent: number | null = null;
+  if (reorderRuleMode === "global") {
+    const companyRule = await setting<{ percent?: unknown }>("inventory.reorderPointRule", { percent: 70 });
+    reorderRulePercent = Number(companyRule.percent ?? 70);
+  } else if (reorderRuleMode === "custom") {
+    reorderRulePercent = payload.reorderRulePercent == null && current?.reorderRuleMode === "custom"
+      ? Number(current.reorderRulePercent)
+      : numberValue(payload, "reorderRulePercent");
+  }
+  if (reorderRulePercent != null && (!Number.isFinite(reorderRulePercent) || reorderRulePercent <= 0 || reorderRulePercent > 100)) throw new WorkflowError("VALIDATION_ERROR", "Reorder percentages must be greater than 0 and no more than 100.");
+  const reorder = reorderRulePercent == null ? requestedReorder : Math.round(maxStock * reorderRulePercent * 10) / 1000;
+  if (reorder < 0 || maxStock < 0) throw new WorkflowError("VALIDATION_ERROR", "Replenishment levels cannot be negative.");
+  if (policy === "stocked" && maxStock < reorder) throw new WorkflowError("VALIDATION_ERROR", "The maximum stock level must be at least the reorder point.");
   if (await first("SELECT id FROM products WHERE sku=? AND id<>?", sku, id)) throw new WorkflowError("DUPLICATE_PRODUCT_SKU", `SKU ${sku} already exists.`, 409);
   for (const identifier of [sku, optionalText(payload, "manufacturerSku"), name].filter((value): value is string => Boolean(value))) {
     if (await first("SELECT id FROM product_aliases WHERE normalized_alias=? AND product_id<>?", normalizedAlias(identifier), id)) {
@@ -2062,10 +2084,10 @@ async function saveProduct(command: WorkflowCommand) {
     : db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
         SELECT ?,?,?,?,?,?,? FROM products WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM products WHERE sku=? AND id<>?) ${immutableHistoryGuard}`)
       .bind(...claimValues(command, result, id), id, version, sku, id, ...(changesImmutableInventoryIdentity ? [id, id, id, id] : []));
-  const values = [sku, optionalText(payload, "manufacturerSku"), name, textValue(payload, "category"), textValue(payload, "material"), textValue(payload, "dimensions"), textValue(payload, "finish"), tracking, policy, standard, price, pricing.suggestedSellingPriceCents, pricingMode, pricing.rule.id, manualPriceReason, when, reorder, maxStock, baseUomId, purchaseUomId, salesUomId, active ? 1 : 0] as const;
+  const values = [sku, optionalText(payload, "manufacturerSku"), name, textValue(payload, "category"), textValue(payload, "material"), textValue(payload, "dimensions"), textValue(payload, "finish"), tracking, policy, standard, price, pricing.suggestedSellingPriceCents, pricingMode, pricing.rule.id, manualPriceReason, when, reorder, maxStock, reorderRuleMode, reorderRulePercent, baseUomId, purchaseUomId, salesUomId, active ? 1 : 0] as const;
   const write = creating
-    ? db.prepare(`INSERT INTO products (id,sku,manufacturer_sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,suggested_selling_price_cents,pricing_mode,applied_margin_rule_id,manual_price_reason,pricing_updated_at,reorder_point,max_stock_level,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(id, ...values, when)
-    : db.prepare(`UPDATE products SET sku=?,manufacturer_sku=?,name=?,category=?,material=?,dimensions=?,finish=?,tracking_policy=?,inventory_policy=?,standard_cost_cents=?,selling_price_cents=?,suggested_selling_price_cents=?,pricing_mode=?,applied_margin_rule_id=?,manual_price_reason=?,pricing_updated_at=?,reorder_point=?,max_stock_level=?,base_uom_id=?,purchase_uom_id=?,sales_uom_id=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(...values, id, version);
+    ? db.prepare(`INSERT INTO products (id,sku,manufacturer_sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,suggested_selling_price_cents,pricing_mode,applied_margin_rule_id,manual_price_reason,pricing_updated_at,reorder_point,max_stock_level,reorder_rule_mode,reorder_rule_percent,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(id, ...values, when)
+    : db.prepare(`UPDATE products SET sku=?,manufacturer_sku=?,name=?,category=?,material=?,dimensions=?,finish=?,tracking_policy=?,inventory_policy=?,standard_cost_cents=?,selling_price_cents=?,suggested_selling_price_cents=?,pricing_mode=?,applied_margin_rule_id=?,manual_price_reason=?,pricing_updated_at=?,reorder_point=?,max_stock_level=?,reorder_rule_mode=?,reorder_rule_percent=?,base_uom_id=?,purchase_uom_id=?,sales_uom_id=?,active=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(...values, id, version);
   const statements: D1PreparedStatement[] = [claim, write];
   if (creating) {
     const configuredMethod = await setting<string>("valuation.defaultMethod", "fifo");
@@ -2078,7 +2100,7 @@ async function saveProduct(command: WorkflowCommand) {
       (id,product_id,event_type,cost_basis_cents,previous_selling_price_cents,suggested_selling_price_cents,effective_selling_price_cents,pricing_mode,margin_rule_id,source_purchase_order_id,reason,created_at,created_by)
       SELECT ?,?,?,?,?,?,?,?,?,NULL,?,?,? WHERE ${marker(command)}`)
       .bind(newId("catalog-price"), id, creating ? "product_created" : "product_master_updated", costBasisCents, current?.sellingPriceCents ?? price, pricing.suggestedSellingPriceCents, price, pricingMode, pricing.rule.id, manualPriceReason, when, command.actor.label),
-    auditStatement(command, "product", id, creating ? "created" : "updated", result.message, { sku, tracking, policy, reorderPoint: reorder, maxStockLevel: maxStock, baseUomId, purchaseUomId, salesUomId, active, pricingMode, suggestedSellingPriceCents: pricing.suggestedSellingPriceCents, sellingPriceCents: price }, when),
+    auditStatement(command, "product", id, creating ? "created" : "updated", result.message, { sku, tracking, policy, reorderPoint: reorder, maxStockLevel: maxStock, reorderRuleMode, reorderRulePercent, baseUomId, purchaseUomId, salesUomId, active, pricingMode, suggestedSellingPriceCents: pricing.suggestedSellingPriceCents, sellingPriceCents: price }, when),
     outboxStatement(command, creating ? "master.product_created" : "master.product_updated", "product", id, { sku, active, pricingMode, sellingPriceCents: price }, when),
   );
   await db.batch(statements);
@@ -3445,6 +3467,7 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
     p.last_unit_cost_vendor_id AS lastUnitCostVendorId,p.last_unit_cost_at AS lastUnitCostAt,source_po.number AS lastUnitCostSourcePoNumber,source_vendor.name AS lastUnitCostVendorName,
     p.selling_price_cents AS sellingPriceCents,p.suggested_selling_price_cents AS suggestedSellingPriceCents,p.pricing_mode AS pricingMode,p.applied_margin_rule_id AS appliedMarginRuleId,
     mr.code AS appliedMarginRuleCode,p.manual_price_reason AS manualPriceReason,p.pricing_updated_at AS pricingUpdatedAt,p.reorder_point AS reorderPoint,p.max_stock_level AS maxStockLevel,
+    p.reorder_rule_mode AS reorderRuleMode,p.reorder_rule_percent AS reorderRulePercent,
     p.base_uom_id AS baseUomId,p.purchase_uom_id AS purchaseUomId,p.sales_uom_id AS salesUomId,p.active,p.version
     FROM products p LEFT JOIN purchase_orders source_po ON source_po.id=p.last_unit_cost_source_po_id LEFT JOIN business_partners source_vendor ON source_vendor.id=p.last_unit_cost_vendor_id
     LEFT JOIN margin_rules mr ON mr.id=p.applied_margin_rule_id ORDER BY p.sku`)
@@ -3570,7 +3593,11 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
 }
 
 export async function getWorkflowSnapshot(actor?:ActorIdentity,input:SnapshotPage={}){
-  const workflowCoreScope: Record<string,string> = { purchasing:"workflow-empty", sales:"workflow-empty", inventory:"stock", "vendor-billing":"workflow-empty", "customer-billing":"workflow-empty", controls:"workflow-empty" };
+  // Advanced snapshots already carry their own totals, permissions, reference options, and
+  // scoped records. The lightweight core companion only supplies product rows for inventory
+  // and orphaned-location reconciliation; recomputing the global operational summary here made
+  // every workflow request pay the app-shell's largest analytical query a second time.
+  const workflowCoreScope: Record<string,string> = { purchasing:"workflow-empty", sales:"workflow-empty", inventory:"workflow-products", "vendor-billing":"workflow-empty", "customer-billing":"workflow-empty", controls:"workflow-empty" };
   const coreInput = workflowCoreScope[String(input.scope ?? "")] ? { ...input, scope: workflowCoreScope[String(input.scope)] } : input;
   const [core,advanced]=await Promise.all([getInventorySnapshot(coreInput),getAdvancedSnapshot(actor,input)]);return{snapshot:core,advanced};}
 

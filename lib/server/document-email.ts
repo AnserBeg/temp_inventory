@@ -1,8 +1,8 @@
 import type { ActorIdentity, AppCapability } from "./auth";
 import { all, first, getD1 } from "./inventory-db";
-import { sendWithConnectedMailbox } from "./email-client";
+import { getEmailSender, sendWithConnectedMailbox } from "./email-client";
 import { maybeCreateInvoicePaymentLink } from "./helcim-payments";
-import type { DocumentEmailPreview, EmailDocumentType, PrintableDocumentType } from "./email-types";
+import type { DocumentEmailPreview, EmailDocumentType, EmailSenderType, PrintableDocumentType } from "./email-types";
 
 type DocumentHeader = {
   id: string;
@@ -341,7 +341,7 @@ function validateRecipients(values: unknown) {
   return recipients;
 }
 
-export async function sendDocumentEmail(actor: ActorIdentity, input: { documentType: EmailDocumentType; documentId: string; recipients: unknown; subject: unknown; message: unknown }, requestUrl?: string) {
+export async function sendDocumentEmail(actor: ActorIdentity, input: { documentType: EmailDocumentType; documentId: string; recipients: unknown; subject: unknown; message: unknown; senderType?: EmailSenderType }, requestUrl?: string) {
   const document = await loadDocument(input.documentType, input.documentId);
   const preview = await getDocumentEmailPreview(input.documentType, input.documentId);
   const recipients = validateRecipients(input.recipients);
@@ -358,28 +358,27 @@ export async function sendDocumentEmail(actor: ActorIdentity, input: { documentT
   const htmlBody = `<div style="font-family:Arial,sans-serif;color:#17342f;line-height:1.5">${escapeHtml(message || preview.defaultMessage).replaceAll("\n", "<br>")}${paymentAction}<p style="color:#5c6f6b;font-size:12px">${escapeHtml(document.label)} ${escapeHtml(document.header.number)} is attached as a PDF generated from PaneFlow&apos;s current system record.</p></div>`;
   const deliveryId = `email-delivery-${crypto.randomUUID()}`;
   const now = new Date().toISOString();
-  const connection = await first<{ provider: string; emailAddress: string }>("SELECT provider,email_address AS emailAddress FROM email_connections WHERE user_id=? AND status='connected' LIMIT 1", actor.id);
-  if (!connection) throw new DocumentEmailError("Connect your email account before sending a document.", "EMAIL_NOT_CONNECTED", 409);
+  const connection = await getEmailSender(actor, input.senderType);
   const db = getD1();
   await db.prepare(`INSERT INTO document_email_deliveries
-    (id,user_id,provider,sender_email,document_type,document_id,document_number,recipients_json,subject,status,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,'pending',?)`)
-    .bind(deliveryId, actor.id, connection.provider, connection.emailAddress, input.documentType, document.header.id, document.header.number, JSON.stringify(recipients), subject, now).run();
+    (id,user_id,provider,sender_type,sender_email,document_type,document_id,document_number,recipients_json,subject,status,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?)`)
+    .bind(deliveryId, actor.id, connection.provider, connection.senderType, connection.senderEmail, input.documentType, document.header.id, document.header.number, JSON.stringify(recipients), subject, now).run();
   try {
-    const pdf = renderDocumentPdf(document, connection.emailAddress);
-    const sent = await sendWithConnectedMailbox(actor, { recipients, subject, htmlBody, fileName: preview.fileName, pdf });
+    const pdf = renderDocumentPdf(document, connection.senderEmail);
+    const sent = await sendWithConnectedMailbox(actor, { recipients, subject, htmlBody, fileName: preview.fileName, pdf }, connection.senderType);
     const sentAt = new Date().toISOString();
     await db.batch([
       db.prepare("UPDATE document_email_deliveries SET status='sent',provider_message_id=?,sent_at=?,last_error=NULL WHERE id=?")
         .bind(sent.messageId || null, sentAt, deliveryId),
       db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)`)
-        .bind(`audit-email-${crypto.randomUUID()}`, input.documentType, document.header.id, "document_emailed", `${document.label} ${document.header.number} emailed to ${recipients.join(", ")}.`, actor.label, actor.id, actor.email, JSON.stringify({ deliveryId, provider: sent.provider, senderEmail: sent.senderEmail, recipients, subject, paymentLinkId: paymentLink?.id ?? null }), sentAt),
+        .bind(`audit-email-${crypto.randomUUID()}`, input.documentType, document.header.id, "document_emailed", `${document.label} ${document.header.number} emailed to ${recipients.join(", ")}.`, actor.label, actor.id, actor.email, JSON.stringify({ deliveryId, provider: sent.provider, senderType: sent.senderType, senderEmail: sent.senderEmail, recipients, subject, paymentLinkId: paymentLink?.id ?? null }), sentAt),
       db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
         VALUES (?,'document.emailed',?,?,?,'pending',0,?,?)`)
-        .bind(`outbox-email-${crypto.randomUUID()}`, input.documentType, document.header.id, JSON.stringify({ deliveryId, documentType: input.documentType, documentId: document.header.id, documentNumber: document.header.number, provider: sent.provider, senderEmail: sent.senderEmail, recipients }), sentAt, sentAt),
+        .bind(`outbox-email-${crypto.randomUUID()}`, input.documentType, document.header.id, JSON.stringify({ deliveryId, documentType: input.documentType, documentId: document.header.id, documentNumber: document.header.number, provider: sent.provider, senderType: sent.senderType, senderEmail: sent.senderEmail, recipients }), sentAt, sentAt),
     ]);
-    return { deliveryId, documentNumber: document.header.number, recipients, senderEmail: sent.senderEmail, sentAt };
+    return { deliveryId, documentNumber: document.header.number, recipients, senderType: sent.senderType, senderEmail: sent.senderEmail, sentAt };
   } catch (error) {
     const messageText = error instanceof Error ? error.message.slice(0, 1_000) : "Email delivery failed.";
     await db.prepare("UPDATE document_email_deliveries SET status='failed',last_error=? WHERE id=?").bind(messageText, deliveryId).run();

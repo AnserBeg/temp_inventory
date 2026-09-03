@@ -87,6 +87,8 @@ export const products = sqliteTable(
     pricingUpdatedAt: text("pricing_updated_at"),
     reorderPoint: real("reorder_point").notNull().default(0),
     maxStockLevel: real("max_stock_level").notNull().default(0),
+    reorderRuleMode: text("reorder_rule_mode").notNull().default("manual"),
+    reorderRulePercent: real("reorder_rule_percent"),
     baseUomId: text("base_uom_id").notNull().default("uom-each"),
     purchaseUomId: text("purchase_uom_id").notNull().default("uom-each"),
     salesUomId: text("sales_uom_id").notNull().default("uom-each"),
@@ -676,10 +678,7 @@ export const appUsers = sqliteTable("app_users", {
   updatedAt: text("updated_at").notNull(),
 }, (table) => [check("app_users_role_check", sql`${table.role} IN ('viewer','operator','accounting','manager','administrator')`)]);
 
-/**
- * A mailbox connection belongs to one authenticated PaneFlow identity. Provider access and
- * refresh tokens are AES-GCM encrypted by the Worker before they reach D1.
- */
+/** A mailbox belongs to a user, or to the reserved company sender identity for the tenant. */
 export const emailConnections = sqliteTable("email_connections", {
     tenantId: text("tenant_id").notNull().default("tenant-default"),
   userId: text("user_id").notNull(),
@@ -711,6 +710,7 @@ export const emailOauthStates = sqliteTable("email_oauth_states", {
   userEmail: text("user_email").notNull(),
   userName: text("user_name").notNull(),
   provider: text("provider").notNull(),
+  connectionType: text("connection_type").notNull().default("personal"),
   returnTo: text("return_to").notNull().default("/"),
   createdAt: text("created_at").notNull(),
   expiresAt: text("expires_at").notNull(),
@@ -718,6 +718,7 @@ export const emailOauthStates = sqliteTable("email_oauth_states", {
 }, (table) => [
   index("idx_email_oauth_states_expires").on(table.tenantId, table.expiresAt),
   check("email_oauth_states_provider_check", sql`${table.provider} IN ('google','microsoft')`),
+  check("email_oauth_states_connection_type_check", sql`${table.connectionType} IN ('company','personal')`),
 ]);
 
 /** Durable send history contains routing metadata but never message or attachment contents. */
@@ -726,6 +727,7 @@ export const documentEmailDeliveries = sqliteTable("document_email_deliveries", 
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),
   provider: text("provider").notNull(),
+  senderType: text("sender_type").notNull().default("personal"),
   senderEmail: text("sender_email").notNull(),
   documentType: text("document_type").notNull(),
   documentId: text("document_id").notNull(),
@@ -741,6 +743,7 @@ export const documentEmailDeliveries = sqliteTable("document_email_deliveries", 
   index("idx_document_email_deliveries_document").on(table.tenantId, table.documentType, table.documentId, table.createdAt),
   index("idx_document_email_deliveries_user_created").on(table.tenantId, table.userId, table.createdAt),
   check("document_email_deliveries_provider_check", sql`${table.provider} IN ('google','microsoft')`),
+  check("document_email_deliveries_sender_type_check", sql`${table.senderType} IN ('company','personal')`),
   check("document_email_deliveries_type_check", sql`${table.documentType} IN ('purchase_order','sales_order','customer_invoice')`),
   check("document_email_deliveries_status_check", sql`${table.status} IN ('pending','sent','failed')`),
 ]);

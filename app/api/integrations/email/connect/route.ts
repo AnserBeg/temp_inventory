@@ -1,6 +1,6 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
 import { createEmailAuthorizationUrl, EmailConfigurationError, EmailProviderError } from "@/lib/server/email-client";
-import type { EmailProvider } from "@/lib/server/email-types";
+import type { EmailProvider, EmailSenderType } from "@/lib/server/email-types";
 
 export async function POST(request: Request) {
   try {
@@ -10,11 +10,14 @@ export async function POST(request: Request) {
     if (!(["google", "microsoft"] as string[]).includes(provider)) {
       return Response.json({ error: { code: "INVALID_EMAIL_PROVIDER", message: "provider must be google or microsoft." } }, { status: 400 });
     }
-    return Response.json(await createEmailAuthorizationUrl(actor, request.url, { provider, returnTo: String(input.returnTo ?? "/") }));
+    const senderType = String(input.senderType ?? "personal") as EmailSenderType;
+    if (!(["company", "personal"] as string[]).includes(senderType)) {
+      return Response.json({ error: { code: "INVALID_EMAIL_SENDER", message: "senderType must be company or personal." } }, { status: 400 });
+    }
+    return Response.json(await createEmailAuthorizationUrl(actor, request.url, { provider, senderType, returnTo: String(input.returnTo ?? "/") }));
   } catch (error) {
     if (error instanceof AuthorizationError) return authorizationResponse(error);
     if (error instanceof EmailConfigurationError || error instanceof EmailProviderError) return Response.json({ error: { code: error.code, message: error.message } }, { status: error.status });
     return Response.json({ error: { code: "EMAIL_CONNECT_FAILED", message: error instanceof Error ? error.message : "Email connection failed." } }, { status: 400 });
   }
 }
-

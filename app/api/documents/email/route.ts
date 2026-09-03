@@ -1,6 +1,7 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
 import { getDocumentEmailPreview, DocumentEmailError, emailDocumentCapability, isEmailDocumentType, sendDocumentEmail } from "@/lib/server/document-email";
 import { EmailConfigurationError, EmailProviderError, getEmailConnectionState } from "@/lib/server/email-client";
+import type { EmailSenderType } from "@/lib/server/email-types";
 
 function responseFor(error: unknown) {
   if (error instanceof AuthorizationError) return authorizationResponse(error);
@@ -30,7 +31,9 @@ export async function POST(request: Request) {
     const documentType = String(input.documentType ?? "");
     const documentId = String(input.documentId ?? "").trim();
     if (!isEmailDocumentType(documentType) || !documentId) return Response.json({ error: { code: "INVALID_DOCUMENT", message: "A supported documentType and documentId are required." } }, { status: 400 });
+    const senderType = input.senderType === undefined ? undefined : String(input.senderType) as EmailSenderType;
+    if (senderType && !(["company", "personal"] as string[]).includes(senderType)) return Response.json({ error: { code: "INVALID_EMAIL_SENDER", message: "senderType must be company or personal." } }, { status: 400 });
     requireCapability(actor, emailDocumentCapability(documentType));
-    return Response.json(await sendDocumentEmail(actor, { documentType, documentId, recipients: input.recipients, subject: input.subject, message: input.message }, request.url));
+    return Response.json(await sendDocumentEmail(actor, { documentType, documentId, recipients: input.recipients, subject: input.subject, message: input.message, senderType }, request.url));
   } catch (error) { return responseFor(error); }
 }

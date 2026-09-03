@@ -3093,6 +3093,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
     partners: [],
     reports: ["products"],
     "workflow-empty": [],
+    "workflow-products": ["products", "inventoryBalances"],
     warehouse: ["purchaseOrders", "purchaseLines", "salesOrders", "salesLines", "products", "inventoryBalances"],
   };
   const requested = scopeDatasets[input.scope ?? ""];
@@ -3148,6 +3149,29 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
            lr.id AS latestReceiptId, lr.version AS latestReceiptVersion,
            lr.number AS latestReceiptNumber, lr.posted_at AS latestReceiptPostedAt,
            lr.packing_slip_number AS latestReceiptPackingSlip,
+           (SELECT json_group_array(json_object('id',r.id,'number',r.number,'postedAt',r.postedAt,'status',r.status,
+              'packingSlipNumber',r.packingSlipNumber,'quantity',r.quantity))
+            FROM (SELECT rc.id,rc.number,rc.posted_at AS postedAt,rc.status,
+                    COALESCE(rc.packing_slip_number,'') AS packingSlipNumber,
+                    COALESCE((SELECT SUM(rl.quantity) FROM receipt_lines rl WHERE rl.receipt_id=rc.id),0) AS quantity
+                  FROM receipts rc WHERE rc.purchase_order_id=po.id
+                  ORDER BY rc.posted_at DESC,rc.number DESC LIMIT 25) r) AS receiptsJson,
+           (SELECT json_group_array(json_object('id',d.id,'number',d.number,'postedAt',d.postedAt,'deliveryDate',d.deliveryDate,
+              'status',d.status,'externalReference',d.externalReference,'quantity',d.quantity))
+            FROM (SELECT dd.id,dd.number,dd.posted_at AS postedAt,dd.delivery_date AS deliveryDate,dd.status,
+                    dd.external_reference AS externalReference,dd.quantity-dd.reversed_qty AS quantity
+                  FROM drop_ship_deliveries dd WHERE dd.purchase_order_id=po.id
+                  ORDER BY dd.posted_at DESC,dd.number DESC LIMIT 25) d) AS purchaseDeliveriesJson,
+           (SELECT json_group_array(json_object('id',b.id,'number',b.number,'status',b.status,'matchStatus',b.matchStatus,
+              'issuedOn',b.issuedOn,'dueOn',b.dueOn,'amountCents',b.amountCents,'paidCents',b.paidCents,
+              'creditedCents',b.creditedCents,'currency',b.currency,'externalReference',b.externalReference))
+            FROM (SELECT vb.id,vb.number,vb.status,vb.match_status AS matchStatus,
+                    COALESCE(vb.invoice_date,vb.posted_at,'') AS issuedOn,COALESCE(vb.due_date,'') AS dueOn,
+                    vb.total_cents AS amountCents,vb.paid_cents AS paidCents,vb.currency,
+                    COALESCE(vb.vendor_invoice_number,'') AS externalReference,
+                    COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted'),0) AS creditedCents
+                  FROM vendor_bills vb WHERE vb.purchase_order_id=po.id
+                  ORDER BY COALESCE(vb.invoice_date,vb.posted_at) DESC,vb.number DESC LIMIT 25) b) AS vendorBillsJson,
            COALESCE(lt.ordered_qty, 0) AS orderedQuantity, COALESCE(mt.gross_received_qty, 0) AS grossReceivedQuantity,
            COALESCE(mt.reversed_qty, 0) AS receiptReversedQuantity, COALESCE(mt.returned_qty, 0) AS vendorReturnedQuantity,
            COALESCE(mt.net_received_qty, 0) AS netReceivedQuantity, COALESCE(lt.closed_qty, 0) AS closedWithoutReceiptQuantity,
@@ -3220,7 +3244,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
            -- The version column below is the balance version used for count concurrency;
            -- editing the catalog row needs the product row's own optimistic-lock value.
            p.version AS productVersion,
-           p.reorder_point AS reorderPoint, p.max_stock_level AS maxStockLevel, COALESCE(b.on_hand_qty,0) AS onHand,
+           p.reorder_point AS reorderPoint,p.max_stock_level AS maxStockLevel,p.reorder_rule_mode AS reorderRuleMode,p.reorder_rule_percent AS reorderRulePercent,COALESCE(b.on_hand_qty,0) AS onHand,
            COALESCE(b.usable_qty,0) AS usable, COALESCE(b.quarantine_qty,0) AS quarantine,
            COALESCE(b.reserved_qty,0) AS reserved, COALESCE(b.usable_qty-b.reserved_qty,0) AS available,
            COALESCE(i.incoming_qty,0) AS incoming, COALESCE(d.demand_qty,0) AS demand,
@@ -3341,6 +3365,20 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                     COALESCE(sh.bill_of_lading_number,'') AS billOfLading
                   FROM shipments sh WHERE sh.sales_order_id=so.id
                   ORDER BY sh.posted_at DESC,sh.number DESC LIMIT 25) s) AS shipmentsJson,
+           (SELECT json_group_array(json_object('id',d.id,'number',d.number,'postedAt',d.postedAt,'deliveryDate',d.deliveryDate,
+              'status',d.status,'externalReference',d.externalReference,'quantity',d.quantity))
+            FROM (SELECT dd.id,dd.number,dd.posted_at AS postedAt,dd.delivery_date AS deliveryDate,dd.status,
+                    dd.external_reference AS externalReference,dd.quantity-dd.reversed_qty AS quantity
+                  FROM drop_ship_deliveries dd WHERE dd.sales_order_id=so.id
+                  ORDER BY dd.posted_at DESC,dd.number DESC LIMIT 25) d) AS salesDeliveriesJson,
+           (SELECT json_group_array(json_object('id',i.id,'number',i.number,'status',i.status,
+              'issuedOn',i.issuedOn,'dueOn',i.dueOn,'amountCents',i.amountCents,'paidCents',i.paidCents,
+              'creditedCents',i.creditedCents,'currency',i.currency))
+            FROM (SELECT ci.id,ci.number,ci.status,ci.invoice_date AS issuedOn,ci.due_date AS dueOn,
+                    ci.total_cents AS amountCents,ci.paid_cents AS paidCents,ci.currency,
+                    COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS creditedCents
+                  FROM customer_invoices ci WHERE ci.sales_order_id=so.id
+                  ORDER BY ci.invoice_date DESC,ci.number DESC LIMIT 25) i) AS customerInvoicesJson,
            COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='sales_order' AND dc.document_id=so.id AND dc.charge_type='freight'),0) AS freightCents,
            COALESCE((SELECT MAX(dc.tax_rate_bps) FROM document_charges dc WHERE dc.document_type='sales_order' AND dc.document_id=so.id AND dc.charge_type='freight'),0) AS freightTaxRateBps,
            COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='sales_order' AND dc.document_id=so.id AND dc.charge_type IN ('fee','handling_fee')),0) AS feeCents,
@@ -3447,9 +3485,10 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
        FROM inventory_counts ic JOIN products p ON p.id=ic.product_id JOIN locations l ON l.id=ic.location_id
       WHERE (?='' OR ic.number LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR l.code LIKE ? ESCAPE '\\')
        ORDER BY ${sort === "oldest" ? "ic.counted_at,ic.id" : "ic.counted_at DESC,ic.id DESC"}`, term, like, like, like, like)) : Promise.resolve([]),
-    referenceAll<Record<string, unknown>>(`SELECT l.id,l.code,l.name,l.location_type AS locationType,l.inventory_status AS inventoryStatus,
-      l.warehouse_id AS warehouseId,w.name AS warehouseName,l.active FROM locations l LEFT JOIN warehouses w ON w.id=l.warehouse_id WHERE l.active=1 ORDER BY w.code,l.code`),
-    pageAll<Record<string, unknown>>(`SELECT id,code,name,partner_type AS partnerType,email,phone,
+    !scope.startsWith("workflow-") ? referenceAll<Record<string, unknown>>(`SELECT l.id,l.code,l.name,l.location_type AS locationType,l.inventory_status AS inventoryStatus,
+      l.warehouse_id AS warehouseId,w.name AS warehouseName,l.active FROM locations l LEFT JOIN warehouses w ON w.id=l.warehouse_id WHERE l.active=1 ORDER BY w.code,l.code`)
+      : Promise.resolve([]),
+    !scope.startsWith("workflow-") ? pageAll<Record<string, unknown>>(`SELECT id,code,name,partner_type AS partnerType,email,phone,
       address_line_1 AS addressLine1,address_line_2 AS addressLine2,city,region,postal_code AS postalCode,country,
       credit_limit_cents AS creditLimitCents,credit_hold AS creditHold,payment_terms AS paymentTerms,currency,version
       FROM business_partners WHERE active=1
@@ -3463,7 +3502,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
         address: "COALESCE(city,address_line_1,'') COLLATE NOCASE",
         terms: "COALESCE(payment_terms,'') COLLATE NOCASE",
         credit: "CASE WHEN credit_hold=1 THEN 1 ELSE COALESCE(credit_limit_cents,0) END",
-      }, "name,id", "id") : sort === "code" ? "code,id" : "name,id"}`, term, like, like, like, like, like, like, scope === "partners" ? status : "", scope === "partners" ? status : ""),
+      }, "name,id", "id") : sort === "code" ? "code,id" : "name,id"}`, term, like, like, like, like, like, like, scope === "partners" ? status : "", scope === "partners" ? status : "")
+      : Promise.resolve([]),
     Promise.resolve([] as Array<Record<string, unknown>>),
     needs("countBalances") ? (pageAll<Record<string, unknown>>(`SELECT ib.product_id AS productId, ib.location_id AS locationId,
       ib.on_hand_qty AS recordedQuantity, ib.reserved_qty AS reservedQuantity, ib.version,
@@ -3478,15 +3518,38 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
         reserved: "ib.reserved_qty",
         available: "ib.on_hand_qty-ib.reserved_qty",
       }, "w.code,l.code,p.sku", "ib.product_id") : "w.code,l.code,p.sku"}`, ...countBalanceBindings)) : Promise.resolve([]),
-    first<Record<string, unknown>>(`WITH po_line_state AS MATERIALIZED (
+    !scope.startsWith("workflow-") ? first<Record<string, unknown>>(`WITH po_movement AS MATERIALIZED (
+      SELECT purchase_order_line_id,SUM(quantity) fulfilled_qty FROM stock_movements
+       WHERE purchase_order_line_id IS NOT NULL GROUP BY purchase_order_line_id
+    ), po_delivery AS MATERIALIZED (
+      SELECT purchase_order_line_id,SUM(quantity-reversed_qty) fulfilled_qty FROM drop_ship_deliveries
+       WHERE purchase_order_line_id IS NOT NULL GROUP BY purchase_order_line_id
+    ), po_line_state AS MATERIALIZED (
       SELECT pol.id,pol.purchase_order_id,pol.product_id,pol.fulfillment_route,po.lifecycle_status,po.expected_date,
-             MAX(pol.ordered_qty-pol.closed_qty-${purchaseLineFulfilledQuantity("pol")},0) open_qty
+             MAX(pol.ordered_qty-pol.closed_qty-CASE WHEN pol.fulfillment_route='drop_ship'
+               THEN COALESCE(pd.fulfilled_qty,0) ELSE COALESCE(pm.fulfilled_qty,0) END,0) open_qty
         FROM purchase_order_lines pol JOIN purchase_orders po ON po.id=pol.purchase_order_id
+        LEFT JOIN po_movement pm ON pm.purchase_order_line_id=pol.id
+        LEFT JOIN po_delivery pd ON pd.purchase_order_line_id=pol.id
+    ), so_movement AS MATERIALIZED (
+      SELECT sales_order_line_id,SUM(CASE WHEN movement_type='sales_shipment' THEN -quantity
+             WHEN movement_type='shipment_reversal' THEN -quantity ELSE 0 END) fulfilled_qty
+        FROM stock_movements WHERE sales_order_line_id IS NOT NULL GROUP BY sales_order_line_id
+    ), so_delivery AS MATERIALIZED (
+      SELECT sales_order_line_id,SUM(quantity-reversed_qty) fulfilled_qty FROM drop_ship_deliveries
+       WHERE sales_order_line_id IS NOT NULL GROUP BY sales_order_line_id
+    ), so_reservation AS MATERIALIZED (
+      SELECT sales_order_line_id,SUM(quantity) reserved_qty FROM reservations
+       WHERE status='active' GROUP BY sales_order_line_id
     ), so_line_state AS MATERIALIZED (
       SELECT sol.id,sol.sales_order_id,sol.product_id,sol.fulfillment_route,so.lifecycle_status,so.requested_date,
-             MAX(sol.ordered_qty-sol.canceled_qty-${salesLineFulfilledQuantity("sol")},0) open_qty,
-             COALESCE((SELECT SUM(rv.quantity) FROM reservations rv WHERE rv.sales_order_line_id=sol.id AND rv.status='active'),0) reserved_qty
+             MAX(sol.ordered_qty-sol.canceled_qty-CASE WHEN sol.fulfillment_route='drop_ship'
+               THEN COALESCE(sd.fulfilled_qty,0) ELSE COALESCE(sm.fulfilled_qty,0) END,0) open_qty,
+             COALESCE(sr.reserved_qty,0) reserved_qty
         FROM sales_order_lines sol JOIN sales_orders so ON so.id=sol.sales_order_id
+        LEFT JOIN so_movement sm ON sm.sales_order_line_id=sol.id
+        LEFT JOIN so_delivery sd ON sd.sales_order_line_id=sol.id
+        LEFT JOIN so_reservation sr ON sr.sales_order_line_id=sol.id
     ), so_product_demand AS MATERIALIZED (
       SELECT sales_order_id,product_id,lifecycle_status,requested_date,SUM(open_qty) open_qty,
              SUM(MIN(open_qty,reserved_qty)) reserved_qty
@@ -3561,7 +3624,7 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       (SELECT COUNT(*) FROM stock_movements) AS movementCount,
       (SELECT COUNT(*) FROM vendor_bills) AS billCount,
       (SELECT COUNT(*) FROM audit_events WHERE NOT (entity_type IN ('product','business_partner') AND action IN ('created','updated'))) AS activityCount,
-      (SELECT COUNT(*) FROM inventory_counts) AS countCount`, warehouseScope, warehouseScope),
+      (SELECT COUNT(*) FROM inventory_counts) AS countCount`, warehouseScope, warehouseScope) : Promise.resolve(null),
   ]);
 
   // Child rows follow the ids already selected for this page. The previous form repeated the
@@ -3569,7 +3632,29 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
   // the work on order and invoice screens before SQLite could apply the same 50-row limit.
   const purchaseOrderIds = purchaseOrders.map((order) => String(order.id)).filter(Boolean);
   const salesOrderIds = salesOrders.map((order) => String(order.id)).filter(Boolean);
-  const [purchaseLines, salesLines] = await Promise.all([
+  const visibleProductIds = products.map((product) => String(product.id)).filter(Boolean);
+  const taxDefaultPromise = first<{ valueJson: string }>("SELECT value_json AS valueJson FROM system_settings WHERE key='tax.defaultRateBps'");
+  const reorderRulePromise = first<{ valueJson: string }>("SELECT value_json AS valueJson FROM system_settings WHERE key='inventory.reorderPointRule'");
+  const orphanedLocationsPromise = all<Record<string, unknown>>(`WITH referenced AS (
+      SELECT ib.location_id AS locationId,SUM(ib.on_hand_qty) AS balanceUnits,COUNT(*) AS balanceRows,0 AS movementRows FROM inventory_balances ib LEFT JOIN locations l ON l.id=ib.location_id WHERE l.id IS NULL GROUP BY ib.location_id
+      UNION ALL
+      SELECT sm.from_location_id,0,0,COUNT(*) FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.from_location_id WHERE sm.from_location_id IS NOT NULL AND l.id IS NULL GROUP BY sm.from_location_id
+      UNION ALL
+      SELECT sm.to_location_id,0,0,COUNT(*) FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.to_location_id WHERE sm.to_location_id IS NOT NULL AND l.id IS NULL GROUP BY sm.to_location_id
+    ) SELECT locationId,SUM(balanceUnits) AS balanceUnits,SUM(balanceRows) AS balanceRows,SUM(movementRows) AS movementRows FROM referenced GROUP BY locationId ORDER BY locationId`);
+  const filteredTotalPromise = (async () => {
+    if (!term && !status && scope !== "customer-invoices") return null;
+    let total: { count: number } | null = null;
+    if (["purchase-orders", "expected-receipts", "vendor-returns"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id WHERE (?='' OR po.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.project_reference,'') LIKE ? ESCAPE '\\' OR COALESCE(po.supplier_quote_number,'') LIKE ? ESCAPE '\\' OR COALESCE(po.supplier_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR po.lifecycle_status=?)${purchaseWorklistFilter("po")}`, term, like, like, like, like, like, purchaseStatus, purchaseStatus);
+    else if (["sales-orders", "fulfillment", "customer-returns", "customer-invoices"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id WHERE (?='' OR so.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(so.project_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR so.lifecycle_status=?)${salesWorklistFilter("so")}`, term, like, like, like, salesStatus, salesStatus);
+    else if (scope === "counts") total = await first<{ count: number }>(`SELECT COUNT(*) AS count ${countBalanceFrom}`, ...countBalanceBindings);
+    else if (["stock", "products"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM products p WHERE p.active=1 AND (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(p.manufacturer_sku,'') LIKE ? ESCAPE '\\' OR p.dimensions LIKE ? ESCAPE '\\' OR p.material LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM product_aliases pa WHERE pa.product_id=p.id AND pa.alias LIKE ? ESCAPE '\\')) AND (?='' OR p.inventory_policy=? OR p.tracking_policy=?)`, term, like, like, like, like, like, like, productStatus, productStatus, productStatus);
+    else if (scope === "movements") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM stock_movements sm JOIN products p ON p.id=sm.product_id LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id WHERE (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(sm.source_document_id,'') LIKE ? ESCAPE '\\' OR COALESCE(${movementDocumentNumber("sm")},'') LIKE ? ESCAPE '\\' OR COALESCE(${movementRelatedOrderNumber("sm")},'') LIKE ? ESCAPE '\\' OR COALESCE(fl.code,'') LIKE ? ESCAPE '\\' OR COALESCE(tl.code,'') LIKE ? ESCAPE '\\' OR sm.posted_by LIKE ? ESCAPE '\\') AND (?='' OR sm.movement_type=?)`, term, like, like, like, like, like, like, like, like, movementStatus, movementStatus);
+    else if (scope === "partners") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM business_partners WHERE active=1 AND (?='' OR code LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR COALESCE(email,'') LIKE ? ESCAPE '\\' OR COALESCE(city,'') LIKE ? ESCAPE '\\' OR COALESCE(postal_code,'') LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM master_record_merges mr WHERE mr.entity_type='business_partner' AND mr.target_id=business_partners.id AND mr.source_label LIKE ? ESCAPE '\\')) AND (?='' OR partner_type=? OR partner_type='both')`, term, like, like, like, like, like, like, status, status);
+    else if (scope === "vendor-bills") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id WHERE (?='' OR vb.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.number,'') LIKE ? ESCAPE '\\' OR vb.vendor_invoice_number LIKE ? ESCAPE '\\') AND (?='' OR vb.status=? OR vb.match_status=?)${billWorklistFilter('vb')}`, term, like, like, like, like, billStatus, billStatus, billStatus);
+    return total ? Number(total.count) : null;
+  })();
+  const [purchaseLines, salesLines, inventoryBalances, taxDefault, reorderRule, orphanedLocations, filteredTotal] = await Promise.all([
     needs("purchaseLines") && purchaseOrderIds.length ? all<Record<string, unknown>>(`SELECT pol.id, pol.purchase_order_id AS purchaseOrderId, pol.product_id AS productId,
       p.sku, p.name AS productName, pol.ordered_qty AS orderedQuantity, pol.closed_qty AS closedWithoutReceiptQuantity,pol.version,
       pol.ordered_uom_id AS orderedUomId,pol.ordered_uom_qty AS orderedUomQuantity,pol.ordered_uom_unit_cost_cents AS orderedUomUnitCostCents,ou.code AS orderedUomCode,
@@ -3651,13 +3736,9 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       LEFT JOIN product_available pa ON pa.product_id=sol.product_id
       WHERE sol.sales_order_id IN (SELECT value FROM json_each(?))
       GROUP BY sol.id ORDER BY sol.id LIMIT ?`, JSON.stringify(salesOrderIds), childLimit) : salesLineRows,
-  ]);
-
-  // Balance rows must follow the product ids chosen by the fully sorted product page. Repeating
-  // only the old name/SKU sort here attached balances from a different page after sorting by
-  // quantity, margin, policy, or any other visible catalog column.
-  const visibleProductIds = products.map((product) => String(product.id)).filter(Boolean);
-  const inventoryBalances = needs("inventoryBalances") && visibleProductIds.length ? await all<Record<string, unknown>>(`SELECT ib.product_id AS productId, ib.location_id AS locationId,
+    // Balance rows follow the ids chosen by the fully sorted product page. Run this alongside
+    // child rows and other independent reads instead of adding another database round trip.
+    needs("inventoryBalances") && visibleProductIds.length ? all<Record<string, unknown>>(`SELECT ib.product_id AS productId, ib.location_id AS locationId,
       ib.on_hand_qty AS recordedQuantity, ib.reserved_qty AS reservedQuantity, ib.version,
       l.code AS locationCode, l.name AS locationName, l.inventory_status AS inventoryStatus,
       w.id AS warehouseId, w.code AS warehouseCode, w.name AS warehouseName
@@ -3665,7 +3746,12 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       JOIN warehouses w ON w.id=l.warehouse_id
       WHERE l.active=1 AND w.active=1 AND (?='' OR w.id=?)
         AND ib.product_id IN (SELECT value FROM json_each(?))
-      ORDER BY w.code,l.code,ib.product_id`, warehouseScope, warehouseScope, JSON.stringify(visibleProductIds)) : inventoryBalanceRows;
+      ORDER BY w.code,l.code,ib.product_id`, warehouseScope, warehouseScope, JSON.stringify(visibleProductIds)) : inventoryBalanceRows,
+    taxDefaultPromise,
+    reorderRulePromise,
+    orphanedLocationsPromise,
+    filteredTotalPromise,
+  ]);
 
   const linesByPo = new Map<string, Array<Record<string, unknown>>>();
   purchaseLines.forEach((line) => {
@@ -3682,7 +3768,6 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
 
   const numeric = (value: unknown) => Number(value ?? 0);
   const summary = Object.fromEntries(Object.entries(aggregate ?? {}).map(([key,value])=>[key,numeric(value)]));
-  const taxDefault = await first<{ valueJson: string }>("SELECT value_json AS valueJson FROM system_settings WHERE key='tax.defaultRateBps'");
   let taxDefaultRateBps = 500;
   if (taxDefault) {
     try {
@@ -3690,29 +3775,16 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
       if (Number.isInteger(parsed) && Number(parsed) >= 0 && Number(parsed) <= 10_000) taxDefaultRateBps = Number(parsed);
     } catch { throw new DomainError("POLICY_CONFIGURATION_ERROR", "Default tax policy is invalid.", 500); }
   }
-  const orphanedLocations = await all<Record<string, unknown>>(`WITH referenced AS (
-      SELECT ib.location_id AS locationId,SUM(ib.on_hand_qty) AS balanceUnits,COUNT(*) AS balanceRows,0 AS movementRows FROM inventory_balances ib LEFT JOIN locations l ON l.id=ib.location_id WHERE l.id IS NULL GROUP BY ib.location_id
-      UNION ALL
-      SELECT sm.from_location_id,0,0,COUNT(*) FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.from_location_id WHERE sm.from_location_id IS NOT NULL AND l.id IS NULL GROUP BY sm.from_location_id
-      UNION ALL
-      SELECT sm.to_location_id,0,0,COUNT(*) FROM stock_movements sm LEFT JOIN locations l ON l.id=sm.to_location_id WHERE sm.to_location_id IS NOT NULL AND l.id IS NULL GROUP BY sm.to_location_id
-    ) SELECT locationId,SUM(balanceUnits) AS balanceUnits,SUM(balanceRows) AS balanceRows,SUM(movementRows) AS movementRows FROM referenced GROUP BY locationId ORDER BY locationId`);
-  let filteredTotal: number | null = null;
-  if (term || status || scope === "customer-invoices") {
-    let total: { count: number } | null = null;
-    if (["purchase-orders", "expected-receipts", "vendor-returns"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id WHERE (?='' OR po.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.project_reference,'') LIKE ? ESCAPE '\\' OR COALESCE(po.supplier_quote_number,'') LIKE ? ESCAPE '\\' OR COALESCE(po.supplier_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR po.lifecycle_status=?)${purchaseWorklistFilter("po")}`, term, like, like, like, like, like, purchaseStatus, purchaseStatus);
-    else if (["sales-orders", "fulfillment", "customer-returns", "customer-invoices"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id WHERE (?='' OR so.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(so.project_reference,'') LIKE ? ESCAPE '\\') AND (?='' OR so.lifecycle_status=?)${salesWorklistFilter("so")}`, term, like, like, like, salesStatus, salesStatus);
-    else if (scope === "counts") total = await first<{ count: number }>(`SELECT COUNT(*) AS count ${countBalanceFrom}`, ...countBalanceBindings);
-    else if (["stock", "products"].includes(scope)) total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM products p WHERE p.active=1 AND (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(p.manufacturer_sku,'') LIKE ? ESCAPE '\\' OR p.dimensions LIKE ? ESCAPE '\\' OR p.material LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM product_aliases pa WHERE pa.product_id=p.id AND pa.alias LIKE ? ESCAPE '\\')) AND (?='' OR p.inventory_policy=? OR p.tracking_policy=?)`, term, like, like, like, like, like, like, productStatus, productStatus, productStatus);
-    else if (scope === "movements") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM stock_movements sm JOIN products p ON p.id=sm.product_id LEFT JOIN locations fl ON fl.id=sm.from_location_id LEFT JOIN locations tl ON tl.id=sm.to_location_id WHERE (?='' OR p.sku LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\' OR COALESCE(sm.source_document_id,'') LIKE ? ESCAPE '\\' OR COALESCE(${movementDocumentNumber("sm")},'') LIKE ? ESCAPE '\\' OR COALESCE(${movementRelatedOrderNumber("sm")},'') LIKE ? ESCAPE '\\' OR COALESCE(fl.code,'') LIKE ? ESCAPE '\\' OR COALESCE(tl.code,'') LIKE ? ESCAPE '\\' OR sm.posted_by LIKE ? ESCAPE '\\') AND (?='' OR sm.movement_type=?)`, term, like, like, like, like, like, like, like, like, movementStatus, movementStatus);
-    else if (scope === "partners") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM business_partners WHERE active=1 AND (?='' OR code LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR COALESCE(email,'') LIKE ? ESCAPE '\\' OR COALESCE(city,'') LIKE ? ESCAPE '\\' OR COALESCE(postal_code,'') LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM master_record_merges mr WHERE mr.entity_type='business_partner' AND mr.target_id=business_partners.id AND mr.source_label LIKE ? ESCAPE '\\')) AND (?='' OR partner_type=? OR partner_type='both')`, term, like, like, like, like, like, like, status, status);
-    else if (scope === "vendor-bills") total = await first<{ count: number }>(`SELECT COUNT(*) AS count FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id WHERE (?='' OR vb.number LIKE ? ESCAPE '\\' OR bp.name LIKE ? ESCAPE '\\' OR COALESCE(po.number,'') LIKE ? ESCAPE '\\' OR vb.vendor_invoice_number LIKE ? ESCAPE '\\') AND (?='' OR vb.status=? OR vb.match_status=?)${billWorklistFilter('vb')}`, term, like, like, like, like, billStatus, billStatus, billStatus);
-    filteredTotal = total ? Number(total.count) : null;
+  let reorderPointPercent = 70;
+  if (reorderRule) {
+    try {
+      const parsed = JSON.parse(reorderRule.valueJson) as { percent?: unknown };
+      if (typeof parsed.percent === "number" && Number.isFinite(parsed.percent) && parsed.percent > 0 && parsed.percent <= 100) reorderPointPercent = parsed.percent;
+    } catch { throw new DomainError("POLICY_CONFIGURATION_ERROR", "Reorder point policy is invalid.", 500); }
   }
-
   return {
     generatedAt: new Date().toISOString(),
-    configuration: { taxDefaultRateBps },
+    configuration: { taxDefaultRateBps, reorderPointPercent },
     summary,
     purchaseOrders,
     products,
@@ -4024,6 +4096,7 @@ export async function searchInventoryReferences(kind: ReferenceLookup, search = 
     // the branch can actually supply the line before committing to it.
     const items = await all<Record<string, unknown>>(`SELECT p.id,p.sku,p.manufacturer_sku AS manufacturerSku,p.name,p.category,p.material,p.dimensions,p.finish,
       p.tracking_policy AS trackingPolicy,p.inventory_policy AS inventoryPolicy,p.reorder_point AS reorderPoint,p.max_stock_level AS maxStockLevel,
+      p.reorder_rule_mode AS reorderRuleMode,p.reorder_rule_percent AS reorderRulePercent,
       p.selling_price_cents AS sellingPriceCents,p.standard_cost_cents AS standardCostCents,p.last_unit_cost_cents AS lastUnitCostCents,
       p.last_unit_cost_source_po_id AS lastUnitCostSourcePoId,p.last_unit_cost_at AS lastUnitCostAt,p.suggested_selling_price_cents AS suggestedSellingPriceCents,
       p.pricing_mode AS pricingMode,p.applied_margin_rule_id AS appliedMarginRuleId,
