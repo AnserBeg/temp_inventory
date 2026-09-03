@@ -66,6 +66,12 @@ Configure one or both OAuth providers and a dedicated encryption secret of at le
 
 For production, each redirect URI must be the exact public URL ending in `/api/integrations/email/callback/google` or `/api/integrations/email/callback/microsoft`.
 
+In the app, open the account menu and choose **Email sending**:
+
+- A company administrator can connect one **Company email**. It becomes the default sender for everyone in that company.
+- Any user can optionally connect **My email**. When both are available, the send dialog offers a small **From** choice; otherwise it uses the only available sender automatically.
+- Connections use the provider's sign-in page. PaneFlow never asks users to enter or store an email password.
+
 ## Helcim customer payments
 
 PaneFlow owns the customer invoice and payment ledger. Helcim provides the PCI-scoped checkout, processor transaction, and settlement state; it does not replace the PaneFlow invoice or write accounting entries directly to QBO. Accounting users can create a payment link from an open customer invoice, and invoice emails automatically include one while Helcim is configured. By default, that button opens Helcim's public Online Invoice View, which keeps a private PaneFlow deployment private. PaneFlow polls invoice-linked card and ACH transactions every five minutes so a private deployment does not depend on externally delivered webhooks. An optional embedded mode renders HelcimPay.js on a separately public HTTPS PaneFlow checkout origin. In both modes, card numbers and bank credentials never pass through PaneFlow.

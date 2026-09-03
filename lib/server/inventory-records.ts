@@ -69,6 +69,10 @@ export type CreateOrderInput = {
    * checking that the actor can both author and approve the document.
    */
   fastTrackApprovalReason?: string;
+  /** Internal recipient copied from the tenant's draft-approval notification setting. */
+  approvalNotificationEmail?: string;
+  /** Trusted application origin used to build a direct purchase-order link. */
+  appOrigin?: string;
 };
 
 type CreateOrderResult = {
@@ -538,6 +542,21 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
       SELECT ?,?,?,?,?,'pending',0,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(newId("outbox"), fastTrack ? input.type === "purchaseOrder" ? "purchase_order.approved" : "sales_order.confirmed" : input.type === "purchaseOrder" ? "purchase_order.draft_created" : "sales_order.draft_created", input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, JSON.stringify({ recordId, itemCount: items.length, totalCents, fastTrack }), now, now, idempotencyKey, recordId, claimToken)
   );
+  if (input.type === "purchaseOrder" && !fastTrack) {
+    const recipient = typeof input.approvalNotificationEmail === "string" ? input.approvalNotificationEmail.trim().toLowerCase() : "";
+    let appOrigin = "";
+    try {
+      const origin = new URL(typeof input.appOrigin === "string" ? input.appOrigin : "");
+      if (/^https?:$/u.test(origin.protocol)) appOrigin = origin.origin;
+    } catch { /* A missing request origin must not prevent the purchase order from being saved. */ }
+    if (recipient.length <= 254 && /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/u.test(recipient) && appOrigin) {
+      statements.push(db.prepare(`INSERT INTO outbox_events
+        (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
+        SELECT ?,'purchase_order.draft_approval_email_requested','purchase_order',?,?,'pending',0,?,?
+        WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(newId("outbox"), recordId, JSON.stringify({ recordId, number: result.number, recipient, appOrigin }), now, now, idempotencyKey, recordId, claimToken));
+    }
+  }
 
   await db.batch(statements);
   const committed = await replay(idempotencyKey, requestHash);

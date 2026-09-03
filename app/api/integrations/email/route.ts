@@ -1,5 +1,5 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
-import { disconnectEmail, EmailConfigurationError, EmailProviderError, getEmailConnectionState, listRecentEmailDeliveries } from "@/lib/server/email-client";
+import { disconnectEmail, EmailConfigurationError, EmailProviderError, getEmailConnectionState, listRecentEmailDeliveries, setPurchaseOrderApprovalEmail } from "@/lib/server/email-client";
 import type { EmailSenderType } from "@/lib/server/email-types";
 
 function errorResponse(error: unknown) {
@@ -26,5 +26,16 @@ export async function DELETE(request: Request) {
     const senderType = (new URL(request.url).searchParams.get("sender") ?? "personal") as EmailSenderType;
     if (!["company", "personal"].includes(senderType)) return Response.json({ error: { code: "INVALID_EMAIL_SENDER", message: "sender must be company or personal." } }, { status: 400 });
     return Response.json(await disconnectEmail(actor, senderType));
+  } catch (error) { return errorResponse(error); }
+}
+
+export async function PATCH(request: Request) {
+  try {
+    const actor = await resolveActor(request); requireCapability(actor, "read");
+    const input = await request.json() as { purchaseOrderApprovalEmail?: unknown };
+    if (typeof input.purchaseOrderApprovalEmail !== "string") {
+      return Response.json({ error: { code: "INVALID_APPROVAL_EMAIL", message: "purchaseOrderApprovalEmail must be a string." } }, { status: 400 });
+    }
+    return Response.json(await setPurchaseOrderApprovalEmail(actor, input.purchaseOrderApprovalEmail));
   } catch (error) { return errorResponse(error); }
 }

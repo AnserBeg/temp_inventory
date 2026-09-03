@@ -765,6 +765,10 @@ test("authorized authors can atomically fast-track orders and vendor bills", asy
   assert.match(vendorBill.message, /approved by its author/);
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,match_status,approved_by,hold_reason FROM vendor_bills WHERE id=?").get(vendorBill.recordId) }, { status: "approved", match_status: "approved_variance", approved_by: manager.label, hold_reason: null });
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,request_type,decided_by FROM approvals WHERE entity_id=?").get(vendorBill.recordId) }, { status: "approved", request_type: "vendor_bill_match_exception", decided_by: manager.label });
+  const purchaseJourney = await inventoryDomain.getInventorySnapshot({ scope: "purchase-orders", search: "PO-FAST-BILL", page: 1, pageSize: 10 });
+  const connectedBills = JSON.parse(purchaseJourney.purchaseOrders[0].vendorBillsJson);
+  assert.equal(connectedBills.length, 1);
+  assert.deepEqual({ id: connectedBills[0].id, externalReference: connectedBills[0].externalReference, amountCents: connectedBills[0].amountCents }, { id: vendorBill.recordId, externalReference: "FAST-BILL-001", amountCents: 10000 });
 });
 
 test("approved PO cost drives the margin matrix while manual prices and contract prices remain controlled", async () => {
@@ -940,6 +944,11 @@ test("immediate sale ships free stock and posts the customer invoice atomically 
   assert.equal(db.sqlite.prepare("SELECT remaining_qty FROM cost_layers WHERE id='layer-immediate'").get().remaining_qty, 1);
   assert.deepEqual({ ...db.sqlite.prepare("SELECT billing_status,version FROM sales_orders WHERE id='so-immediate'").get() }, { billing_status: "invoiced", version: 2 });
   assert.deepEqual(db.sqlite.prepare("SELECT event_type FROM outbox_events WHERE aggregate_id IN (?,?) ORDER BY event_type").all(result.shipmentId, result.invoiceId).map((row) => row.event_type), ["customer_invoice.posted", "inventory.shipment_posted"]);
+  const salesJourney = await inventoryDomain.getInventorySnapshot({ scope: "sales-orders", search: "SO-IMMEDIATE", page: 1, pageSize: 10 });
+  const connectedInvoices = JSON.parse(salesJourney.salesOrders[0].customerInvoicesJson);
+  const connectedShipments = JSON.parse(salesJourney.salesOrders[0].shipmentsJson);
+  assert.deepEqual({ number: connectedInvoices[0].number, amountCents: connectedInvoices[0].amountCents }, { number: result.invoiceNumber, amountCents: 2205 });
+  assert.deepEqual({ number: connectedShipments[0].number, trackingNumber: connectedShipments[0].trackingNumber }, { number: result.shipmentNumber, trackingNumber: "PICKUP-42" });
 
   const repeated = await inventoryDomain.executeInventoryCommand(command);
   assert.equal(repeated.invoiceId, result.invoiceId);

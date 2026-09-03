@@ -17,6 +17,8 @@ export type WorkflowCommand = {
   actor: ActorIdentity;
   claimToken?: string;
   requestHash?: string;
+  /** Trusted request origin used only for links in server-generated notifications. */
+  appOrigin?: string;
 };
 
 export class WorkflowError extends Error {
@@ -334,6 +336,9 @@ async function createDraft(command: WorkflowCommand, type: "purchaseOrder" | "sa
   const payload = command.payload ?? {};
   if (fastTrack) assertFastTrackAuthority(command, "operationalWrite");
   const fastTrackApprovalReason = fastTrack ? textValue(payload, "approvalReason") : undefined;
+  const approvalNotificationEmail = type === "purchaseOrder" && !fastTrack
+    ? await setting<string>("email.purchaseOrderApprovalRecipient", "")
+    : "";
   try {
     return await createOrderRecord({
       ...(payload as Omit<CreateOrderInput, "type" | "idempotencyKey">),
@@ -344,6 +349,8 @@ async function createDraft(command: WorkflowCommand, type: "purchaseOrder" | "sa
       actorEmail: command.actor.email,
       requestHash: command.requestHash,
       fastTrackApprovalReason,
+      approvalNotificationEmail,
+      appOrigin: command.appOrigin,
     } as CreateOrderInput);
   } catch (error) {
     if (error instanceof RecordValidationError) throw new WorkflowError(error.code, error.message, error.status);

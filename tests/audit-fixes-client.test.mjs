@@ -168,7 +168,8 @@ test("counter sale keeps its idempotency key through a conflict (review item 7)"
 
 test("posted customer invoices expose their printable document", () => {
   assert.match(sources.suite, /recordHref=\{\(record\) => `\/api\/documents\/pdf\?documentType=customer_invoice&documentId=\$\{encodeURIComponent\(record\.id\)\}`\}/);
-  assert.match(sources.suite, /title=\{`Open \$\{record\.number\} PDF`\}/);
+  assert.match(sources.suite, /title=\{`Download \$\{record\.number\} as a PDF`\}/);
+  assert.match(sources.suite, /<DocumentDownloadLink documentType="customer_invoice"/);
   assert.match(sources.suite, /Paid invoices remain here as completed records\./);
 });
 
@@ -196,6 +197,20 @@ test("core workflows show their cross-page handoffs and continue after invoice p
   assert.match(sources.app, /aria-current=\{index === active \? "step" : undefined\}/);
   assert.match(sources.suite, /if \(kind === "createCustomerInvoice"\) selectTab\("billing-actions"\);/);
   assert.match(sources.css, /\.process-guide li\.current/);
+});
+
+test("each order keeps its connected documents and next action in one progression", () => {
+  assert.match(sources.app, /function RecordProgress/);
+  assert.match(sources.app, /Purchase to payment for \$\{po\.number\}/);
+  assert.match(sources.app, /Order to cash for \$\{so\.number\}/);
+  assert.match(sources.app, /Connected documents and the next action stay with this order\./);
+  assert.match(sources.app, /parsePurchaseReceipts\(item\.receiptsJson\)/);
+  assert.match(sources.app, /parseFinancialDocuments\(item\.vendorBillsJson\)/);
+  assert.match(sources.app, /parseFinancialDocuments\(item\.customerInvoicesJson\)/);
+  assert.match(sources.app, /parseSettlementDocuments\(item\.vendorSettlementsJson\)/);
+  assert.match(sources.app, /parseSettlementDocuments\(item\.customerSettlementsJson\)/);
+  assert.match(sources.suite, /filterWorkflowState\(state, filterReference\)/);
+  assert.match(sources.css, /\.record-next-action/);
 });
 
 test("required operational choices are visible before posting", () => {

@@ -8,6 +8,8 @@ import { D1SqliteDatabase } from "./d1-sqlite.mjs";
 const db = new D1SqliteDatabase();
 let emailClient;
 let documentEmail;
+let advancedDomain;
+let outbox;
 
 async function applyMigrations() {
   const directory = new URL("../drizzle/", import.meta.url);
@@ -38,6 +40,8 @@ before(async () => {
   env.EMAIL_MICROSOFT_REDIRECT_URI = "https://paneflow.example.test/api/integrations/email/callback/microsoft";
   emailClient = await import("../lib/server/email-client.ts");
   documentEmail = await import("../lib/server/document-email.ts");
+  advancedDomain = await import("../lib/server/advanced-domain.ts");
+  outbox = await import("../lib/server/outbox.ts");
 
   await run("INSERT INTO app_users (user_id,email,full_name,role,active,created_at,updated_at) VALUES (?,?,?,?,1,?,?)", operator.id, operator.email, operator.name, operator.role, now, now);
   await run("INSERT INTO app_users (user_id,email,full_name,role,active,created_at,updated_at) VALUES (?,?,?,?,1,?,?)", accountant.id, accountant.email, accountant.name, accountant.role, now, now);
@@ -56,9 +60,11 @@ before(async () => {
 
 after(() => db.close());
 
-test("email migration creates constrained per-user connections and delivery history", () => {
+test("email migration creates constrained sender connections and delivery history", () => {
   const tables = db.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('email_connections','email_oauth_states','document_email_deliveries') ORDER BY name").all().map((row) => row.name);
   assert.deepEqual(tables, ["document_email_deliveries", "email_connections", "email_oauth_states"]);
+  assert.ok(db.sqlite.prepare("PRAGMA table_info(email_oauth_states)").all().some((column) => column.name === "connection_type"));
+  assert.ok(db.sqlite.prepare("PRAGMA table_info(document_email_deliveries)").all().some((column) => column.name === "sender_type"));
   assert.throws(() => db.sqlite.prepare("INSERT INTO email_connections (user_id,provider,email_address,status,scopes,encrypted_access_token,encrypted_refresh_token,access_token_expires_at,connected_at,updated_at) VALUES ('bad','imap','bad@example.test','connected','send','a','b','2099-01-01','2026-01-01','2026-01-01')").run(), /CHECK constraint failed/);
 });
 
@@ -100,12 +106,24 @@ test("authoritative previews default to partner email and reject unapproved docu
   const po = await documentEmail.getDocumentEmailPreview("purchase_order", "email-po");
   assert.equal(po.defaultRecipient, "vendor@example.test");
   assert.equal(po.fileName, "PO-EMAIL.pdf");
+  const purchaseOrderPdf = await documentEmail.getDocumentPdf("purchase_order", "email-po");
+  const purchaseOrderSource = Buffer.from(purchaseOrderPdf.body).toString("latin1");
+  assert.match(purchaseOrderSource, /PURCHASE ORDER/);
+  assert.match(purchaseOrderSource, /ITEM \/ DESCRIPTION/);
+  assert.match(purchaseOrderSource, /ITEMS SUBTOTAL/);
+  const salesOrderPdf = await documentEmail.getDocumentPdf("sales_order", "email-so");
+  const salesOrderSource = Buffer.from(salesOrderPdf.body).toString("latin1");
+  assert.match(salesOrderSource, /SALES ORDER/);
+  assert.match(salesOrderSource, /CUSTOMER \/ SHIP TO/);
   const invoice = await documentEmail.getDocumentEmailPreview("customer_invoice", "email-invoice");
   assert.equal(invoice.defaultRecipient, "customer@example.test");
   await run("UPDATE customer_invoices SET status='paid',paid_cents=total_cents WHERE id='email-invoice'");
   const printable = await documentEmail.getDocumentPdf("customer_invoice", "email-invoice");
   assert.equal(printable.fileName, "INV-EMAIL.pdf");
   assert.match(Buffer.from(printable.body).subarray(0, 12).toString("ascii"), /^%PDF-1\.4/);
+  const invoiceSource = Buffer.from(printable.body).toString("latin1");
+  assert.match(invoiceSource, /BALANCE DUE/);
+  assert.match(invoiceSource, /Page 1 of 1/);
   const vendorBill = await documentEmail.getDocumentPdf("vendor_bill", "email-bill");
   assert.equal(vendorBill.fileName, "VB-EMAIL.pdf");
   assert.match(Buffer.from(vendorBill.body).subarray(0, 12).toString("ascii"), /^%PDF-1\.4/);
@@ -192,5 +210,95 @@ test("recipient validation rejects header injection and records provider failure
       documentType: "sales_order", documentId: "email-so", recipients: ["customer@example.test"], subject: "SO-EMAIL", message: "Attached",
     }), /Gmail send failed/);
     assert.equal(db.sqlite.prepare("SELECT status FROM document_email_deliveries WHERE document_id='email-so' ORDER BY created_at DESC LIMIT 1").get().status, "failed");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("an administrator can connect one company sender that is the simple default for every user", async () => {
+  await assert.rejects(
+    emailClient.createEmailAuthorizationUrl(operator, "https://paneflow.example.test/api/integrations/email/connect", { provider: "google", senderType: "company" }),
+    /Only a company administrator/,
+  );
+  const administrator = { ...operator, role: "administrator" };
+  const authorization = await emailClient.createEmailAuthorizationUrl(administrator, "https://paneflow.example.test/api/integrations/email/connect", {
+    provider: "google", senderType: "company", returnTo: "/?view=sales-orders",
+  });
+  const authorizationUrl = new URL(authorization.authorizationUrl);
+  assert.equal(authorizationUrl.searchParams.has("login_hint"), false);
+  const state = authorizationUrl.searchParams.get("state");
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (input, init = {}) => {
+      const target = String(input);
+      if (target === "https://oauth2.googleapis.com/token") return Response.json({ access_token: "company-access", refresh_token: "company-refresh", expires_in: 3600, scope: "gmail.send" });
+      if (target.includes("/oauth2/v3/userinfo")) return Response.json({ email: "office@paneflow.test" });
+      if (target.includes("gmail.googleapis.com")) {
+        assert.equal(init.headers.authorization, "Bearer company-access");
+        return Response.json({ id: "gmail-company-message" });
+      }
+      throw new Error(`Unexpected company email request ${target}`);
+    };
+    const completed = await emailClient.completeEmailAuthorization("https://paneflow.example.test/api/integrations/email/callback/google", { provider: "google", state, code: "company-code" });
+    assert.equal(completed.senderType, "company");
+    const connectionState = await emailClient.getEmailConnectionState(accountant, "https://paneflow.example.test/");
+    assert.equal(connectionState.companyConnection.emailAddress, "office@paneflow.test");
+    assert.equal(connectionState.personalConnection.emailAddress, "accountant-mailbox@example.test");
+    assert.equal(connectionState.defaultSender, "company");
+    assert.equal(connectionState.connection.emailAddress, "office@paneflow.test");
+
+    const sent = await documentEmail.sendDocumentEmail(operator, {
+      documentType: "sales_order", documentId: "email-so", recipients: ["customer@example.test"], subject: "SO-EMAIL", message: "Attached",
+    });
+    assert.equal(sent.senderType, "company");
+    assert.equal(sent.senderEmail, "office@paneflow.test");
+    const delivery = db.sqlite.prepare("SELECT sender_type AS senderType,sender_email AS senderEmail FROM document_email_deliveries WHERE id=?").get(sent.deliveryId);
+    assert.equal(delivery.senderType, "company");
+    assert.equal(delivery.senderEmail, "office@paneflow.test");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("new draft purchase orders email the configured approver with a direct link", async () => {
+  const administrator = { ...operator, role: "administrator" };
+  await emailClient.setPurchaseOrderApprovalEmail(administrator, " APPROVALS@PANEFLOW.TEST ");
+  const connectionState = await emailClient.getEmailConnectionState(operator, "https://paneflow.example.test/");
+  assert.equal(connectionState.purchaseOrderApprovalEmail, "approvals@paneflow.test");
+
+  const created = await advancedDomain.executeWorkflow({
+    command: "createPurchaseOrderDraft",
+    idempotencyKey: "email-draft-po-alert",
+    actor: operator,
+    appOrigin: "https://paneflow.example.test",
+    payload: {
+      vendorId: "email-vendor",
+      expectedDate: "2026-09-12",
+      lines: [{ productId: "email-product", quantity: 1, unitCostCents: 10000 }],
+    },
+  });
+  const queued = db.sqlite.prepare("SELECT id,status,payload_json AS payload FROM outbox_events WHERE event_type='purchase_order.draft_approval_email_requested' AND aggregate_id=?").get(created.recordId);
+  assert.equal(queued.status, "pending");
+  assert.equal(JSON.parse(queued.payload).recipient, "approvals@paneflow.test");
+
+  const originalFetch = globalThis.fetch;
+  let gmailRaw = "";
+  try {
+    globalThis.fetch = async (input, init = {}) => {
+      const target = String(input);
+      if (target.includes("gmail.googleapis.com")) {
+        assert.equal(init.headers.authorization, "Bearer company-access");
+        gmailRaw = JSON.parse(String(init.body)).raw;
+        return Response.json({ id: "gmail-draft-po-alert" });
+      }
+      throw new Error(`Unexpected draft alert request ${target}`);
+    };
+    const processed = await outbox.processOutboxBatch({ limit: 10 });
+    assert.equal(processed.failed, 0);
+    const normalized = gmailRaw.replaceAll("-", "+").replaceAll("_", "/");
+    const mime = Buffer.from(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="), "base64").toString("utf8");
+    assert.doesNotMatch(mime, /application\/pdf/);
+    const encodedHtml = mime.split("\r\n\r\n")[1].replace(/\s/gu, "");
+    const html = Buffer.from(encodedHtml, "base64").toString("utf8");
+    assert.match(html, /requires approval/);
+    assert.match(html, new RegExp(`po=${created.recordId}`));
+    assert.match(html, /view=purchase-orders/);
+    assert.equal(db.sqlite.prepare("SELECT status FROM outbox_events WHERE id=?").get(queued.id).status, "processed");
   } finally { globalThis.fetch = originalFetch; }
 });

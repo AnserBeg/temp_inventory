@@ -2,6 +2,7 @@ import type { ActorIdentity, AppCapability } from "./auth";
 import { all, first, getD1 } from "./inventory-db";
 import { getEmailSender, sendWithConnectedMailbox } from "./email-client";
 import { maybeCreateInvoicePaymentLink } from "./helcim-payments";
+import { currentTenant } from "./tenancy";
 import type { DocumentEmailPreview, EmailDocumentType, EmailSenderType, PrintableDocumentType } from "./email-types";
 
 type DocumentHeader = {
@@ -10,14 +11,18 @@ type DocumentHeader = {
   status: string;
   partyName: string;
   partyEmail: string | null;
+  partyPhone: string | null;
   currency: string;
   totalCents: number;
   subtotalCents: number | null;
   taxCents: number | null;
+  paidCents: number | null;
+  creditedCents: number | null;
   documentDate: string;
   dueOrExpectedDate: string | null;
   paymentTerms: string | null;
   reference: string | null;
+  preparedBy: string | null;
   supplierQuoteNumber: string | null;
   supplierReference: string | null;
   addressLine1: string | null;
@@ -67,17 +72,17 @@ export function isPrintableDocumentType(value: string): value is PrintableDocume
 async function documentHeader(type: PrintableDocumentType, id: string) {
   if (type === "purchase_order") {
     return first<DocumentHeader>(`SELECT po.id,po.number,po.lifecycle_status AS status,bp.name AS partyName,bp.email AS partyEmail,
-      po.currency,po.total_cents AS totalCents,NULL AS subtotalCents,NULL AS taxCents,substr(po.created_at,1,10) AS documentDate,
+      bp.phone AS partyPhone,po.currency,po.total_cents AS totalCents,NULL AS subtotalCents,NULL AS taxCents,NULL AS paidCents,NULL AS creditedCents,substr(po.created_at,1,10) AS documentDate,
       po.expected_date AS dueOrExpectedDate,po.payment_terms AS paymentTerms,po.project_reference AS reference,
-      po.supplier_quote_number AS supplierQuoteNumber,po.supplier_reference AS supplierReference,
+      po.buyer_name AS preparedBy,po.supplier_quote_number AS supplierQuoteNumber,po.supplier_reference AS supplierReference,
       bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
       FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id WHERE po.id=? LIMIT 1`, id);
   }
   if (type === "sales_order") {
     return first<DocumentHeader>(`SELECT so.id,so.number,so.lifecycle_status AS status,bp.name AS partyName,bp.email AS partyEmail,
-      so.currency,so.total_cents AS totalCents,NULL AS subtotalCents,NULL AS taxCents,substr(so.created_at,1,10) AS documentDate,
+      bp.phone AS partyPhone,so.currency,so.total_cents AS totalCents,NULL AS subtotalCents,NULL AS taxCents,NULL AS paidCents,NULL AS creditedCents,substr(so.created_at,1,10) AS documentDate,
       so.requested_date AS dueOrExpectedDate,so.payment_terms AS paymentTerms,so.project_reference AS reference,
-      NULL AS supplierQuoteNumber,NULL AS supplierReference,
+      so.owner_name AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,
       COALESCE(so.ship_to_address_line_1,bp.address_line_1) AS addressLine1,COALESCE(so.ship_to_address_line_2,bp.address_line_2) AS addressLine2,
       COALESCE(so.ship_to_city,bp.city) AS city,COALESCE(so.ship_to_region,bp.region) AS region,
       COALESCE(so.ship_to_postal_code,bp.postal_code) AS postalCode,COALESCE(so.ship_to_country,bp.country) AS country
@@ -85,17 +90,19 @@ async function documentHeader(type: PrintableDocumentType, id: string) {
   }
   if (type === "vendor_bill") {
     return first<DocumentHeader>(`SELECT vb.id,vb.number,vb.status,bp.name AS partyName,bp.email AS partyEmail,
-      vb.currency,vb.total_cents AS totalCents,vb.subtotal_cents AS subtotalCents,vb.tax_cents AS taxCents,
+      bp.phone AS partyPhone,vb.currency,vb.total_cents AS totalCents,vb.subtotal_cents AS subtotalCents,vb.tax_cents AS taxCents,
+      vb.paid_cents AS paidCents,COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted'),0) AS creditedCents,
       vb.invoice_date AS documentDate,vb.due_date AS dueOrExpectedDate,vb.payment_terms AS paymentTerms,po.number AS reference,
-      NULL AS supplierQuoteNumber,NULL AS supplierReference,
+      vb.approved_by AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,
       bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
       FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id
       LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id WHERE vb.id=? LIMIT 1`, id);
   }
   return first<DocumentHeader>(`SELECT ci.id,ci.number,ci.status,bp.name AS partyName,bp.email AS partyEmail,
-    ci.currency,ci.total_cents AS totalCents,ci.subtotal_cents AS subtotalCents,ci.tax_cents AS taxCents,
+    bp.phone AS partyPhone,ci.currency,ci.total_cents AS totalCents,ci.subtotal_cents AS subtotalCents,ci.tax_cents AS taxCents,
+    ci.paid_cents AS paidCents,COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS creditedCents,
     ci.invoice_date AS documentDate,ci.due_date AS dueOrExpectedDate,ci.payment_terms AS paymentTerms,so.number AS reference,
-    NULL AS supplierQuoteNumber,NULL AS supplierReference,
+    ci.posted_by AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,
     bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
     FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id
     LEFT JOIN sales_orders so ON so.id=ci.sales_order_id WHERE ci.id=? LIMIT 1`, id);
@@ -190,62 +197,28 @@ function cleanPdfText(value: unknown) {
     .replaceAll(/[\u2018\u2019]/g, "'").replaceAll(/[\u201c\u201d]/g, '"').replaceAll(/[^\x20-\x7E]/g, "?").trim();
 }
 
-function wrapText(value: string, width = 88) {
-  const words = cleanPdfText(value).split(/\s+/).filter(Boolean);
-  if (!words.length) return [""];
-  const lines: string[] = [];
-  let line = "";
-  for (const word of words) {
-    if (!line) { line = word; continue; }
-    if (`${line} ${word}`.length <= width) line += ` ${word}`;
-    else { lines.push(line); line = word; }
-  }
-  if (line) lines.push(line);
-  return lines;
-}
-
-type PdfRow = { text: string; size?: number; bold?: boolean; gapAfter?: number };
-
 function pdfEscape(value: string) {
   return cleanPdfText(value).replaceAll("\\", "\\\\").replaceAll("(", "\\(").replaceAll(")", "\\)");
 }
 
-function buildPdf(rows: PdfRow[]) {
-  const pages: PdfRow[][] = [];
-  let page: PdfRow[] = [];
-  let y = 744;
-  for (const row of rows) {
-    const height = Math.max((row.size ?? 10) + 4 + (row.gapAfter ?? 0), 14);
-    if (y - height < 52 && page.length) { pages.push(page); page = []; y = 744; }
-    page.push(row); y -= height;
-  }
-  if (page.length || !pages.length) pages.push(page);
-
+function buildPdf(pages: string[][], title: string) {
   const objectCount = 4 + pages.length * 2;
   const objects = new Array<string>(objectCount + 1).fill("");
   objects[1] = "<< /Type /Catalog /Pages 2 0 R >>";
   objects[3] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
   objects[4] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>";
   const pageReferences: string[] = [];
-  pages.forEach((pageRows, pageIndex) => {
+  pages.forEach((commands, pageIndex) => {
     const contentId = 5 + pageIndex * 2;
     const pageId = contentId + 1;
     pageReferences.push(`${pageId} 0 R`);
-    let lineY = 744;
-    const commands: string[] = [];
-    for (const row of pageRows) {
-      const size = row.size ?? 10;
-      commands.push(`BT /F${row.bold ? 2 : 1} ${size} Tf 1 0 0 1 48 ${lineY} Tm (${pdfEscape(row.text)}) Tj ET`);
-      lineY -= Math.max(size + 4 + (row.gapAfter ?? 0), 14);
-    }
-    commands.push(`BT /F1 8 Tf 1 0 0 1 48 28 Tm (PaneFlow - Page ${pageIndex + 1} of ${pages.length}) Tj ET`);
     const stream = commands.join("\n");
     objects[contentId] = `<< /Length ${new TextEncoder().encode(stream).length} >>\nstream\n${stream}\nendstream`;
     objects[pageId] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentId} 0 R >>`;
   });
   objects[2] = `<< /Type /Pages /Kids [${pageReferences.join(" ")}] /Count ${pages.length} >>`;
 
-  let output = "%PDF-1.4\n%PaneFlow\n";
+  let output = `%PDF-1.4\n%${safeFilePart(title)}\n`;
   const offsets = new Array<number>(objectCount + 1).fill(0);
   for (let id = 1; id <= objectCount; id += 1) {
     offsets[id] = new TextEncoder().encode(output).length;
@@ -266,54 +239,316 @@ function printableDescription(value: string | null) {
   } catch { return value; }
 }
 
-function renderDocumentPdf(document: LoadedDocument, senderEmail?: string) {
-  const { header } = document;
-  const rows: PdfRow[] = [
-    { text: "PANEFLOW OPERATIONS", size: 11, bold: true },
-    { text: document.label.toUpperCase(), size: 20, bold: true },
-    { text: header.number, size: 14, bold: true, gapAfter: 8 },
-    { text: `${document.type === "purchase_order" || document.type === "vendor_bill" ? "Vendor" : "Customer"}: ${header.partyName}`, bold: true },
-  ];
-  const address = [header.addressLine1, header.addressLine2, header.city, header.region, header.postalCode, header.country].filter(Boolean).join(", ");
-  if (address) rows.push(...wrapText(address).map((text) => ({ text })));
-  if (header.partyEmail) rows.push({ text: `Email: ${header.partyEmail}` });
-  rows.push(
-    { text: `Status: ${cleanPdfText(header.status).replaceAll("_", " ")}` },
-    { text: `${document.type === "customer_invoice" || document.type === "vendor_bill" ? "Invoice" : "Order"} date: ${header.documentDate || "-"}` },
-    { text: `${document.type === "purchase_order" ? "Expected" : document.type === "sales_order" ? "Requested" : "Due"}: ${header.dueOrExpectedDate || "-"}` },
-    { text: `Currency: ${header.currency}${header.paymentTerms ? `   Terms: ${header.paymentTerms}` : ""}${header.reference ? `   Reference: ${header.reference}` : ""}`, gapAfter: document.type === "purchase_order" && (header.supplierQuoteNumber || header.supplierReference) ? 0 : 8 },
-    ...(document.type === "purchase_order" && (header.supplierQuoteNumber || header.supplierReference)
-      ? [{ text: `Supplier quote: ${header.supplierQuoteNumber || "-"}${header.supplierReference ? `   Supplier reference: ${header.supplierReference}` : ""}`, gapAfter: 8 }]
-      : []),
-    { text: "ITEMS", size: 12, bold: true },
-  );
-  document.lines.forEach((line, index) => {
-    rows.push(...wrapText(`${index + 1}. ${line.sku} - ${line.productName}`, 80).map((text, lineIndex) => ({ text, bold: lineIndex === 0 })));
-    const quantity = Number(line.quantity);
-    const lineSubtotal = Math.round(quantity * Number(line.unitAmountCents));
-    const lineTotal = line.lineTotalCents ?? Math.max(lineSubtotal - Number(line.discountCents), 0);
-    rows.push({ text: `   ${quantity} ${line.uomCode ?? "unit(s)"} x ${money(Number(line.unitAmountCents), header.currency)}   ${money(lineTotal, header.currency)}` });
-    const description = printableDescription(line.description);
-    if (description) rows.push(...wrapText(`   ${description}`, 82).map((text) => ({ text })));
-    if (line.discountCents) rows.push({ text: `   Discount: -${money(Number(line.discountCents), header.currency)}` });
-    if (line.taxable && line.taxRateBps) rows.push({ text: `   Tax rate: ${(Number(line.taxRateBps) / 100).toFixed(2)}%` });
-  });
-  if (document.charges.length) {
-    rows.push({ text: "CHARGES", size: 12, bold: true, gapAfter: 2 });
-    for (const charge of document.charges) {
-      const sign = charge.direction === "subtract" ? -1 : 1;
-      rows.push({ text: `${charge.description}: ${money(sign * Number(charge.amountCents), header.currency)}${charge.taxAmountCents ? `   Tax ${money(Number(charge.taxAmountCents), header.currency)}` : ""}` });
-    }
+type PdfColor = readonly [number, number, number];
+type PdfTextOptions = { size?: number; bold?: boolean; color?: PdfColor; align?: "left" | "right"; maxWidth?: number };
+type PreparedLine = {
+  index: number;
+  name: string[];
+  details: string[];
+  quantity: string;
+  unitAmount: string;
+  tax: string;
+  lineAmount: string;
+  lineAmountCents: number;
+  height: number;
+};
+type PdfDocumentPage = { lines: PreparedLine[]; continuation: boolean; summary: boolean };
+
+const PDF = {
+  pageWidth: 612,
+  margin: 44,
+  contentWidth: 524,
+  tableColumns: [44, 318, 367, 445, 496, 568] as const,
+  ink: [0.09, 0.2, 0.18] as PdfColor,
+  accent: [0.12, 0.36, 0.3] as PdfColor,
+  accentSoft: [0.91, 0.95, 0.93] as PdfColor,
+  muted: [0.36, 0.43, 0.41] as PdfColor,
+  rule: [0.82, 0.86, 0.84] as PdfColor,
+  wash: [0.965, 0.975, 0.97] as PdfColor,
+  white: [1, 1, 1] as PdfColor,
+};
+
+function pdfNumber(value: number) {
+  return Number(value.toFixed(3)).toString();
+}
+
+function pdfColor(color: PdfColor, stroke = false) {
+  return `${color.map(pdfNumber).join(" ")} ${stroke ? "RG" : "rg"}`;
+}
+
+function estimateTextWidth(value: string, size: number) {
+  let units = 0;
+  for (const char of cleanPdfText(value)) {
+    if (/[ ilI.,'`:;|!]/u.test(char)) units += 0.27;
+    else if (/[MW@%&#]/u.test(char)) units += 0.84;
+    else if (/[A-Z0-9]/u.test(char)) units += 0.61;
+    else units += 0.51;
   }
-  if (header.subtotalCents != null) rows.push({ text: `Subtotal: ${money(Number(header.subtotalCents), header.currency)}`, bold: true });
-  if (header.taxCents != null) rows.push({ text: `Tax: ${money(Number(header.taxCents), header.currency)}`, bold: true });
-  rows.push(
-    { text: `TOTAL: ${money(Number(header.totalCents), header.currency)}`, size: 14, bold: true, gapAfter: 10 },
-    { text: senderEmail
-      ? `Sent from ${senderEmail} through PaneFlow on ${new Date().toISOString().slice(0, 10)}.`
-      : `Generated from PaneFlow on ${new Date().toISOString().slice(0, 10)}.` },
-  );
-  return buildPdf(rows);
+  return units * size;
+}
+
+function fitPdfText(value: string, width: number, size: number) {
+  const clean = cleanPdfText(value);
+  if (estimateTextWidth(clean, size) <= width) return clean;
+  let fitted = clean;
+  while (fitted && estimateTextWidth(`${fitted}...`, size) > width) fitted = fitted.slice(0, -1);
+  return `${fitted.trimEnd()}...`;
+}
+
+function wrapPdfText(value: string, width: number, size: number, maxLines = Number.POSITIVE_INFINITY) {
+  const words = cleanPdfText(value).split(/\s+/u).filter(Boolean);
+  if (!words.length) return [];
+  const lines: string[] = [];
+  let line = "";
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (estimateTextWidth(candidate, size) <= width) { line = candidate; continue; }
+    if (line) lines.push(line);
+    line = estimateTextWidth(word, size) <= width ? word : fitPdfText(word, width, size);
+    if (lines.length === maxLines) break;
+  }
+  if (line && lines.length < maxLines) lines.push(line);
+  if (lines.length === maxLines && words.join(" ") !== lines.join(" ")) lines[maxLines - 1] = fitPdfText(`${lines[maxLines - 1]}...`, width, size);
+  return lines;
+}
+
+function pdfText(commands: string[], value: string, x: number, y: number, options: PdfTextOptions = {}) {
+  const size = options.size ?? 9;
+  const text = options.maxWidth ? fitPdfText(value, options.maxWidth, size) : cleanPdfText(value);
+  const width = estimateTextWidth(text, size);
+  const drawX = options.align === "right" ? x - width : x;
+  commands.push(`${pdfColor(options.color ?? PDF.ink)} BT /F${options.bold ? 2 : 1} ${pdfNumber(size)} Tf 1 0 0 1 ${pdfNumber(drawX)} ${pdfNumber(y)} Tm (${pdfEscape(text)}) Tj ET`);
+}
+
+function pdfRect(commands: string[], x: number, top: number, width: number, height: number, fill: PdfColor, stroke?: PdfColor) {
+  commands.push(`${pdfColor(fill)} ${pdfColor(stroke ?? fill, true)} ${pdfNumber(x)} ${pdfNumber(top - height)} ${pdfNumber(width)} ${pdfNumber(height)} re ${stroke ? "B" : "f"}`);
+}
+
+function pdfLine(commands: string[], x1: number, y1: number, x2: number, y2: number, color = PDF.rule, width = 0.7) {
+  commands.push(`${pdfColor(color, true)} ${pdfNumber(width)} w ${pdfNumber(x1)} ${pdfNumber(y1)} m ${pdfNumber(x2)} ${pdfNumber(y2)} l S`);
+}
+
+function titleFor(type: PrintableDocumentType) {
+  if (type === "purchase_order") return "PURCHASE ORDER";
+  if (type === "sales_order") return "SALES ORDER";
+  if (type === "vendor_bill") return "VENDOR BILL";
+  return "INVOICE";
+}
+
+function partyLabel(type: PrintableDocumentType) {
+  if (type === "purchase_order" || type === "vendor_bill") return "VENDOR";
+  if (type === "sales_order") return "CUSTOMER / SHIP TO";
+  return "BILL TO";
+}
+
+function documentDateLabel(type: PrintableDocumentType) {
+  return type === "customer_invoice" || type === "vendor_bill" ? "Invoice date" : "Order date";
+}
+
+function targetDateLabel(type: PrintableDocumentType) {
+  if (type === "purchase_order") return "Expected date";
+  if (type === "sales_order") return "Requested date";
+  return "Due date";
+}
+
+function documentNote(type: PrintableDocumentType, number: string) {
+  if (type === "purchase_order") return `Please reference purchase order ${number} on shipping documents and invoices.`;
+  if (type === "sales_order") return `Please reference sales order ${number} in all order correspondence.`;
+  if (type === "customer_invoice") return `Thank you for your business. Please include invoice ${number} with payment.`;
+  return `Recorded against the supplier document for ${number}.`;
+}
+
+function addressLines(header: DocumentHeader) {
+  const locality = [header.city, header.region, header.postalCode].filter(Boolean).join(" ");
+  return [header.partyName, header.addressLine1, header.addressLine2, locality, header.country, header.partyEmail, header.partyPhone]
+    .filter((value): value is string => Boolean(value));
+}
+
+function metadataRows(type: PrintableDocumentType, header: DocumentHeader) {
+  const rows: Array<[string, string]> = [
+    [documentDateLabel(type), header.documentDate || "-"],
+    [targetDateLabel(type), header.dueOrExpectedDate || "-"],
+    ["Payment terms", header.paymentTerms || "Not specified"],
+    ["Currency", header.currency],
+  ];
+  if (header.reference) rows.push([type === "customer_invoice" || type === "vendor_bill" ? "Related order" : "Project reference", header.reference]);
+  if (header.preparedBy) rows.push([type === "purchase_order" ? "Buyer" : type === "sales_order" ? "Sales owner" : "Prepared by", header.preparedBy]);
+  if (header.supplierQuoteNumber || header.supplierReference) rows.push(["Supplier quote / ref", [header.supplierQuoteNumber, header.supplierReference].filter(Boolean).join(" / ")]);
+  return rows.slice(0, 7);
+}
+
+function lineAmount(line: DocumentLine) {
+  const gross = Math.round(Number(line.quantity) * Number(line.unitAmountCents));
+  return Number(line.lineTotalCents ?? Math.max(gross - Number(line.discountCents), 0));
+}
+
+function lineTax(line: DocumentLine, amount: number) {
+  return line.taxable && line.taxRateBps ? Math.round(amount * Number(line.taxRateBps) / 10_000) : 0;
+}
+
+function prepareLines(document: LoadedDocument): PreparedLine[] {
+  return document.lines.map((line, index) => {
+    const amount = lineAmount(line);
+    const description = printableDescription(line.description);
+    const details = [line.sku, ...(description ? wrapPdfText(description, 252, 8, 3) : []), ...(line.discountCents ? [`Discount: -${money(Number(line.discountCents), document.header.currency)}`] : [])];
+    const name = wrapPdfText(line.productName, 252, 9.5, 2);
+    return {
+      index: index + 1,
+      name,
+      details,
+      quantity: `${Number(line.quantity).toLocaleString("en-CA", { maximumFractionDigits: 3 })} ${line.uomCode ?? "EA"}`,
+      unitAmount: money(Number(line.unitAmountCents), document.header.currency),
+      tax: line.taxable && line.taxRateBps ? money(lineTax(line, amount), document.header.currency) : "-",
+      lineAmount: money(amount, document.header.currency),
+      lineAmountCents: amount,
+      height: Math.max(39, 17 + name.length * 11 + details.length * 9),
+    };
+  });
+}
+
+function summaryHeight(document: LoadedDocument) {
+  const balanceRows = document.type === "customer_invoice" || document.type === "vendor_bill" ? 2 : 0;
+  return Math.max(104, 45 + (document.charges.length + 3 + balanceRows) * 17);
+}
+
+function paginateDocument(document: LoadedDocument, lines: PreparedLine[]) {
+  const pages: PdfDocumentPage[] = [{ lines: [], continuation: false, summary: false }];
+  let current = pages[0];
+  let remaining = 512 - 78;
+  for (const line of lines) {
+    if (line.height > remaining && current.lines.length) {
+      current = { lines: [], continuation: true, summary: false };
+      pages.push(current);
+      remaining = 672 - 78;
+    }
+    current.lines.push(line);
+    remaining -= line.height;
+  }
+  if (summaryHeight(document) > remaining) {
+    current = { lines: [], continuation: true, summary: true };
+    pages.push(current);
+  } else current.summary = true;
+  return pages;
+}
+
+function drawDocumentHeader(commands: string[], document: LoadedDocument, companyName: string, continuation: boolean) {
+  const title = titleFor(document.type);
+  if (continuation) {
+    pdfRect(commands, PDF.margin, 756, 7, 32, PDF.accent);
+    pdfText(commands, companyName.toUpperCase(), 61, 744, { size: 13, bold: true, maxWidth: 250 });
+    pdfText(commands, `${title}  ${document.header.number}`, 568, 744, { size: 10, bold: true, color: PDF.accent, align: "right", maxWidth: 235 });
+    pdfText(commands, "CONTINUED", 568, 727, { size: 7.5, bold: true, color: PDF.muted, align: "right" });
+    pdfLine(commands, PDF.margin, 714, 568, 714, PDF.accent, 1.2);
+    return 698;
+  }
+
+  pdfRect(commands, PDF.margin, 756, 9, 47, PDF.accent);
+  pdfText(commands, companyName.toUpperCase(), 62, 744, { size: 16, bold: true, maxWidth: 275 });
+  pdfText(commands, "PANEFLOW OPERATIONS", 62, 727, { size: 7.5, bold: true, color: PDF.muted });
+  pdfText(commands, title, 568, 739, { size: 20, bold: true, align: "right", maxWidth: 225 });
+  pdfText(commands, document.header.number, 568, 716, { size: 11, bold: true, color: PDF.accent, align: "right", maxWidth: 225 });
+  pdfLine(commands, PDF.margin, 696, 568, 696, PDF.accent, 1.4);
+
+  pdfText(commands, partyLabel(document.type), 54, 675, { size: 7.5, bold: true, color: PDF.accent });
+  pdfRect(commands, PDF.margin, 664, 252, 105, PDF.wash, PDF.rule);
+  const party = addressLines(document.header);
+  party.slice(0, 7).forEach((value, index) => pdfText(commands, value, 55, 644 - index * 13, { size: index === 0 ? 10 : 8.2, bold: index === 0, color: index === 0 ? PDF.ink : PDF.muted, maxWidth: 230 }));
+
+  const status = cleanPdfText(document.header.status).replaceAll("_", " ").toUpperCase();
+  pdfText(commands, "DOCUMENT DETAILS", 330, 675, { size: 7.5, bold: true, color: PDF.accent });
+  const badgeWidth = Math.max(54, estimateTextWidth(status, 7.5) + 18);
+  pdfRect(commands, 568 - badgeWidth, 683, badgeWidth, 19, PDF.accentSoft);
+  pdfText(commands, status, 559, 670, { size: 7.5, bold: true, color: PDF.accent, align: "right", maxWidth: badgeWidth - 18 });
+  const metadata = metadataRows(document.type, document.header);
+  metadata.forEach(([label, value], index) => {
+    const y = 649 - index * 14;
+    pdfText(commands, label.toUpperCase(), 330, y, { size: 7.1, bold: true, color: PDF.muted, maxWidth: 82 });
+    pdfText(commands, value, 568, y, { size: 8.5, align: "right", maxWidth: 148 });
+  });
+  return 540;
+}
+
+function drawTableHeader(commands: string[], top: number) {
+  const [x0, x1, x2, x3, x4, x5] = PDF.tableColumns;
+  pdfRect(commands, x0, top, x5 - x0, 26, PDF.ink);
+  pdfText(commands, "ITEM / DESCRIPTION", x0 + 8, top - 17, { size: 7.4, bold: true, color: PDF.white });
+  pdfText(commands, "QTY", x2 - 8, top - 17, { size: 7.4, bold: true, color: PDF.white, align: "right" });
+  pdfText(commands, "UNIT PRICE", x3 - 8, top - 17, { size: 7.4, bold: true, color: PDF.white, align: "right" });
+  pdfText(commands, "TAX", x4 - 8, top - 17, { size: 7.4, bold: true, color: PDF.white, align: "right" });
+  pdfText(commands, "AMOUNT", x5 - 8, top - 17, { size: 7.4, bold: true, color: PDF.white, align: "right" });
+  [x1, x2, x3, x4].forEach((x) => pdfLine(commands, x, top - 26, x, top, [0.25, 0.37, 0.34], 0.45));
+  return top - 26;
+}
+
+function drawPreparedLine(commands: string[], line: PreparedLine, top: number) {
+  const [x0, x1, x2, x3, x4, x5] = PDF.tableColumns;
+  if (line.index % 2 === 0) pdfRect(commands, x0, top, x5 - x0, line.height, PDF.wash);
+  pdfText(commands, String(line.index), x0 + 8, top - 16, { size: 8, bold: true, color: PDF.accent });
+  line.name.forEach((value, index) => pdfText(commands, value, x0 + 27, top - 16 - index * 11, { size: 9.2, bold: true, maxWidth: x1 - x0 - 36 }));
+  let detailY = top - 16 - line.name.length * 11;
+  line.details.forEach((value) => { pdfText(commands, value, x0 + 27, detailY, { size: 7.8, color: PDF.muted, maxWidth: x1 - x0 - 36 }); detailY -= 9; });
+  pdfText(commands, line.quantity, x2 - 8, top - 16, { size: 8.4, align: "right", maxWidth: x2 - x1 - 12 });
+  pdfText(commands, line.unitAmount, x3 - 8, top - 16, { size: 8.4, align: "right", maxWidth: x3 - x2 - 12 });
+  pdfText(commands, line.tax, x4 - 8, top - 16, { size: 8.4, align: "right", maxWidth: x4 - x3 - 12 });
+  pdfText(commands, line.lineAmount, x5 - 8, top - 16, { size: 8.4, bold: true, align: "right", maxWidth: x5 - x4 - 12 });
+  pdfLine(commands, x0, top - line.height, x5, top - line.height);
+  [x1, x2, x3, x4].forEach((x) => pdfLine(commands, x, top - line.height, x, top, PDF.rule, 0.45));
+  return top - line.height;
+}
+
+function summaryRows(document: LoadedDocument) {
+  const itemSubtotal = document.lines.reduce((sum, line) => sum + lineAmount(line), 0);
+  const computedTax = document.lines.reduce((sum, line) => sum + lineTax(line, lineAmount(line)), 0)
+    + document.charges.reduce((sum, charge) => sum + (charge.direction === "subtract" ? -1 : 1) * Math.abs(Number(charge.taxAmountCents)), 0);
+  const rows: Array<{ label: string; amount: number; total?: boolean; muted?: boolean }> = [
+    { label: "Items subtotal", amount: itemSubtotal },
+    ...document.charges.map((charge) => ({ label: charge.description, amount: (charge.direction === "subtract" ? -1 : 1) * Number(charge.amountCents) })),
+    { label: "Tax", amount: document.header.taxCents ?? computedTax },
+    { label: "Total", amount: Number(document.header.totalCents), total: true },
+  ];
+  if (document.type === "customer_invoice" || document.type === "vendor_bill") {
+    const paid = Number(document.header.paidCents ?? 0) + Number(document.header.creditedCents ?? 0);
+    rows.push({ label: "Payments / credits", amount: -paid, muted: true });
+    rows.push({ label: "Balance due", amount: Math.max(Number(document.header.totalCents) - paid, 0), total: true });
+  }
+  return rows;
+}
+
+function drawSummary(commands: string[], document: LoadedDocument, top: number, companyName: string, senderEmail?: string) {
+  const leftWidth = 292;
+  pdfText(commands, "TERMS & NOTES", PDF.margin, top - 4, { size: 7.5, bold: true, color: PDF.accent });
+  const noteLines = wrapPdfText(documentNote(document.type, document.header.number), leftWidth, 8.5, 4);
+  noteLines.forEach((line, index) => pdfText(commands, line, PDF.margin, top - 21 - index * 11, { size: 8.5, color: PDF.muted }));
+  if (senderEmail) pdfText(commands, `Sent by ${senderEmail}`, PDF.margin, top - 76, { size: 7.5, color: PDF.muted, maxWidth: leftWidth });
+
+  const rows = summaryRows(document);
+  let y = top;
+  for (const row of rows) {
+    const height = row.total ? 25 : 17;
+    if (row.total) pdfRect(commands, 374, y, 194, height, PDF.accentSoft);
+    pdfText(commands, row.label.toUpperCase(), 384, y - (row.total ? 17 : 12), { size: row.total ? 8.2 : 7.5, bold: row.total, color: row.muted ? PDF.muted : row.total ? PDF.accent : PDF.ink, maxWidth: 126 });
+    pdfText(commands, money(row.amount, document.header.currency), 558, y - (row.total ? 17 : 12), { size: row.total ? 10 : 8.5, bold: row.total, color: row.muted ? PDF.muted : row.total ? PDF.accent : PDF.ink, align: "right", maxWidth: 76 });
+    y -= height;
+  }
+  pdfText(commands, `${companyName} | ${document.header.currency}`, PDF.margin, 47, { size: 7.2, color: PDF.muted, maxWidth: 260 });
+}
+
+function renderDocumentPdf(document: LoadedDocument, senderEmail?: string) {
+  const companyName = currentTenant()?.tenantName || "PaneFlow";
+  const preparedLines = prepareLines(document);
+  const pageLayout = paginateDocument(document, preparedLines);
+  const pages = pageLayout.map((page, pageIndex) => {
+    const commands: string[] = [];
+    const tableTop = drawDocumentHeader(commands, document, companyName, page.continuation);
+    let y = drawTableHeader(commands, tableTop);
+    for (const line of page.lines) y = drawPreparedLine(commands, line, y);
+    if (page.summary) drawSummary(commands, document, y - 18, companyName, senderEmail);
+    pdfLine(commands, PDF.margin, 37, 568, 37, PDF.rule, 0.6);
+    pdfText(commands, `Generated ${new Date().toISOString().slice(0, 10)}`, PDF.margin, 23, { size: 7, color: PDF.muted });
+    pdfText(commands, `Page ${pageIndex + 1} of ${pageLayout.length}`, 568, 23, { size: 7, color: PDF.muted, align: "right" });
+    return commands;
+  });
+  return buildPdf(pages, `${titleFor(document.type)}-${document.header.number}`);
 }
 
 /** Build the same authoritative PDF used for email without requiring a mailbox connection. */

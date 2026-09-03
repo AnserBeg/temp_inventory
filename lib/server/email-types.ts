@@ -19,6 +19,7 @@ export type EmailConnectionState = {
   personalConnection: EmailConnectionSummary | null;
   defaultSender: EmailSenderType | null;
   canManageCompany: boolean;
+  purchaseOrderApprovalEmail: string;
   /** The sender selected automatically: company first, then personal. */
   connection: EmailConnectionSummary | null;
 };

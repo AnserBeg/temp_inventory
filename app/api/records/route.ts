@@ -1,5 +1,7 @@
 import { createOrderRecord, RecordValidationError, type CreateOrderInput } from "@/lib/server/inventory-records";
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
+import { getEmailConnectionState } from "@/lib/server/email-client";
+import { processOutboxBatch } from "@/lib/server/outbox";
 
 export const dynamic = "force-dynamic";
 
@@ -12,7 +14,12 @@ export async function POST(request: Request) {
     payload.actor = actor.label;
     payload.actorId = actor.id;
     payload.actorEmail = actor.email;
+    payload.appOrigin = new URL(request.url).origin;
+    payload.approvalNotificationEmail = payload.type === "purchaseOrder"
+      ? (await getEmailConnectionState(actor, request.url)).purchaseOrderApprovalEmail
+      : "";
     const result = await createOrderRecord(payload);
+    try { await processOutboxBatch({ limit: 10 }); } catch { /* The durable event remains available for scheduled retry. */ }
     return Response.json(result, {
       status: 201,
       headers: { "Cache-Control": "no-store" },

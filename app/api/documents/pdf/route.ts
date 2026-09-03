@@ -22,7 +22,7 @@ export async function GET(request: Request) {
     const pdf = await getDocumentPdf(documentType, documentId);
     return new Response(pdf.body, { headers: {
       "Content-Type": "application/pdf",
-      "Content-Disposition": `inline; filename="${pdf.fileName}"`,
+      "Content-Disposition": `attachment; filename="${pdf.fileName}"`,
       "Cache-Control": "private, no-store",
     } });
   } catch (error) { return errorResponse(error); }

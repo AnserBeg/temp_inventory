@@ -31,7 +31,7 @@ export async function POST(request: Request) {
     if (!capability) throw new WorkflowError("UNKNOWN_COMMAND", `Unsupported workflow command: ${input.command ?? ""}.`);
     requireCapability(actor, capability);
 
-    const result = await executeWorkflow({ ...input, actor });
+    const result = await executeWorkflow({ ...input, actor, appOrigin: new URL(request.url).origin });
     // Delivery is best-effort after the database transaction. The outbox row is already
     // durable, so a downstream outage never turns a successful business posting into a 500.
     try { await processOutboxBatch({ limit: 10 }); } catch { /* scheduled/manual retry retains the event */ }

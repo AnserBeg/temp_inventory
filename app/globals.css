@@ -565,6 +565,10 @@ a.button.disabled { opacity: .5; pointer-events: none; }
 .email-sender-setting { position: relative; flex-wrap: wrap; padding: 9px 0; border-bottom: 1px solid var(--line); }
 .email-sender-setting:last-child { border-bottom: 0; padding-bottom: 2px; }
 .email-sender-setting > .email-provider-choice { flex: 1 0 100%; }
+.email-approval-setting .email-provider-choice { align-items: center; }
+.email-approval-setting label { flex: 1 1 170px; }
+.email-approval-setting input { width: 100%; min-height: 34px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: #fff; font-size: 12px; }
+.email-approval-setting .email-provider-choice > small { flex: 1 0 100%; }
 .email-admin-note { margin-left: auto; }
 .email-provider-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .email-provider-actions .button { min-height: 34px; padding: 7px 10px; font-size: 11px; }
@@ -602,6 +606,7 @@ a.button.disabled { opacity: .5; pointer-events: none; }
 .batch-receipt-line small { color: var(--ink-soft); font-size: 11px; }
 .batch-receipt-line label { display: grid; gap: 4px; color: var(--ink-soft); font-size: 11px; font-weight: 700; }
 .radio-row { min-height: 38px; display: flex; align-items: center; gap: 9px; padding: 7px 8px; border: 1px solid transparent; border-radius: 5px; font-size: 12px; }
+.command-form > label.radio-row { display: flex; }
 .form-grid > label.radio-row { align-self: end; display: flex; }
 .radio-row:has(input:checked) { border-color: #9fc6bb; background: var(--brand-soft); color: var(--brand-dark); }
 .radio-row input { accent-color: var(--brand); }
@@ -932,6 +937,12 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .workflow-service.unavailable { color: var(--warning); }
 .workflow-service.unavailable::before { background: var(--warning); }
 
+/* The administrative workspace has enough destinations to overflow a desktop-width row.
+   Let it form a compact second line instead of hiding the final destinations off-screen. */
+.controls-tabbar { flex-wrap: wrap; overflow-x: visible; }
+.controls-tabbar > button { flex: 1 1 auto; justify-content: center; }
+.controls-tabbar .workflow-service { flex-basis: 100%; margin: 2px 7px 4px; text-align: right; }
+
 .workflow-banner { display: flex; align-items: center; gap: 12px; padding: 11px 13px; border: 1px solid #e8c887; border-radius: 7px; background: var(--warning-soft); color: #704a10; font-size: 12px; }
 .workflow-banner span { flex: 1; }
 .workflow-banner button { min-height: 34px; border: 1px solid #d4ae62; border-radius: 5px; background: #fff; color: #704a10; font-size: 12px; font-weight: 700; }
@@ -1069,7 +1080,7 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .record-progress-header h3 { margin: 2px 0 0; font-size: 17px; letter-spacing: -.015em; }
 .record-progress-header > p { max-width: 360px; margin: 0; color: var(--ink-soft); font-size: 11px; text-align: right; }
 .record-progress-steps { display: flex; margin: 0; padding: 0; overflow-x: auto; list-style: none; }
-.record-progress-steps > li { position: relative; min-width: 170px; flex: 1 0 170px; display: grid; grid-template-columns: 28px minmax(0, 1fr); align-content: start; gap: 9px; min-height: 150px; padding: 14px 13px; border-right: 1px solid var(--line); border-top: 3px solid var(--line-strong); background: #fff; }
+.record-progress-steps > li { position: relative; min-width: 145px; flex: 1 0 145px; display: grid; grid-template-columns: 28px minmax(0, 1fr); align-content: start; gap: 9px; min-height: 150px; padding: 14px 13px; border-right: 1px solid var(--line); border-top: 3px solid var(--line-strong); background: #fff; }
 .record-progress-steps > li:last-child { border-right: 0; }
 .record-progress-steps > li.complete { border-top-color: var(--success); background: #fbfefc; }
 .record-progress-steps > li.current { border-top-color: var(--info); background: #fbfdff; }
@@ -1265,7 +1276,9 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .pricing-table-heading p { margin: 0; color: var(--ink-soft); font-size: 11px; }
 .pricing-workspace .workflow-panel > .workflow-banner { margin: 0 20px 18px; }
 
+.pricing-section-tabs { position: sticky; top: 80px; z-index: 20; }
 .pricing-card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 20px; background: #f7f9f7; }
+.pricing-card-grid.focused { grid-template-columns: minmax(0, 760px); }
 .pricing-card { display: flex; flex-direction: column; padding: 18px; }
 .pricing-card-heading { min-height: 96px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
 .pricing-card-heading h3 { font-size: 17px; }
@@ -1291,6 +1304,10 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 }
 
 @media (max-width: 640px) {
+  .controls-tabbar { flex-wrap: nowrap; overflow-x: auto; }
+  .controls-tabbar > button { flex: 0 0 auto; }
+  .controls-tabbar .workflow-service { flex-basis: auto; margin: 0 0 0 auto; text-align: left; }
+  .pricing-section-tabs { position: static; }
   .pricing-workspace .workflow-panel-header { padding: 14px 16px; }
   .pricing-rule-layout, .pricing-card-grid { gap: 12px; padding: 12px; }
   .pricing-rule-form, .pricing-card, .pricing-default-card { padding: 15px; }

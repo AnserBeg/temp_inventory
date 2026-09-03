@@ -3155,13 +3155,13 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                     COALESCE(rc.packing_slip_number,'') AS packingSlipNumber,
                     COALESCE((SELECT SUM(rl.quantity) FROM receipt_lines rl WHERE rl.receipt_id=rc.id),0) AS quantity
                   FROM receipts rc WHERE rc.purchase_order_id=po.id
-                  ORDER BY rc.posted_at DESC,rc.number DESC LIMIT 25) r) AS receiptsJson,
+                  ORDER BY rc.posted_at DESC,rc.number DESC) r) AS receiptsJson,
            (SELECT json_group_array(json_object('id',d.id,'number',d.number,'postedAt',d.postedAt,'deliveryDate',d.deliveryDate,
               'status',d.status,'externalReference',d.externalReference,'quantity',d.quantity))
             FROM (SELECT dd.id,dd.number,dd.posted_at AS postedAt,dd.delivery_date AS deliveryDate,dd.status,
                     dd.external_reference AS externalReference,dd.quantity-dd.reversed_qty AS quantity
                   FROM drop_ship_deliveries dd WHERE dd.purchase_order_id=po.id
-                  ORDER BY dd.posted_at DESC,dd.number DESC LIMIT 25) d) AS purchaseDeliveriesJson,
+                  ORDER BY dd.posted_at DESC,dd.number DESC) d) AS purchaseDeliveriesJson,
            (SELECT json_group_array(json_object('id',b.id,'number',b.number,'status',b.status,'matchStatus',b.matchStatus,
               'issuedOn',b.issuedOn,'dueOn',b.dueOn,'amountCents',b.amountCents,'paidCents',b.paidCents,
               'creditedCents',b.creditedCents,'currency',b.currency,'externalReference',b.externalReference))
@@ -3171,7 +3171,19 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                     COALESCE(vb.vendor_invoice_number,'') AS externalReference,
                     COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted'),0) AS creditedCents
                   FROM vendor_bills vb WHERE vb.purchase_order_id=po.id
-                  ORDER BY COALESCE(vb.invoice_date,vb.posted_at) DESC,vb.number DESC LIMIT 25) b) AS vendorBillsJson,
+                  ORDER BY COALESCE(vb.invoice_date,vb.posted_at) DESC,vb.number DESC) b) AS vendorBillsJson,
+           (SELECT json_group_array(json_object('id',s.id,'number',s.number,'kind',s.kind,'postedAt',s.postedAt,
+              'amountCents',s.amountCents,'currency',s.currency,'appliedTo',s.appliedTo))
+            FROM (SELECT vc.id,vc.number,'credit' AS kind,vc.posted_at AS postedAt,vc.amount_cents AS amountCents,
+                    vc.currency,COALESCE(vb.number,po.number) AS appliedTo
+                  FROM vendor_credits vc LEFT JOIN vendor_bills vb ON vb.id=vc.vendor_bill_id
+                  WHERE COALESCE(vb.purchase_order_id,vc.purchase_order_id)=po.id AND vc.status='posted'
+                  UNION ALL
+                  SELECT pay.id,pay.number,'payment' AS kind,pay.posted_at AS postedAt,pay.amount_cents AS amountCents,
+                    pay.currency,vb.number AS appliedTo
+                  FROM payments pay JOIN vendor_bills vb ON pay.document_type='vendor_bill' AND pay.document_id=vb.id
+                  WHERE vb.purchase_order_id=po.id
+                  ORDER BY 4 DESC,2 DESC) s) AS vendorSettlementsJson,
            COALESCE(lt.ordered_qty, 0) AS orderedQuantity, COALESCE(mt.gross_received_qty, 0) AS grossReceivedQuantity,
            COALESCE(mt.reversed_qty, 0) AS receiptReversedQuantity, COALESCE(mt.returned_qty, 0) AS vendorReturnedQuantity,
            COALESCE(mt.net_received_qty, 0) AS netReceivedQuantity, COALESCE(lt.closed_qty, 0) AS closedWithoutReceiptQuantity,
@@ -3364,13 +3376,13 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                     COALESCE(sh.service_level,'') AS serviceLevel,COALESCE(sh.tracking_number,'') AS trackingNumber,
                     COALESCE(sh.bill_of_lading_number,'') AS billOfLading
                   FROM shipments sh WHERE sh.sales_order_id=so.id
-                  ORDER BY sh.posted_at DESC,sh.number DESC LIMIT 25) s) AS shipmentsJson,
+                  ORDER BY sh.posted_at DESC,sh.number DESC) s) AS shipmentsJson,
            (SELECT json_group_array(json_object('id',d.id,'number',d.number,'postedAt',d.postedAt,'deliveryDate',d.deliveryDate,
               'status',d.status,'externalReference',d.externalReference,'quantity',d.quantity))
             FROM (SELECT dd.id,dd.number,dd.posted_at AS postedAt,dd.delivery_date AS deliveryDate,dd.status,
                     dd.external_reference AS externalReference,dd.quantity-dd.reversed_qty AS quantity
                   FROM drop_ship_deliveries dd WHERE dd.sales_order_id=so.id
-                  ORDER BY dd.posted_at DESC,dd.number DESC LIMIT 25) d) AS salesDeliveriesJson,
+                  ORDER BY dd.posted_at DESC,dd.number DESC) d) AS salesDeliveriesJson,
            (SELECT json_group_array(json_object('id',i.id,'number',i.number,'status',i.status,
               'issuedOn',i.issuedOn,'dueOn',i.dueOn,'amountCents',i.amountCents,'paidCents',i.paidCents,
               'creditedCents',i.creditedCents,'currency',i.currency))
@@ -3378,7 +3390,19 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                     ci.total_cents AS amountCents,ci.paid_cents AS paidCents,ci.currency,
                     COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS creditedCents
                   FROM customer_invoices ci WHERE ci.sales_order_id=so.id
-                  ORDER BY ci.invoice_date DESC,ci.number DESC LIMIT 25) i) AS customerInvoicesJson,
+                  ORDER BY ci.invoice_date DESC,ci.number DESC) i) AS customerInvoicesJson,
+           (SELECT json_group_array(json_object('id',s.id,'number',s.number,'kind',s.kind,'postedAt',s.postedAt,
+              'amountCents',s.amountCents,'currency',s.currency,'appliedTo',s.appliedTo))
+            FROM (SELECT cc.id,cc.number,'credit' AS kind,cc.posted_at AS postedAt,cc.amount_cents AS amountCents,
+                    cc.currency,COALESCE(ci.number,so.number) AS appliedTo
+                  FROM customer_credits cc LEFT JOIN customer_invoices ci ON ci.id=cc.customer_invoice_id
+                  WHERE COALESCE(ci.sales_order_id,cc.sales_order_id)=so.id AND cc.status='posted'
+                  UNION ALL
+                  SELECT pay.id,pay.number,'payment' AS kind,pay.posted_at AS postedAt,pay.amount_cents AS amountCents,
+                    pay.currency,ci.number AS appliedTo
+                  FROM payments pay JOIN customer_invoices ci ON pay.document_type='customer_invoice' AND pay.document_id=ci.id
+                  WHERE ci.sales_order_id=so.id
+                  ORDER BY 4 DESC,2 DESC) s) AS customerSettlementsJson,
            COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='sales_order' AND dc.document_id=so.id AND dc.charge_type='freight'),0) AS freightCents,
            COALESCE((SELECT MAX(dc.tax_rate_bps) FROM document_charges dc WHERE dc.document_type='sales_order' AND dc.document_id=so.id AND dc.charge_type='freight'),0) AS freightTaxRateBps,
            COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='sales_order' AND dc.document_id=so.id AND dc.charge_type IN ('fee','handling_fee')),0) AS feeCents,

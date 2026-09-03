@@ -126,9 +126,10 @@ export async function getEmailConnectionState(actor: ActorIdentity, requestUrl: 
     try { const config = providerConfig(provider, requestUrl); return [{ provider, label: config.label }]; }
     catch { return []; }
   });
-  const [companyRow, personalRow] = await Promise.all([
+  const [companyRow, personalRow, approvalSetting] = await Promise.all([
     first<StoredConnection>(connectionSql(), COMPANY_MAILBOX_OWNER),
     first<StoredConnection>(connectionSql(), actor.id),
+    first<{ valueJson: string }>("SELECT value_json AS valueJson FROM system_settings WHERE key='email.purchaseOrderApprovalRecipient'"),
   ]);
   const summary = (row: StoredConnection | null): EmailConnectionSummary | null => row ? {
     senderType: row.senderType,
@@ -144,14 +145,47 @@ export async function getEmailConnectionState(actor: ActorIdentity, requestUrl: 
   const defaultSender: EmailSenderType | null = companyRow?.status === "connected"
     ? "company"
     : personalRow?.status === "connected" ? "personal" : null;
+  let purchaseOrderApprovalEmail = "";
+  try {
+    const value = approvalSetting ? JSON.parse(approvalSetting.valueJson) : "";
+    if (typeof value === "string") purchaseOrderApprovalEmail = value;
+  } catch { /* A malformed setting is treated as unset and can be replaced from the UI. */ }
   return {
     configuredProviders,
     companyConnection,
     personalConnection,
     defaultSender,
     canManageCompany: hasCapability(actor, "administer"),
+    purchaseOrderApprovalEmail,
     connection: defaultSender === "company" ? companyConnection : defaultSender === "personal" ? personalConnection : null,
   };
+}
+
+function validEmailAddress(value: string) {
+  return value.length <= 254 && /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/u.test(value);
+}
+
+export async function setPurchaseOrderApprovalEmail(actor: ActorIdentity, value: string) {
+  if (!hasCapability(actor, "administer")) {
+    throw new EmailProviderError("Only a company administrator can change approval email alerts.", "COMPANY_EMAIL_FORBIDDEN", 403);
+  }
+  const emailAddress = value.trim().toLowerCase();
+  if (emailAddress && !validEmailAddress(emailAddress)) {
+    throw new EmailProviderError("Enter a valid email address for purchase-order approvals.", "INVALID_APPROVAL_EMAIL", 400);
+  }
+  const now = new Date().toISOString();
+  const db = getD1();
+  await db.batch([
+    db.prepare(`INSERT INTO system_settings (key,value_json,description,version,updated_by,updated_at)
+      VALUES ('email.purchaseOrderApprovalRecipient',?,'Receives an email when a purchase-order draft is created.',1,?,?)
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,description=excluded.description,
+        version=system_settings.version+1,updated_by=excluded.updated_by,updated_at=excluded.updated_at`)
+      .bind(JSON.stringify(emailAddress), actor.label, now),
+    db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
+      VALUES (?,'system_setting','email.purchaseOrderApprovalRecipient','approval_email_updated',?,?,?,?,?,?)`)
+      .bind(`audit-email-${crypto.randomUUID()}`, emailAddress ? `Draft purchase-order approval alerts will be sent to ${emailAddress}.` : "Draft purchase-order approval alerts were turned off.", actor.label, actor.id, actor.email, JSON.stringify({ emailAddress }), now),
+  ]);
+  return { purchaseOrderApprovalEmail: emailAddress };
 }
 
 export async function createEmailAuthorizationUrl(actor: ActorIdentity, requestUrl: string, input: { provider: EmailProvider; senderType?: EmailSenderType; returnTo?: string }) {
@@ -313,7 +347,20 @@ function encodedHeader(value: string) {
   return `=?UTF-8?B?${utf8Base64(value)}?=`;
 }
 
-function mimeMessage(input: { sender: string; recipients: string[]; subject: string; htmlBody: string; fileName: string; pdf: Uint8Array }) {
+type OutboundEmail = { recipients: string[]; subject: string; htmlBody: string; fileName?: string; pdf?: Uint8Array };
+
+function mimeMessage(input: OutboundEmail & { sender: string }) {
+  if (!input.fileName || !input.pdf) return [
+    `From: ${input.sender}`,
+    `To: ${input.recipients.join(", ")}`,
+    `Subject: ${encodedHeader(input.subject)}`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    utf8Base64(input.htmlBody).replace(/.{1,76}/g, "$&\r\n").trim(),
+    "",
+  ].join("\r\n");
   const boundary = `paneflow-${crypto.randomUUID()}`;
   const attachment = bytesToBase64(input.pdf).replace(/.{1,76}/g, "$&\r\n").trim();
   return [
@@ -339,7 +386,7 @@ function mimeMessage(input: { sender: string; recipients: string[]; subject: str
   ].join("\r\n");
 }
 
-async function providerSend(connection: StoredConnection, token: string, input: { recipients: string[]; subject: string; htmlBody: string; fileName: string; pdf: Uint8Array }) {
+async function providerSend(connection: StoredConnection, token: string, input: OutboundEmail) {
   if (connection.provider === "google") {
     const raw = utf8Base64(mimeMessage({ sender: connection.emailAddress, ...input })).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
     const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
@@ -356,7 +403,7 @@ async function providerSend(connection: StoredConnection, token: string, input: 
       subject: input.subject,
       body: { contentType: "HTML", content: input.htmlBody },
       toRecipients: input.recipients.map((address) => ({ emailAddress: { address } })),
-      attachments: [{ "@odata.type": "#microsoft.graph.fileAttachment", name: input.fileName, contentType: "application/pdf", contentBytes: bytesToBase64(input.pdf) }],
+      ...(input.fileName && input.pdf ? { attachments: [{ "@odata.type": "#microsoft.graph.fileAttachment", name: input.fileName, contentType: "application/pdf", contentBytes: bytesToBase64(input.pdf) }] } : {}),
     }, saveToSentItems: true }),
   });
   if (response.status === 401) return { unauthorized: true as const };
@@ -386,8 +433,7 @@ export async function getEmailSender(actor: ActorIdentity, senderType?: EmailSen
   return { provider: connection.provider, senderEmail: connection.emailAddress, senderType: connection.senderType };
 }
 
-export async function sendWithConnectedMailbox(actor: ActorIdentity, input: { recipients: string[]; subject: string; htmlBody: string; fileName: string; pdf: Uint8Array }, senderType?: EmailSenderType) {
-  const connection = await selectedConnection(actor, senderType);
+async function sendWithConnection(connection: StoredConnection, input: OutboundEmail) {
   let token = await accessToken(connection);
   let result = await providerSend(connection, token, input);
   if (result.unauthorized) {
@@ -400,6 +446,25 @@ export async function sendWithConnectedMailbox(actor: ActorIdentity, input: { re
     throw new EmailProviderError(`${connection.senderType === "company" ? "The company email" : "Your email"} needs to be authorized again.`, "EMAIL_REAUTHORIZATION_REQUIRED", 401);
   }
   return { provider: connection.provider, senderEmail: connection.emailAddress, senderType: connection.senderType, messageId: result.messageId };
+}
+
+export async function sendWithConnectedMailbox(actor: ActorIdentity, input: OutboundEmail, senderType?: EmailSenderType) {
+  return sendWithConnection(await selectedConnection(actor, senderType), input);
+}
+
+/** System notifications always use the tenant's shared company sender, never a user's mailbox. */
+export async function sendWithCompanyMailbox(input: OutboundEmail) {
+  if (!input.recipients.length || input.recipients.some((recipient) => !validEmailAddress(recipient))) {
+    throw new EmailProviderError("The system notification recipient is invalid.", "INVALID_EMAIL_RECIPIENT", 400);
+  }
+  if (!input.subject.trim() || /[\r\n]/u.test(input.subject)) {
+    throw new EmailProviderError("The system notification subject is invalid.", "INVALID_EMAIL_SUBJECT", 400);
+  }
+  const connection = await first<StoredConnection>(connectionSql(), COMPANY_MAILBOX_OWNER);
+  if (!connection || connection.status !== "connected") {
+    throw new EmailProviderError("Connect the company email before system notifications can be sent.", "COMPANY_EMAIL_NOT_CONNECTED", 409);
+  }
+  return sendWithConnection(connection, input);
 }
 
 export async function disconnectEmail(actor: ActorIdentity, senderType: EmailSenderType = "personal") {

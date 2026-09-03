@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { deleteAttachmentObject } from "./attachments";
+import { sendWithCompanyMailbox } from "./email-client";
 import { getD1 } from "./inventory-db";
 
 type OutboxEnvironment = {
@@ -18,6 +19,11 @@ type OutboxRow = {
 };
 
 const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, "0")).join("");
+const INTERNAL_DRAFT_PO_EMAIL = "purchase_order.draft_approval_email_requested";
+
+function escapeHtml(value: string) {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+}
 
 async function signature(secret: string, timestamp: string, body: string) {
   const encoder = new TextEncoder();
@@ -50,7 +56,7 @@ export async function processOutboxBatch({ limit = 20 }: { limit?: number } = {}
   await db.prepare(`UPDATE outbox_events SET status='processing',locked_at=?
     WHERE id IN (SELECT id FROM outbox_events
       WHERE ((status IN ('pending','failed') AND available_at<=?) OR (status='processing' AND locked_at<?))
-        AND (?=1 OR event_type='attachment.delete_requested')
+        AND (?=1 OR event_type IN ('attachment.delete_requested','purchase_order.draft_approval_email_requested'))
       ORDER BY created_at,id LIMIT ?)`)
     .bind(claimedAt, claimedAt, new Date(now.getTime() - 10 * 60_000).toISOString(), webhookConfigured ? 1 : 0, bounded).run();
   const claimed = await db.prepare(`SELECT id,event_type AS eventType,aggregate_type AS aggregateType,
@@ -68,7 +74,26 @@ export async function processOutboxBatch({ limit = 20 }: { limit?: number } = {}
         const objectKey = payload && typeof payload === "object" && "objectKey" in payload ? String((payload as { objectKey?: unknown }).objectKey ?? "") : "";
         await deleteAttachmentObject(objectKey);
       }
-      if (endpoint && secret) {
+      if (event.eventType === INTERNAL_DRAFT_PO_EMAIL) {
+        const values = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+        const recipient = String(values.recipient ?? "").trim();
+        const number = String(values.number ?? "Purchase order").trim();
+        const recordId = String(values.recordId ?? event.aggregateId).trim();
+        const origin = new URL(String(values.appOrigin ?? ""));
+        if (!/^https?:$/u.test(origin.protocol)) throw new Error("Draft purchase-order link must use HTTP or HTTPS.");
+        const reviewUrl = new URL("/", origin);
+        reviewUrl.searchParams.set("view", "purchase-orders");
+        reviewUrl.searchParams.set("po", recordId);
+        reviewUrl.searchParams.set("number", number);
+        const safeNumber = escapeHtml(number);
+        const safeUrl = escapeHtml(reviewUrl.toString());
+        await sendWithCompanyMailbox({
+          recipients: [recipient],
+          subject: `${number} draft created — approval required`,
+          htmlBody: `<p>A new purchase order draft, <strong>${safeNumber}</strong>, was created and requires approval.</p><p><a href="${safeUrl}">Review purchase order</a></p>`,
+        });
+      }
+      if (endpoint && secret && event.eventType !== INTERNAL_DRAFT_PO_EMAIL) {
         const response = await fetch(endpoint, {
           method: "POST",
           headers: {

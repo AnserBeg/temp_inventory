@@ -15,6 +15,7 @@ type ConnectionState = {
   personalConnection: ConnectionSummary | null;
   defaultSender: EmailSenderType | null;
   canManageCompany: boolean;
+  purchaseOrderApprovalEmail: string;
   connection: ConnectionSummary | null;
 };
 type PreviewResponse = {
@@ -51,6 +52,7 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState(false);
   const [setupTarget, setSetupTarget] = useState<EmailSenderType | null>(null);
+  const [approvalEmail, setApprovalEmail] = useState("");
   // Every setState here happens after the response arrives, never synchronously inside the
   // effect that starts the load; errors are handled where they occur rather than by the caller.
   const load = useCallback(async () => {
@@ -59,6 +61,7 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
       const body = await response.json() as ConnectionState;
       if (!response.ok) throw new Error(errorMessage(body, "Email connection status is unavailable."));
       setState(body);
+      setApprovalEmail(body.purchaseOrderApprovalEmail ?? "");
       setError("");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Email connection status is unavailable.");
@@ -80,6 +83,20 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
       if (!response.ok) throw new Error(errorMessage(body, "The mailbox could not be disconnected."));
       await load();
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The mailbox could not be disconnected."); }
+    finally { setBusy(""); }
+  };
+  const saveApprovalEmail = async () => {
+    setBusy("approval-email"); setError("");
+    try {
+      const response = await fetch("/api/integrations/email", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ purchaseOrderApprovalEmail: approvalEmail }),
+      });
+      const body = await response.json() as { purchaseOrderApprovalEmail?: string; error?: unknown };
+      if (!response.ok) throw new Error(errorMessage(body, "The approval email could not be saved."));
+      await load();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "The approval email could not be saved."); }
     finally { setBusy(""); }
   };
 
@@ -107,6 +124,14 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
     {state && expanded ? <div className="email-sender-list">
       {senderRow("company", state.companyConnection, state.canManageCompany)}
       {senderRow("personal", state.personalConnection, true)}
+      <div className="email-sender-setting email-approval-setting">
+        <div><strong>Draft PO approvals</strong><small>{state.purchaseOrderApprovalEmail || "No alert recipient"}</small></div>
+        {state.canManageCompany ? <div className="email-provider-actions email-provider-choice">
+          <label><span className="sr-only">Draft purchase order approval email</span><input type="email" value={approvalEmail} onChange={(event) => setApprovalEmail(event.target.value)} placeholder="approvals@company.com" disabled={Boolean(busy)} /></label>
+          <button type="button" className="text-button" disabled={Boolean(busy) || approvalEmail.trim() === state.purchaseOrderApprovalEmail} onClick={() => void saveApprovalEmail()}>{busy === "approval-email" ? "Saving…" : "Save"}</button>
+          <small>Email this address when a new draft needs approval. Leave blank to turn alerts off.</small>
+        </div> : null}
+      </div>
     </div> : null}
   </div>;
 }
@@ -119,6 +144,13 @@ export function EmailDocumentButton({ documentType, documentId, documentNumber, 
     <button type="button" className={className} disabled={disabled} onClick={() => setOpen(true)} title={disabled ? "Your role cannot send this document." : `Email ${documentNumber} as a PDF`}>{children}</button>
     {open ? <EmailDocumentDialog documentType={documentType} documentId={documentId} documentNumber={documentNumber} onClose={() => setOpen(false)} /> : null}
   </>;
+}
+
+export function DocumentDownloadLink({ documentType, documentId, documentNumber, className = "button secondary", children = "Download PDF" }: {
+  documentType: DocumentType; documentId: string; documentNumber: string; className?: string; children?: string;
+}) {
+  const query = new URLSearchParams({ documentType, documentId });
+  return <a className={className} href={`/api/documents/pdf?${query}`} download title={`Download ${documentNumber} as a PDF`}>{children}</a>;
 }
 
 function EmailDocumentDialog({ documentType, documentId, documentNumber, onClose }: { documentType: DocumentType; documentId: string; documentNumber: string; onClose: () => void }) {
