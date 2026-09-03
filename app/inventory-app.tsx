@@ -51,7 +51,10 @@ type PurchaseLine = {
   open: number;
   openToReceive: number;
   openToDeliver: number;
+  /** Quantity already committed to non-void vendor bills, in the displayed purchase UOM. */
+  billed: number;
   unitCost: number;
+  baseUnitCost: number;
   orderedUomId?: string;
   orderedUomCode?: string;
   uomFactorToBase: number;
@@ -142,6 +145,8 @@ type PurchaseOrder = {
   feeTaxRateBps: number;
   depositCents: number;
   buyer: string;
+  orderedAt?: string;
+  orderedBy?: string;
   orderDate: string;
   submissionNote?: string;
   revision: number;
@@ -830,6 +835,8 @@ type FinancialDocumentRecord = {
   outstanding: number;
   currency: string;
   externalReference?: string;
+  qboStatus?: string;
+  qboEntityId?: string;
 };
 
 type SettlementDocumentRecord = {
@@ -925,10 +932,12 @@ function prefetchSnapshot(request: ReturnType<typeof createSnapshotRequest>) {
 type WorkflowGuideStep = { label: string; detail: string; view: ViewKey; tab?: string };
 
 const purchasingWorkflow: WorkflowGuideStep[] = [
-  { label: "Commit order", detail: "Draft and approve", view: "purchase-orders" },
-  { label: "Receive stock", detail: "Post warehouse receipt", view: "expected-receipts" },
-  { label: "Match vendor bill", detail: "PO + receipt + vendor invoice", view: "vendor-bills" },
-  { label: "Settle payable", detail: "Credit or record payment", view: "vendor-bills", tab: "billing-actions" },
+  { label: "Draft", detail: "Create and submit", view: "purchase-orders" },
+  { label: "Approve", detail: "Release for ordering", view: "purchase-orders", tab: "approvals" },
+  { label: "Place order", detail: "Mark vendor order sent", view: "purchase-orders" },
+  { label: "Receive", detail: "Post supplier fulfillment", view: "expected-receipts" },
+  { label: "Create bill", detail: "Prefill from PO receipts", view: "vendor-bills" },
+  { label: "Send to QBO", detail: "Accounting owns payment", view: "vendor-bills" },
 ];
 
 const salesWorkflow: WorkflowGuideStep[] = [
@@ -1713,7 +1722,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               {view === "purchase-orders" && (
                 <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { changeWorkspaceTab("overview"); setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }}>
                 {selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1721,7 +1730,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               )}
               {view === "expected-receipts" && (
                 selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canOperate={snapshot.viewer.permissions.canOperate} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} receivingOnly />
                 )
@@ -1924,7 +1933,7 @@ function PageActions({ view, source, canOperate, canApprove, onNavigate, onCreat
   // Warehouse mode used to repeat the connection pill here, a few pixels from the identical one
   // the page eyebrow already renders for every view.
   if (!ready) return null;
-  if (view === "purchase-orders") return canOperate ? <button className="button primary" onClick={() => onCreate("purchaseOrder")}>Create purchase order</button> : null;
+  if (view === "purchase-orders") return <button className="button primary" onClick={() => onCreate("purchaseOrder")}>Create purchase order</button>;
   if (view === "sales-orders") return canOperate ? <button className="button primary" onClick={() => onCreate("salesOrder")}>Create sales order</button> : null;
   if (view === "stock") return canOperate ? <button className="button secondary" onClick={() => onNavigate("counts")}>Start inventory count</button> : null;
   // Adding a SKU used to be reachable only from inside an order line or the master-data tab,
@@ -2088,12 +2097,14 @@ function useLocalTableSort<T>(rows: T[], accessors: Record<string, (row: T) => u
  *  label answers the operator's immediate question: what needs to happen next? */
 function purchaseOrderStage(po: PurchaseOrder) {
   const lifecycle = po.lifecycle.toLowerCase();
-  const billing = po.billing.toLowerCase();
   if (lifecycle === "draft" || lifecycle.includes("pending") || lifecycle === "rejected" || lifecycle === "canceled") return po.lifecycle;
-  if (po.open > 0) return po.fulfilled > 0 ? "Partially fulfilled" : "Awaiting fulfillment";
-  if (billing.includes("partially")) return "Partially billed";
-  if (billing === "fully billed" || billing === "billed") return "Fully billed";
-  return "Awaiting vendor bill";
+  if (!po.orderedAt) return "Awaiting order";
+  if (po.fulfilled <= 0) return "Ordered";
+  if (po.open > 0) return "Partially received";
+  const activeBills = po.vendorBills.filter((bill) => bill.status.toLowerCase() !== "void");
+  if (!activeBills.length) return "Received";
+  if (activeBills.every((bill) => bill.qboStatus?.toLowerCase() === "succeeded")) return "Sent to QBO";
+  return "Bill created";
 }
 
 const worklistColumnLabels: Partial<Record<ViewKey, Record<string, string>>> = {
@@ -2151,9 +2162,9 @@ function WorkflowGuide({ view, workspaceTab, onNavigate }: { view: ViewKey; work
   let active = 0;
 
   if (["purchase-orders", "expected-receipts", "vendor-bills"].includes(view)) {
-    title = "Purchase to payment";
+    title = "Purchase to accounting";
     steps = purchasingWorkflow;
-    active = view === "purchase-orders" ? 0 : view === "expected-receipts" ? 1 : workspaceTab === "billing-actions" ? 3 : 2;
+    active = view === "purchase-orders" ? workspaceTab === "approvals" ? 1 : 0 : view === "expected-receipts" ? 3 : 4;
   } else if (["sales-orders", "fulfillment", "customer-invoices"].includes(view)) {
     title = "Order to cash";
     steps = salesWorkflow;
@@ -2222,16 +2233,19 @@ function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSo
       <td className="numeric strong">{formatDocumentMoney(po.total, po.currency, false)}</td>
       {/* "Open" named both the remaining-quantity column and this button. The action says what
           it does to a document; the column keeps the ERP term for quantity. */}
-      <td>{canOperate && po.lifecycle.toLowerCase() === "approved" && po.openToReceive > 0 ? <button className="row-action" onClick={() => onReceive(po)}>Receive</button> : <button className="row-action" onClick={() => onOpen(po.id)}>View</button>}</td>
+      <td>{canOperate && po.lifecycle.toLowerCase() === "approved" && Boolean(po.orderedAt) && po.openToReceive > 0 ? <button className="row-action" onClick={() => onReceive(po)}>Receive</button> : <button className="row-action" onClick={() => onOpen(po.id)}>View</button>}</td>
     </tr>)}{!orders.length ? <tr><td colSpan={12}><div className="empty-inline">No purchase order matches this filter.</div></td></tr> : null}</tbody></table></div>
   </section>;
 }
 
-function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpenVendorBilling, onOpenApprovalQueue, onOpenDropShip, onSubmitForApproval, onChanged }: { po: PurchaseOrder; canOperate: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: (tab?: string) => void; onOpenApprovalQueue: () => void; onOpenDropShip: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void }) {
+function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBack, onEdit, onCommand, onOpenVendorBilling, onOpenApprovalQueue, onOpenQbo, onOpenDropShip, onSubmitForApproval, onChanged }: { po: PurchaseOrder; canDraft: boolean; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: (tab?: string) => void; onOpenApprovalQueue: () => void; onOpenQbo: () => void; onOpenDropShip: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   const [submitNote, setSubmitNote] = useState("");
   const [mergeOpen, setMergeOpen] = useState(false);
+  const [billOpen, setBillOpen] = useState(false);
+  const [ordering, setOrdering] = useState(false);
+  const [orderError, setOrderError] = useState("");
   // A rejected revision is the buyer's to correct and resubmit, so it is edited like a draft.
   const lifecycle = po.lifecycle.toLowerCase();
   const isDraft = ["draft", "rejected"].includes(po.lifecycle.toLowerCase());
@@ -2247,37 +2261,50 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
     try { await onSubmitForApproval(submitNote.trim()); } catch (caught) { setActivateError(caught instanceof Error ? caught.message : "The purchase order could not be submitted."); }
     finally { setActivating(false); }
   };
+  const markOrdered = async () => {
+    setOrdering(true); setOrderError("");
+    try { onChanged(await postWorkflow("markPurchaseOrderOrdered", po.id, po.version, { supplierReference: po.supplierReference ?? "" })); }
+    catch (caught) { setOrderError(caught instanceof Error ? caught.message : "The purchase order could not be marked as ordered."); }
+    finally { setOrdering(false); }
+  };
   const totals = documentTotals(po.lines.map((line) => ({ quantity: line.ordered, unitAmount: line.unitCost, discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps })), po);
   const lineTable = useLocalTableSort(po.lines, { line: (row) => po.lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, customer: (row) => row.customerRef ?? "Stock", ordered: (row) => row.ordered, received: (row) => row.received - row.returned, returned: (row) => row.returned, closed: (row) => row.closed, open: (row) => row.open, unitCost: (row) => row.unitCost, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitCost, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitCost, row.discountCents) });
   const activeVendorBills = po.vendorBills.filter((bill) => bill.status.toLowerCase() !== "void");
   const vendorBillOutstanding = activeVendorBills.reduce((sum, bill) => sum + bill.outstanding, 0);
   const billNeedsAttention = activeVendorBills.some((bill) => bill.status.toLowerCase().includes("hold") || bill.matchStatus?.toLowerCase().includes("exception"));
   const billingSaysComplete = ["fully billed", "billed"].includes(po.billing.toLowerCase());
+  const billableLines = po.lines.filter((line) => line.fulfilled - line.billed > 0.000001);
+  const qboFailed = activeVendorBills.some((bill) => ["failed", "conflict"].includes(bill.qboStatus?.toLowerCase() ?? ""));
+  const qboComplete = activeVendorBills.length > 0 && activeVendorBills.every((bill) => bill.qboStatus?.toLowerCase() === "succeeded");
+  const qboPending = activeVendorBills.length > 0 && !qboComplete && !qboFailed;
   const fulfillmentDocuments: RecordProgressDocument[] = [
     ...po.receipts.map((receipt) => ({ number: receipt.number, detail: `${receipt.quantity} received · ${formatDocumentDate(receipt.postedAt)}${receipt.packingSlipNumber ? ` · slip ${receipt.packingSlipNumber}` : ""}` })),
     ...po.supplierDeliveries.map((delivery) => ({ number: delivery.number, detail: `${delivery.quantity} delivered · ${formatDocumentDate(delivery.deliveryDate)}${delivery.externalReference ? ` · ${delivery.externalReference}` : ""}` })),
   ];
   const billDocuments: RecordProgressDocument[] = activeVendorBills.map((bill) => ({
     number: bill.number,
-    detail: `${bill.externalReference ? `Vendor ${bill.externalReference} · ` : ""}${bill.matchStatus ? `${bill.matchStatus} · ` : ""}${formatDocumentMoney(bill.amount, bill.currency)}${bill.outstanding > 0 ? ` · ${formatDocumentMoney(bill.outstanding, bill.currency)} outstanding` : " · settled"}`,
+    detail: `${bill.externalReference ? `Invoice ${bill.externalReference} · ` : ""}${bill.matchStatus ? `${bill.matchStatus} · ` : ""}${formatDocumentMoney(bill.amount, bill.currency)}${bill.outstanding > 0 ? ` · ${formatDocumentMoney(bill.outstanding, bill.currency)} outstanding` : " · settled"}`,
     href: `/api/documents/pdf?documentType=vendor_bill&documentId=${encodeURIComponent(bill.id)}`,
   }));
-  const settlementDocuments: RecordProgressDocument[] = po.settlements.map((settlement) => ({
-    number: settlement.number,
-    detail: `${titleCase(settlement.kind)}${settlement.appliedTo ? ` to ${settlement.appliedTo}` : ""} · ${formatDocumentDate(settlement.postedAt)} · ${formatDocumentMoney(settlement.amount, settlement.currency)}`,
-  }));
+  const stopped = lifecycle === "canceled";
+  const approved = lifecycle === "approved";
   const purchaseProgress: RecordProgressStep[] = [
-    { label: "Purchase order", state: lifecycle === "canceled" ? "stopped" : lifecycle === "approved" ? "complete" : lifecycle.includes("pending") || lifecycle === "rejected" ? "attention" : "current", summary: `${po.lifecycle} · revision ${po.revision} · ${formatDocumentMoney(po.total, po.currency)}`, documents: [{ number: po.number, detail: `${po.vendor} · ordered ${formatDocumentDate(po.orderDate)}`, href: `/api/documents/pdf?documentType=purchase_order&documentId=${encodeURIComponent(po.id)}` }] },
-    { label: "Supplier fulfillment", state: lifecycle === "canceled" ? "stopped" : po.open <= 0 && lifecycle === "approved" ? "complete" : lifecycle === "approved" ? "current" : "upcoming", summary: `${po.fulfilled} of ${po.ordered} fulfilled · ${po.closed} closed · ${po.open} open`, documents: fulfillmentDocuments },
-    { label: "Vendor bill", state: lifecycle === "canceled" ? "stopped" : billNeedsAttention || (billingSaysComplete && !activeVendorBills.length) ? "attention" : billingSaysComplete && activeVendorBills.length > 0 ? "complete" : activeVendorBills.length > 0 || (lifecycle === "approved" && po.open <= 0) ? "current" : "upcoming", summary: activeVendorBills.length ? `${activeVendorBills.length} connected bill${activeVendorBills.length === 1 ? "" : "s"} · ${po.billing}` : billingSaysComplete ? "Billing status is complete, but no connected bill was found" : `${po.billing} · no vendor bill posted`, documents: billDocuments },
-    { label: "Payable settlement", state: lifecycle === "canceled" ? "stopped" : activeVendorBills.length && vendorBillOutstanding <= 0 ? "complete" : activeVendorBills.length ? "current" : "upcoming", summary: activeVendorBills.length ? `${formatDocumentMoney(vendorBillOutstanding, po.currency)} outstanding across connected bills` : "Begins after a vendor bill is posted", documents: settlementDocuments },
+    { label: "Draft", state: stopped ? "stopped" : isDraft ? lifecycle === "rejected" ? "attention" : "current" : "complete", summary: isDraft ? lifecycle === "rejected" ? "Returned for correction" : "Editable by any signed-in user" : `Revision ${po.revision} saved`, documents: [{ number: po.number, detail: `${po.vendor} · ${formatDocumentMoney(po.total, po.currency)}`, href: `/api/documents/pdf?documentType=purchase_order&documentId=${encodeURIComponent(po.id)}` }] },
+    { label: "Submitted", state: stopped ? "stopped" : lifecycle.includes("pending") ? "current" : approved ? "complete" : "upcoming", summary: lifecycle.includes("pending") ? "Approval email sent · decision pending" : approved ? "Approved by purchasing" : "Submit when the draft is ready" },
+    { label: "Awaiting order", state: stopped ? "stopped" : po.orderedAt ? "complete" : approved ? "current" : "upcoming", summary: po.orderedAt ? `Placed ${formatDocumentDate(po.orderedAt)}` : approved ? "Approved and ready to place with vendor" : "Begins after approval" },
+    { label: "Ordered", state: stopped ? "stopped" : po.orderedAt && po.fulfilled > 0 ? "complete" : po.orderedAt ? "current" : "upcoming", summary: po.orderedAt ? `${po.orderedBy ?? "Purchasing"} · ${po.supplierReference || "vendor confirmation not recorded"}` : "Receiving stays locked until the order is placed" },
+    { label: "Received", state: stopped ? "stopped" : po.orderedAt && po.open <= 0 ? "complete" : po.orderedAt && po.fulfilled > 0 ? "current" : "upcoming", summary: po.fulfilled > 0 ? `${po.fulfilled} of ${po.ordered} received${po.open > 0 ? " · partial" : ""}` : "No quantity received yet", documents: fulfillmentDocuments },
+    { label: "Bill created", state: stopped ? "stopped" : billNeedsAttention || (billingSaysComplete && !activeVendorBills.length) ? "attention" : activeVendorBills.length ? "complete" : po.orderedAt && po.open <= 0 ? "current" : "upcoming", summary: activeVendorBills.length ? `${activeVendorBills.length} supplier invoice${activeVendorBills.length === 1 ? "" : "s"} connected · ${po.billing}` : billableLines.length ? "Received lines are ready to become a bill" : "Begins after receiving", documents: billDocuments },
+    { label: "Sent to QBO", state: stopped ? "stopped" : qboFailed ? "attention" : qboComplete ? "complete" : activeVendorBills.length ? "current" : "upcoming", summary: qboComplete ? "Accounting handoff complete" : qboFailed ? "QBO needs attention" : qboPending ? "Queued for automatic QBO delivery" : "Accounting pays the bill in QuickBooks" },
   ];
   const nextAction: RecordNextAction = lifecycle === "canceled"
     ? { title: "No action — order canceled", detail: "This progression is retained as history.", tone: "success" }
     : isDraft
       ? { title: lifecycle === "rejected" ? "Correct and resubmit the order" : "Finish and submit the order", detail: "Review the lines and supporting note before sending it for approval.", label: "Edit draft", onClick: onEdit }
       : lifecycle.includes("pending")
-        ? { title: "Purchasing approval is required", detail: "An approver must accept or reject the commercial commitment before fulfillment.", label: "Open approval queue", onClick: onOpenApprovalQueue, tone: "warning" }
+        ? { title: "Approval is the only next step", detail: "The configured approver has been emailed. Inventory and ordering remain locked.", label: "Open approval queue", onClick: onOpenApprovalQueue, tone: "warning" }
+        : !po.orderedAt
+          ? { title: "Place the approved order", detail: "Send the PO to the vendor, then confirm here so receiving can begin.", label: ordering ? "Marking ordered…" : "Mark as ordered", onClick: () => void markOrdered() }
         : po.openToReceive > 0
           ? { title: `Receive ${po.openToReceive} remaining unit${po.openToReceive === 1 ? "" : "s"}`, detail: "Post the warehouse receipt against this order and capture the packing slip.", label: "Receive remaining", onClick: () => onCommand("receive") }
           : po.openToDeliver > 0
@@ -2286,30 +2313,52 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
               ? { title: "Resolve the vendor bill exception", detail: "Review the three-way match or hold before approval and payment.", label: "Open match exceptions", onClick: () => onOpenVendorBilling("match"), tone: "warning" }
               : billingSaysComplete && !activeVendorBills.length
                 ? { title: "Reconcile the missing bill link", detail: "The order says fully billed, but no vendor bill is connected to it.", label: "Review vendor billing", onClick: () => onOpenVendorBilling("overview"), tone: "warning" }
-                : !billingSaysComplete
-                  ? { title: "Record the vendor bill", detail: "Create the payable from this order and its posted fulfillment; inventory will not move again.", label: "Open vendor billing", onClick: () => onOpenVendorBilling("overview") }
-                  : vendorBillOutstanding > 0
-                    ? { title: `Settle ${formatDocumentMoney(vendorBillOutstanding, po.currency)}`, detail: "Record payment or apply a vendor credit to the connected bill.", label: "Open bill actions", onClick: () => onOpenVendorBilling("billing-actions") }
-                    : { title: "Purchase-to-payment complete", detail: "The commitment, fulfillment, bill, and settlement are complete.", tone: "success" };
+                : billableLines.length
+                  ? canPostFinancial
+                    ? { title: "Create the bill from this PO", detail: "All received, unbilled lines are prefilled. Add the supplier invoice number and confirm.", label: "Create bill", onClick: () => setBillOpen(true) }
+                    : { title: "Bill creation is ready", detail: "Accounting can create it here from the received PO lines.", label: "Open vendor billing", onClick: () => onOpenVendorBilling("overview") }
+                  : qboFailed
+                    ? { title: "QBO delivery needs attention", detail: "The bill remains recorded here; review the sync issue before accounting pays it.", label: "Review QBO sync", onClick: onOpenQbo, tone: "warning" }
+                    : qboPending
+                      ? { title: "Sending bill to QBO", detail: "The accounting handoff runs automatically. No duplicate entry is needed.", label: "View QBO status", onClick: onOpenQbo }
+                      : activeVendorBills.length
+                        ? { title: "Sent to QBO", detail: "Accounting now owns payment in QuickBooks Online.", tone: "success" }
+                        : { title: "Nothing to bill yet", detail: "Receiving must be completed before the bill can be created.", tone: "warning" };
   return <div className="object-page">
     <button className="back-button" onClick={onBack}>← Back to purchase orders</button>
     <section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Purchase order · Revision {po.revision}</span><h2>{po.number}</h2><p>{po.vendor} · {destinationSummary}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(po.total, po.currency)}</strong><small>{po.currency}</small></div></div>
-      <div className="status-summary"><div><small>Commercial</small><StatusBadge>{po.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{po.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{po.billing}</StatusBadge></div></div>
+      <div className="status-summary"><div><small>Workflow</small><StatusBadge>{purchaseOrderStage(po)}</StatusBadge></div><div><small>Receiving</small><StatusBadge>{po.fulfillment}</StatusBadge></div><div><small>Supplier bill</small><StatusBadge>{po.billing}</StatusBadge></div></div>
       {po.exception && <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Action needed</strong><p>{po.exception}</p></div></div>}
-      {activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}
-      {isDraft && canOperate ? <form className="draft-activation" onSubmit={submit} noValidate><label><span>Submission note{requiredMark}</span><input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required aria-required="true" /><small className="field-hint">{submitNote.trim() ? "" : "Required before the order can be submitted."}</small></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : po.lifecycle.toLowerCase() === "rejected" ? "Resubmit for approval" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button>{po.lifecycle.toLowerCase() === "draft" ? <button className="button secondary" type="button" onClick={() => setMergeOpen(true)}>Merge another draft</button> : null}</form> : null}
+      {activateError || orderError ? <div className="error-summary" role="alert"><p>{activateError || orderError}</p></div> : null}
+      {isDraft && canDraft ? <form className="draft-activation" onSubmit={submit} noValidate><label><span>Submission note{requiredMark}</span><input value={submitNote} onChange={(event) => setSubmitNote(event.target.value)} placeholder="Why this order is needed" required aria-required="true" /><small className="field-hint">{submitNote.trim() ? "" : "Required before the order can be submitted."}</small></label><button className="button primary" type="submit" disabled={activating || !submitNote.trim()}>{activating ? "Submitting…" : po.lifecycle.toLowerCase() === "rejected" ? "Resubmit for approval" : "Submit for approval"}</button><button className="button secondary" type="button" onClick={onEdit}>Edit draft lines</button>{po.lifecycle.toLowerCase() === "draft" ? <button className="button secondary" type="button" onClick={() => setMergeOpen(true)}>Merge another draft</button> : null}</form> : null}
       {canOperate ? <div className="object-actions">
         {po.lifecycle.toLowerCase() === "approved" && <DocumentDownloadLink documentType="purchase_order" documentId={po.id} documentNumber={po.number}>Download purchase order</DocumentDownloadLink>}
         {po.lifecycle.toLowerCase() === "approved" && <EmailDocumentButton documentType="purchase_order" documentId={po.id} documentNumber={po.number}>Email purchase order</EmailDocumentButton>}
-        {po.lifecycle.toLowerCase() === "approved" && po.openToReceive > 0 && <button className="button primary" onClick={() => onCommand("receive")}>Receive remaining</button>}
-        {po.lifecycle.toLowerCase() === "approved" && po.openToDeliver > 0 && <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button>}
+        {po.lifecycle.toLowerCase() === "approved" && !po.orderedAt && <button className="button primary" onClick={() => void markOrdered()} disabled={ordering}>{ordering ? "Marking ordered…" : "Mark as ordered"}</button>}
+        {po.lifecycle.toLowerCase() === "approved" && Boolean(po.orderedAt) && po.openToReceive > 0 && <button className="button primary" onClick={() => onCommand("receive")}>Receive remaining</button>}
+        {po.lifecycle.toLowerCase() === "approved" && Boolean(po.orderedAt) && po.openToDeliver > 0 && <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button>}
         {po.lifecycle.toLowerCase() === "approved" && hasStockLines && po.lines.some((line) => line.fulfillmentRoute === "stock" && line.closed > 0) && <button className="button primary" onClick={() => onCommand("reopen")}>Reopen stock-receipt quantity</button>}
         {po.lifecycle.toLowerCase() === "approved" && po.open > 0 && <button className="button secondary" onClick={() => onCommand("close")}>Close unfulfilled quantity</button>}
         {po.latestReceiptId && po.lines.some((line) => line.latestReceiptReversible > 0) && <button className="button secondary" onClick={() => onCommand("reverse")}>Reverse incorrect receipt</button>}
         {po.received - po.returned > 0 && <button className="button ghost" onClick={() => onCommand("vendor-return")}>Return to vendor</button>}
       </div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}
     </section>
-    <RecordProgress title={`Purchase to payment for ${po.number}`} steps={purchaseProgress} next={nextAction} />
+    <RecordProgress title={`Purchase to accounting for ${po.number}`} steps={purchaseProgress} next={nextAction} />
+    <section className="panel connected-purchase-documents">
+      <PanelHeading title="Purchase order & supplier invoices" detail="The source PO and every connected bill stay together in one accounting handoff." />
+      <div className="connected-document-grid">
+        <a className="connected-document-card primary-document" href={`/api/documents/pdf?documentType=purchase_order&documentId=${encodeURIComponent(po.id)}`} target="_blank" rel="noreferrer">
+          <span>Purchase order</span><strong>{po.number}</strong><small>{po.vendor} · {formatDocumentMoney(po.total, po.currency)}</small>
+        </a>
+        {activeVendorBills.map((bill) => <a className="connected-document-card" key={bill.id} href={`/api/documents/pdf?documentType=vendor_bill&documentId=${encodeURIComponent(bill.id)}`} target="_blank" rel="noreferrer">
+          <span>Supplier invoice</span><strong>{bill.externalReference || bill.number}</strong><small>{bill.number} · {formatDocumentMoney(bill.amount, bill.currency)}</small><StatusBadge>{bill.qboStatus ? `QBO ${bill.qboStatus}` : bill.matchStatus || bill.status}</StatusBadge>
+        </a>)}
+        {Boolean(billableLines.length || !activeVendorBills.length) ? <button className="connected-document-card create-document-card" type="button" onClick={() => setBillOpen(true)} disabled={!canPostFinancial || !billableLines.length}>
+          <span>Next document</span><strong>Create supplier bill</strong><small>{billableLines.length ? `${billableLines.length} received line${billableLines.length === 1 ? "" : "s"} will be prefilled` : "Receive goods before creating the bill"}</small>
+        </button> : null}
+      </div>
+      {activeVendorBills.length ? <p className="connected-document-summary">{formatDocumentMoney(vendorBillOutstanding, po.currency)} outstanding · {qboComplete ? "handed to accounting in QBO" : qboFailed ? "QBO delivery needs attention" : "automatic QBO delivery in progress"}</p> : null}
+    </section>
     <section className="metric-row object-metrics">
       <MetricDisplay label="Ordered" value={po.ordered} />
       {/* Same quantity the line table calls "Net received"; two names for one number sent
@@ -2338,7 +2387,56 @@ function PurchaseOrderDetail({ po, canOperate, onBack, onEdit, onCommand, onOpen
     <div className="detail-columns"><section className="panel"><PanelHeading title="Related state" /><dl className="definition-list"><div><dt>Purchase order</dt><dd>{po.number} · revision {po.revision}</dd></div><div><dt>Latest receipt</dt><dd>{po.latestReceiptNumber ? <>{po.latestReceiptNumber}<br /><small>{formatDocumentDate(po.latestReceiptPostedAt)}</small></> : po.received > 0 ? "Recorded stock movements" : "No receipt posted"}</dd></div><div><dt>Packing slip</dt><dd>{po.latestReceiptPackingSlip ?? (po.latestReceiptNumber ? "Not recorded" : "—")}</dd></div><div><dt>Linked demand</dt><dd>{po.customerRef ?? "Stock replenishment"}</dd></div><div><dt>Billing</dt><dd>{po.billing}</dd></div></dl></section>
       <section className="panel"><PanelHeading title="Posting summary" /><div className="timeline"><div className="timeline-item"><span className="timeline-dot info" /><div><strong>Revision {po.revision} · {po.lifecycle}</strong><p>Commercial state is version checked independently of inventory.</p><small>Raised by {po.buyer || "an unrecorded buyer"}</small>{po.submissionNote ? <p className="submission-note">“{po.submissionNote}”</p> : null}</div></div><div className="timeline-item"><span className="timeline-dot success" /><div><strong>{po.received - po.returned} units net received</strong><p>{po.received} received · {po.returned} returned · {po.closed} closed without receipt.</p><small>{po.fulfillment}</small></div></div></div></section></div>
     {mergeOpen ? <MergePurchaseOrderDialog purchaseOrder={po} onClose={() => setMergeOpen(false)} onSaved={(message) => { setMergeOpen(false); onChanged(message); }} /> : null}
+    {billOpen ? <CreateBillFromPurchaseOrderDialog purchaseOrder={po} onClose={() => setBillOpen(false)} onSaved={(message) => { setBillOpen(false); onChanged(message); }} /> : null}
   </div>;
+}
+
+function CreateBillFromPurchaseOrderDialog({ purchaseOrder, onClose, onSaved }: { purchaseOrder: PurchaseOrder; onClose: () => void; onSaved: (message: string) => void }) {
+  const terms = purchaseOrder.paymentTerms || "Net 30";
+  const [vendorInvoiceNumber, setVendorInvoiceNumber] = useState("");
+  const [invoiceDate, setInvoiceDate] = useState(() => localDateString());
+  const [dueDate, setDueDate] = useState(() => dueDateForTerms(localDateString(), terms));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useDialogDismiss(onClose, busy);
+  const billableLines = purchaseOrder.lines.filter((line) => line.fulfilled - line.billed > 0.000001);
+  const itemSubtotalCents = billableLines.reduce((sum, line) => sum + Math.round((line.fulfilled - line.billed) * line.uomFactorToBase * line.baseUnitCost * 100), 0);
+  const expectedItemTaxCents = billableLines.reduce((sum, line) => sum + (line.taxable ? Math.round((line.fulfilled - line.billed) * line.uomFactorToBase * line.baseUnitCost * 100 * line.taxRateBps / 10_000) : 0), 0);
+  const effectiveTaxRateBps = itemSubtotalCents > 0 ? Math.round(expectedItemTaxCents * 10_000 / itemSubtotalCents) : 0;
+  const includeOrderCharges = !purchaseOrder.vendorBills.some((bill) => bill.status.toLowerCase() !== "void");
+  const chargeSubtotalCents = includeOrderCharges ? purchaseOrder.freightCents + purchaseOrder.feeCents + purchaseOrder.depositCents : 0;
+  const chargeTaxCents = includeOrderCharges ? Math.round(purchaseOrder.freightCents * purchaseOrder.freightTaxRateBps / 10_000) + Math.round(purchaseOrder.feeCents * purchaseOrder.feeTaxRateBps / 10_000) : 0;
+  const previewTaxCents = Math.round(itemSubtotalCents * effectiveTaxRateBps / 10_000) + chargeTaxCents;
+  const previewTotalCents = itemSubtotalCents + chargeSubtotalCents + previewTaxCents;
+  const charge = (chargeType: string, description: string, amountCents: number, taxRateBps: number, refundable = false) => amountCents > 0 ? { chargeType, description, amountCents, direction: "add", taxable: !refundable && taxRateBps > 0, refundable, taxCode: refundable || !taxRateBps ? "EXEMPT" : "TAX", taxRateBps: refundable ? 0 : taxRateBps } : null;
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!vendorInvoiceNumber.trim()) { setError("Enter the supplier invoice number."); return; }
+    if (!billableLines.length) { setError("There are no received, unbilled lines left on this purchase order."); return; }
+    setBusy(true); setError("");
+    try {
+      const charges = includeOrderCharges ? [
+        charge("freight", "Inbound freight", purchaseOrder.freightCents, purchaseOrder.freightTaxRateBps),
+        charge("fee", "Vendor fee", purchaseOrder.feeCents, purchaseOrder.feeTaxRateBps),
+        charge("returnable_deposit", "Refundable deposit", purchaseOrder.depositCents, 0, true),
+      ].filter((value): value is NonNullable<typeof value> => Boolean(value)) : [];
+      onSaved(await postWorkflow("createVendorBill", purchaseOrder.id, purchaseOrder.version, {
+        purchaseOrderId: purchaseOrder.id,
+        vendorInvoiceNumber: vendorInvoiceNumber.trim(),
+        invoiceDate,
+        dueDate,
+        currency: purchaseOrder.currency,
+        exchangeRateToBase: purchaseOrder.exchangeRateToBase,
+        paymentTerms: terms,
+        taxCode: effectiveTaxRateBps ? "TAX" : "EXEMPT",
+        taxRateBps: effectiveTaxRateBps,
+        lines: billableLines.map((line) => ({ purchaseOrderLineId: line.id, quantity: (line.fulfilled - line.billed) * line.uomFactorToBase, unitCostCents: Math.round(line.baseUnitCost * 100) })),
+        charges,
+      }));
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "The supplier bill could not be created."); }
+    finally { setBusy(false); }
+  };
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog auto-bill-dialog" role="dialog" aria-modal="true" aria-label={`Create supplier bill from ${purchaseOrder.number}`}><div className="dialog-header"><div><span className="section-kicker">Next stage · {purchaseOrder.number}</span><h2>Create supplier bill</h2><p>Received, unbilled quantities are already included. Enter the vendor&apos;s invoice details and review the handoff.</p></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose} disabled={busy}>×</button></div><form className="command-form" onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<div className="auto-bill-fields"><label><span>Supplier invoice number{requiredMark}</span><input autoFocus value={vendorInvoiceNumber} onChange={(event) => setVendorInvoiceNumber(event.target.value)} placeholder="From the supplier invoice" required /></label><label><span>Invoice date{requiredMark}</span><input type="date" value={invoiceDate} onChange={(event) => { const value = event.target.value; setInvoiceDate(value); setDueDate(dueDateForTerms(value, terms)); }} required /></label><label><span>Due date{requiredMark}</span><input type="date" min={invoiceDate} value={dueDate} onChange={(event) => setDueDate(event.target.value)} required /></label></div><div className="auto-bill-lines"><div className="auto-bill-lines-heading"><strong>Prefilled from received lines</strong><span>{billableLines.length} line{billableLines.length === 1 ? "" : "s"}</span></div>{billableLines.map((line) => <div className="auto-bill-line" key={line.id}><div><strong>{line.product}</strong><small>{line.sku}{line.orderedUomCode ? ` · ${line.orderedUomCode}` : ""}</small></div><span>{line.fulfilled - line.billed} × {formatDocumentMoney(line.unitCost, purchaseOrder.currency)}</span><strong>{formatDocumentMoney((line.fulfilled - line.billed) * line.unitCost, purchaseOrder.currency)}</strong></div>)}</div><div className="auto-bill-review"><div><span>Document link</span><strong>{purchaseOrder.number} → supplier invoice</strong></div><div><span>Terms</span><strong>{terms}</strong></div><div><span>Bill total</span><strong>{formatDocumentMoney(previewTotalCents / 100, purchaseOrder.currency)}</strong></div><div><span>After posting</span><strong>Automatically queued for QBO</strong></div></div><p className="field-hint">Creating this bill records the payable; it does not move inventory or record payment. Accounting completes payment in QuickBooks Online.</p><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose} disabled={busy}>Keep reviewing</button><button type="submit" className="button primary" disabled={busy || !vendorInvoiceNumber.trim() || !billableLines.length}>{busy ? "Creating bill…" : "Create bill & queue for QBO"}</button></div></form></section></div>;
 }
 
 function MergePurchaseOrderDialog({ purchaseOrder, onClose, onSaved }: { purchaseOrder: PurchaseOrder; onClose: () => void; onSaved: (message: string) => void }) {
@@ -4402,7 +4500,9 @@ function normalizeSnapshot(input: unknown): Snapshot {
       open: number(line.openToFulfillQuantity, number(line.openToReceiveQuantity)) / factor,
       openToReceive: number(line.openToReceiveQuantity) / factor,
       openToDeliver: number(line.openToDeliverQuantity) / factor,
+      billed: number(line.billedQuantity) / factor,
       unitCost: number(line.orderedUomUnitCostCents, number(line.unitCostCents)) / 100,
+      baseUnitCost: number(line.unitCostCents) / 100,
       orderedUomId: text(line.orderedUomId) || undefined,
       orderedUomCode: text(line.orderedUomCode) || undefined,
       uomFactorToBase: factor,
@@ -4420,7 +4520,9 @@ function normalizeSnapshot(input: unknown): Snapshot {
     });
     // Empty when the order has none: a fabricated date a week out read as a real promise.
     const expectedDate = text(item.expectedDate);
-    const open = number(item.openToFulfillQuantity, number(item.openToReceiveQuantity));
+    // Commercially open quantity remains visible while an approved PO is waiting to be placed;
+    // the separate open-to-receive values stay zero until the buyer marks it ordered.
+    const open = lines.length ? lines.reduce((sum, line) => sum + line.open, 0) : number(item.openToFulfillQuantity, number(item.openToReceiveQuantity));
     const fulfilled = number(item.supplierFulfilledQuantity, number(item.netReceivedQuantity));
     const closed = number(item.closedWithoutReceiptQuantity);
     const billingStatus = text(item.billingStatus, "not_billed");
@@ -4445,7 +4547,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
       open,
       openToReceive: number(item.openToReceiveQuantity),
       openToDeliver: number(item.openToDeliverQuantity),
-      billed: fulfilled,
+      billed: lines.reduce((sum, line) => sum + line.billed, 0),
       total: number(item.totalCents) / 100,
       currency: text(item.currency, "CAD"),
       exchangeRateToBase: number(item.exchangeRateToBase, 1),
@@ -4460,6 +4562,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
       feeTaxRateBps: number(item.feeTaxRateBps),
       depositCents: number(item.depositCents),
       buyer: text(item.buyerName, "Unassigned"),
+      orderedAt: text(item.orderedAt) || undefined,
+      orderedBy: text(item.orderedBy) || undefined,
       orderDate: text(item.orderDate).slice(0, 10),
       submissionNote: text(item.submissionNote) || undefined,
       // The commercial revision the vendor would recognise, not the optimistic-lock version.
@@ -4873,6 +4977,8 @@ function parseFinancialDocuments(value: unknown): FinancialDocumentRecord[] {
       outstanding: Math.max(amount - paid - credited, 0),
       currency: text(row.currency, "CAD"),
       externalReference: text(row.externalReference) || undefined,
+      qboStatus: text(row.qboStatus) ? titleCase(text(row.qboStatus)) : undefined,
+      qboEntityId: text(row.qboEntityId) || undefined,
     };
   });
 }

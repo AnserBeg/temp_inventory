@@ -19,7 +19,8 @@ type OutboxRow = {
 };
 
 const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, "0")).join("");
-const INTERNAL_DRAFT_PO_EMAIL = "purchase_order.draft_approval_email_requested";
+const LEGACY_DRAFT_PO_EMAIL = "purchase_order.draft_approval_email_requested";
+const INTERNAL_SUBMITTED_PO_EMAIL = "purchase_order.approval_email_requested";
 const INTERNAL_APPROVED_PO_EMAIL = "purchase_order.approved_email_requested";
 
 function escapeHtml(value: string) {
@@ -57,7 +58,7 @@ export async function processOutboxBatch({ limit = 20 }: { limit?: number } = {}
   await db.prepare(`UPDATE outbox_events SET status='processing',locked_at=?
     WHERE id IN (SELECT id FROM outbox_events
       WHERE ((status IN ('pending','failed') AND available_at<=?) OR (status='processing' AND locked_at<?))
-        AND (?=1 OR event_type IN ('attachment.delete_requested','purchase_order.draft_approval_email_requested','purchase_order.approved_email_requested'))
+        AND (?=1 OR event_type IN ('attachment.delete_requested','purchase_order.draft_approval_email_requested','purchase_order.approval_email_requested','purchase_order.approved_email_requested'))
       ORDER BY created_at,id LIMIT ?)`)
     .bind(claimedAt, claimedAt, new Date(now.getTime() - 10 * 60_000).toISOString(), webhookConfigured ? 1 : 0, bounded).run();
   const claimed = await db.prepare(`SELECT id,event_type AS eventType,aggregate_type AS aggregateType,
@@ -75,7 +76,7 @@ export async function processOutboxBatch({ limit = 20 }: { limit?: number } = {}
         const objectKey = payload && typeof payload === "object" && "objectKey" in payload ? String((payload as { objectKey?: unknown }).objectKey ?? "") : "";
         await deleteAttachmentObject(objectKey);
       }
-      if (event.eventType === INTERNAL_DRAFT_PO_EMAIL) {
+      if ([LEGACY_DRAFT_PO_EMAIL, INTERNAL_SUBMITTED_PO_EMAIL].includes(event.eventType)) {
         const values = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
         const recipient = String(values.recipient ?? "").trim();
         const number = String(values.number ?? "Purchase order").trim();
@@ -90,8 +91,8 @@ export async function processOutboxBatch({ limit = 20 }: { limit?: number } = {}
         const safeUrl = escapeHtml(reviewUrl.toString());
         await sendWithCompanyMailbox({
           recipients: [recipient],
-          subject: `${number} draft created — approval required`,
-          htmlBody: `<p>A new purchase order draft, <strong>${safeNumber}</strong>, was created and requires approval.</p><p><a href="${safeUrl}">Review purchase order</a></p>`,
+          subject: `${number} submitted — approval required`,
+          htmlBody: `<p>Purchase order <strong>${safeNumber}</strong> was submitted and is ready for your approval.</p><p><a href="${safeUrl}">Review purchase order</a></p>`,
         });
       }
       if (event.eventType === INTERNAL_APPROVED_PO_EMAIL) {
@@ -113,7 +114,7 @@ export async function processOutboxBatch({ limit = 20 }: { limit?: number } = {}
           htmlBody: `<p>The draft purchase order <strong>${safeNumber}</strong> has been approved.</p><p><a href="${safeUrl}">View purchase order</a></p>`,
         });
       }
-      if (endpoint && secret && event.eventType !== INTERNAL_DRAFT_PO_EMAIL && event.eventType !== INTERNAL_APPROVED_PO_EMAIL) {
+      if (endpoint && secret && ![LEGACY_DRAFT_PO_EMAIL, INTERNAL_SUBMITTED_PO_EMAIL, INTERNAL_APPROVED_PO_EMAIL].includes(event.eventType)) {
         const response = await fetch(endpoint, {
           method: "POST",
           headers: {

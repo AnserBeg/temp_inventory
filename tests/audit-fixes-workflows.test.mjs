@@ -43,7 +43,7 @@ async function insertProduct(id, sku, costCents, priceCents, extra = {}) {
 
 async function insertApprovedPurchaseOrder(id, lines, extra = {}) {
   const total = lines.reduce((sum, line) => sum + Math.round((line.uomQuantity ?? line.quantity) * (line.uomUnitCost ?? line.unitCost)), 0);
-  await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,revision_number,version,created_at) VALUES (?,?,'vendor-audit','approved','not_billed','2026-09-10','CAD',1,?,?,1,1,'2026-09-01')", id, extra.number ?? id.toUpperCase(), total, total);
+  await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,ordered_at,ordered_by,revision_number,version,created_at) VALUES (?,?,'vendor-audit','approved','not_billed','2026-09-10','CAD',1,?,?,'2026-09-01T08:00:00Z','Test buyer',1,1,'2026-09-01')", id, extra.number ?? id.toUpperCase(), total, total);
   await run("INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at) VALUES (?,?,1,'approved','{}','Seeded approved commitment','Audit seed','2026-09-01')", `revision-${id}-1`, id);
   for (const line of lines) {
     await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps,version) VALUES (?,?,?,?,0,?,?,?,?,?,0,0,0,1)",

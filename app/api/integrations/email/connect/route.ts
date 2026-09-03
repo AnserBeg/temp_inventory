@@ -1,12 +1,12 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
 import { createEmailAuthorizationUrl, EmailConfigurationError, EmailProviderError } from "@/lib/server/email-client";
-import type { EmailProvider, EmailSenderType } from "@/lib/server/email-types";
+import type { EmailSenderType, OAuthEmailProvider } from "@/lib/server/email-types";
 
 export async function POST(request: Request) {
   try {
     const actor = await resolveActor(request); requireCapability(actor, "read");
     const input = await request.json() as Record<string, unknown>;
-    const provider = String(input.provider ?? "") as EmailProvider;
+    const provider = String(input.provider ?? "") as OAuthEmailProvider;
     if (!(["google", "microsoft"] as string[]).includes(provider)) {
       return Response.json({ error: { code: "INVALID_EMAIL_PROVIDER", message: "provider must be google or microsoft." } }, { status: 400 });
     }

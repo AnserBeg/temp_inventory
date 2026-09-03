@@ -37,7 +37,7 @@ function product(id, sku, { tracking = "quantity", policy = "stocked", cost = 10
   return run(`INSERT INTO products ${PRODUCT_COLUMNS} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, sku, `${sku} product`, "audit", "test", "test", "test", tracking, policy, cost, cost * 2, 0, uom, uom, uom, 1, 1, "2026-08-01");
 }
 function purchaseOrder(id, number, lines, { expected = "2026-08-10", currency = "CAD" } = {}) {
-  run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES (?,?,?,'approved','not_billed',?,?,1,1000,1000,1,'2026-08-01')", id, number, "vendor-audit", expected, currency);
+  run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,ordered_at,ordered_by,version,created_at) VALUES (?,?,?,'approved','not_billed',?,?,1,1000,1000,'2026-08-01T08:00:00Z','Test buyer',1,'2026-08-01')", id, number, "vendor-audit", expected, currency);
   for (const [lineId, productId, quantity, cost, closed = 0] of lines) {
     run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,fulfillment_route,version) VALUES (?,?,?,?,?,?,'stock',1)", lineId, id, productId, quantity, closed, cost);
   }

@@ -1,4 +1,5 @@
-export type EmailProvider = "google" | "microsoft";
+export type OAuthEmailProvider = "google" | "microsoft";
+export type EmailProvider = OAuthEmailProvider | "smtp";
 export type EmailSenderType = "company" | "personal";
 export type EmailDocumentType = "purchase_order" | "sales_order" | "customer_invoice";
 export type PrintableDocumentType = EmailDocumentType | "vendor_bill";
@@ -14,7 +15,7 @@ export type EmailConnectionSummary = {
 };
 
 export type EmailConnectionState = {
-  configuredProviders: Array<{ provider: EmailProvider; label: string }>;
+  configuredProviders: Array<{ provider: OAuthEmailProvider; label: string }>;
   companyConnection: EmailConnectionSummary | null;
   personalConnection: EmailConnectionSummary | null;
   defaultSender: EmailSenderType | null;

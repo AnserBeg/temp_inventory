@@ -30,6 +30,7 @@ export const TENANT_OWNED_TABLES = [
   "drop_ship_deliveries",
   "email_connections",
   "email_oauth_states",
+  "smtp_email_connections",
   "helcim_checkout_sessions",
   "helcim_connections",
   "helcim_invoice_mirrors",

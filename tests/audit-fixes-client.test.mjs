@@ -188,9 +188,10 @@ test("sales progression only offers actions whose supply prerequisite is ready",
 
 test("core workflows show their cross-page handoffs and continue after invoice posting", () => {
   assert.match(sources.app, /const purchasingWorkflow: WorkflowGuideStep\[\]/);
-  assert.match(sources.app, /Purchase to payment/);
+  assert.match(sources.app, /Purchase to accounting/);
   assert.match(sources.app, /Order to cash/);
-  assert.match(sources.app, /Match vendor bill/);
+  assert.match(sources.app, /Create bill/);
+  assert.match(sources.app, /Send to QBO/);
   assert.match(sources.app, /Collect or credit/);
   assert.match(sources.app, /Financial action stays separate/);
   assert.match(sources.app, /<WorkflowGuide view=\{view\} workspaceTab=\{workspaceTab\} onNavigate=\{navigate\} \/>/);
@@ -208,7 +209,7 @@ test("remote dropdown loading does not flash stale states or lose a newer reques
 
 test("each order keeps its connected documents and next action in one progression", () => {
   assert.match(sources.app, /function RecordProgress/);
-  assert.match(sources.app, /Purchase to payment for \$\{po\.number\}/);
+  assert.match(sources.app, /Purchase to accounting for \$\{po\.number\}/);
   assert.match(sources.app, /Order to cash for \$\{so\.number\}/);
   assert.match(sources.app, /Connected documents and the next action stay with this order\./);
   assert.match(sources.app, /parsePurchaseReceipts\(item\.receiptsJson\)/);

@@ -3,14 +3,15 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useDialogDismiss } from "./use-dialog-dismiss";
 
-type EmailProvider = "google" | "microsoft";
+type OAuthEmailProvider = "google" | "microsoft";
+type EmailProvider = OAuthEmailProvider | "smtp";
 type EmailSenderType = "company" | "personal";
 type DocumentType = "purchase_order" | "sales_order" | "customer_invoice";
 type ConnectionSummary = {
   senderType: EmailSenderType; provider: EmailProvider; providerLabel: string; emailAddress: string; status: string; connectedAt: string; lastError?: string;
 };
 type ConnectionState = {
-  configuredProviders: Array<{ provider: EmailProvider; label: string }>;
+  configuredProviders: Array<{ provider: OAuthEmailProvider; label: string }>;
   companyConnection: ConnectionSummary | null;
   personalConnection: ConnectionSummary | null;
   defaultSender: EmailSenderType | null;
@@ -26,6 +27,7 @@ type PreviewResponse = {
   };
   email: ConnectionState;
 };
+const emptySmtpForm = { emailAddress: "", host: "", port: "587", username: "", password: "" };
 
 function errorMessage(body: unknown, fallback: string) {
   if (body && typeof body === "object" && "error" in body) {
@@ -36,7 +38,7 @@ function errorMessage(body: unknown, fallback: string) {
   return fallback;
 }
 
-async function beginConnection(provider: EmailProvider, senderType: EmailSenderType) {
+async function beginConnection(provider: OAuthEmailProvider, senderType: EmailSenderType) {
   const response = await fetch("/api/integrations/email/connect", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -53,6 +55,8 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState(false);
   const [setupTarget, setSetupTarget] = useState<EmailSenderType | null>(null);
+  const [setupMethod, setSetupMethod] = useState<"choice" | "smtp">("choice");
+  const [smtpForm, setSmtpForm] = useState(emptySmtpForm);
   const [approvalEmail, setApprovalEmail] = useState("");
   const [approvedEmails, setApprovedEmails] = useState("");
   // Every setState here happens after the response arrives, never synchronously inside the
@@ -73,10 +77,26 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
   // Deferred a tick, as the other loaders are, so no state is set synchronously inside the effect.
   useEffect(() => { const timer = window.setTimeout(() => void load(), 0); return () => window.clearTimeout(timer); }, [load]);
 
-  const connect = async (provider: EmailProvider, senderType: EmailSenderType) => {
+  const connect = async (provider: OAuthEmailProvider, senderType: EmailSenderType) => {
     setBusy(`${senderType}:${provider}`); setError("");
     try { await beginConnection(provider, senderType); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The email connection could not be started."); setBusy(""); }
+  };
+  const saveSmtp = async (senderType: EmailSenderType) => {
+    setBusy(`${senderType}:smtp`); setError("");
+    try {
+      const response = await fetch("/api/integrations/email/smtp", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ senderType, ...smtpForm, port: Number(smtpForm.port) }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(errorMessage(body, "The SMTP details could not be saved."));
+      setSmtpForm(emptySmtpForm);
+      setSetupTarget(null); setSetupMethod("choice");
+      await load();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "The SMTP details could not be saved."); }
+    finally { setBusy(""); }
   };
   const disconnect = async (senderType: EmailSenderType) => {
     setBusy(`${senderType}:disconnect`); setError("");
@@ -117,7 +137,7 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
     finally { setBusy(""); }
   };
 
-  const providerName = (provider: EmailProvider) => provider === "google" ? "Google" : "Microsoft 365";
+  const providerName = (provider: OAuthEmailProvider) => provider === "google" ? "Google" : "Microsoft 365";
   const senderRow = (senderType: EmailSenderType, connection: ConnectionSummary | null, canManage: boolean) => {
     const title = senderType === "company" ? "Company email" : "My email";
     const description = senderType === "company" ? "Shared with everyone" : "Only you can use this";
@@ -125,24 +145,34 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
     return <div className="email-sender-setting" key={senderType}>
       <div><strong>{title}</strong><small>{ready ? connection.emailAddress : connection ? "Needs to be reconnected" : description}</small></div>
       {ready && canManage ? <button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => void disconnect(senderType)}>{busy === `${senderType}:disconnect` ? "Removing…" : "Remove"}</button> : null}
-      {!ready && canManage && setupTarget !== senderType ? <button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => setSetupTarget(senderType)}>{connection ? "Reconnect" : "Connect"}</button> : null}
+      {!ready && canManage && setupTarget !== senderType ? <button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => { setSmtpForm(emptySmtpForm); setSetupTarget(senderType); setSetupMethod("choice"); }}>{connection ? "Reconnect" : "Connect"}</button> : null}
       {!ready && !canManage ? <small className="email-admin-note">Not set up</small> : null}
-      {setupTarget === senderType ? <div className="email-provider-actions email-provider-choice">
+      {setupTarget === senderType && setupMethod === "choice" ? <div className="email-provider-actions email-provider-choice">
         {state?.configuredProviders.map((provider) => <button type="button" className="button secondary" key={provider.provider} disabled={Boolean(busy)} onClick={() => void connect(provider.provider, senderType)}>{busy === `${senderType}:${provider.provider}` ? "Opening…" : providerName(provider.provider)}</button>)}
-        <button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => setSetupTarget(null)}>Cancel</button>
-        {!state?.configuredProviders.length ? <small>Email sign-in is not configured for this installation.</small> : null}
+        <button type="button" className="button secondary" disabled={Boolean(busy)} onClick={() => setSetupMethod("smtp")}>SMTP</button>
+        <button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => { setSmtpForm(emptySmtpForm); setSetupTarget(null); }}>Cancel</button>
+        {!state?.configuredProviders.length ? <small>Use SMTP now. Google and Microsoft sign-in can be added later.</small> : null}
+      </div> : null}
+      {setupTarget === senderType && setupMethod === "smtp" ? <div className="smtp-setup-form">
+        <label><span>Email address</span><input type="email" autoComplete="email" value={smtpForm.emailAddress} onChange={(event) => setSmtpForm((value) => ({ ...value, emailAddress: event.target.value }))} placeholder="office@company.com" disabled={Boolean(busy)} /></label>
+        <label><span>SMTP server</span><input type="text" autoComplete="off" value={smtpForm.host} onChange={(event) => setSmtpForm((value) => ({ ...value, host: event.target.value }))} placeholder="smtp.example.com" disabled={Boolean(busy)} /></label>
+        <label><span>Port</span><select value={smtpForm.port} onChange={(event) => setSmtpForm((value) => ({ ...value, port: event.target.value }))} disabled={Boolean(busy)}><option value="587">587</option><option value="465">465</option><option value="2525">2525</option></select></label>
+        <label><span>Username</span><input type="text" autoComplete="username" value={smtpForm.username} onChange={(event) => setSmtpForm((value) => ({ ...value, username: event.target.value }))} placeholder="Usually your email" disabled={Boolean(busy)} /></label>
+        <label><span>Password</span><input type="password" autoComplete="new-password" value={smtpForm.password} onChange={(event) => setSmtpForm((value) => ({ ...value, password: event.target.value }))} placeholder="Password or app password" disabled={Boolean(busy)} /></label>
+        <div className="email-provider-actions"><button type="button" className="button primary" disabled={Boolean(busy) || !smtpForm.emailAddress || !smtpForm.host || !smtpForm.username || !smtpForm.password} onClick={() => void saveSmtp(senderType)}>{busy === `${senderType}:smtp` ? "Checking…" : "Save SMTP"}</button><button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => setSetupMethod("choice")}>Back</button></div>
+        <small>We’ll verify these details before saving. Your password is encrypted.</small>
       </div> : null}
     </div>;
   };
 
   return <div className={`email-connection-manager ${compact ? "compact" : ""}`}>
-    <div className="email-connection-heading"><div><strong>Email sending</strong>{state?.connection ? <small>{state.connection.senderType === "company" ? "Company" : "Personal"} · {state.connection.emailAddress}</small> : <small>{state ? "No sender is set up" : "Checking email…"}</small>}</div>{state ? <button type="button" className="text-button" onClick={() => { setExpanded((value) => !value); setSetupTarget(null); }}>{expanded ? "Done" : state.connection ? "Manage" : "Set up"}</button> : null}</div>
+    <div className="email-connection-heading"><div><strong>Email sending</strong>{state?.connection ? <small>{state.connection.senderType === "company" ? "Company" : "Personal"} · {state.connection.emailAddress}</small> : <small>{state ? "No sender is set up" : "Checking email…"}</small>}</div>{state ? <button type="button" className="text-button" onClick={() => { setExpanded((value) => !value); setSmtpForm(emptySmtpForm); setSetupTarget(null); setSetupMethod("choice"); }}>{expanded ? "Done" : state.connection ? "Manage" : "Set up"}</button> : null}</div>
     {error ? <p className="text-danger" role="alert">{error}</p> : null}
     {state && expanded ? <div className="email-sender-list">
       {senderRow("company", state.companyConnection, state.canManageCompany)}
       {senderRow("personal", state.personalConnection, true)}
       <div className="email-sender-setting email-approval-setting">
-        <div><strong>Draft PO approvals</strong><small>{state.purchaseOrderApprovalEmail || "No alert recipient"}</small></div>
+        <div><strong>Submitted PO approvals</strong><small>{state.purchaseOrderApprovalEmail || "No alert recipient"}</small></div>
         {state.canManageCompany ? <div className="email-provider-actions email-provider-choice">
           <label><span className="sr-only">Draft purchase order approval email</span><input type="email" value={approvalEmail} onChange={(event) => setApprovalEmail(event.target.value)} placeholder="approvals@company.com" disabled={Boolean(busy)} /></label>
           <button type="button" className="text-button" disabled={Boolean(busy) || approvalEmail.trim() === state.purchaseOrderApprovalEmail} onClick={() => void saveApprovalEmail()}>{busy === "approval-email" ? "Saving…" : "Save"}</button>
@@ -221,7 +251,7 @@ function EmailDocumentDialog({ documentType, documentId, documentNumber, onClose
     finally { setBusy(false); }
   };
 
-  const connect = async (provider: EmailProvider) => {
+  const connect = async (provider: OAuthEmailProvider) => {
     setBusy(true); setError("");
     try { await beginConnection(provider, "personal"); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "The email connection could not be started."); setBusy(false); }
@@ -237,7 +267,7 @@ function EmailDocumentDialog({ documentType, documentId, documentNumber, onClose
       : <form onSubmit={submit}>
         {loading ? <div className="empty-inline">Preparing the current document and checking your mailbox…</div> : null}
         {error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}
-        {data && !availableSenders.length ? <div className="email-connect-required"><strong>Set up email to send</strong><p>Connect your email here, or ask a company administrator to set up the shared company email.</p><div className="email-provider-actions">{data.email.configuredProviders.map((provider) => <button type="button" className="button secondary" key={provider.provider} disabled={busy} onClick={() => void connect(provider.provider)}>Connect {provider.provider === "google" ? "Google" : "Microsoft 365"}</button>)}</div>{!data.email.configuredProviders.length ? <small>Email sign-in is not configured for this installation.</small> : null}</div> : null}
+        {data && !availableSenders.length ? <div className="email-connect-required"><strong>Set up email to send</strong><p>Connect your email here, or ask a company administrator to set up the shared company email.</p><div className="email-provider-actions">{data.email.configuredProviders.map((provider) => <button type="button" className="button secondary" key={provider.provider} disabled={busy} onClick={() => void connect(provider.provider)}>Connect {provider.provider === "google" ? "Google" : "Microsoft 365"}</button>)}</div><small>SMTP setup is under Email sending in your account menu.</small></div> : null}
         {data && selectedSender ? <><div className="email-sender-summary"><span>From</span>{availableSenders.length > 1 ? <select aria-label="Email sender" value={senderType} onChange={(event) => setSenderType(event.target.value as EmailSenderType)}>{availableSenders.map((connection) => <option value={connection.senderType} key={connection.senderType}>{connection.senderType === "company" ? "Company" : "My email"} — {connection.emailAddress}</option>)}</select> : <strong>{selectedSender.emailAddress}</strong>}<small>{selectedSender.senderType === "company" ? "Company email" : "Your email"} · {data.document.fileName} will be attached</small></div><div className="command-form">
           <label>To<input type="text" inputMode="email" value={recipient} onChange={(event) => setRecipient(event.target.value)} placeholder={`${data.document.partyName}'s email address`} required /><small>Separate multiple recipients with commas.</small></label>
           <label>Subject<input value={subject} maxLength={200} onChange={(event) => setSubject(event.target.value)} required /></label>

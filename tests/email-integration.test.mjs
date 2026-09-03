@@ -10,6 +10,7 @@ let emailClient;
 let documentEmail;
 let advancedDomain;
 let outbox;
+let smtpClient;
 
 async function applyMigrations() {
   const directory = new URL("../drizzle/", import.meta.url);
@@ -42,6 +43,7 @@ before(async () => {
   documentEmail = await import("../lib/server/document-email.ts");
   advancedDomain = await import("../lib/server/advanced-domain.ts");
   outbox = await import("../lib/server/outbox.ts");
+  smtpClient = await import("../lib/server/smtp-client.ts");
 
   await run("INSERT INTO app_users (user_id,email,full_name,role,active,created_at,updated_at) VALUES (?,?,?,?,1,?,?)", operator.id, operator.email, operator.name, operator.role, now, now);
   await run("INSERT INTO app_users (user_id,email,full_name,role,active,created_at,updated_at) VALUES (?,?,?,?,1,?,?)", accountant.id, accountant.email, accountant.name, accountant.role, now, now);
@@ -61,11 +63,12 @@ before(async () => {
 after(() => db.close());
 
 test("email migration creates constrained sender connections and delivery history", () => {
-  const tables = db.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('email_connections','email_oauth_states','document_email_deliveries') ORDER BY name").all().map((row) => row.name);
-  assert.deepEqual(tables, ["document_email_deliveries", "email_connections", "email_oauth_states"]);
+  const tables = db.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('email_connections','email_oauth_states','smtp_email_connections','document_email_deliveries') ORDER BY name").all().map((row) => row.name);
+  assert.deepEqual(tables, ["document_email_deliveries", "email_connections", "email_oauth_states", "smtp_email_connections"]);
   assert.ok(db.sqlite.prepare("PRAGMA table_info(email_oauth_states)").all().some((column) => column.name === "connection_type"));
   assert.ok(db.sqlite.prepare("PRAGMA table_info(document_email_deliveries)").all().some((column) => column.name === "sender_type"));
   assert.throws(() => db.sqlite.prepare("INSERT INTO email_connections (user_id,provider,email_address,status,scopes,encrypted_access_token,encrypted_refresh_token,access_token_expires_at,connected_at,updated_at) VALUES ('bad','imap','bad@example.test','connected','send','a','b','2099-01-01','2026-01-01','2026-01-01')").run(), /CHECK constraint failed/);
+  assert.throws(() => db.sqlite.prepare("INSERT INTO smtp_email_connections (user_id,email_address,host,port,username,encrypted_password,connected_at,updated_at) VALUES ('bad','bad@example.test','smtp.example.test',25,'bad','secret','2026-01-01','2026-01-01')").run(), /CHECK constraint failed/);
 });
 
 test("Google OAuth is user-bound, one-use, and encrypts mailbox tokens at rest", async () => {
@@ -256,7 +259,7 @@ test("an administrator can connect one company sender that is the simple default
   } finally { globalThis.fetch = originalFetch; }
 });
 
-test("new draft purchase orders email the configured approver with a direct link", async () => {
+test("submitting a purchase order emails the configured approver with a direct link", async () => {
   const administrator = { ...operator, role: "administrator" };
   await emailClient.setPurchaseOrderApprovalEmail(administrator, " APPROVALS@PANEFLOW.TEST ");
   const connectionState = await emailClient.getEmailConnectionState(operator, "https://paneflow.example.test/");
@@ -264,7 +267,7 @@ test("new draft purchase orders email the configured approver with a direct link
 
   const created = await advancedDomain.executeWorkflow({
     command: "createPurchaseOrderDraft",
-    idempotencyKey: "email-draft-po-alert",
+    idempotencyKey: "email-submitted-po-create",
     actor: operator,
     appOrigin: "https://paneflow.example.test",
     payload: {
@@ -273,7 +276,13 @@ test("new draft purchase orders email the configured approver with a direct link
       lines: [{ productId: "email-product", quantity: 1, unitCostCents: 10000 }],
     },
   });
-  const queued = db.sqlite.prepare("SELECT id,status,payload_json AS payload FROM outbox_events WHERE event_type='purchase_order.draft_approval_email_requested' AND aggregate_id=?").get(created.recordId);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM outbox_events WHERE event_type IN ('purchase_order.draft_approval_email_requested','purchase_order.approval_email_requested') AND aggregate_id=?").get(created.recordId).count, 0);
+  await advancedDomain.executeWorkflow({
+    command: "submitPurchaseOrder", entityId: created.recordId, version: 1,
+    idempotencyKey: "email-submitted-po-alert", actor: operator, appOrigin: "https://paneflow.example.test",
+    payload: { reason: "Ready for approval" },
+  });
+  const queued = db.sqlite.prepare("SELECT id,status,payload_json AS payload FROM outbox_events WHERE event_type='purchase_order.approval_email_requested' AND aggregate_id=?").get(created.recordId);
   assert.equal(queued.status, "pending");
   assert.equal(JSON.parse(queued.payload).recipient, "approvals@paneflow.test");
 
@@ -285,7 +294,7 @@ test("new draft purchase orders email the configured approver with a direct link
       if (target.includes("gmail.googleapis.com")) {
         assert.equal(init.headers.authorization, "Bearer company-access");
         gmailRaw = JSON.parse(String(init.body)).raw;
-        return Response.json({ id: "gmail-draft-po-alert" });
+        return Response.json({ id: "gmail-submitted-po-alert" });
       }
       throw new Error(`Unexpected draft alert request ${target}`);
     };
@@ -296,7 +305,7 @@ test("new draft purchase orders email the configured approver with a direct link
     assert.doesNotMatch(mime, /application\/pdf/);
     const encodedHtml = mime.split("\r\n\r\n")[1].replace(/\s/gu, "");
     const html = Buffer.from(encodedHtml, "base64").toString("utf8");
-    assert.match(html, /requires approval/);
+    assert.match(html, /ready for your approval/);
     assert.match(html, new RegExp(`po=${created.recordId}`));
     assert.match(html, /view=purchase-orders/);
     assert.equal(db.sqlite.prepare("SELECT status FROM outbox_events WHERE id=?").get(queued.id).status, "processed");
@@ -361,4 +370,66 @@ test("approving a draft emails its creator's current account and the configured 
     assert.match(html, new RegExp(`po=${created.recordId}`));
     assert.equal(db.sqlite.prepare("SELECT status FROM outbox_events WHERE id=?").get(queued.id).status, "processed");
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test("SMTP setup verifies before replacing the sender, encrypts the password, and sends documents", async () => {
+  const administrator = { ...operator, role: "administrator" };
+  await assert.rejects(emailClient.saveSmtpConnection(operator, "company", {
+    emailAddress: "smtp@paneflow.test", host: "smtp.example.test", port: 587, username: "smtp-user", password: "smtp-password",
+  }), /Only a company administrator/);
+
+  smtpClient.setSmtpTransportFactoryForTests(() => ({
+    async verify() { throw new Error("Invalid SMTP login"); },
+    async sendMail() { throw new Error("send should not run"); },
+  }));
+  await assert.rejects(emailClient.saveSmtpConnection(administrator, "company", {
+    emailAddress: "smtp@paneflow.test", host: "smtp.example.test", port: 587, username: "smtp-user", password: "smtp-password",
+  }), /could not be verified/);
+  assert.equal(db.sqlite.prepare("SELECT provider FROM email_connections WHERE user_id='__company__'").get().provider, "google");
+
+  let verified;
+  let mail;
+  smtpClient.setSmtpTransportFactoryForTests((options) => ({
+    async verify() { verified = options; return true; },
+    async sendMail(input) { mail = input; return { messageId: "smtp-message-email-so" }; },
+  }));
+  try {
+    const connected = await emailClient.saveSmtpConnection(administrator, "company", {
+      emailAddress: " SMTP@PANEFLOW.TEST ", host: "SMTP.EXAMPLE.TEST", port: 587, username: "smtp-user", password: "smtp-password",
+    });
+    assert.deepEqual(connected, { emailAddress: "smtp@paneflow.test", provider: "smtp", senderType: "company" });
+    assert.equal(verified.host, "smtp.example.test");
+    assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM email_connections WHERE user_id='__company__'").get().count, 0);
+    const stored = db.sqlite.prepare("SELECT encrypted_password AS password,status FROM smtp_email_connections WHERE user_id='__company__'").get();
+    assert.equal(stored.status, "connected");
+    assert.match(stored.password, /^v1\./);
+    assert.doesNotMatch(stored.password, /smtp-password/);
+    const state = await emailClient.getEmailConnectionState(operator, "https://paneflow.example.test/");
+    assert.equal(state.companyConnection.provider, "smtp");
+    assert.equal(state.companyConnection.providerLabel, "SMTP");
+
+    const sent = await documentEmail.sendDocumentEmail(operator, {
+      documentType: "sales_order", documentId: "email-so", recipients: ["customer@example.test"], subject: "SO-EMAIL via SMTP", message: "Attached",
+    });
+    assert.equal(sent.senderEmail, "smtp@paneflow.test");
+    assert.deepEqual(mail.to, ["customer@example.test"]);
+    assert.equal(mail.attachments[0].filename, "SO-EMAIL.pdf");
+    assert.match(mail.attachments[0].content.subarray(0, 8).toString("ascii"), /^%PDF-1/);
+    const delivery = db.sqlite.prepare("SELECT provider,provider_message_id AS messageId FROM document_email_deliveries WHERE id=?").get(sent.deliveryId);
+    assert.equal(delivery.provider, "smtp");
+    assert.equal(delivery.messageId, "smtp-message-email-so");
+
+    await emailClient.saveSmtpConnection(operator, "personal", {
+      emailAddress: "operator-smtp@paneflow.test", host: "smtp.example.test", port: 465, username: "operator-smtp", password: "personal-password",
+    });
+    const personalState = await emailClient.getEmailConnectionState(operator, "https://paneflow.example.test/");
+    assert.equal(personalState.personalConnection.provider, "smtp");
+    assert.equal(personalState.personalConnection.emailAddress, "operator-smtp@paneflow.test");
+    assert.equal(personalState.companyConnection.emailAddress, "smtp@paneflow.test");
+    const personalSend = await documentEmail.sendDocumentEmail(operator, {
+      documentType: "sales_order", documentId: "email-so", recipients: ["customer@example.test"], subject: "Personal SMTP", message: "Attached", senderType: "personal",
+    });
+    assert.equal(personalSend.senderType, "personal");
+    assert.equal(personalSend.senderEmail, "operator-smtp@paneflow.test");
+  } finally { smtpClient.setSmtpTransportFactoryForTests(null); }
 });

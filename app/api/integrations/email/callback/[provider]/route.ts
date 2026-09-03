@@ -1,12 +1,12 @@
 import { completeEmailAuthorization, EmailConfigurationError, EmailProviderError } from "@/lib/server/email-client";
-import type { EmailProvider } from "@/lib/server/email-types";
+import type { OAuthEmailProvider } from "@/lib/server/email-types";
 import { sha256Hex } from "@/lib/server/email-crypto";
 import { ensureDatabase, getRootD1 } from "@/lib/server/inventory-db";
 import { runWithTenant } from "@/lib/server/tenancy";
 
 export async function GET(request: Request, context: { params: Promise<{ provider: string }> }) {
   const { provider: rawProvider } = await context.params;
-  const provider = rawProvider as EmailProvider;
+  const provider = rawProvider as OAuthEmailProvider;
   const url = new URL(request.url);
   if (!(["google", "microsoft"] as string[]).includes(provider)) return Response.json({ error: { code: "INVALID_EMAIL_PROVIDER", message: "Unknown email provider." } }, { status: 404 });
   const oauthError = url.searchParams.get("error");

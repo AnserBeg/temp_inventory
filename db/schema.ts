@@ -141,6 +141,8 @@ export const purchaseOrders = sqliteTable(
     dueDate: text("due_date"),
     totalCents: integer("total_cents").notNull(),
     buyerName: text("buyer_name"),
+    orderedAt: text("ordered_at"),
+    orderedBy: text("ordered_by"),
     projectReference: text("project_reference"),
     supplierQuoteNumber: text("supplier_quote_number"),
     supplierReference: text("supplier_reference"),
@@ -721,6 +723,28 @@ export const emailOauthStates = sqliteTable("email_oauth_states", {
   check("email_oauth_states_connection_type_check", sql`${table.connectionType} IN ('company','personal')`),
 ]);
 
+/** Password-authenticated SMTP mailboxes, kept separate from OAuth token records. */
+export const smtpEmailConnections = sqliteTable("smtp_email_connections", {
+  tenantId: text("tenant_id").notNull().default("tenant-default"),
+  userId: text("user_id").notNull(),
+  emailAddress: text("email_address").notNull(),
+  host: text("host").notNull(),
+  port: integer("port").notNull(),
+  username: text("username").notNull(),
+  encryptedPassword: text("encrypted_password").notNull(),
+  status: text("status").notNull().default("connected"),
+  connectedAt: text("connected_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  lastError: text("last_error"),
+  version: integer("version").notNull().default(1),
+}, (table) => [
+  primaryKey({ columns: [table.tenantId, table.userId] }),
+  uniqueIndex("idx_smtp_email_connections_address").on(table.tenantId, table.emailAddress),
+  index("idx_smtp_email_connections_status").on(table.tenantId, table.status),
+  check("smtp_email_connections_port_check", sql`${table.port} IN (465,587,2525)`),
+  check("smtp_email_connections_status_check", sql`${table.status} IN ('connected','error')`),
+]);
+
 /** Durable send history contains routing metadata but never message or attachment contents. */
 export const documentEmailDeliveries = sqliteTable("document_email_deliveries", {
     tenantId: text("tenant_id").notNull().default("tenant-default"),
@@ -742,7 +766,7 @@ export const documentEmailDeliveries = sqliteTable("document_email_deliveries", 
 }, (table) => [
   index("idx_document_email_deliveries_document").on(table.tenantId, table.documentType, table.documentId, table.createdAt),
   index("idx_document_email_deliveries_user_created").on(table.tenantId, table.userId, table.createdAt),
-  check("document_email_deliveries_provider_check", sql`${table.provider} IN ('google','microsoft')`),
+  check("document_email_deliveries_provider_check", sql`${table.provider} IN ('google','microsoft','smtp')`),
   check("document_email_deliveries_sender_type_check", sql`${table.senderType} IN ('company','personal')`),
   check("document_email_deliveries_type_check", sql`${table.documentType} IN ('purchase_order','sales_order','customer_invoice')`),
   check("document_email_deliveries_status_check", sql`${table.status} IN ('pending','sent','failed')`),

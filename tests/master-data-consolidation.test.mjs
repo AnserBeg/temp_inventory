@@ -64,7 +64,7 @@ test("product merge combines balances, preserves aliases, references history, an
 });
 
 test("receipt posting uses the product's preferred bin when the caller supplies only a warehouse", async () => {
-  await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,revision_number,created_at) VALUES ('default-bin-po','PO-BIN','merge-vendor','approved','not_billed','2026-09-02','CAD',1,100,100,1,1,'2026-09-01')");
+  await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,ordered_at,ordered_by,version,revision_number,created_at) VALUES ('default-bin-po','PO-BIN','merge-vendor','approved','not_billed','2026-09-02','CAD',1,100,100,'2026-09-01T08:00:00Z','Test buyer',1,1,'2026-09-01')");
   await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,discount_cents,taxable,tax_code,tax_rate_bps,fulfillment_route,version) VALUES ('default-bin-line','default-bin-po','merge-product',1,0,100,'uom-each',1,100,0,0,'EXEMPT',0,'stock',1)");
   await inventoryDomain.executeInventoryCommand({ command: "postReceipt", entityId: "default-bin-po", version: 1, idempotencyKey: "receive-default-bin", payload: { lineId: "default-bin-line", quantity: 1, warehouseId: "merge-warehouse", postingDate: "2026-09-02", actor: "Receiver" } });
   assert.equal(row("SELECT to_location_id FROM stock_movements WHERE purchase_order_line_id='default-bin-line'").to_location_id, "merge-bin");

@@ -20,6 +20,7 @@ const entityPriority: Record<string, number> = {
 
 const qboPurchaseOrderEvents = new Set([
   "purchase_order.approved",
+  "purchase_order.ordered",
   "purchase_order.amendment_rejected_restored",
   "purchase_order.remainder_closed",
   "purchase_order.remainder_reopened",

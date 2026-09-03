@@ -41,18 +41,21 @@ const today = () => new Date().toISOString().slice(0, 10);
 const timestampOnDate = (postingDate: string, recordedAt = new Date().toISOString()) => `${postingDate}${recordedAt.slice(10)}`;
 
 export const workflowCapabilities = {
-  createPurchaseOrderDraft: "operationalWrite",
+  // Draft authoring and submission create no stock or financial posting. Every authenticated
+  // user with read access may prepare a purchasing request; approval remains manager-gated.
+  createPurchaseOrderDraft: "read",
   createApprovedPurchaseOrder: "approve",
-  updatePurchaseOrderDraft: "operationalWrite",
+  updatePurchaseOrderDraft: "read",
   cancelPurchaseOrder: "operationalWrite",
   createSalesOrderDraft: "operationalWrite",
   createConfirmedSalesOrder: "approve",
   updateSalesOrderDraft: "operationalWrite",
   confirmSalesOrder: "operationalWrite",
   cancelSalesOrder: "operationalWrite",
-  submitPurchaseOrder: "operationalWrite",
+  submitPurchaseOrder: "read",
   approvePurchaseOrder: "approve",
   rejectPurchaseOrder: "approve",
+  markPurchaseOrderOrdered: "operationalWrite",
   amendPurchaseOrder: "operationalWrite",
   requestOverReceiptApproval: "operationalWrite",
   requestApproval: "operationalWrite",
@@ -336,9 +339,6 @@ async function createDraft(command: WorkflowCommand, type: "purchaseOrder" | "sa
   const payload = command.payload ?? {};
   if (fastTrack) assertFastTrackAuthority(command, "operationalWrite");
   const fastTrackApprovalReason = fastTrack ? textValue(payload, "approvalReason") : undefined;
-  const approvalNotificationEmail = type === "purchaseOrder" && !fastTrack
-    ? await setting<string>("email.purchaseOrderApprovalRecipient", "")
-    : "";
   try {
     return await createOrderRecord({
       ...(payload as Omit<CreateOrderInput, "type" | "idempotencyKey">),
@@ -349,7 +349,6 @@ async function createDraft(command: WorkflowCommand, type: "purchaseOrder" | "sa
       actorEmail: command.actor.email,
       requestHash: command.requestHash,
       fastTrackApprovalReason,
-      approvalNotificationEmail,
       appOrigin: command.appOrigin,
     } as CreateOrderInput);
   } catch (error) {
@@ -610,14 +609,14 @@ async function submitPurchaseOrder(command: WorkflowCommand) {
   const id = textValue({ entityId: command.entityId }, "entityId");
   const reason = textValue(command.payload ?? {}, "reason");
   const version = command.version ?? 0;
-  const current = await first<{ lifecycleStatus: string; version: number }>("SELECT lifecycle_status AS lifecycleStatus, version FROM purchase_orders WHERE id=?", id);
+  const current = await first<{ lifecycleStatus: string; version: number; number: string }>("SELECT lifecycle_status AS lifecycleStatus, version, number FROM purchase_orders WHERE id=?", id);
   if (!current) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
   if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before submitting.", 409, current.version);
   if (!["draft", "rejected"].includes(current.lifecycleStatus)) throw new WorkflowError("INVALID_STATE", "Only draft or rejected purchase orders can be submitted.", 409, current.version);
   const approvalId = newId("approval");
   const result: WorkflowResult = { message: "Purchase order submitted for approval; inventory is unchanged.", impact: { physical: "No stock movement.", commercial: "Commitment remains inactive until approval.", financial: "No bill created.", onHandDelta: 0 }, recordId: id };
   const db = commandD1(command); const when = new Date().toISOString();
-  await db.batch([
+  const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
       SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=?`).bind(...claimValues(command, result, id), id, version),
     db.prepare(`UPDATE purchase_orders SET lifecycle_status='pending_approval',version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(id, version),
@@ -628,7 +627,19 @@ async function submitPurchaseOrder(command: WorkflowCommand) {
       SELECT ?,'purchase_order',?,'purchase_order_approval','pending',?,?,?,'{}',1 WHERE ${marker(command)}`).bind(approvalId, id, command.actor.label, reason, when),
     auditStatement(command, "purchase_order", id, "submitted_for_approval", result.message, { reason, approvalId }, when),
     outboxStatement(command, "purchase_order.approval_requested", "purchase_order", id, { approvalId }, when),
-  ]);
+  ];
+  const recipient = (await setting<string>("email.purchaseOrderApprovalRecipient", "")).trim().toLowerCase();
+  let appOrigin = "";
+  try {
+    const origin = new URL(command.appOrigin ?? "");
+    if (/^https?:$/u.test(origin.protocol)) appOrigin = origin.origin;
+  } catch { /* A missing request origin must not block submission. */ }
+  if (recipient.length <= 254 && /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/u.test(recipient) && appOrigin) {
+    statements.push(outboxStatement(command, "purchase_order.approval_email_requested", "purchase_order", id, {
+      recordId: id, number: current.number, recipient, appOrigin,
+    }, when));
+  }
+  await db.batch(statements);
   return finish(command);
 }
 
@@ -674,12 +685,12 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
   }
   const message = amendmentDecision
     ? decision === "approved"
-      ? "Purchase-order amendment approved; the revised open quantities now contribute to incoming supply."
+      ? "Purchase-order amendment approved; place the revised order with the vendor before receiving."
       : "Purchase-order amendment rejected; the prior approved commitment was restored without moving inventory."
     : decision === "approved"
-      ? "Purchase order approved; open quantities now contribute to incoming supply."
+      ? "Purchase order approved and awaiting placement with the vendor."
       : "Purchase order rejected; no purchasing commitment or inventory movement was created.";
-  const result: WorkflowResult = { message, impact: { physical: "No stock movement.", commercial: restoration ? "Prior approved incoming commitment restored." : decision === "approved" ? "Incoming forecast activated." : "Commitment remains inactive.", financial: "No vendor bill created.", onHandDelta: 0 }, recordId: id };
+  const result: WorkflowResult = { message, impact: { physical: "No stock movement.", commercial: restoration ? "Prior approved commitment restored." : decision === "approved" ? "Approved for ordering; fulfillment stays locked until marked ordered." : "Commitment remains inactive.", financial: "No vendor bill created.", onHandDelta: 0 }, recordId: id };
   const db = commandD1(command); const when = new Date().toISOString();
   let approvedEmailPayload: { recordId: string; number: string; recipients: string[]; appOrigin: string } | null = null;
   if (decision === "approved" && !amendmentDecision) {
@@ -716,7 +727,9 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
     restoration
       ? db.prepare(`UPDATE purchase_orders SET lifecycle_status='approved',revision_number=?,total_cents=?,base_total_cents=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`)
         .bind(restoration.revision, restoration.total, restoration.baseTotal, id, version)
-      : db.prepare(`UPDATE purchase_orders SET lifecycle_status=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(decision, id, version),
+      : db.prepare(`UPDATE purchase_orders SET lifecycle_status=?,ordered_at=CASE WHEN ?='approved' THEN NULL ELSE ordered_at END,
+          ordered_by=CASE WHEN ?='approved' THEN NULL ELSE ordered_by END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`)
+        .bind(decision, decision, decision, id, version),
     db.prepare(`UPDATE approvals SET status=?,decided_by=?,decision_reason=?,decided_at=?,version=version+1 WHERE id=? AND version=? AND status='pending' AND ${marker(command)}`)
       .bind(decision, command.actor.label, reason, when, approval.id, approval.version),
     db.prepare(`UPDATE purchase_order_revisions SET lifecycle_status=? WHERE purchase_order_id=? AND revision_number=? AND lifecycle_status='pending_approval' AND ${marker(command)}`)
@@ -1475,8 +1488,8 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
   const dueDate = dateValue(payload, "dueDate", invoiceDate);
   if (dueDate < invoiceDate) throw new WorkflowError("VALIDATION_ERROR", "dueDate cannot be before invoiceDate.");
   await assertPeriodOpen("accounting", invoiceDate);
-  const order = await first<{ vendorId: string; currency: string; exchange: number; version: number }>("SELECT vendor_id AS vendorId,currency,exchange_rate_to_base AS exchange,version FROM purchase_orders WHERE id=? AND lifecycle_status='approved'", purchaseOrderId);
-  if (!order) throw new WorkflowError("NOT_FOUND", "Approved purchase order was not found.", 404);
+  const order = await first<{ vendorId: string; currency: string; exchange: number; version: number }>("SELECT vendor_id AS vendorId,currency,exchange_rate_to_base AS exchange,version FROM purchase_orders WHERE id=? AND lifecycle_status='approved' AND ordered_at IS NOT NULL", purchaseOrderId);
+  if (!order) throw new WorkflowError("NOT_FOUND", "An ordered purchase order was not found. Mark the approved PO as ordered before creating its bill.", 404);
   if (command.version != null && command.version !== order.version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before billing.", 409, order.version);
   if (await first("SELECT id FROM vendor_bills WHERE vendor_id=? AND vendor_invoice_number=?", order.vendorId, vendorInvoiceNumber)) {
     throw new WorkflowError("DUPLICATE_VENDOR_INVOICE", "This vendor invoice number already exists for the vendor.", 409);
@@ -1548,7 +1561,7 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
   const lineClaimBindings = normalized.flatMap((line) => [line.poLineId, purchaseOrderId, tolerances.quantity, line.quantity, ...(line.aheadOfReceipt ? [] : [tolerances.quantity, line.quantity])]);
   const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
-      SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='approved'
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='approved' AND ordered_at IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM vendor_bills WHERE vendor_id=? AND vendor_invoice_number=?) AND ${lineClaims}`)
       .bind(...claimValues(command, result, billId), purchaseOrderId, order.version, order.vendorId, vendorInvoiceNumber, ...lineClaimBindings),
     db.prepare(`INSERT INTO vendor_bills (id,number,vendor_id,purchase_order_id,status,match_status,total_cents,due_date,currency,vendor_invoice_number,invoice_date,posted_at,approved_at,approved_by,subtotal_cents,tax_cents,paid_cents,hold_reason,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,version)
@@ -1643,6 +1656,37 @@ async function voidVendorBill(command: WorkflowCommand) {
       ELSE 'partially_billed' END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(bill.purchaseOrderId, bill.purchaseVersion ?? 0),
   );
   await db.batch(statements);
+  return finish(command);
+}
+
+async function markPurchaseOrderOrdered(command: WorkflowCommand) {
+  const id = textValue({ entityId: command.entityId }, "entityId");
+  const version = command.version ?? 0;
+  const supplierReference = optionalText(command.payload ?? {}, "supplierReference");
+  const current = await first<{ version: number; status: string; orderedAt: string | null; number: string }>(
+    "SELECT version,lifecycle_status AS status,ordered_at AS orderedAt,number FROM purchase_orders WHERE id=?", id
+  );
+  if (!current) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
+  if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before marking it ordered.", 409, current.version);
+  if (current.status !== "approved") throw new WorkflowError("INVALID_STATE", "Only an approved purchase order can be marked as ordered.", 409, current.version);
+  if (current.orderedAt) throw new WorkflowError("INVALID_STATE", "This purchase order is already marked as ordered.", 409, current.version);
+  const when = new Date().toISOString();
+  const result: WorkflowResult = {
+    message: `${current.number} marked as ordered. Receiving is now available.`,
+    impact: { physical: "No stock movement.", commercial: "The approved order has been placed with the vendor.", financial: "No vendor bill created.", onHandDelta: 0 },
+    recordId: id,
+  };
+  const db = commandD1(command);
+  await db.batch([
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='approved' AND ordered_at IS NULL`)
+      .bind(...claimValues(command, result, id), id, version),
+    db.prepare(`UPDATE purchase_orders SET ordered_at=?,ordered_by=?,supplier_reference=COALESCE(NULLIF(?,''),supplier_reference),version=version+1
+      WHERE id=? AND version=? AND lifecycle_status='approved' AND ordered_at IS NULL AND ${marker(command)}`)
+      .bind(when, command.actor.label, supplierReference ?? "", id, version),
+    auditStatement(command, "purchase_order", id, "purchase_order_marked_ordered", result.message, { supplierReference }, when),
+    outboxStatement(command, "purchase_order.ordered", "purchase_order", id, { supplierReference }, when),
+  ]);
   return finish(command);
 }
 
@@ -3087,11 +3131,11 @@ async function postDropShipDelivery(command: WorkflowCommand) {
   const externalReference = textValue(payload, "externalReference");
   const source = await first<{
     productId: string; salesOrderId: string; salesVersion: number; salesStatus: string; salesOrdered: number; salesCanceled: number;
-    purchaseLineId: string; purchaseOrderId: string; purchaseVersion: number; purchaseStatus: string; purchaseOrdered: number;
+    purchaseLineId: string; purchaseOrderId: string; purchaseVersion: number; purchaseStatus: string; purchaseOrderedAt: string | null; purchaseOrdered: number;
     allocationId: string; allocationVersion: number; allocationQuantity: number; allocationReceived: number; deliveredSales: number; deliveredPurchase: number;
   }>(`SELECT sol.product_id AS productId,sol.sales_order_id AS salesOrderId,so.version AS salesVersion,so.lifecycle_status AS salesStatus,
       sol.ordered_qty AS salesOrdered,sol.canceled_qty AS salesCanceled,pol.id AS purchaseLineId,pol.purchase_order_id AS purchaseOrderId,
-      po.version AS purchaseVersion,po.lifecycle_status AS purchaseStatus,pol.ordered_qty AS purchaseOrdered,
+      po.version AS purchaseVersion,po.lifecycle_status AS purchaseStatus,po.ordered_at AS purchaseOrderedAt,pol.ordered_qty AS purchaseOrdered,
       sa.id AS allocationId,sa.version AS allocationVersion,sa.allocated_qty AS allocationQuantity,sa.received_qty AS allocationReceived,
       COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0) AS deliveredSales,
       COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0) AS deliveredPurchase
@@ -3103,6 +3147,7 @@ async function postDropShipDelivery(command: WorkflowCommand) {
       AND pol.source_sales_order_line_id=sol.id AND pol.product_id=sol.product_id`, salesLineId);
   if (!source) throw new WorkflowError("DROP_SHIP_LINK_REQUIRED", "A symmetric drop-ship PO/SO line link is required.", 409);
   if (source.salesStatus !== "confirmed" || source.purchaseStatus !== "approved") throw new WorkflowError("INVALID_STATE", "Drop-ship delivery requires a confirmed sales order and approved purchase order.", 409);
+  if (!source.purchaseOrderedAt) throw new WorkflowError("INVALID_STATE", "Mark the approved purchase order as ordered before posting a supplier delivery.", 409);
   if (command.version != null && command.version !== source.salesVersion) throw new WorkflowError("VERSION_CONFLICT", "Sales order changed; refresh before posting delivery.", 409, source.salesVersion);
   const salesRemaining = roundQuantity(source.salesOrdered - source.salesCanceled - source.deliveredSales);
   const purchaseRemaining = roundQuantity(Math.min(source.purchaseOrdered - source.deliveredPurchase, source.allocationQuantity - source.allocationReceived));
@@ -3117,7 +3162,7 @@ async function postDropShipDelivery(command: WorkflowCommand) {
       JOIN purchase_order_lines pol ON pol.id=sol.linked_purchase_order_line_id JOIN purchase_orders po ON po.id=pol.purchase_order_id
       JOIN supply_allocations sa ON sa.purchase_order_line_id=pol.id AND sa.sales_order_line_id=sol.id
       WHERE sol.id=? AND sol.fulfillment_route='drop_ship' AND pol.fulfillment_route='drop_ship' AND pol.source_sales_order_line_id=sol.id
-        AND so.lifecycle_status='confirmed' AND so.version=? AND po.lifecycle_status='approved' AND po.version=?
+        AND so.lifecycle_status='confirmed' AND so.version=? AND po.lifecycle_status='approved' AND po.ordered_at IS NOT NULL AND po.version=?
         AND sa.status='active' AND sa.version=? AND sa.allocated_qty-sa.received_qty>=?
         AND sol.ordered_qty-sol.canceled_qty-COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)>=?
         AND pol.ordered_qty-COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)>=?`)
@@ -3648,6 +3693,7 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
     case "submitpurchaseorder": return submitPurchaseOrder(command);
     case "approvepurchaseorder": return decidePurchaseOrder(command, "approved");
     case "rejectpurchaseorder": return decidePurchaseOrder(command, "rejected");
+    case "markpurchaseorderordered": return markPurchaseOrderOrdered(command);
     case "amendpurchaseorder": return amendPurchaseOrder(command);
     case "requestoverreceiptapproval": case "requestapproval": return requestApproval(command);
     case "approveapproval": return decideApproval(command, "approved");

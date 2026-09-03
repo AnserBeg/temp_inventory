@@ -81,7 +81,9 @@ test("migrated relationship guards reject cross-tenant parents", async () => {
 
 test("schema and migration cover every company-owned table", () => {
   const schema = readFileSync(new URL("../db/schema.ts", import.meta.url), "utf8");
-  const migration = readFileSync(new URL("../drizzle/0030_cute_joshua_kane.sql", import.meta.url), "utf8");
+  const migrationDirectory = new URL("../drizzle/", import.meta.url);
+  const migration = readdirSync(migrationDirectory).filter((name) => /^\d{4}.*\.sql$/u.test(name)).sort()
+    .map((name) => readFileSync(new URL(name, migrationDirectory), "utf8")).join("\n");
   const integrityMigration = readFileSync(new URL("../drizzle/0031_tenant-integrity.sql", import.meta.url), "utf8");
   assert.match(schema, /export const tenants = sqliteTable/);
   assert.match(schema, /export const tenantMemberships = sqliteTable/);
@@ -89,7 +91,7 @@ test("schema and migration cover every company-owned table", () => {
     if (table === "tenant_memberships") continue;
     const quoted = `\`${table}\``;
     const rebuilt = `\`__new_${table}\``;
-    assert.match(migration, new RegExp(`(?:ALTER TABLE ${quoted} ADD \`tenant_id\`|CREATE TABLE ${rebuilt}[\\s\\S]*?\`tenant_id\`)`), `${table} must be tenantized`);
+    assert.match(migration, new RegExp(`(?:ALTER TABLE ${quoted} ADD \`tenant_id\`|CREATE TABLE (?:${rebuilt}|${quoted})[\\s\\S]*?\`tenant_id\`)`), `${table} must be tenantized`);
   }
   assert.match(migration, /INSERT OR IGNORE INTO `tenants`/);
   assert.match(migration, /FROM `app_users`/);

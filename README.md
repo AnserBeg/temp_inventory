@@ -56,13 +56,14 @@ Migration `0030` creates the organization registry, assigns existing users and r
 
 ### Document email
 
-Each authenticated user can connect a Google Workspace/Gmail or Microsoft 365/Outlook mailbox from the account menu. Approved purchase orders, confirmed sales orders, and posted customer invoices can then be sent as PDF attachments from that user's own mailbox. PaneFlow reads the document from D1 at send time, enforces the same operational or financial role as the underlying document, and records the sender, recipients, document, provider result, and audit event without retaining the message body or attachment.
+Each authenticated user can connect a mailbox from the account menu with SMTP, Google Workspace/Gmail, or Microsoft 365/Outlook. Approved purchase orders, confirmed sales orders, and posted customer invoices can then be sent as PDF attachments from that user's own mailbox. PaneFlow reads the document from D1 at send time, enforces the same operational or financial role as the underlying document, and records the sender, recipients, document, provider result, and audit event without retaining the message body or attachment.
 
 Configure one or both OAuth providers and a dedicated encryption secret of at least 32 characters:
 
 - Google: `EMAIL_GOOGLE_CLIENT_ID`, `EMAIL_GOOGLE_CLIENT_SECRET`, and `EMAIL_GOOGLE_REDIRECT_URI`. Enable the Gmail API and register the callback URI; the app requests `gmail.send`, OpenID, and email identity scopes.
 - Microsoft: `EMAIL_MICROSOFT_CLIENT_ID`, `EMAIL_MICROSOFT_CLIENT_SECRET`, `EMAIL_MICROSOFT_REDIRECT_URI`, and optionally `EMAIL_MICROSOFT_TENANT_ID` (defaults to `common`). Register the callback URI and allow delegated `User.Read` and `Mail.Send` permissions.
-- Both providers use `EMAIL_TOKEN_ENCRYPTION_KEY`; keep it as a Worker secret and stable across deploys. OAuth access and refresh tokens are AES-GCM encrypted before being stored in D1.
+- SMTP needs no OAuth application credentials. Enter the sender address, SMTP host, port, username, and password in the account menu; PaneFlow verifies the login before replacing the current sender. Ports 465, 587, and 2525 are supported with TLS. Raw SMTP requires a Node runtime such as Render and does not run on the current Cloudflare-hosted Sites runtime.
+- Every connection uses `EMAIL_TOKEN_ENCRYPTION_KEY`; keep it secret and stable across deploys. OAuth tokens and SMTP passwords are AES-GCM encrypted before being stored in D1.
 
 For production, each redirect URI must be the exact public URL ending in `/api/integrations/email/callback/google` or `/api/integrations/email/callback/microsoft`.
 
