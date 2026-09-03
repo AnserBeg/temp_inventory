@@ -279,7 +279,7 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
     const controller = new AbortController();
     // Enter the pending state before the debounce elapses. Otherwise the list paints its old
     // rows (or an empty message), flashes to "Searching…", and then paints the response.
-    setLoading(true);
+    const pendingTimer = window.setTimeout(() => { if (current) setLoading(true); }, 0);
     const timer = window.setTimeout(async () => {
       try {
         const params = new URLSearchParams({ lookup: kind, q: query, limit: "25" });
@@ -313,7 +313,7 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
         if (current) setLoading(false);
       }
     }, 180);
-    return () => { current = false; controller.abort(); window.clearTimeout(timer); };
+    return () => { current = false; controller.abort(); window.clearTimeout(pendingTimer); window.clearTimeout(timer); };
   }, [currency, exchangeRateToBase, kind, lineId, locationId, open, partnerId, productId, quantity, query, role, warehouseId]);
 
   const beginLookup = (nextQuery: string) => {

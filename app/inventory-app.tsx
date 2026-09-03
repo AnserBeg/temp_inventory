@@ -932,12 +932,12 @@ function prefetchSnapshot(request: ReturnType<typeof createSnapshotRequest>) {
 type WorkflowGuideStep = { label: string; detail: string; view: ViewKey; tab?: string };
 
 const purchasingWorkflow: WorkflowGuideStep[] = [
-  { label: "Draft", detail: "Create and submit", view: "purchase-orders" },
+  { label: "Draft", detail: "Create and submit", view: "purchase-orders", tab: "drafts" },
   { label: "Approve", detail: "Release for ordering", view: "purchase-orders", tab: "approvals" },
-  { label: "Place order", detail: "Mark vendor order sent", view: "purchase-orders" },
-  { label: "Receive", detail: "Post supplier fulfillment", view: "expected-receipts" },
-  { label: "Create bill", detail: "Prefill from PO receipts", view: "vendor-bills" },
-  { label: "Send to QBO", detail: "Accounting owns payment", view: "vendor-bills" },
+  { label: "Place order", detail: "Mark vendor order sent", view: "purchase-orders", tab: "awaiting-order" },
+  { label: "Receive", detail: "Post supplier fulfillment", view: "purchase-orders", tab: "receive" },
+  { label: "Create bill", detail: "Prefill from PO receipts", view: "purchase-orders", tab: "create-bill" },
+  { label: "Send to QBO", detail: "Accounting owns payment", view: "purchase-orders", tab: "send-qbo" },
 ];
 
 const salesWorkflow: WorkflowGuideStep[] = [
@@ -1720,7 +1720,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
             <Suspense fallback={<LoadingState />}>
               {view === "home" && <Dashboard snapshot={snapshot} navigate={navigate} openPo={setSelectedPoId} />}
               {view === "purchase-orders" && (
-                <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { changeWorkspaceTab("overview"); setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }}>
+                <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={(tab) => { setSelectedPoId(null); changeWorkspaceTab(tab); }} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} detailOpen={Boolean(selectedPo)}>
                 {selectedPo ? (
                   <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
                 ) : (
@@ -2164,7 +2164,8 @@ function WorkflowGuide({ view, workspaceTab, onNavigate }: { view: ViewKey; work
   if (["purchase-orders", "expected-receipts", "vendor-bills"].includes(view)) {
     title = "Purchase to accounting";
     steps = purchasingWorkflow;
-    active = view === "purchase-orders" ? workspaceTab === "approvals" ? 1 : 0 : view === "expected-receipts" ? 3 : 4;
+    const purchaseTabStep: Record<string, number> = { drafts: 0, approvals: 1, "awaiting-order": 2, receive: 3, "create-bill": 4, "send-qbo": 5 };
+    active = view === "purchase-orders" ? purchaseTabStep[workspaceTab] ?? 0 : view === "expected-receipts" ? 3 : workspaceTab === "billing-actions" ? 5 : 4;
   } else if (["sales-orders", "fulfillment", "customer-invoices"].includes(view)) {
     title = "Order to cash";
     steps = salesWorkflow;

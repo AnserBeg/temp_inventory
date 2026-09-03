@@ -251,7 +251,15 @@ function emptyWorkflowState(): WorkflowState {
 }
 
 const tabs: Record<OperationsWorkspaceKind, Array<{ key: string; label: string }>> = {
-  purchasing: [{ key: "overview", label: "Orders" }, { key: "drafts", label: "Drafts & revisions" }, { key: "approvals", label: "Approval queue" }],
+  purchasing: [
+    { key: "overview", label: "All POs" },
+    { key: "drafts", label: "Draft" },
+    { key: "approvals", label: "Approval queue" },
+    { key: "awaiting-order", label: "Awaiting order" },
+    { key: "receive", label: "Receive" },
+    { key: "create-bill", label: "Create bill" },
+    { key: "send-qbo", label: "Send to QBO" },
+  ],
   sales: [{ key: "overview", label: "Orders" }, { key: "lifecycle", label: "Confirm / cancel" }, { key: "reservations", label: "Reservations" }, { key: "drop-ship", label: "Drop-ship deliveries" }, { key: "shipment-corrections", label: "Shipment corrections" }],
   inventory: [{ key: "overview", label: "Balances" }, { key: "transfers", label: "Transfers & status" }, { key: "approvals", label: "Inventory approvals" }, { key: "traceability", label: "Traceability" }, { key: "valuation", label: "Valuation" }, { key: "returnables", label: "Returnables" }],
   "vendor-billing": [{ key: "overview", label: "All bills" }, { key: "match", label: "Match exceptions" }, { key: "billing-actions", label: "Open bill actions" }],
@@ -268,7 +276,7 @@ const overviewCreateActions: Partial<Record<OperationsWorkspaceKind, ActionDefin
   "customer-billing": { kind: "createCustomerInvoice", title: "Create customer invoice", description: "Post eligible fulfilled quantities as a customer receivable. Inventory does not move again.", finalLabel: "Create & post customer invoice" },
 };
 
-export function OperationsWorkspace({ workspace, children, initialTab = "overview", onTabChange, onDurableRefresh, refreshToken = 0, filterReference = "", onCreateOrder, onOpenOrder }: { workspace: OperationsWorkspaceKind; children: ReactNode; initialTab?: string; onTabChange?: (tab: string) => void; onDurableRefresh?: () => void | Promise<void>; refreshToken?: number; filterReference?: string; onCreateOrder?: () => void; /** Opens a listed order's own page, where a draft or rejected revision can be edited. */ onOpenOrder?: (record: { id: string; number: string }) => void }) {
+export function OperationsWorkspace({ workspace, children, initialTab = "overview", onTabChange, onDurableRefresh, refreshToken = 0, filterReference = "", onCreateOrder, onOpenOrder, onOpenQbo, detailOpen = false }: { workspace: OperationsWorkspaceKind; children: ReactNode; initialTab?: string; onTabChange?: (tab: string) => void; onDurableRefresh?: () => void | Promise<void>; refreshToken?: number; filterReference?: string; onCreateOrder?: () => void; /** Opens a listed order's own page, where the next PO action and connected documents stay together. */ onOpenOrder?: (record: { id: string; number: string }) => void; onOpenQbo?: () => void; /** Keeps a selected record in the stage it was opened from; choosing a tab closes it in the parent. */ detailOpen?: boolean }) {
   const validTab = tabs[workspace].some((tab) => tab.key === initialTab) ? initialTab : "overview";
   const controlSection = ["policies", "periods-access", "integrations", "reconciliation", "units", "master-data"].includes(validTab)
     ? "settings"
@@ -372,18 +380,19 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
         <span className={`workflow-service ${serviceState}`} role="status" title={serviceError || undefined}>{serviceState === "live" ? "Durable workflows live" : serviceState === "loading" ? "Loading workflows…" : "Workflow service unavailable"}</span>
       </div>
       {serviceState === "unavailable" && visibleTab !== "overview" ? <div className="workflow-banner warning"><strong>Changes are temporarily unavailable.</strong><span>{serviceError || "Reference data is shown below. Reconnect before posting a business action so it can be durably recorded."}</span><button onClick={() => void load()}>Retry connection</button></div> : null}
-      {visibleTab === "overview" ? <>{overviewCreate ? <div className="workspace-overview-actions"><ActionButton kind="primary" disabled={!canAction(overviewCreate.kind)} onClick={() => setAction(overviewCreate)}>{overviewCreate.finalLabel}</ActionButton></div> : null}{children}</>
+      {visibleTab === "overview" || detailOpen ? <>{visibleTab === "overview" && !detailOpen && overviewCreate ? <div className="workspace-overview-actions"><ActionButton kind="primary" disabled={!canAction(overviewCreate.kind)} onClick={() => setAction(overviewCreate)}>{overviewCreate.finalLabel}</ActionButton></div> : null}{children}</>
         : loadedWorkspace !== workspace && serviceState === "loading" ? <div className="workflow-empty" role="status">Loading records…</div>
-        : <WorkflowTab workspace={workspace} tab={visibleTab} state={visibleState} canAction={canAction} openAction={setAction} refresh={load} onImportComplete={async () => { await load(); await onDurableRefresh?.(); }} onCreateOrder={onCreateOrder} onOpenOrder={onOpenOrder} />}
+        : <WorkflowTab workspace={workspace} tab={visibleTab} state={visibleState} canAction={canAction} openAction={setAction} refresh={load} onImportComplete={async () => { await load(); await onDurableRefresh?.(); }} onCreateOrder={onCreateOrder} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />}
       {action ? <WorkflowDialog action={action} state={state} onClose={() => setAction(null)} onSubmit={async (payload) => { await execute(action.kind, payload); setAction(null); }} /> : null}
       {toast ? <div className="workflow-toast" role="status"><span aria-hidden="true">✓</span>{toast}</div> : null}
     </div>
   );
 }
 
-function WorkflowTab({ workspace, tab, state, canAction, openAction, refresh, onImportComplete, onCreateOrder, onOpenOrder }: { workspace: OperationsWorkspaceKind; tab: string; state: WorkflowState; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void; refresh: () => Promise<void>; onImportComplete: () => void | Promise<void>; onCreateOrder?: () => void; onOpenOrder?: (record: { id: string; number: string }) => void }) {
+function WorkflowTab({ workspace, tab, state, canAction, openAction, refresh, onImportComplete, onCreateOrder, onOpenOrder, onOpenQbo }: { workspace: OperationsWorkspaceKind; tab: string; state: WorkflowState; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void; refresh: () => Promise<void>; onImportComplete: () => void | Promise<void>; onCreateOrder?: () => void; onOpenOrder?: (record: { id: string; number: string }) => void; onOpenQbo?: () => void }) {
   if (workspace === "purchasing" && tab === "drafts") return <PurchaseDrafts state={state} canAction={canAction} openAction={openAction} onImportComplete={onImportComplete} onCreateOrder={onCreateOrder} onOpenOrder={onOpenOrder} />;
-  if (workspace === "purchasing" && tab === "approvals") return <ApprovalQueue records={state.purchaseOrders.filter((item) => item.status.toLowerCase().includes("pending"))} canAction={canAction} openAction={openAction} />;
+  if (workspace === "purchasing" && tab === "approvals") return <ApprovalQueue records={purchaseQueueRecords(state.purchaseOrders, "approvals")} canAction={canAction} openAction={openAction} onOpenOrder={onOpenOrder} />;
+  if (workspace === "purchasing" && ["awaiting-order", "receive", "create-bill", "send-qbo"].includes(tab)) return <PurchaseStageQueue stage={tab as PurchaseQueueStage} records={purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage)} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />;
   if (workspace === "sales" && tab === "reservations") return <Reservations records={state.reservations} canAction={canAction} openAction={openAction} />;
   if (workspace === "sales" && tab === "lifecycle") return <SalesLifecycle records={state.options.salesOrders.map((option) => {
     const row = option.data ?? {};
@@ -988,18 +997,29 @@ function ActionButton({ children, onClick, disabled, kind = "secondary" }: { chi
 }
 
 function PurchaseDrafts({ state, canAction, openAction, onImportComplete, onCreateOrder, onOpenOrder }: { state: WorkflowState; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void; onImportComplete: () => void | Promise<void>; onCreateOrder?: () => void; onOpenOrder?: (record: { id: string; number: string }) => void }) {
-  const drafts = state.purchaseOrders.filter((item) => workflowStatusIs(item.status, "draft", "rejected"));
-  const approved = state.purchaseOrders.filter((item) => item.status.toLowerCase() === "approved");
+  const drafts = purchaseQueueRecords(state.purchaseOrders, "drafts");
   const cancelAction = (record: WorkflowRecord) => <ActionButton kind="quiet" disabled={!canAction("cancelPurchaseOrder")} onClick={() => openAction({ kind: "cancelPurchaseOrder", title: `Cancel ${record.number}`, description: "Cancel this unreceived purchasing commitment and release any dedicated customer-demand links.", finalLabel: "Cancel purchase order", record })}>Cancel</ActionButton>;
   // A rejected revision comes back to the buyer to be corrected, so the row leads to the
   // order's own page, where its lines can be edited before it is resubmitted.
   const openAction2 = (record: WorkflowRecord) => onOpenOrder ? <ActionButton kind="quiet" onClick={() => onOpenOrder({ id: record.id, number: record.number })}>{workflowStatusIs(record.status, "rejected") ? "Open to edit" : "Open"}</ActionButton> : null;
   const createActions = <div className="purchase-draft-actions"><PlyGemImportButton disabled={state.permissions.createPurchaseOrderDraft !== true} onImported={onImportComplete} />{onCreateOrder ? <ActionButton kind="primary" onClick={onCreateOrder}>Create purchase order</ActionButton> : null}</div>;
-  return <div className="workflow-stack"><Section title="Draft purchase orders" detail="Import one or many Ply Gem PDFs, or create a draft manually." action={createActions}><RecordTable records={drafts} columns={["number", "party", "quantity", "amount", "status"]} actions={(record) => <>{openAction2(record)}<ActionButton disabled={!canAction("submitPurchaseOrder")} onClick={() => openAction({ kind: "submitPurchaseOrder", title: `Submit ${record.number} for approval`, description: "Freeze the current revision, email the configured approver, and wait for a decision. Inventory does not move.", finalLabel: "Submit for approval", record })}>Submit</ActionButton>{cancelAction(record)}</>} /></Section><Section title="Approved orders awaiting vendor placement"><RecordTable records={approved} columns={["number", "party", "quantity", "amount", "status"]} actions={(record) => <><ActionButton kind="quiet" disabled={!canAction("amendPurchaseOrder")} onClick={() => openAction({ kind: "amendPurchaseOrder", title: `Amend ${record.number}`, description: "Create a new draft revision while retaining the approved revision previously shared with the vendor.", finalLabel: "Create amended revision", record })}>Amend</ActionButton>{cancelAction(record)}</>} /></Section><Section title="Revision history"><RecordTable records={state.revisions} columns={["number", "reference", "party", "amount", "status"]} /></Section>{state.attachments.length ? <AttachmentsPanel records={state.attachments.filter((item) => /PO|RCPT|return/i.test(item.document))} /> : null}</div>;
+  return <Section title="Draft purchase orders" detail="Draft and rejected POs stay here until a buyer edits or submits them for approval." action={createActions}><RecordTable records={drafts} columns={["number", "party", "quantity", "amount", "status"]} actions={(record) => <>{openAction2(record)}<ActionButton disabled={!canAction("submitPurchaseOrder")} onClick={() => openAction({ kind: "submitPurchaseOrder", title: `Submit ${record.number} for approval`, description: "Freeze the current revision, email the configured approver, and wait for a decision. Inventory does not move.", finalLabel: "Submit for approval", record })}>Submit</ActionButton>{cancelAction(record)}</>} /></Section>;
 }
 
-function ApprovalQueue({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
-  return <Section title="Purchasing approvals"><RecordCards records={records} renderActions={(record) => <><ActionButton kind="primary" disabled={!canAction("approvePurchaseOrder")} onClick={() => openAction({ kind: "approvePurchaseOrder", title: `Approve ${record.number}`, description: "Approve the commercial commitment and release it to the Awaiting order stage. Receiving and payables remain locked.", finalLabel: "Approve purchase order", record })}>Approve</ActionButton><ActionButton disabled={!canAction("rejectPurchaseOrder")} onClick={() => openAction({ kind: "rejectPurchaseOrder", title: `Reject ${record.number}`, description: "Return this revision to the buyer with a required explanation.", finalLabel: "Reject and return to buyer", record })}>Reject</ActionButton></>} /></Section>;
+function ApprovalQueue({ records, canAction, openAction, onOpenOrder }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void; onOpenOrder?: (record: { id: string; number: string }) => void }) {
+  return <Section title="Purchase orders awaiting approval" detail="Only submitted POs that need an approval decision appear here."><RecordCards records={records} renderActions={(record) => <>{onOpenOrder ? <ActionButton kind="quiet" onClick={() => onOpenOrder({ id: record.id, number: record.number })}>Open PO</ActionButton> : null}<ActionButton kind="primary" disabled={!canAction("approvePurchaseOrder")} onClick={() => openAction({ kind: "approvePurchaseOrder", title: `Approve ${record.number}`, description: "Approve the commercial commitment and release it to the Awaiting order stage. Receiving and payables remain locked.", finalLabel: "Approve purchase order", record })}>Approve</ActionButton><ActionButton disabled={!canAction("rejectPurchaseOrder")} onClick={() => openAction({ kind: "rejectPurchaseOrder", title: `Reject ${record.number}`, description: "Return this revision to the buyer for correction. A comment can be added when useful.", finalLabel: "Reject and return to buyer", record })}>Reject</ActionButton></>} /></Section>;
+}
+
+function PurchaseStageQueue({ stage, records, onOpenOrder, onOpenQbo }: { stage: PurchaseQueueStage; records: WorkflowRecord[]; onOpenOrder?: (record: { id: string; number: string }) => void; onOpenQbo?: () => void }) {
+  const content: Record<Exclude<PurchaseQueueStage, "drafts" | "approvals">, { title: string; detail: string; action: string }> = {
+    "awaiting-order": { title: "Approved POs awaiting vendor order", detail: "Only approved POs that have not yet been placed with the vendor appear here.", action: "Open & place order" },
+    receive: { title: "POs awaiting supplier fulfillment", detail: "Ordered and partially received POs stay here until supplier fulfillment is complete.", action: "Open & receive" },
+    "create-bill": { title: "Received POs ready for a bill", detail: "Only fully received or fulfilled POs with quantity left to bill appear here.", action: "Open & create bill" },
+    "send-qbo": { title: "Bills ready for QuickBooks Online", detail: "Only fully billed POs whose supplier bills still need a successful QBO handoff appear here.", action: "Open PO" },
+  };
+  if (stage === "drafts" || stage === "approvals") return null;
+  const copy = content[stage];
+  return <Section title={copy.title} detail={copy.detail}><RecordTable records={records} columns={["number", "party", "quantity", "amount", "status", "detail"]} actions={(record) => <>{onOpenOrder ? <ActionButton kind={stage === "send-qbo" ? "quiet" : "primary"} onClick={() => onOpenOrder({ id: record.id, number: record.number })}>{copy.action}</ActionButton> : null}{stage === "send-qbo" && onOpenQbo ? <ActionButton kind="primary" onClick={onOpenQbo}>Open QBO</ActionButton> : null}</>} /></Section>;
 }
 
 function CountApprovalInbox({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
@@ -1180,8 +1200,7 @@ function RecordCards<T extends WorkflowRecord>({ records, renderActions }: { rec
   const currentPage = Math.min(page, pages);
   const visible = records.slice((currentPage - 1) * WORKFLOW_PAGE_SIZE, currentPage * WORKFLOW_PAGE_SIZE);
   return <><div className="workflow-record-cards">{visible.map((record) => <article key={record.id}><header><div><span className="workflow-kicker">{record.reference ?? record.status}</span><h3>{record.number}</h3><p>{record.party}</p></div><StatusPill>{record.status}</StatusPill></header>{record.exception || record.detail ? <div className={`record-callout ${record.exception ? "warning" : "neutral"}`}>{record.exception ?? record.detail}</div> : null}
-    {/* The note the buyer was required to type when submitting. Requiring a justification and
-        then hiding it from the person deciding made the requirement decorative. */}
+    {/* Show an optional buyer note when one was supplied; approval never depends on it. */}
     {record.note ? <blockquote className="record-note">“{record.note}”</blockquote> : null}
     <dl>{record.requester ? <div><dt>Requested by</dt><dd>{record.requester}</dd></div> : null}{record.issuedOn ? <div><dt>Raised</dt><dd>{formatWorkflowDate(record.issuedOn)}</dd></div> : null}{record.dueOn ? <div><dt>Expected</dt><dd>{formatWorkflowDate(record.dueOn)}</dd></div> : null}{/* Omitted rather than dashed when a record type does not carry them: a vendor bill has
     no quantity or revision, so every card printed two empty rows between the dates and
@@ -1236,6 +1255,50 @@ function documentStatusIsSettled(status: string) {
 function workflowStatusIs(status: string, ...expected: string[]) {
   const normalize = (value: string) => value.toLowerCase().replaceAll(/[_\s-]/g, "");
   return expected.some((value) => normalize(value) === normalize(status));
+}
+
+type PurchaseQueueStage = "drafts" | "approvals" | "awaiting-order" | "receive" | "create-bill" | "send-qbo";
+
+function purchaseBills(record: WorkflowRecord) {
+  const input = record.data?.vendorBillsJson;
+  try {
+    const parsed = typeof input === "string" ? JSON.parse(input) : input;
+    return Array.isArray(parsed) ? parsed.filter((bill): bill is Record<string, unknown> => Boolean(bill) && typeof bill === "object" && !workflowStatusIs(String((bill as Record<string, unknown>).status ?? ""), "void")) : [];
+  } catch { return []; }
+}
+
+/** A PO belongs to at most one queue. Canceled and fully synced records remain in All POs. */
+function purchaseQueueStage(record: WorkflowRecord): PurchaseQueueStage | null {
+  const data = record.data ?? {};
+  const lifecycle = String(data.lifecycleStatus ?? record.status);
+  if (workflowStatusIs(lifecycle, "draft", "rejected")) return "drafts";
+  if (workflowStatusIs(lifecycle, "pending_approval")) return "approvals";
+  if (!workflowStatusIs(lifecycle, "approved")) return null;
+  if (!String(data.orderedAt ?? "").trim()) return "awaiting-order";
+  if (Number(data.openToFulfillQuantity ?? 0) > 0) return "receive";
+  const bills = purchaseBills(record);
+  if (!workflowStatusIs(String(data.billingStatus ?? "not_billed"), "fully_billed") || !bills.length) return "create-bill";
+  if (bills.every((bill) => workflowStatusIs(String(bill.qboStatus ?? ""), "succeeded"))) return null;
+  return "send-qbo";
+}
+
+function purchaseQueueRecord(record: WorkflowRecord, stage: PurchaseQueueStage): WorkflowRecord {
+  const data = record.data ?? {};
+  const ordered = Number(data.orderedQuantity ?? record.quantity ?? 0);
+  const fulfilled = Number(data.supplierFulfilledQuantity ?? 0);
+  if (stage === "awaiting-order") return { ...record, status: "Awaiting order", detail: "Approved; vendor order not yet placed" };
+  if (stage === "receive") return { ...record, status: fulfilled > 0 ? "Partially received" : "Ordered", detail: `${fulfilled} of ${ordered} supplier units fulfilled` };
+  if (stage === "create-bill") return { ...record, status: workflowStatusIs(String(data.billingStatus ?? ""), "partially_billed") ? "Partially billed" : "Ready to bill", detail: "Supplier fulfillment complete; create the bill from this PO" };
+  if (stage === "send-qbo") {
+    const qboStatuses = purchaseBills(record).map((bill) => String(bill.qboStatus ?? "").toLowerCase());
+    const status = qboStatuses.some((value) => value === "failed") ? "QBO needs attention" : qboStatuses.some((value) => ["pending", "processing"].includes(value)) ? "QBO sync queued" : "Ready for QBO";
+    return { ...record, status, detail: "Supplier bill created; accounting handoff is next" };
+  }
+  return record;
+}
+
+function purchaseQueueRecords(records: WorkflowRecord[], stage: PurchaseQueueStage) {
+  return records.filter((record) => purchaseQueueStage(record) === stage).map((record) => purchaseQueueRecord(record, stage));
 }
 
 /**
@@ -1680,7 +1743,7 @@ function filterWorkflowState(state: WorkflowState, filterReference: string): Wor
 }
 
 function tabCount(workspace: OperationsWorkspaceKind, tab: string, state: WorkflowState) {
-  if (workspace === "purchasing" && tab === "approvals") return state.purchaseOrders.filter((record) => record.status.toLowerCase().includes("pending")).length;
+  if (workspace === "purchasing" && ["drafts", "approvals", "awaiting-order", "receive", "create-bill", "send-qbo"].includes(tab)) return purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage).length;
   if (workspace === "vendor-billing" && tab === "match") return state.vendorBills.filter((record) => record.exception).length;
   if (workspace === "inventory" && tab === "returnables") return state.assets.filter((record) => !/closed/i.test(record.status)).length;
   if ((workspace === "inventory" || workspace === "controls") && tab === "approvals") return state.approvals.filter((record) => /pending/i.test(record.status) && ["inventory_count_variance", "over_receipt"].includes(String(record.data?.requestType ?? ""))).length;
@@ -1807,10 +1870,10 @@ function normalizeLiveWorkflowState(input: unknown, snapshotInput?: unknown): Wo
   const permissionLabels = [["canOperate", "Operational posting"], ["canPostFinancial", "Financial posting"], ["canApprove", "Approval decisions"], ["canAdminister", "System administration"], ["canExport", "Data export"]].filter(([key]) => permissions[key] === true).map(([, label]) => label);
   const actor = raw.currentUser && typeof raw.currentUser === "object" ? raw.currentUser as Record<string, unknown> : null;
   const summaryTotals = raw.summary && typeof raw.summary === "object" ? raw.summary as Record<string, unknown> : {};
-  const poRecords: WorkflowRecord[] = purchaseOrders.map((row) => ({ id: text(row, "id"), number: text(row, "number", "id"), status: human(row.lifecycleStatus), party: text(row, "vendorName"), reference: text(row, "supplierQuoteNumber") ? `Supplier quote ${text(row, "supplierQuoteNumber")}${text(row, "supplierReference") ? ` · ${text(row, "supplierReference")}` : ""}` : text(row, "projectReference", "expectedDate"), amount: number(row, "totalCents") / 100, currency: text(row, "currency") || "CAD", quantity: number(row, "orderedQuantity"), version: number(row, "version") || undefined, revision: number(row, "revisionNumber") || 1,
+  const poRecords: WorkflowRecord[] = purchaseOrders.map((row) => ({ id: text(row, "id"), number: text(row, "number", "id"), status: human(row.lifecycleStatus), party: text(row, "vendorName"), reference: text(row, "supplierQuoteNumber") ? `Supplier quote ${text(row, "supplierQuoteNumber")}${text(row, "supplierReference") ? ` · ${text(row, "supplierReference")}` : ""}` : text(row, "projectReference", "expectedDate"), amount: number(row, "totalCents") / 100, currency: text(row, "currency") || "CAD", quantity: number(row, "orderedQuantity"), version: number(row, "version") || undefined, revision: number(row, "revisionNumber") || 1, data: row,
     issuedOn: text(row, "orderDate"), dueOn: text(row, "expectedDate"), requester: text(row, "buyerName"), note: text(row, "submissionNote"),
     // An approver was previously shown a vendor and a number. What is being bought, by whom,
-    // and the justification they were required to type all lived elsewhere.
+    // and any note the buyer supplied all lived elsewhere.
     // The core snapshot attaches `lines` directly; the purchasing workflow query returns them
     // as JSON so one narrow row can still carry its detail.
     lines: rows(row.lines ?? jsonArray(row.linesJson)).map((line, index) => {

@@ -3563,8 +3563,8 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
     FROM business_partners ORDER BY code LIMIT ? OFFSET ?`, pageSize, offset) : [];
   const workflowPurchaseOrders = include("purchasing") ? await unpagedAll<Record<string, unknown>>(`SELECT po.id,po.number,po.lifecycle_status AS lifecycleStatus,po.expected_date AS expectedDate,
       po.total_cents AS totalCents,po.currency,po.version,po.revision_number AS revisionNumber,bp.name AS vendorName,
-      -- An approver decides on this row alone, so it has to carry who raised the order, the
-      -- justification they were required to type, and what is actually being bought.
+      -- An approver decides on this row alone, so it has to carry who raised the order, any
+      -- optional note they supplied, and what is actually being bought.
       po.buyer_name AS buyerName,po.created_at AS orderDate,po.project_reference AS projectReference,
       po.supplier_quote_number AS supplierQuoteNumber,po.supplier_reference AS supplierReference,
       (SELECT por.reason FROM purchase_order_revisions por WHERE por.purchase_order_id=po.id
@@ -3670,7 +3670,10 @@ export async function getWorkflowSnapshot(actor?:ActorIdentity,input:SnapshotPag
   // scoped records. The lightweight core companion only supplies product rows for inventory
   // and orphaned-location reconciliation; recomputing the global operational summary here made
   // every workflow request pay the app-shell's largest analytical query a second time.
-  const workflowCoreScope: Record<string,string> = { purchasing:"workflow-empty", sales:"workflow-empty", inventory:"workflow-products", "vendor-billing":"workflow-empty", "customer-billing":"workflow-empty", controls:"workflow-empty" };
+  // Purchasing's stage queues need the full PO lifecycle, fulfillment, billing, and QBO
+  // delivery state. The narrow advanced approval query intentionally omits completed receipts
+  // and billed orders, so use the richer PO register as the queue's classification source.
+  const workflowCoreScope: Record<string,string> = { purchasing:"purchase-orders", sales:"workflow-empty", inventory:"workflow-products", "vendor-billing":"workflow-empty", "customer-billing":"workflow-empty", controls:"workflow-empty" };
   const coreInput = workflowCoreScope[String(input.scope ?? "")] ? { ...input, scope: workflowCoreScope[String(input.scope)] } : input;
   const [core,advanced]=await Promise.all([getInventorySnapshot(coreInput),getAdvancedSnapshot(actor,input)]);return{snapshot:core,advanced};}
 

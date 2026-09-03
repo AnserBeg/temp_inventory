@@ -3144,8 +3144,8 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
            -- The commercial revision, which only a renegotiated order advances. Distinct from
            -- po.version, the optimistic-lock counter that every state change bumps.
            po.revision_number AS revisionNumber,
-           -- The note the buyer had to type to submit the current revision. An approver who
-           -- cannot read it is approving a number.
+           -- Preserve an optional buyer note with the revision so an approver can read any
+           -- context that was supplied without making commentary a workflow gate.
            (SELECT por.reason FROM purchase_order_revisions por WHERE por.purchase_order_id=po.id
              AND por.revision_number=po.revision_number ORDER BY por.rowid DESC LIMIT 1) AS submissionNote,
            COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='purchase_order' AND dc.document_id=po.id AND dc.charge_type='freight'),0) AS freightCents,

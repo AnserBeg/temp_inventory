@@ -118,9 +118,11 @@ export function AddressAutocomplete({
   const selectedRef = useRef(onAddressSelected);
   const [mode, setMode] = useState<"loading" | "ready" | "fallback">("loading");
 
-  valueRef.current = value;
-  changeRef.current = onChange;
-  selectedRef.current = onAddressSelected;
+  useEffect(() => {
+    valueRef.current = value;
+    changeRef.current = onChange;
+    selectedRef.current = onAddressSelected;
+  }, [onAddressSelected, onChange, value]);
 
   useEffect(() => {
     let disposed = false;
