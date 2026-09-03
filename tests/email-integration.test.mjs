@@ -302,3 +302,63 @@ test("new draft purchase orders email the configured approver with a direct link
     assert.equal(db.sqlite.prepare("SELECT status FROM outbox_events WHERE id=?").get(queued.id).status, "processed");
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test("approving a draft emails its creator's current account and the configured extra recipients", async () => {
+  const administrator = { ...accountant, role: "administrator" };
+  await assert.rejects(emailClient.setPurchaseOrderApprovedEmails(operator, "purchasing@example.test"), /Only a company administrator/);
+  await emailClient.setPurchaseOrderApprovalEmail(administrator, "");
+  const saved = await emailClient.setPurchaseOrderApprovedEmails(administrator,
+    " PURCHASING@EXAMPLE.TEST; creator-current@example.test, owner@example.test, purchasing@example.test ");
+  assert.equal(saved.purchaseOrderApprovedEmails, "purchasing@example.test, creator-current@example.test, owner@example.test");
+
+  const created = await advancedDomain.executeWorkflow({
+    command: "createPurchaseOrderDraft",
+    idempotencyKey: "email-approved-po-create",
+    actor: operator,
+    appOrigin: "https://paneflow.example.test",
+    payload: {
+      vendorId: "email-vendor",
+      expectedDate: "2026-09-14",
+      lines: [{ productId: "email-product", quantity: 1, unitCostCents: 12000 }],
+    },
+  });
+  await run("UPDATE app_users SET email='creator-current@example.test' WHERE user_id=?", operator.id);
+  await advancedDomain.executeWorkflow({
+    command: "submitPurchaseOrder", entityId: created.recordId, version: 1,
+    idempotencyKey: "email-approved-po-submit", actor: operator, payload: { reason: "Ready for approval" },
+  });
+  await advancedDomain.executeWorkflow({
+    command: "approvePurchaseOrder", entityId: created.recordId, version: 2,
+    idempotencyKey: "email-approved-po-decide", actor: administrator,
+    appOrigin: "https://paneflow.example.test", payload: { reason: "Approved" },
+  });
+
+  const queued = db.sqlite.prepare("SELECT id,status,payload_json AS payload FROM outbox_events WHERE event_type='purchase_order.approved_email_requested' AND aggregate_id=?").get(created.recordId);
+  assert.equal(queued.status, "pending");
+  const payload = JSON.parse(queued.payload);
+  assert.deepEqual(payload.recipients, ["creator-current@example.test", "purchasing@example.test", "owner@example.test"]);
+
+  const originalFetch = globalThis.fetch;
+  let gmailRaw = "";
+  try {
+    globalThis.fetch = async (input, init = {}) => {
+      const target = String(input);
+      if (target.includes("gmail.googleapis.com")) {
+        assert.equal(init.headers.authorization, "Bearer company-access");
+        gmailRaw = JSON.parse(String(init.body)).raw;
+        return Response.json({ id: "gmail-approved-po-alert" });
+      }
+      throw new Error(`Unexpected approved PO alert request ${target}`);
+    };
+    const processed = await outbox.processOutboxBatch({ limit: 10 });
+    assert.equal(processed.failed, 0);
+    const normalized = gmailRaw.replaceAll("-", "+").replaceAll("_", "/");
+    const mime = Buffer.from(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="), "base64").toString("utf8");
+    assert.match(mime, /To: creator-current@example\.test, purchasing@example\.test, owner@example\.test/);
+    const encodedHtml = mime.split("\r\n\r\n")[1].replace(/\s/gu, "");
+    const html = Buffer.from(encodedHtml, "base64").toString("utf8");
+    assert.match(html, /has been approved/);
+    assert.match(html, new RegExp(`po=${created.recordId}`));
+    assert.equal(db.sqlite.prepare("SELECT status FROM outbox_events WHERE id=?").get(queued.id).status, "processed");
+  } finally { globalThis.fetch = originalFetch; }
+});

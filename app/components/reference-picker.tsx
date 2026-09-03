@@ -31,7 +31,7 @@ export const PAYMENT_TERMS = ["Due on receipt", "Net 15", "Net 30", "Net 45", "N
 const quickCreateLabels: Record<QuickCreateKind, string> = {
   customer: "New customer",
   vendor: "New vendor",
-  partner: "New vendor / customer",
+  partner: "New customer / vendor",
   product: "New product",
   location: "New location",
   uom: "New unit of measure",
@@ -350,7 +350,7 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
 }
 
 /** Minimal create form for the records people discover they are missing mid-task. */
-export function QuickCreateDialog({ kind, companyReorderPercent, onClose, onCreated }: { kind: QuickCreateKind; companyReorderPercent?: number; onClose: () => void; onCreated: (option: PickerOption) => void | Promise<void> }) {
+export function QuickCreateDialog({ kind, companyReorderPercent, submitLabel = "Create and use", onClose, onCreated }: { kind: QuickCreateKind; companyReorderPercent?: number; submitLabel?: string; onClose: () => void; onCreated: (option: PickerOption) => void | Promise<void> }) {
   const isPartner = kind === "customer" || kind === "vendor" || kind === "partner";
   // Master records with no dependent lookups of their own; they need only their own fields.
   const isSimpleMaster = kind === "uom" || kind === "priceList" || kind === "assetType";
@@ -389,10 +389,10 @@ export function QuickCreateDialog({ kind, companyReorderPercent, onClose, onCrea
   const [inventoryStatus, setInventoryStatus] = useState("usable");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const closeRef = useRef<HTMLButtonElement>(null);
+  const firstFieldRef = useRef<HTMLInputElement>(null);
 
   useDialogDismiss(onClose, busy);
-  useEffect(() => { closeRef.current?.focus(); }, []);
+  useEffect(() => { firstFieldRef.current?.focus(); }, []);
 
   /**
    * Every field the server will reject the record without, named the way the labels name them.
@@ -443,18 +443,18 @@ export function QuickCreateDialog({ kind, companyReorderPercent, onClose, onCrea
     finally { setBusy(false); }
   };
 
-  const field = (labelText: string, node: ReactNode) => <label><span>{labelText}</span>{node}</label>;
+  const field = (labelText: string, node: ReactNode, required = false) => <label><span>{labelText}{required ? <span className="required-mark" aria-hidden="true"> *</span> : null}</span>{node}</label>;
 
   return <div className="modal-overlay quick-create-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
     <section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label={`Create ${kind}`}>
-      <div className="dialog-header"><h2>{quickCreateLabels[kind]}</h2><button ref={closeRef} type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div>
+      <div className="dialog-header"><h2>{quickCreateLabels[kind]}</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div>
       {/* Deliberately not a <form>: this dialog opens from inside the order composer's form,
           and a nested form submits the outer one instead of posting the new record. */}
       <div onKeyDown={(event) => { if (event.key === "Enter" && !busy) { event.preventDefault(); void submit(); } }}>
         {error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}
         <div className="command-form form-grid">
-          {field(kind === "product" ? "SKU" : "Code", <input value={code} onChange={(event) => setCode(event.target.value)} required aria-required="true" />)}
-          {field("Name", <input value={name} onChange={(event) => setName(event.target.value)} required aria-required="true" />)}
+          {field(kind === "product" ? "SKU" : "Code", <input ref={firstFieldRef} value={code} onChange={(event) => setCode(event.target.value)} required aria-required="true" />, true)}
+          {field("Name", <input value={name} onChange={(event) => setName(event.target.value)} required aria-required="true" />, true)}
           {kind === "partner" ? field("Type", <select value={partnerType} onChange={(event) => setPartnerType(event.target.value)}><option value="customer">Customer</option><option value="vendor">Vendor</option><option value="both">Both</option></select>) : null}
           {isPartner ? <>
             {field("Currency", <select value={currency} onChange={(event) => setCurrency(event.target.value)}><option>CAD</option><option>USD</option><option>EUR</option></select>)}
@@ -470,12 +470,12 @@ export function QuickCreateDialog({ kind, companyReorderPercent, onClose, onCrea
           {kind === "product" ? <>
             {/* Routed through the picker rather than a bare select: both tables grow with the
                 business and are past a glance long before anyone notices. */}
-            <RemoteSearchSelect kind="uoms" label="Unit of measure" placeholder="Search active units" value={uomId} initialOptions={[]} onSelect={(option) => setUomId(option.id)} mapItem={(item) => ({ id: String(item.id), label: `${String(item.code)} · ${String(item.name)}`, detail: `${String(item.dimension)} · precision ${String(item.precision)}` })} />
+            <RemoteSearchSelect kind="uoms" label="Unit of measure" placeholder="Search active units" value={uomId} initialOptions={[]} required onSelect={(option) => setUomId(option.id)} mapItem={(item) => ({ id: String(item.id), label: `${String(item.code)} · ${String(item.name)}`, detail: `${String(item.dimension)} · precision ${String(item.precision)}` })} />
             {field("Manufacturer SKU (optional)", <input value={manufacturerSku} onChange={(event) => setManufacturerSku(event.target.value)} />)}
-            {field("Category", <input value={category} onChange={(event) => setCategory(event.target.value)} required />)}
-            {field("Material", <input value={material} onChange={(event) => setMaterial(event.target.value)} required />)}
-            {field("Dimensions / configuration", <input value={dimensions} onChange={(event) => setDimensions(event.target.value)} required />)}
-            {field("Finish", <input value={finish} onChange={(event) => setFinish(event.target.value)} required />)}
+            {field("Category", <input value={category} onChange={(event) => setCategory(event.target.value)} required />, true)}
+            {field("Material", <input value={material} onChange={(event) => setMaterial(event.target.value)} required />, true)}
+            {field("Dimensions / configuration", <input value={dimensions} onChange={(event) => setDimensions(event.target.value)} required />, true)}
+            {field("Finish", <input value={finish} onChange={(event) => setFinish(event.target.value)} required />, true)}
             {field("Tracking policy", <select value={trackingPolicy} onChange={(event) => setTrackingPolicy(event.target.value)}><option value="quantity">Quantity</option><option value="lot">Lot</option><option value="serial">Serial</option></select>)}
             {field("Inventory policy", <select value={inventoryPolicy} onChange={(event) => setInventoryPolicy(event.target.value)}><option value="stocked">Stocked</option><option value="special_order">Special order</option><option value="drop_ship">Drop ship</option></select>)}
             <div className="replenishment-create-heading full-field"><strong>Max stock &amp; reorder point</strong><small>Set the target stock level, then choose when purchasing should reorder.</small></div>
@@ -487,7 +487,7 @@ export function QuickCreateDialog({ kind, companyReorderPercent, onClose, onCrea
             {field("Selling price", <NumberField min="0" step="0.01" value={price} onChange={setPrice} />)}
           </> : null}
           {kind === "location" ? <>
-            <RemoteSearchSelect kind="warehouses" label="Warehouse" placeholder="Search active warehouses" value={warehouseId} initialOptions={[]} onSelect={(option) => setWarehouseId(option.id)} mapItem={(item) => ({ id: String(item.id), label: `${String(item.code)} · ${String(item.name)}`, detail: String(item.timezone ?? "") })} />
+            <RemoteSearchSelect kind="warehouses" label="Warehouse" placeholder="Search active warehouses" value={warehouseId} initialOptions={[]} required onSelect={(option) => setWarehouseId(option.id)} mapItem={(item) => ({ id: String(item.id), label: `${String(item.code)} · ${String(item.name)}`, detail: String(item.timezone ?? "") })} />
             {field("Inventory status", <select value={inventoryStatus} onChange={(event) => setInventoryStatus(event.target.value)}><option value="usable">Usable</option><option value="quarantine">Quarantine</option><option value="damaged">Damaged</option></select>)}
           </> : null}
           {kind === "uom" ? <>
@@ -507,7 +507,7 @@ export function QuickCreateDialog({ kind, companyReorderPercent, onClose, onCrea
             the `required` attributes above never fired because this is deliberately not a form,
             so the two fields that identify the record were not checked at all. */}
         {missingFields.length ? <p className="read-only-label">Still needed: {missingFields.join(", ")}.</p> : null}
-        <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button type="button" className="button primary" onClick={() => void submit()} disabled={busy || missingFields.length > 0}>{busy ? "Creating…" : "Create and use"}</button></div>
+        <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button type="button" className="button primary" onClick={() => void submit()} disabled={busy || missingFields.length > 0}>{busy ? "Creating…" : submitLabel}</button></div>
       </div>
     </section>
   </div>;

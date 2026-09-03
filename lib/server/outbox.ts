@@ -20,6 +20,7 @@ type OutboxRow = {
 
 const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, "0")).join("");
 const INTERNAL_DRAFT_PO_EMAIL = "purchase_order.draft_approval_email_requested";
+const INTERNAL_APPROVED_PO_EMAIL = "purchase_order.approved_email_requested";
 
 function escapeHtml(value: string) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
@@ -56,7 +57,7 @@ export async function processOutboxBatch({ limit = 20 }: { limit?: number } = {}
   await db.prepare(`UPDATE outbox_events SET status='processing',locked_at=?
     WHERE id IN (SELECT id FROM outbox_events
       WHERE ((status IN ('pending','failed') AND available_at<=?) OR (status='processing' AND locked_at<?))
-        AND (?=1 OR event_type IN ('attachment.delete_requested','purchase_order.draft_approval_email_requested'))
+        AND (?=1 OR event_type IN ('attachment.delete_requested','purchase_order.draft_approval_email_requested','purchase_order.approved_email_requested'))
       ORDER BY created_at,id LIMIT ?)`)
     .bind(claimedAt, claimedAt, new Date(now.getTime() - 10 * 60_000).toISOString(), webhookConfigured ? 1 : 0, bounded).run();
   const claimed = await db.prepare(`SELECT id,event_type AS eventType,aggregate_type AS aggregateType,
@@ -93,7 +94,26 @@ export async function processOutboxBatch({ limit = 20 }: { limit?: number } = {}
           htmlBody: `<p>A new purchase order draft, <strong>${safeNumber}</strong>, was created and requires approval.</p><p><a href="${safeUrl}">Review purchase order</a></p>`,
         });
       }
-      if (endpoint && secret && event.eventType !== INTERNAL_DRAFT_PO_EMAIL) {
+      if (event.eventType === INTERNAL_APPROVED_PO_EMAIL) {
+        const values = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+        const recipients = Array.isArray(values.recipients) ? values.recipients.map(String) : [];
+        const number = String(values.number ?? "Purchase order").trim();
+        const recordId = String(values.recordId ?? event.aggregateId).trim();
+        const origin = new URL(String(values.appOrigin ?? ""));
+        if (!/^https?:$/u.test(origin.protocol)) throw new Error("Approved purchase-order link must use HTTP or HTTPS.");
+        const reviewUrl = new URL("/", origin);
+        reviewUrl.searchParams.set("view", "purchase-orders");
+        reviewUrl.searchParams.set("po", recordId);
+        reviewUrl.searchParams.set("number", number);
+        const safeNumber = escapeHtml(number);
+        const safeUrl = escapeHtml(reviewUrl.toString());
+        await sendWithCompanyMailbox({
+          recipients,
+          subject: `${number} approved`,
+          htmlBody: `<p>The draft purchase order <strong>${safeNumber}</strong> has been approved.</p><p><a href="${safeUrl}">View purchase order</a></p>`,
+        });
+      }
+      if (endpoint && secret && event.eventType !== INTERNAL_DRAFT_PO_EMAIL && event.eventType !== INTERNAL_APPROVED_PO_EMAIL) {
         const response = await fetch(endpoint, {
           method: "POST",
           headers: {

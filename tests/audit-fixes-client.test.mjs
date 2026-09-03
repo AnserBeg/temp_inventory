@@ -231,3 +231,29 @@ test("billing actions use explicit business verbs", () => {
   assert.match(sources.suite, />Record payment<\/ActionButton>/);
   assert.match(sources.suite, />Issue credit<\/ActionButton>/);
 });
+
+test("reports, pricing, and settings expose focused navigation", () => {
+  assert.match(sources.app, /label: "Reports".*tabs: \["overview", "approvals", "audit"\]/);
+  assert.match(sources.app, /label: "Settings".*tabs: \["policies", "periods-access", "integrations", "reconciliation", "units", "master-data"\]/);
+  assert.match(sources.suite, /const visibleTabs = workspace !== "controls"/);
+  assert.match(sources.app, /pageSize: input\.view === "reports" \? "500" : "50"/);
+  assert.match(sources.suite, /formatWorkflowDate\(record\.time\)/);
+});
+
+test("customer and vendor account screens follow the selected role", () => {
+  assert.match(sources.app, /label: "Customers & vendors"/);
+  assert.match(sources.app, /partner\.type === "vendor" \? Promise\.resolve\(\[\]\) : loadAll\("salesOrders", "open"\)/);
+  assert.match(sources.app, /partner\.type === "customer" \? Promise\.resolve\(\[\]\) : loadAll\("purchaseOrders", "open"\)/);
+  assert.match(sources.app, /partner\.type === "vendor" \? "Not applicable"/);
+  assert.match(sources.app, /\{isCustomerAccount \? <>/);
+  assert.match(sources.app, /onOpenOrder\(order\)/);
+});
+
+test("create screens state required choices and truthful draft effects", () => {
+  assert.match(sources.suite, /const \[baseUomId, setBaseUomId\] = useState\(""\)/);
+  assert.match(sources.suite, /setBaseUomId\(""\); setPurchaseUomId\(""\); setSalesUomId\(""\)/);
+  assert.match(sources.picker, /submitLabel = "Create and use"/);
+  assert.match(sources.app, /submitLabel="Create product"/);
+  assert.match(sources.picker, /label="Unit of measure".*required onSelect/);
+  assert.match(sources.app, /not active until \$\{isPurchase \? "approved" : "confirmed"\}/);
+});

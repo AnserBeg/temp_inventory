@@ -1194,10 +1194,10 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .audit-timeline p { margin: 0; color: var(--ink-soft); font-size: 12px; }
 .audit-timeline small { color: #87918d; font-size: 11px; }
 .policy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 12px; }
-.policy-grid article { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+.policy-grid article { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; align-items: start; padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
 .policy-grid h3 { margin: 4px 0 2px; font-size: 13px; }
 .policy-grid p { margin: 0; color: var(--ink-soft); font-size: 11px; }
-.policy-grid > article > strong { padding: 5px 8px; border-radius: 5px; background: var(--surface-soft); font-size: 12px; }
+.policy-grid > article > strong { justify-self: start; max-width: 100%; padding: 5px 8px; border-radius: 5px; background: var(--surface-soft); font-size: 12px; overflow-wrap: anywhere; }
 .policy-grid .workflow-action { grid-column: 1 / -1; justify-self: start; }
 .policy-grid .featured-policy { border-color: #9fc8bc; background: linear-gradient(135deg, #f1faf6, #fff); box-shadow: inset 3px 0 0 var(--brand); }
 .policy-grid .featured-policy > strong { background: var(--brand); color: #fff; }

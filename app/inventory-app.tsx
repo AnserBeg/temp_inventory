@@ -713,7 +713,7 @@ function dueDateForTerms(baseDate: string, terms: string) {
 }
 
 
-type NavItem = { key: ViewKey; label: string; glyph: string; tab?: string };
+type NavItem = { key: ViewKey; label: string; glyph: string; tab?: string; tabs?: readonly string[] };
 
 const navGroups: Array<{ label?: string; items: NavItem[] }> = [
   { items: [{ key: "home", label: "Home", glyph: "H" }] },
@@ -754,11 +754,10 @@ const navGroups: Array<{ label?: string; items: NavItem[] }> = [
   {
     items: [
       { key: "products", label: "Catalog", glyph: "◇" },
-      { key: "partners", label: "Partners", glyph: "◎" },
+      { key: "partners", label: "Customers & vendors", glyph: "◎" },
+      { key: "reports", label: "Reports", glyph: "▥", tab: "overview", tabs: ["overview", "approvals", "audit"] },
       { key: "reports", label: "Pricing", glyph: "%", tab: "pricing" },
-      // The remaining control tabs stay together; pricing gets a direct route because it is a
-      // routine commercial task rather than an occasional system-administration setting.
-      { key: "reports", label: "Reports & admin", glyph: "▥" },
+      { key: "reports", label: "Settings", glyph: "⚙", tab: "policies", tabs: ["policies", "periods-access", "integrations", "reconciliation", "units", "master-data"] },
       { key: "warehouse", label: "Warehouse mode", glyph: "▣" },
     ],
   },
@@ -781,10 +780,22 @@ const viewTitles: Record<ViewKey, { title: string; description?: string }> = {
   "vendor-bills": { title: "Vendor bills" },
   "customer-invoices": { title: "Customer invoices" },
   products: { title: "Product catalog" },
-  partners: { title: "Partners" },
-  reports: { title: "Reports & administration" },
+  partners: { title: "Customers & vendors" },
+  reports: { title: "Reports" },
   warehouse: { title: "Warehouse mode" },
 };
+
+function navItemIsActive(item: NavItem, view: ViewKey, workspaceTab: string) {
+  if (view !== item.key) return false;
+  if (item.tabs) return item.tabs.includes(workspaceTab);
+  return item.tab ? workspaceTab === item.tab : true;
+}
+
+function reportsPageTitle(workspaceTab: string) {
+  if (workspaceTab === "pricing") return "Pricing";
+  if (["policies", "periods-access", "integrations", "reconciliation", "units", "master-data"].includes(workspaceTab)) return "Settings";
+  return "Reports";
+}
 
 type PurchaseReceiptRecord = {
   id: string;
@@ -863,7 +874,9 @@ type SnapshotRequestInput = {
 function createSnapshotRequest(input: SnapshotRequestInput) {
   const params = new URLSearchParams({
     page: String(input.page),
-    pageSize: "50",
+    // Reports paginate their product table locally. Loading the complete catalog for this
+    // bounded reporting view avoids stacking a second, unrelated server pager beneath it.
+    pageSize: input.view === "reports" ? "500" : "50",
     scope: input.view,
     worklistQuery: input.search,
     status: input.status,
@@ -913,7 +926,7 @@ type WorkflowGuideStep = { label: string; detail: string; view: ViewKey; tab?: s
 const purchasingWorkflow: WorkflowGuideStep[] = [
   { label: "Commit order", detail: "Draft and approve", view: "purchase-orders" },
   { label: "Receive stock", detail: "Post warehouse receipt", view: "expected-receipts" },
-  { label: "Match vendor bill", detail: "Order + fulfillment + invoice", view: "vendor-bills" },
+  { label: "Match vendor bill", detail: "PO + receipt + vendor invoice", view: "vendor-bills" },
   { label: "Settle payable", detail: "Credit or record payment", view: "vendor-bills", tab: "billing-actions" },
 ];
 
@@ -1625,12 +1638,12 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               {group.items.map((item) => (
                 <button
                   key={`${item.key}:${item.tab ?? "overview"}`}
-                  className={`nav-item ${view === item.key && (item.tab ? workspaceTab === item.tab : item.key !== "reports" || workspaceTab !== "pricing") ? "active" : ""}`}
+                  className={`nav-item ${navItemIsActive(item, view, workspaceTab) ? "active" : ""}`}
                   onPointerEnter={() => scheduleViewPrefetch(item.key)}
                   onPointerLeave={cancelViewPrefetch}
                   onFocus={() => preloadViewCode(item.key)}
                   onClick={() => navigate(item.key, undefined, item.tab ?? "overview")}
-                  aria-current={view === item.key && (item.tab ? workspaceTab === item.tab : item.key !== "reports" || workspaceTab !== "pricing") ? "page" : undefined}
+                  aria-current={navItemIsActive(item, view, workspaceTab) ? "page" : undefined}
                   // Named explicitly, with the badge folded in: the glyph is decorative and the
                   // tree was reading these as unnamed buttons.
                   aria-label={item.key === "expected-receipts" && snapshot.summary.lateReceipts > 0 ? `${item.label}, ${snapshot.summary.lateReceipts} late` : item.key === "vendor-bills" && snapshot.summary.matchExceptions > 0 ? `${item.label}, exceptions present` : item.label}
@@ -1680,7 +1693,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
           <div className="page-heading">
             <div>
               <div className="eyebrow-row"><span className={`connection ${source}`}>{source === "server" ? "Connected" : source === "loading" ? "Connecting" : "Connection interrupted"}</span><span>{lastUpdatedAt ? `Last updated ${lastUpdatedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : "No successful refresh yet"}</span></div>
-              <h1>{view === "reports" && workspaceTab === "pricing" ? "Pricing" : viewTitles[view].title}</h1>
+              <h1>{view === "reports" ? reportsPageTitle(workspaceTab) : viewTitles[view].title}</h1>
               {viewTitles[view].description ? <p>{viewTitles[view].description}</p> : null}
             </div>
             <PageActions view={view} source={source} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} onNavigate={navigate} onCreate={setCreateOrder} onCreatePartner={() => setEditingPartner("new")} onCreateProduct={() => setCreatingProduct(true)} />
@@ -1756,7 +1769,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InventoryCountSessions warehouseId={warehouseId} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} canAdminister={snapshot.viewer.permissions.canAdminister} onDurableRefresh={loadSnapshot} /></OperationsWorkspace>}
               {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenPurchaseOrder={(bill) => { if (!bill.purchaseOrderId) return; navigate("purchase-orders"); setWorklistQuery(bill.po); setAppliedWorklistQuery(bill.po); setSelectedPoId(bill.purchaseOrderId); }} /></OperationsWorkspace>}
               {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenSalesOrder={(so) => { navigate("sales-orders"); setWorklistQuery(so.number); setAppliedWorklistQuery(so.number); setSelectedSoId(so.id); }} /></OperationsWorkspace>}
-              {view === "partners" && <PartnersView partners={snapshot.partners} selectedId={selectedPartnerId} canApprove={snapshot.viewer.permissions.canApprove} canOperate={snapshot.viewer.permissions.canOperate} canAdminister={snapshot.viewer.permissions.canAdminister} onOpen={setSelectedPartnerId} onEdit={setEditingPartner} onChanged={(message) => { setToast(message); void loadSnapshot(); }} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
+              {view === "partners" && <PartnersView partners={snapshot.partners} selectedId={selectedPartnerId} canApprove={snapshot.viewer.permissions.canApprove} canOperate={snapshot.viewer.permissions.canOperate} canAdminister={snapshot.viewer.permissions.canAdminister} onOpen={setSelectedPartnerId} onEdit={setEditingPartner} onChanged={(message) => { setToast(message); void loadSnapshot(); }} onOpenOrder={(order) => { navigate(order.kind === "sales" ? "sales-orders" : "purchase-orders"); setWorklistQuery(order.number); setAppliedWorklistQuery(order.number); if (order.kind === "sales") setSelectedSoId(order.id); else setSelectedPoId(order.id); }} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
               {view === "reports" && <OperationsWorkspace workspace="controls" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><ReportsView snapshot={snapshot} warehouseId={warehouseId} /></OperationsWorkspace>}
               {view === "warehouse" && <WarehouseView snapshot={snapshot} source={source} canOperate={snapshot.viewer.permissions.canOperate} navigate={navigate} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} />}
             </Suspense>
@@ -1865,6 +1878,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
         <QuickCreateDialog
           kind="product"
           companyReorderPercent={snapshot.configuration.reorderPointPercent}
+          submitLabel="Create product"
           onClose={() => setCreatingProduct(false)}
           onCreated={async (option) => { setCreatingProduct(false); setToast(`${option.label} added to the catalog.`); await loadSnapshot(); }}
         />
@@ -1916,7 +1930,7 @@ function PageActions({ view, source, canOperate, canApprove, onNavigate, onCreat
   // which is the wrong place to look when you are standing on the catalog. Master data is an
   // approver's job, matching the permission the create command itself checks.
   if (view === "products") return canApprove ? <button className="button primary" onClick={onCreateProduct}>Add product</button> : null;
-  if (view === "partners") return canApprove ? <button className="button primary" onClick={onCreatePartner}>Add partner</button> : null;
+  if (view === "partners") return canApprove ? <button className="button primary" onClick={onCreatePartner}>Add customer / vendor</button> : null;
   return null;
 }
 
@@ -2792,7 +2806,7 @@ function EditProductDialog({ product, companyReorderPercent, onClose, onSaved }:
         <label><span>Finish</span><input value={form.finish} onChange={(event) => set({ finish: event.target.value })} required /></label>
         <label><span>Tracking policy</span><select value={form.trackingPolicy} onChange={(event) => set({ trackingPolicy: event.target.value })}><option value="quantity">Quantity</option><option value="lot">Lot</option><option value="serial">Serial</option></select></label>
         <label><span>Inventory policy</span><select value={form.inventoryPolicy} onChange={(event) => set({ inventoryPolicy: event.target.value })}><option value="stocked">Stocked</option><option value="special_order">Special order</option><option value="drop_ship">Drop ship</option></select></label>
-        <fieldset className="replenishment-editor full-field"><legend>Max stock &amp; reorder rule</legend><div className="replenishment-editor-intro"><strong>Set the ceiling first, then choose when to reorder.</strong><small>Purchasing suggests enough stock to return this part to its maximum.</small></div><label><span>Maximum stock level ({product.baseUomCode})</span><NumberField min="0" step="0.001" value={form.maxStockLevel} onChange={(maxStockLevel) => set({ maxStockLevel })} /><small>The target quantity after replenishment.</small></label><label><span>Reorder method</span><select value={form.reorderRuleMode} onChange={(event) => set({ reorderRuleMode: event.target.value as "manual" | "global" | "custom" })}><option value="manual">Enter a quantity manually</option><option value="global">Use company rule ({companyReorderPercent}% of max)</option><option value="custom">Use a custom percentage</option></select><small>Company-rule parts update when max changes.</small></label>{form.reorderRuleMode === "manual" ? <label><span>Reorder point ({product.baseUomCode})</span><NumberField min="0" max={form.maxStockLevel} step="0.001" value={form.reorderPoint} onChange={(reorderPoint) => set({ reorderPoint })} /><small>Start replenishment at or below this quantity.</small></label> : form.reorderRuleMode === "custom" ? <label><span>Custom percentage of max</span><NumberField min="0.1" max="100" step="0.1" value={form.reorderRulePercent} onChange={(reorderRulePercent) => set({ reorderRulePercent })} /><small>This rule applies only to this part.</small></label> : <div className="reorder-company-note"><span>Company rule</span><strong>{companyReorderPercent}% of maximum stock</strong><small>Change it for all following parts in Reports &amp; administration → System policies.</small></div>}<div className="reorder-preview"><span>Resulting reorder point</span><strong>{formatQuantity(effectiveReorderPoint)} {product.baseUomCode}</strong><small>{form.reorderRuleMode === "manual" ? "Manual quantity" : `${activeReorderPercent}% × ${formatQuantity(form.maxStockLevel)} maximum`}</small></div></fieldset>
+        <fieldset className="replenishment-editor full-field"><legend>Max stock &amp; reorder rule</legend><div className="replenishment-editor-intro"><strong>Set the ceiling first, then choose when to reorder.</strong><small>Purchasing suggests enough stock to return this part to its maximum.</small></div><label><span>Maximum stock level ({product.baseUomCode})</span><NumberField min="0" step="0.001" value={form.maxStockLevel} onChange={(maxStockLevel) => set({ maxStockLevel })} /><small>The target quantity after replenishment.</small></label><label><span>Reorder method</span><select value={form.reorderRuleMode} onChange={(event) => set({ reorderRuleMode: event.target.value as "manual" | "global" | "custom" })}><option value="manual">Enter a quantity manually</option><option value="global">Use company rule ({companyReorderPercent}% of max)</option><option value="custom">Use a custom percentage</option></select><small>Company-rule parts update when max changes.</small></label>{form.reorderRuleMode === "manual" ? <label><span>Reorder point ({product.baseUomCode})</span><NumberField min="0" max={form.maxStockLevel} step="0.001" value={form.reorderPoint} onChange={(reorderPoint) => set({ reorderPoint })} /><small>Start replenishment at or below this quantity.</small></label> : form.reorderRuleMode === "custom" ? <label><span>Custom percentage of max</span><NumberField min="0.1" max="100" step="0.1" value={form.reorderRulePercent} onChange={(reorderRulePercent) => set({ reorderRulePercent })} /><small>This rule applies only to this part.</small></label> : <div className="reorder-company-note"><span>Company rule</span><strong>{companyReorderPercent}% of maximum stock</strong><small>Change it for all following parts in Settings → System policies.</small></div>}<div className="reorder-preview"><span>Resulting reorder point</span><strong>{formatQuantity(effectiveReorderPoint)} {product.baseUomCode}</strong><small>{form.reorderRuleMode === "manual" ? "Manual quantity" : `${activeReorderPercent}% × ${formatQuantity(form.maxStockLevel)} maximum`}</small></div></fieldset>
         <label><span>Standard cost</span><NumberField min="0" step="0.01" value={form.standardCost} onChange={(standardCost) => set({ standardCost })} /></label>
         <label><span>Pricing mode</span><select value={form.pricingMode} onChange={(event) => set({ pricingMode: event.target.value as "automatic" | "manual" })}><option value="automatic">Automatic from margin matrix</option><option value="manual">Manual override</option></select></label>
         <label><span>Selling price</span><NumberField min="0" step="0.01" value={form.sellingPrice} onChange={(sellingPrice) => set({ sellingPrice })} disabled={form.pricingMode === "automatic"} /><small>{form.pricingMode === "automatic" ? `Will use the current suggestion (${exact.format(product.suggestedSellingPrice)}).` : `Current matrix suggestion: ${exact.format(product.suggestedSellingPrice)}.`}</small></label>
@@ -2829,18 +2843,19 @@ function MovementsTable({ movements, onOpenOrder, sort, setSort }: { movements: 
   </tr>)}{!movements.length ? <tr><td colSpan={9}><div className="empty-inline">No posted movement matches this filter.</div></td></tr> : null}</tbody></table></div>;
 }
 
-function PartnersView({ partners, selectedId, canApprove, canOperate, canAdminister, onOpen, onEdit, onChanged, sort, setSort }: { partners: Partner[]; selectedId: string | null; canApprove: boolean; canOperate: boolean; canAdminister: boolean; onOpen: (id: string | null) => void; onEdit: (partner: Partner) => void; onChanged: (message: string) => void } & WorklistSortProps) {
+function PartnersView({ partners, selectedId, canApprove, canOperate, canAdminister, onOpen, onEdit, onChanged, onOpenOrder, sort, setSort }: { partners: Partner[]; selectedId: string | null; canApprove: boolean; canOperate: boolean; canAdminister: boolean; onOpen: (id: string | null) => void; onEdit: (partner: Partner) => void; onChanged: (message: string) => void; onOpenOrder: (order: PartnerOrder) => void } & WorklistSortProps) {
   const selected = partners.find((partner) => partner.id === selectedId);
-  if (selected) return <PartnerDetail partner={selected} canApprove={canApprove} canOperate={canOperate} canAdminister={canAdminister} onBack={() => onOpen(null)} onEdit={() => onEdit(selected)} onChanged={onChanged} />;
-  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Customers and vendors</caption><thead><tr><SortableHeader label="Partner" column="partner" sort={sort} setSort={setSort} /><SortableHeader label="Type" column="type" sort={sort} setSort={setSort} /><SortableHeader label="Contact" column="contact" sort={sort} setSort={setSort} /><SortableHeader label="Address" column="address" sort={sort} setSort={setSort} /><SortableHeader label="Terms" column="terms" sort={sort} setSort={setSort} /><SortableHeader label="Credit control" column="credit" sort={sort} setSort={setSort} defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{partners.map((partner) => <tr key={partner.id}><td><button className="table-link" onClick={() => onOpen(partner.id)}>{partner.name}</button><small>{partner.code}</small></td><td>{titleCase(partner.type)}</td><td>{partner.email || "—"}<small>{partner.phone || ""}</small></td><td>{[partner.addressLine1, partner.city, partner.region, partner.postalCode].filter(Boolean).join(", ") || "Not recorded"}</td><td>{partner.paymentTerms || "—"}</td><td>{partner.creditHold ? <StatusBadge tone="danger">Credit hold</StatusBadge> : partner.creditLimitCents ? formatDocumentMoney(partner.creditLimitCents / 100, partner.currency) : "No limit"}</td><td><button className="row-action" onClick={() => onOpen(partner.id)}>Open</button></td></tr>)}{!partners.length ? <tr><td colSpan={7}><div className="empty-inline">No business partners match this view.</div></td></tr> : null}</tbody></table></div></section>;
+  if (selected) return <PartnerDetail partner={selected} canApprove={canApprove} canOperate={canOperate} canAdminister={canAdminister} onBack={() => onOpen(null)} onEdit={() => onEdit(selected)} onChanged={onChanged} onOpenOrder={onOpenOrder} />;
+  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Customers and vendors</caption><thead><tr><SortableHeader label="Account" column="partner" sort={sort} setSort={setSort} /><SortableHeader label="Type" column="type" sort={sort} setSort={setSort} /><SortableHeader label="Contact" column="contact" sort={sort} setSort={setSort} /><SortableHeader label="Address" column="address" sort={sort} setSort={setSort} /><SortableHeader label="Terms" column="terms" sort={sort} setSort={setSort} /><SortableHeader label="Credit control" column="credit" sort={sort} setSort={setSort} defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{partners.map((partner) => <tr key={partner.id}><td><button className="table-link" onClick={() => onOpen(partner.id)}>{partner.name}</button><small>{partner.code}</small></td><td>{titleCase(partner.type)}</td><td>{partner.email || "—"}<small>{partner.phone || ""}</small></td><td>{[partner.addressLine1, partner.city, partner.region, partner.postalCode].filter(Boolean).join(", ") || "Not recorded"}</td><td>{partner.paymentTerms || "—"}</td><td>{partner.type === "vendor" ? "Not applicable" : partner.creditHold ? <StatusBadge tone="danger">Credit hold</StatusBadge> : partner.creditLimitCents ? formatDocumentMoney(partner.creditLimitCents / 100, partner.currency) : "No limit"}</td><td><button className="row-action" onClick={() => onOpen(partner.id)}>Open</button></td></tr>)}{!partners.length ? <tr><td colSpan={7}><div className="empty-inline">No customer or vendor matches this view.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
 type PartnerAddress = { id: string; label: string; contactName?: string; addressLine1: string; addressLine2?: string; city: string; region: string; postalCode: string; country: string; deliveryInstructions?: string; isDefault: boolean; version: number };
+type PartnerOrder = { kind: "sales" | "purchase"; id: string; number: string; detail: string };
 
 /** One account in one place: contacts, credit, ship-to sites, and its open commercial state. */
-function PartnerDetail({ partner, canApprove, canOperate, canAdminister, onBack, onEdit, onChanged }: { partner: Partner; canApprove: boolean; canOperate: boolean; canAdminister: boolean; onBack: () => void; onEdit: () => void; onChanged: (message: string) => void }) {
+function PartnerDetail({ partner, canApprove, canOperate, canAdminister, onBack, onEdit, onChanged, onOpenOrder }: { partner: Partner; canApprove: boolean; canOperate: boolean; canAdminister: boolean; onBack: () => void; onEdit: () => void; onChanged: (message: string) => void; onOpenOrder: (order: PartnerOrder) => void }) {
   const [addresses, setAddresses] = useState<PartnerAddress[]>([]);
-  const [orders, setOrders] = useState<Array<{ id: string; number: string; detail: string }>>([]);
+  const [orders, setOrders] = useState<PartnerOrder[]>([]);
   const [invoices, setInvoices] = useState<Array<{ id: string; number: string; status: string; invoiceDate: string; dueDate: string; total: number; paid: number; outstanding: number; currency: string }>>([]);
   const [priceLists, setPriceLists] = useState<Array<{ id: string; label: string; detail: string }>>([]);
   const [addingAddress, setAddingAddress] = useState(false);
@@ -2878,13 +2893,23 @@ function PartnerDetail({ partner, canApprove, canOperate, canAdminister, onBack,
       await Promise.resolve();
       if (controller.signal.aborted) return;
       setDetailLoading(true); setDetailError("");
+      const loadOrders = async () => {
+        const [salesRows, purchaseRows] = await Promise.all([
+          partner.type === "vendor" ? Promise.resolve([]) : loadAll("salesOrders", "open"),
+          partner.type === "customer" ? Promise.resolve([]) : loadAll("purchaseOrders", "open"),
+        ]);
+        return [
+          ...salesRows.map((item) => ({ kind: "sales" as const, item })),
+          ...purchaseRows.map((item) => ({ kind: "purchase" as const, item })),
+        ];
+      };
       const [addressRows, orderRows, invoiceRows, priceListRows] = await Promise.all([
         loadAll("partnerAddresses"),
-        loadAll(isCustomer ? "salesOrders" : "purchaseOrders", "open"),
+        loadOrders(),
         // The whole ledger, not only what is unpaid: a page that said "no open invoices" for an
         // account with a year of settled billing read as an account with no history at all.
         isCustomer ? loadAll("customerInvoices") : Promise.resolve([]),
-        loadAll("priceListAssignments"),
+        isCustomer ? loadAll("priceListAssignments") : Promise.resolve([]),
       ]);
       setAddresses(addressRows.map((item) => ({
         id: text(item.id), label: text(item.label), contactName: text(item.contactName) || undefined,
@@ -2892,9 +2917,9 @@ function PartnerDetail({ partner, canApprove, canOperate, canAdminister, onBack,
         city: text(item.city), region: text(item.region), postalCode: text(item.postalCode), country: text(item.country, "CA"),
         deliveryInstructions: text(item.deliveryInstructions) || undefined, isDefault: number(item.isDefault) !== 0, version: number(item.version, 1),
       })));
-      setOrders(orderRows.map((item) => ({
-        id: text(item.id), number: text(item.number),
-        detail: `${titleCase(text(item.status))} · ${formatDocumentMoney(number(item.totalCents) / 100, text(item.currency, partner.currency))}`,
+      setOrders(orderRows.map(({ kind, item }) => ({
+        kind, id: text(item.id), number: text(item.number),
+        detail: `${partner.type === "both" ? kind === "sales" ? "Sales order · " : "Purchase order · " : ""}${titleCase(text(item.status))} · ${formatDocumentMoney(number(item.totalCents) / 100, text(item.currency, partner.currency))}`,
       })));
       setInvoices(invoiceRows.map((item) => ({
         id: text(item.id), number: text(item.number), status: titleCase(text(item.status, "posted")),
@@ -2909,24 +2934,24 @@ function PartnerDetail({ partner, canApprove, canOperate, canAdminister, onBack,
           text(item.validFrom) || text(item.validTo) ? `valid ${formatDocumentDate(text(item.validFrom), "any date")} – ${formatDocumentDate(text(item.validTo), "no end")}` : "no date limit"].filter(Boolean).join(" · "),
       })));
     })().catch((caught) => {
-      if (!(caught instanceof DOMException && caught.name === "AbortError")) setDetailError(caught instanceof Error ? caught.message : "Partner activity could not be loaded.");
+      if (!(caught instanceof DOMException && caught.name === "AbortError")) setDetailError(caught instanceof Error ? caught.message : "Account activity could not be loaded.");
     }).finally(() => { if (!controller.signal.aborted) setDetailLoading(false); });
     return () => controller.abort();
-  }, [isCustomer, partner.currency, partner.id, refreshToken]);
+  }, [isCustomer, partner.currency, partner.id, partner.type, refreshToken]);
 
   const addressTable = useLocalTableSort(addresses, { label: (row) => row.label, contact: (row) => row.contactName, address: (row) => `${row.addressLine1} ${row.city} ${row.region} ${row.postalCode}`, instructions: (row) => row.deliveryInstructions, default: (row) => Number(row.isDefault) });
   const invoiceTable = useLocalTableSort(invoices, { number: (row) => row.number, invoiced: (row) => row.invoiceDate, due: (row) => row.dueDate, status: (row) => row.status, total: (row) => row.total, paid: (row) => row.paid, outstanding: (row) => row.outstanding });
 
   return <div className="object-page">
-    <button className="back-button" onClick={onBack}>← Back to partners</button>
-    {detailError ? <div className="exception-banner" role="alert"><span aria-hidden="true">!</span><div><strong>Partner activity unavailable</strong><p>{detailError}</p></div></div> : null}
+    <button className="back-button" onClick={onBack}>← Back to customers &amp; vendors</button>
+    {detailError ? <div className="exception-banner" role="alert"><span aria-hidden="true">!</span><div><strong>Account activity unavailable</strong><p>{detailError}</p></div></div> : null}
     <section className="object-header panel"><div className="object-title"><div><span className="section-kicker">{titleCase(partner.type)} · {partner.code}</span><h2>{partner.name}</h2><p>{[partner.email, partner.phone].filter(Boolean).join(" · ") || "No contact recorded"}</p></div>
       {/* A credit limit on its own is not credit control. What matters at order entry is how
           much of it is already used, so the limit is shown beside the live receivable. */}
       {isCustomer ? <div className="object-total"><span>Receivable outstanding</span><strong>{formatDocumentMoney(outstanding, partner.currency)}</strong><small>{creditLimit ? `of ${formatDocumentMoney(creditLimit, partner.currency)} limit` : "No credit limit set"}</small></div> : null}</div>
-      {partner.creditHold ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Credit hold</strong><p>New sales orders for this account cannot be confirmed until the hold is released.</p></div></div> : null}
+      {isCustomer && partner.creditHold ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Credit hold</strong><p>New sales orders for this account cannot be confirmed until the hold is released.</p></div></div> : null}
       {isCustomer && !partner.creditHold && creditLimit > 0 && outstanding > creditLimit ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Over credit limit</strong><p>{formatDocumentMoney(outstanding - creditLimit, partner.currency)} above the {formatDocumentMoney(creditLimit, partner.currency)} limit.</p></div></div> : null}
-      <div className="object-actions">{canApprove ? <button className="button primary" onClick={onEdit}>Edit partner</button> : null}{isCustomer && canOperate ? <button className="button secondary" onClick={() => setAddingAddress(true)}>Add ship-to address</button> : null}{canAdminister ? <button className="button secondary" onClick={() => setMerging(true)}>Merge duplicate</button> : null}</div>
+      <div className="object-actions">{canApprove ? <button className="button primary" onClick={onEdit}>Edit {partner.type === "both" ? "customer & vendor" : partner.type}</button> : null}{isCustomer && canOperate ? <button className="button secondary" onClick={() => setAddingAddress(true)}>Add ship-to address</button> : null}{canAdminister ? <button className="button secondary" onClick={() => setMerging(true)}>Merge duplicate</button> : null}</div>
     </section>
     <div className="detail-columns">
       <section className="panel"><PanelHeading title="Account" /><dl className="definition-list">
@@ -2935,9 +2960,9 @@ function PartnerDetail({ partner, canApprove, canOperate, canAdminister, onBack,
         <div><dt>Currency</dt><dd>{partner.currency}</dd></div>
         {isCustomer ? <div><dt>Credit limit</dt><dd>{creditLimit ? formatDocumentMoney(creditLimit, partner.currency) : "None"}</dd></div> : null}
         {isCustomer ? <div><dt>Credit available</dt><dd>{creditLimit ? formatDocumentMoney(Math.max(creditLimit - outstanding, 0), partner.currency) : "Unlimited"}</dd></div> : null}
-        <div><dt>Contract pricing</dt><dd>{detailLoading ? "Loading…" : priceLists.length ? priceLists.map((list) => list.label).join(", ") : "Catalog price only"}</dd></div>
+        {isCustomer ? <div><dt>Contract pricing</dt><dd>{detailLoading ? "Loading…" : priceLists.length ? priceLists.map((list) => list.label).join(", ") : "Catalog price only"}</dd></div> : null}
       </dl></section>
-      <section className="panel"><PanelHeading title={isCustomer ? "Open sales orders" : "Open purchase orders"} detail="Orders with quantity or billing still outstanding" />{detailLoading ? <div className="empty-inline">Loading partner activity…</div> : orders.length ? <ul className="plain-list">{orders.map((order) => <li key={order.id}><strong>{order.number}</strong><span>{order.detail}</span></li>)}</ul> : <div className="empty-inline">No open orders for this partner.</div>}</section>
+      <section className="panel"><PanelHeading title={partner.type === "both" ? "Open sales & purchase orders" : isCustomer ? "Open sales orders" : "Open purchase orders"} detail="Orders with quantity or billing still outstanding" />{detailLoading ? <div className="empty-inline">Loading account activity…</div> : orders.length ? <ul className="plain-list">{orders.map((order) => <li key={`${order.kind}:${order.id}`}><button type="button" className="table-link" onClick={() => onOpenOrder(order)}>{order.number}</button><span>{order.detail}</span></li>)}</ul> : <div className="empty-inline">No open orders for this account.</div>}</section>
     </div>
     {priceLists.length ? <section className="panel"><PanelHeading title="Assigned price lists" detail="Applied before the catalog price when an order line is priced" />
       <ul className="plain-list">{priceLists.map((list) => <li key={list.id}><strong>{list.label}</strong><span>{list.detail}</span></li>)}</ul></section> : null}
@@ -2986,14 +3011,14 @@ function PartnerAddressDialog({ partnerId, address, onClose, onSaved }: { partne
     <form onSubmit={submit}>
       {error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}
       <div className="command-form form-grid">
-        <label>Label<input value={form.label} onChange={(event) => set({ label: event.target.value })} placeholder="Job site or branch name" required /></label>
+        <label><span>Label{requiredMark}</span><input value={form.label} onChange={(event) => set({ label: event.target.value })} placeholder="Job site or branch name" required /></label>
         <label>Site contact<input value={form.contactName} onChange={(event) => set({ contactName: event.target.value })} /></label>
-        <label>Address line 1<input value={form.addressLine1} onChange={(event) => set({ addressLine1: event.target.value })} required /></label>
+        <label><span>Address line 1{requiredMark}</span><input value={form.addressLine1} onChange={(event) => set({ addressLine1: event.target.value })} required /></label>
         <label>Address line 2<input value={form.addressLine2} onChange={(event) => set({ addressLine2: event.target.value })} /></label>
-        <label>City<input value={form.city} onChange={(event) => set({ city: event.target.value })} required /></label>
-        <label>Province / region<input value={form.region} onChange={(event) => set({ region: event.target.value })} required /></label>
-        <label>Postal code<input value={form.postalCode} onChange={(event) => set({ postalCode: event.target.value })} required /></label>
-        <label>Country<input value={form.country} onChange={(event) => set({ country: event.target.value.toUpperCase() })} required /></label>
+        <label><span>City{requiredMark}</span><input value={form.city} onChange={(event) => set({ city: event.target.value })} required /></label>
+        <label><span>Province / region{requiredMark}</span><input value={form.region} onChange={(event) => set({ region: event.target.value })} required /></label>
+        <label><span>Postal code{requiredMark}</span><input value={form.postalCode} onChange={(event) => set({ postalCode: event.target.value })} required /></label>
+        <label><span>Country{requiredMark}</span><input value={form.country} onChange={(event) => set({ country: event.target.value.toUpperCase() })} required /></label>
         <label className="project-field">Delivery instructions<input value={form.deliveryInstructions} onChange={(event) => set({ deliveryInstructions: event.target.value })} placeholder="Crane access, gate code, appointment window" /></label>
         <label className="radio-row"><input type="checkbox" checked={form.isDefault} onChange={(event) => set({ isDefault: event.target.checked })} /><span>Use as this customer&apos;s default ship-to</span></label>
       </div>
@@ -3039,6 +3064,9 @@ function PartnerEditor({ partner, onClose, onSaved }: { partner: Partner | "new"
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const isCustomerAccount = form.partnerType !== "vendor";
+  const accountLabel = form.partnerType === "both" ? "customer & vendor" : form.partnerType;
+  const accountTitle = `${accountLabel[0].toUpperCase()}${accountLabel.slice(1)}`;
   useDialogDismiss(onClose, busy);
   const set = (patch: Partial<typeof form>) => setForm((current) => ({ ...current, ...patch }));
   const submit = async (event: FormEvent) => {
@@ -3057,14 +3085,14 @@ function PartnerEditor({ partner, onClose, onSaved }: { partner: Partner | "new"
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The partner could not be saved."); }
     finally { setBusy(false); }
   };
-  return <div className="modal-overlay" role="presentation"><section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label={editing ? "Edit partner" : "New partner"}>
-    <div className="dialog-header"><h2>{editing ? `Edit ${source?.name}` : "New vendor / customer"}</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div>
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label={editing ? `Edit ${accountLabel}` : `New ${accountLabel}`}>
+    <div className="dialog-header"><h2>{editing ? `Edit ${source?.name}` : `New ${accountLabel}`}</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div>
     <form onSubmit={submit}>
       {error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}
       <div className="command-form form-grid">
-        <label>Partner code<input value={form.code} onChange={(event) => set({ code: event.target.value.toUpperCase() })} required /></label>
-        <label>Name<input value={form.name} onChange={(event) => set({ name: event.target.value })} required /></label>
-        <label>Type<select value={form.partnerType} onChange={(event) => set({ partnerType: event.target.value as Partner["type"] })}><option value="customer">Customer</option><option value="vendor">Vendor</option><option value="both">Both</option></select></label>
+        <label><span>{accountTitle} code{requiredMark}</span><input value={form.code} onChange={(event) => set({ code: event.target.value.toUpperCase() })} required /></label>
+        <label><span>Name{requiredMark}</span><input value={form.name} onChange={(event) => set({ name: event.target.value })} required /></label>
+        <label>Account type<select value={form.partnerType} onChange={(event) => set({ partnerType: event.target.value as Partner["type"] })}><option value="customer">Customer</option><option value="vendor">Vendor</option><option value="both">Both roles</option></select></label>
         <label>Currency<select value={form.currency} onChange={(event) => set({ currency: event.target.value })}><option>CAD</option><option>USD</option><option>EUR</option></select></label>
         <label>Payment terms<select value={form.paymentTerms} onChange={(event) => set({ paymentTerms: event.target.value })}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label>
         <label>Email<input type="email" value={form.email} onChange={(event) => set({ email: event.target.value })} /></label>
@@ -3075,10 +3103,10 @@ function PartnerEditor({ partner, onClose, onSaved }: { partner: Partner | "new"
         <label>Province / region<input value={form.region} onChange={(event) => set({ region: event.target.value })} /></label>
         <label>Postal code<input value={form.postalCode} onChange={(event) => set({ postalCode: event.target.value })} /></label>
         <label>Country<input value={form.country} onChange={(event) => set({ country: event.target.value.toUpperCase() })} /></label>
-        <label>Credit limit<NumberField min="0" step="0.01" value={form.creditLimit} onChange={(creditLimit) => set({ creditLimit })} /></label>
-        <label className="radio-row"><input type="checkbox" checked={form.creditHold} onChange={(event) => set({ creditHold: event.target.checked })} /><span>Credit hold</span></label>
+        {isCustomerAccount ? <><label>Credit limit<NumberField min="0" step="0.01" value={form.creditLimit} onChange={(creditLimit) => set({ creditLimit })} /></label>
+        <label className="radio-row"><input type="checkbox" checked={form.creditHold} onChange={(event) => set({ creditHold: event.target.checked })} /><span>Credit hold</span></label></> : null}
       </div>
-      <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="button primary" disabled={busy}>{busy ? "Saving…" : editing ? "Save changes" : "Create partner"}</button></div>
+      <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="button primary" disabled={busy}>{busy ? "Saving…" : editing ? "Save changes" : `Create ${accountLabel}`}</button></div>
     </form>
   </section></div>;
 }
@@ -3896,10 +3924,11 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
     finally { setSubmitting(false); }
   };
 
+  const draftQuantitySummary = `${quantity} ${quantity === 1 ? "unit" : "units"} across ${lines.length} ${lines.length === 1 ? "line" : "lines"}`;
   const impact = [
     { category: "Physical inventory", label: "On-hand inventory", after: "No change" },
-    { category: "Commercial commitment", label: isPurchase ? "Expected incoming" : "Customer demand", before: 0, after: fastTrack ? `${quantity} active units across ${lines.length} lines` : `${quantity} draft units across ${lines.length} lines`, tone: "info" as Severity },
-    { category: "Commercial commitment", label: "Fulfillment routes", after: [...new Set(lines.map((line) => line.route))].join(", ") },
+    { category: "Commercial commitment", label: fastTrack ? (isPurchase ? "Expected incoming" : "Customer demand") : (isPurchase ? "Draft purchase quantity" : "Draft sales quantity"), ...(fastTrack ? { before: 0 } : {}), after: fastTrack ? `${draftQuantitySummary} active` : `${draftQuantitySummary} · not active until ${isPurchase ? "approved" : "confirmed"}`, tone: "info" as Severity },
+    { category: "Commercial commitment", label: "Fulfillment routes", after: [...new Set(lines.map((line) => titleCase(line.route.replaceAll("-", " "))))].join(", ") },
     { category: "Financial effect", label: fastTrack ? "Authorized commitment total" : "Draft total", before: money.format(0), after: `${currency} ${total.toFixed(2)}` },
     { category: "Financial effect", label: "Refundable core / empty deposit", after: `${currency} ${deposit.toFixed(2)}` },
   ];

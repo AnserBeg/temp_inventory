@@ -2746,7 +2746,11 @@ export type SnapshotPage = {
 
 export function normalizeSnapshotPage(input: SnapshotPage = {}) {
   const page = Number.isInteger(input.page) && Number(input.page) > 0 ? Number(input.page) : 1;
-  const pageSize = Number.isInteger(input.pageSize) ? Math.min(Math.max(Number(input.pageSize), 1), 100) : 50;
+  // The reports screen applies its own visible 20-row paging to a bounded product dataset. It
+  // needs the full catalog so that report sorting, filtering, and export are complete, while
+  // ordinary operational registers retain the smaller server-side safety limit.
+  const maximumPageSize = input.scope === "reports" ? 500 : 100;
+  const pageSize = Number.isInteger(input.pageSize) ? Math.min(Math.max(Number(input.pageSize), 1), maximumPageSize) : 50;
   return { page, pageSize, offset: (page - 1) * pageSize };
 }
 

@@ -65,7 +65,7 @@ type TraceUnit = {
 };
 
 type AssetRecord = WorkflowRecord & { assetType: string; customer: string; deposit: number; issued: number; returned: number };
-type PolicyRecord = { id: string; name: string; value: string; description: string; risk: string; version?: number; data?: Record<string, unknown> };
+type PolicyRecord = { id: string; name: string; value: string; displayValue?: string; description: string; risk: string; version?: number; data?: Record<string, unknown> };
 /** `data` carries the raw row so a dialog can prefill from fields the summary does not show. */
 type ActionRecord = { id: string; number?: string; status?: string; party?: string; reference?: string; amount?: number; currency?: string; quantity?: number; detail?: string; version?: number; revision?: number; exception?: string; value?: string; data?: Record<string, unknown> };
 type AuditRecord = { id: string; time: string; actor: string; action: string; record: string; impact: string; category: string };
@@ -183,6 +183,35 @@ async function requestWorkflowState(workspace: OperationsWorkspaceKind) {
 
 const REORDER_POINT_RULE_KEY = "inventory.reorderPointRule";
 
+const policyNames: Record<string, string> = {
+  "company.profile": "Company profile",
+  "inventory.countApprovalThreshold": "Count approval thresholds",
+  "inventory.negativeAllowed": "Negative inventory",
+  "inventory.scrapApprovalThresholdCents": "Scrap approval threshold",
+  "matching.tolerances": "Vendor bill matching tolerances",
+  "receiving.overReceiptPolicy": "Over-receipt policy",
+  "security.defaultRole": "Default user role",
+  "tax.defaultRateBps": "Default tax rate",
+  "valuation.defaultMethod": "Default valuation method",
+};
+
+function policyDisplayValue(id: string, value: unknown) {
+  const object = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const dollars = (cents: unknown) => formatWorkflowMoney(Number(cents ?? 0) / 100, "CAD");
+  const label = (input: unknown) => String(input ?? "").replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+  if (id === "company.profile") return [object.name, object.industry, object.currency, object.inventoryAsOf ? `Inventory as of ${formatWorkflowDate(String(object.inventoryAsOf))}` : null].filter(Boolean).join(" · ");
+  if (id === "inventory.countApprovalThreshold") return `Quantity ${Number(object.absoluteQuantity ?? 0)} · value ${dollars(object.absoluteValueCents)}`;
+  if (id === "inventory.negativeAllowed") return value === true ? "Allowed" : "Blocked";
+  if (id === "inventory.scrapApprovalThresholdCents") return dollars(value);
+  if (id === "matching.tolerances") return `Quantity ${Number(object.quantity ?? 0)} · unit price ${dollars(object.unitPriceCents)} · total ${dollars(object.totalCents)} · allowed charges ${Array.isArray(object.allowedChargeKinds) ? object.allowedChargeKinds.map(label).join(", ") : "none"}`;
+  if (id === "receiving.overReceiptPolicy") return `Tolerance ${Number(object.tolerancePct ?? 0)}% · approval above ${Number(object.approvalRequiredAbovePct ?? 0)}%`;
+  if (id === "tax.defaultRateBps") return `${Number(value ?? 0) / 100}%`;
+  if (id === "valuation.defaultMethod") return String(value ?? "").toUpperCase();
+  if (typeof value === "boolean") return value ? "Enabled" : "Disabled";
+  if (typeof value === "string" || typeof value === "number") return label(value);
+  return JSON.stringify(value);
+}
+
 function reorderPointRule(record?: ActionRecord | PolicyRecord) {
   const raw = record?.data?.value;
   const value = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
@@ -240,6 +269,14 @@ const overviewCreateActions: Partial<Record<OperationsWorkspaceKind, ActionDefin
 
 export function OperationsWorkspace({ workspace, children, initialTab = "overview", onTabChange, onDurableRefresh, refreshToken = 0, filterReference = "", onCreateOrder, onOpenOrder }: { workspace: OperationsWorkspaceKind; children: ReactNode; initialTab?: string; onTabChange?: (tab: string) => void; onDurableRefresh?: () => void | Promise<void>; refreshToken?: number; filterReference?: string; onCreateOrder?: () => void; /** Opens a listed order's own page, where a draft or rejected revision can be edited. */ onOpenOrder?: (record: { id: string; number: string }) => void }) {
   const validTab = tabs[workspace].some((tab) => tab.key === initialTab) ? initialTab : "overview";
+  const controlSection = ["policies", "periods-access", "integrations", "reconciliation", "units", "master-data"].includes(validTab)
+    ? "settings"
+    : validTab === "pricing" ? "pricing" : "reports";
+  const visibleTabs = workspace !== "controls" ? tabs[workspace] : tabs.controls.filter((tab) => {
+    if (controlSection === "settings") return ["policies", "periods-access", "integrations", "reconciliation", "units", "master-data"].includes(tab.key);
+    if (controlSection === "pricing") return tab.key === "pricing";
+    return ["overview", "approvals", "audit"].includes(tab.key);
+  });
   const requestedTab = `${workspace}:${initialTab}`;
   const [tabSelection, setTabSelection] = useState({ request: requestedTab, tab: validTab });
   const initiallyCached = workflowCache.get(workspace);
@@ -330,7 +367,7 @@ export function OperationsWorkspace({ workspace, children, initialTab = "overvie
   return (
     <div className="operations-workspace" onClickCapture={routeLegacyAction}>
       <div className={`workspace-tabbar ${workspace === "controls" ? "controls-tabbar" : ""}`} role="tablist" aria-label={`${workspace} workspace views`}>
-        {tabs[workspace].map((tab) => <button key={tab.key} role="tab" aria-selected={visibleTab === tab.key} className={visibleTab === tab.key ? "active" : ""} onClick={() => selectTab(tab.key)}>{tab.label}{tabCount(workspace, tab.key, visibleState) ? <span>{tabCount(workspace, tab.key, visibleState)}</span> : null}</button>)}
+        {visibleTabs.map((tab) => <button key={tab.key} role="tab" aria-selected={visibleTab === tab.key} className={visibleTab === tab.key ? "active" : ""} onClick={() => selectTab(tab.key)}>{tab.label}{tabCount(workspace, tab.key, visibleState) ? <span>{tabCount(workspace, tab.key, visibleState)}</span> : null}</button>)}
         <span className={`workflow-service ${serviceState}`} role="status" title={serviceError || undefined}>{serviceState === "live" ? "Durable workflows live" : serviceState === "loading" ? "Loading workflows…" : "Workflow service unavailable"}</span>
       </div>
       {serviceState === "unavailable" && visibleTab !== "overview" ? <div className="workflow-banner warning"><strong>Changes are temporarily unavailable.</strong><span>{serviceError || "Reference data is shown below. Reconnect before posting a business action so it can be durably recorded."}</span><button onClick={() => void load()}>Retry connection</button></div> : null}
@@ -380,7 +417,7 @@ function Section({ title, detail, action, children }: { title: string; detail?: 
 }
 
 function AccessNotice() {
-  return <section className="workflow-banner"><strong>Role administration</strong><span>User access is server-managed; only an administrator can assign or disable a role.</span></section>;
+  return <section className="workflow-banner"><strong>Your access</strong><span>Your role is enforced by the server. Administrators can change access in Settings → Periods &amp; access.</span></section>;
 }
 
 function PeriodsAndAccess({ state, canAction, openAction }: { state: WorkflowState; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
@@ -885,7 +922,9 @@ function PriceListsPanel({ state, refresh }: { state: WorkflowState; refresh: ()
 type MasterKind = "product" | "partner" | "warehouse" | "location" | "asset";
 function MasterDataPanel({ state, refresh }: { state: WorkflowState; refresh: () => Promise<void> }) {
   const [kind, setKind] = useState<MasterKind>("product"); const [mode, setMode] = useState("create"); const [selectedId, setSelectedId] = useState(""); const [selectedVersion, setSelectedVersion] = useState(0); const [code, setCode] = useState(""); const [name, setName] = useState(""); const [detail, setDetail] = useState("vendor"); const [warehouseId, setWarehouseId] = useState(state.options.warehouses[0]?.id ?? ""); const [cost, setCost] = useState(0); const [price, setPrice] = useState(0); const [reason, setReason] = useState(""); const [message, setMessage] = useState(""); const [busy, setBusy] = useState(false);
-  const [baseUomId, setBaseUomId] = useState(state.options.uoms[0]?.id ?? ""); const [purchaseUomId, setPurchaseUomId] = useState(state.options.uoms[0]?.id ?? ""); const [salesUomId, setSalesUomId] = useState(state.options.uoms[0]?.id ?? "");
+  // Unit choice changes inventory math. A blank required picker is safer than silently making
+  // the first alphabetical unit (often a crate) the base, purchasing, and sales unit.
+  const [baseUomId, setBaseUomId] = useState(""); const [purchaseUomId, setPurchaseUomId] = useState(""); const [salesUomId, setSalesUomId] = useState("");
   // Unit labels carried from the selected product, for units beyond the picker's first page.
   const [uomLabels, setUomLabels] = useState({ base: "", purchase: "", sales: "" });
   const [manufacturerSku, setManufacturerSku] = useState(""); const [category, setCategory] = useState(""); const [material, setMaterial] = useState(""); const [dimensions, setDimensions] = useState(""); const [finish, setFinish] = useState(""); const [trackingPolicy, setTrackingPolicy] = useState("quantity"); const [inventoryPolicy, setInventoryPolicy] = useState("stocked"); const [reorderPoint, setReorderPoint] = useState(0); const [maxStockLevel, setMaxStockLevel] = useState(0);
@@ -895,7 +934,7 @@ function MasterDataPanel({ state, refresh }: { state: WorkflowState; refresh: ()
   const options = kind === "product" ? state.options.products : kind === "partner" ? state.options.partners : kind === "warehouse" ? state.options.warehouses : kind === "location" ? state.options.locations : state.options.assetTypes;
   const masterLookupKind: LookupKind = kind === "partner" ? "partners" : kind === "warehouse" ? "warehouses" : kind === "location" ? "locations" : "assetTypes";
   const commandStem = ({ product: "Product", partner: "BusinessPartner", warehouse: "Warehouse", location: "Location", asset: "ReturnableAssetType" } as const)[kind];
-  const resetFields = (nextKind: MasterKind = kind) => { setSelectedId(""); setSelectedVersion(0); setCode(""); setName(""); setDetail(nextKind === "partner" ? "vendor" : nextKind === "location" ? "storage" : ""); setWarehouseId(state.options.warehouses[0]?.id ?? ""); setBaseUomId(state.options.uoms[0]?.id ?? ""); setPurchaseUomId(state.options.uoms[0]?.id ?? ""); setSalesUomId(state.options.uoms[0]?.id ?? ""); setManufacturerSku(""); setCategory(""); setMaterial(""); setDimensions(""); setFinish(""); setTrackingPolicy("quantity"); setInventoryPolicy("stocked"); setReorderPoint(0); setMaxStockLevel(0); setCost(0); setPrice(0); setEmail(""); setPhone(""); setCurrency("CAD"); setPaymentTerms("Net 30"); setTimezone("America/Edmonton"); setInventoryStatus("usable"); setAddressLine1(""); setAddressLine2(""); setCity(""); setRegion(""); setPostalCode(""); setCountry("CA"); setCreditLimit(0); setCreditHold(false); setReason(""); setMessage(""); };
+  const resetFields = (nextKind: MasterKind = kind) => { setSelectedId(""); setSelectedVersion(0); setCode(""); setName(""); setDetail(nextKind === "partner" ? "vendor" : nextKind === "location" ? "storage" : ""); setWarehouseId(state.options.warehouses[0]?.id ?? ""); setBaseUomId(""); setPurchaseUomId(""); setSalesUomId(""); setUomLabels({ base: "", purchase: "", sales: "" }); setManufacturerSku(""); setCategory(""); setMaterial(""); setDimensions(""); setFinish(""); setTrackingPolicy("quantity"); setInventoryPolicy("stocked"); setReorderPoint(0); setMaxStockLevel(0); setCost(0); setPrice(0); setEmail(""); setPhone(""); setCurrency("CAD"); setPaymentTerms("Net 30"); setTimezone("America/Edmonton"); setInventoryStatus("usable"); setAddressLine1(""); setAddressLine2(""); setCity(""); setRegion(""); setPostalCode(""); setCountry("CA"); setCreditLimit(0); setCreditHold(false); setReason(""); setMessage(""); };
   const selectRecord = (id: string, supplied?: SelectOption) => {
     setSelectedId(id); setMessage("");
     const selected = supplied ?? options.find((item) => item.id === id); const row = selected?.data ?? {};
@@ -1058,11 +1097,11 @@ function AuditTimeline({ state }: { state: WorkflowState }) {
   const pages = Math.max(1, Math.ceil(visible.length / WORKFLOW_PAGE_SIZE));
   const currentPage = Math.min(page, pages);
   const pageRecords = visible.slice((currentPage - 1) * WORKFLOW_PAGE_SIZE, currentPage * WORKFLOW_PAGE_SIZE);
-  return <div className="workflow-stack"><Section title="Unified audit timeline"><div className="audit-filters" role="group" aria-label="Audit category">{["All", "Commercial", "Physical", "Financial"].map((item) => <button key={item} className={category === item ? "active" : ""} onClick={() => { setCategory(item); setPage(1); }}>{item}</button>)}</div><ol className="audit-timeline">{pageRecords.map((record) => <li key={record.id}><span className="audit-dot" /><div><span className="workflow-kicker">{record.category} · {record.time}</span><h3>{record.action} · {record.record}</h3><p>{record.impact}</p><small title={record.actor}>Actor: {actorName(record.actor)} · Source relationship: {record.record}</small></div></li>)}</ol>{!visible.length ? <div className="workflow-empty">No audit events match this category.</div> : null}<LocalPager label="Audit timeline pages" page={currentPage} pages={pages} setPage={setPage} /></Section><AttachmentsPanel records={attachments} state={state} /></div>;
+  return <div className="workflow-stack"><Section title="Unified audit timeline"><div className="audit-filters" role="group" aria-label="Audit category">{["All", "Commercial", "Physical", "Financial"].map((item) => <button key={item} className={category === item ? "active" : ""} onClick={() => { setCategory(item); setPage(1); }}>{item}</button>)}</div><ol className="audit-timeline">{pageRecords.map((record) => <li key={record.id}><span className="audit-dot" /><div><span className="workflow-kicker">{record.category} · {formatWorkflowDate(record.time)}</span><h3>{record.action} · {record.record}</h3><p>{record.impact}</p><small title={record.actor}>Actor: {actorName(record.actor)} · Source relationship: {record.record}</small></div></li>)}</ol>{!visible.length ? <div className="workflow-empty">No audit events match this category.</div> : null}<LocalPager label="Audit timeline pages" page={currentPage} pages={pages} setPage={setPage} /></Section><AttachmentsPanel records={attachments} state={state} /></div>;
 }
 
 function Policies({ records, user, canAction, openAction }: { records: PolicyRecord[]; user: CurrentUser; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
-  return <div className="workflow-stack"><section className="current-user-card"><div className="user-avatar" aria-hidden="true">{user.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div><div><span className="workflow-kicker">Current user and role</span><h2>{user.name}</h2><p>{user.role}</p></div><ul aria-label="Granted permission groups">{user.permissions.map((permission) => <li key={permission}>✓ {permission}</li>)}</ul></section><Section title="System policies"><div className="policy-grid">{records.map((record) => { const reorderRule = record.id === REORDER_POINT_RULE_KEY; return <article key={record.id} className={reorderRule ? "featured-policy" : undefined}><div><span className="workflow-kicker">{record.risk}</span><h3>{record.name}</h3><p>{record.description}</p></div><strong>{record.value}</strong><ActionButton disabled={!canAction("updatePolicy")} onClick={() => openAction({ kind: "updatePolicy", title: reorderRule ? "Set company reorder rule" : `Change ${record.name}`, description: reorderRule ? "Choose the reorder percentage and whether to apply it to every stocked part or only parts already following the company rule." : `${record.description} Existing posted records will not be changed.`, finalLabel: reorderRule ? "Apply reorder rule" : "Save policy for future transactions", record })}>{canAction("updatePolicy") ? reorderRule ? "Set company rule" : "Review change" : "Not permitted"}</ActionButton></article>; })}</div></Section></div>;
+  return <div className="workflow-stack"><section className="current-user-card"><div className="user-avatar" aria-hidden="true">{user.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div><div><span className="workflow-kicker">Current user and role</span><h2>{user.name}</h2><p>{user.role}</p></div><ul aria-label="Granted permission groups">{user.permissions.map((permission) => <li key={permission}>✓ {permission}</li>)}</ul></section><Section title="System policies"><div className="policy-grid">{records.map((record) => { const reorderRule = record.id === REORDER_POINT_RULE_KEY; return <article key={record.id} className={reorderRule ? "featured-policy" : undefined}><div><span className="workflow-kicker">{record.risk}</span><h3>{record.name}</h3><p>{record.description}</p></div><strong>{record.displayValue ?? record.value}</strong><ActionButton disabled={!canAction("updatePolicy")} onClick={() => openAction({ kind: "updatePolicy", title: reorderRule ? "Set company reorder rule" : `Change ${record.name}`, description: reorderRule ? "Choose the reorder percentage and whether to apply it to every stocked part or only parts already following the company rule." : `${record.description} Existing posted records will not be changed.`, finalLabel: reorderRule ? "Apply reorder rule" : "Save policy for future transactions", record })}>{canAction("updatePolicy") ? reorderRule ? "Set company rule" : "Review change" : "Not permitted"}</ActionButton></article>; })}</div></Section></div>;
 }
 
 function AttachmentsPanel({ records, state }: { records: AttachmentRecord[]; state?: WorkflowState }) {
@@ -1801,7 +1840,7 @@ function normalizeLiveWorkflowState(input: unknown, snapshotInput?: unknown): Wo
       const rule = reorderPointRule({ id, data: row });
       return { id, name: "Reorder point rule", value: `${rule.percent}% of max`, description: "Automatically calculates reorder points from each part’s maximum stock level.", risk: rule.applyToAllStocked ? "Company rule · all stocked parts" : "Company rule · opted-in parts", version: number(row, "version") || undefined, data: row };
     }
-    return { id, name: id, value: typeof row.value === "string" ? row.value : JSON.stringify(row.value), description: text(row, "description"), risk: "Changes future transactions only", version: number(row, "version") || undefined, data: row };
+    return { id, name: policyNames[id] ?? id.replaceAll(".", " ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/\b\w/g, (letter) => letter.toUpperCase()), value: typeof row.value === "string" ? row.value : JSON.stringify(row.value), displayValue: policyDisplayValue(id, row.value), description: text(row, "description"), risk: "Changes future transactions only", version: number(row, "version") || undefined, data: row };
   }).sort((left, right) => left.id === REORDER_POINT_RULE_KEY ? -1 : right.id === REORDER_POINT_RULE_KEY ? 1 : left.name.localeCompare(right.name));
   const periodLockRecords: WorkflowRecord[] = rows(raw.periodLocks).map((row) => ({ id: text(row, "id"), number: human(row.module), status: number(row, "active") ? "Active" : "Unlocked", reference: `Through ${text(row, "lockedThrough")}`, detail: text(row, "reason"), version: number(row, "version") || undefined, data: row }));
   const valuationPolicyRecords: WorkflowRecord[] = rows(raw.valuationPolicies).map((row) => ({ id: text(row, "product_id", "productId"), number: `${text(row, "sku")} · ${text(row, "productName")}`, status: human(row.method), amount: number(row, "standard_cost_cents", "standardCostCents") / 100, detail: `Average ${money0(number(row, "average_cost_cents", "averageCostCents"))}`, version: number(row, "version") || undefined, data: row }));

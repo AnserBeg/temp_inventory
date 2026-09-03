@@ -636,7 +636,7 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
   const id = textValue({ entityId: command.entityId }, "entityId");
   const reason = textValue(command.payload ?? {}, "reason");
   const version = command.version ?? 0;
-  const current = await first<{ version: number; status: string; revision: number }>("SELECT version, lifecycle_status AS status, revision_number AS revision FROM purchase_orders WHERE id=?", id);
+  const current = await first<{ version: number; status: string; revision: number; number: string }>("SELECT version, lifecycle_status AS status, revision_number AS revision, number FROM purchase_orders WHERE id=?", id);
   if (!current) throw new WorkflowError("NOT_FOUND", "Purchase order was not found.", 404);
   if (current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Purchase order changed; refresh before deciding.", 409, current.version);
   if (current.status !== "pending_approval") throw new WorkflowError("INVALID_STATE", "Only pending purchase orders can be approved or rejected.", 409);
@@ -681,6 +681,24 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
       : "Purchase order rejected; no purchasing commitment or inventory movement was created.";
   const result: WorkflowResult = { message, impact: { physical: "No stock movement.", commercial: restoration ? "Prior approved incoming commitment restored." : decision === "approved" ? "Incoming forecast activated." : "Commitment remains inactive.", financial: "No vendor bill created.", onHandDelta: 0 }, recordId: id };
   const db = commandD1(command); const when = new Date().toISOString();
+  let approvedEmailPayload: { recordId: string; number: string; recipients: string[]; appOrigin: string } | null = null;
+  if (decision === "approved" && !amendmentDecision) {
+    const creator = await first<{ actorId: string | null }>(`SELECT actor_id AS actorId FROM audit_events
+      WHERE entity_type='purchase_order' AND entity_id=? AND action='purchase_order_draft_created'
+      ORDER BY created_at,id LIMIT 1`, id);
+    const creatorAccount = creator?.actorId
+      ? await first<{ email: string }>("SELECT email FROM app_users WHERE user_id=? AND active=1", creator.actorId)
+      : null;
+    const additional = await setting<string>("email.purchaseOrderApprovedRecipients", "");
+    const candidates = [creatorAccount?.email ?? "", ...additional.split(/[;,]/u)];
+    const recipients = [...new Set(candidates.map((email) => email.trim().toLowerCase()).filter((email) => email.length <= 254 && /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/u.test(email)))];
+    let appOrigin = "";
+    try {
+      const origin = new URL(command.appOrigin ?? "");
+      if (/^https?:$/u.test(origin.protocol)) appOrigin = origin.origin;
+    } catch { /* A missing request origin must not block the approval transaction. */ }
+    if (recipients.length && appOrigin) approvedEmailPayload = { recordId: id, number: current.number, recipients, appOrigin };
+  }
   const pricingStatements = decision === "approved"
     ? await prepareExistingApprovedPurchaseCostStatements({
         claim: command,
@@ -717,6 +735,9 @@ async function decidePurchaseOrder(command: WorkflowCommand, decision: "approved
     outboxStatement(command, restoration ? "purchase_order.amendment_rejected_restored" : `purchase_order.${decision}`,
       "purchase_order", id, { reason, approvalId: approval.id, restoredRevision: restoration?.revision ?? null }, when),
   );
+  if (approvedEmailPayload) {
+    statements.push(outboxStatement(command, "purchase_order.approved_email_requested", "purchase_order", id, approvedEmailPayload, when));
+  }
   await db.batch(statements);
   return finish(command);
 }

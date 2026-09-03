@@ -126,10 +126,11 @@ export async function getEmailConnectionState(actor: ActorIdentity, requestUrl: 
     try { const config = providerConfig(provider, requestUrl); return [{ provider, label: config.label }]; }
     catch { return []; }
   });
-  const [companyRow, personalRow, approvalSetting] = await Promise.all([
+  const [companyRow, personalRow, approvalSetting, approvedSetting] = await Promise.all([
     first<StoredConnection>(connectionSql(), COMPANY_MAILBOX_OWNER),
     first<StoredConnection>(connectionSql(), actor.id),
     first<{ valueJson: string }>("SELECT value_json AS valueJson FROM system_settings WHERE key='email.purchaseOrderApprovalRecipient'"),
+    first<{ valueJson: string }>("SELECT value_json AS valueJson FROM system_settings WHERE key='email.purchaseOrderApprovedRecipients'"),
   ]);
   const summary = (row: StoredConnection | null): EmailConnectionSummary | null => row ? {
     senderType: row.senderType,
@@ -146,9 +147,14 @@ export async function getEmailConnectionState(actor: ActorIdentity, requestUrl: 
     ? "company"
     : personalRow?.status === "connected" ? "personal" : null;
   let purchaseOrderApprovalEmail = "";
+  let purchaseOrderApprovedEmails = "";
   try {
     const value = approvalSetting ? JSON.parse(approvalSetting.valueJson) : "";
     if (typeof value === "string") purchaseOrderApprovalEmail = value;
+  } catch { /* A malformed setting is treated as unset and can be replaced from the UI. */ }
+  try {
+    const value = approvedSetting ? JSON.parse(approvedSetting.valueJson) : "";
+    if (typeof value === "string") purchaseOrderApprovedEmails = value;
   } catch { /* A malformed setting is treated as unset and can be replaced from the UI. */ }
   return {
     configuredProviders,
@@ -157,12 +163,22 @@ export async function getEmailConnectionState(actor: ActorIdentity, requestUrl: 
     defaultSender,
     canManageCompany: hasCapability(actor, "administer"),
     purchaseOrderApprovalEmail,
+    purchaseOrderApprovedEmails,
     connection: defaultSender === "company" ? companyConnection : defaultSender === "personal" ? personalConnection : null,
   };
 }
 
 function validEmailAddress(value: string) {
   return value.length <= 254 && /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/u.test(value);
+}
+
+function normalizedEmailList(value: string) {
+  const emails = [...new Set(value.split(/[;,]/u).map((email) => email.trim().toLowerCase()).filter(Boolean))];
+  if (emails.length > 20) throw new EmailProviderError("Enter no more than 20 approval notification addresses.", "TOO_MANY_APPROVED_PO_EMAILS", 400);
+  if (emails.some((email) => !validEmailAddress(email))) {
+    throw new EmailProviderError("Enter valid email addresses separated by commas.", "INVALID_APPROVED_PO_EMAIL", 400);
+  }
+  return emails.join(", ");
 }
 
 export async function setPurchaseOrderApprovalEmail(actor: ActorIdentity, value: string) {
@@ -186,6 +202,26 @@ export async function setPurchaseOrderApprovalEmail(actor: ActorIdentity, value:
       .bind(`audit-email-${crypto.randomUUID()}`, emailAddress ? `Draft purchase-order approval alerts will be sent to ${emailAddress}.` : "Draft purchase-order approval alerts were turned off.", actor.label, actor.id, actor.email, JSON.stringify({ emailAddress }), now),
   ]);
   return { purchaseOrderApprovalEmail: emailAddress };
+}
+
+export async function setPurchaseOrderApprovedEmails(actor: ActorIdentity, value: string) {
+  if (!hasCapability(actor, "administer")) {
+    throw new EmailProviderError("Only a company administrator can change approved purchase-order alerts.", "COMPANY_EMAIL_FORBIDDEN", 403);
+  }
+  const emailAddresses = normalizedEmailList(value);
+  const now = new Date().toISOString();
+  const db = getD1();
+  await db.batch([
+    db.prepare(`INSERT INTO system_settings (key,value_json,description,version,updated_by,updated_at)
+      VALUES ('email.purchaseOrderApprovedRecipients',?,'Additional recipients notified when a draft purchase order is approved.',1,?,?)
+      ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,description=excluded.description,
+        version=system_settings.version+1,updated_by=excluded.updated_by,updated_at=excluded.updated_at`)
+      .bind(JSON.stringify(emailAddresses), actor.label, now),
+    db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
+      VALUES (?,'system_setting','email.purchaseOrderApprovedRecipients','approved_po_emails_updated',?,?,?,?,?,?)`)
+      .bind(`audit-email-${crypto.randomUUID()}`, emailAddresses ? `Approved purchase-order alerts will also be sent to ${emailAddresses}.` : "Additional approved purchase-order alerts were turned off.", actor.label, actor.id, actor.email, JSON.stringify({ emailAddresses: emailAddresses ? emailAddresses.split(", ") : [] }), now),
+  ]);
+  return { purchaseOrderApprovedEmails: emailAddresses };
 }
 
 export async function createEmailAuthorizationUrl(actor: ActorIdentity, requestUrl: string, input: { provider: EmailProvider; senderType?: EmailSenderType; returnTo?: string }) {

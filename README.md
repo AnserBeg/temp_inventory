@@ -54,7 +54,7 @@ The Worker establishes the tenant context for the whole request using `AsyncLoca
 
 Migration `0030` creates the organization registry, assigns existing users and rows to the default organization, and replaces global business-key constraints with tenant-aware ones. Migration `0031` installs cross-tenant relationship guards. Apply the complete migration chain before deploying the matching Worker; do not run new application code against a database that has not reached both migrations.
 
-### Per-user document email
+### Document email
 
 Each authenticated user can connect a Google Workspace/Gmail or Microsoft 365/Outlook mailbox from the account menu. Approved purchase orders, confirmed sales orders, and posted customer invoices can then be sent as PDF attachments from that user's own mailbox. PaneFlow reads the document from D1 at send time, enforces the same operational or financial role as the underlying document, and records the sender, recipients, document, provider result, and audit event without retaining the message body or attachment.
 
@@ -69,6 +69,8 @@ For production, each redirect URI must be the exact public URL ending in `/api/i
 In the app, open the account menu and choose **Email sending**:
 
 - A company administrator can connect one **Company email**. It becomes the default sender for everyone in that company.
+- The same administrator can set one **Draft PO approvals** address. Every new draft PO sends a brief approval-required alert from the company email with a direct link to the draft.
+- An adjacent **Approved PO notifications** field accepts comma-separated addresses. When the draft is approved, PaneFlow emails its creator at their current account address plus those extra recipients, with duplicates removed.
 - Any user can optionally connect **My email**. When both are available, the send dialog offers a small **From** choice; otherwise it uses the only available sender automatically.
 - Connections use the provider's sign-in page. PaneFlow never asks users to enter or store an email password.
 

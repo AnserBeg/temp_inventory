@@ -1,5 +1,5 @@
 import { authorizationResponse, AuthorizationError, requireCapability, resolveActor } from "@/lib/server/auth";
-import { disconnectEmail, EmailConfigurationError, EmailProviderError, getEmailConnectionState, listRecentEmailDeliveries, setPurchaseOrderApprovalEmail } from "@/lib/server/email-client";
+import { disconnectEmail, EmailConfigurationError, EmailProviderError, getEmailConnectionState, listRecentEmailDeliveries, setPurchaseOrderApprovalEmail, setPurchaseOrderApprovedEmails } from "@/lib/server/email-client";
 import type { EmailSenderType } from "@/lib/server/email-types";
 
 function errorResponse(error: unknown) {
@@ -32,7 +32,10 @@ export async function DELETE(request: Request) {
 export async function PATCH(request: Request) {
   try {
     const actor = await resolveActor(request); requireCapability(actor, "read");
-    const input = await request.json() as { purchaseOrderApprovalEmail?: unknown };
+    const input = await request.json() as { purchaseOrderApprovalEmail?: unknown; purchaseOrderApprovedEmails?: unknown };
+    if (typeof input.purchaseOrderApprovedEmails === "string") {
+      return Response.json(await setPurchaseOrderApprovedEmails(actor, input.purchaseOrderApprovedEmails));
+    }
     if (typeof input.purchaseOrderApprovalEmail !== "string") {
       return Response.json({ error: { code: "INVALID_APPROVAL_EMAIL", message: "purchaseOrderApprovalEmail must be a string." } }, { status: 400 });
     }

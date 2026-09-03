@@ -16,6 +16,7 @@ type ConnectionState = {
   defaultSender: EmailSenderType | null;
   canManageCompany: boolean;
   purchaseOrderApprovalEmail: string;
+  purchaseOrderApprovedEmails: string;
   connection: ConnectionSummary | null;
 };
 type PreviewResponse = {
@@ -53,6 +54,7 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
   const [expanded, setExpanded] = useState(false);
   const [setupTarget, setSetupTarget] = useState<EmailSenderType | null>(null);
   const [approvalEmail, setApprovalEmail] = useState("");
+  const [approvedEmails, setApprovedEmails] = useState("");
   // Every setState here happens after the response arrives, never synchronously inside the
   // effect that starts the load; errors are handled where they occur rather than by the caller.
   const load = useCallback(async () => {
@@ -62,6 +64,7 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
       if (!response.ok) throw new Error(errorMessage(body, "Email connection status is unavailable."));
       setState(body);
       setApprovalEmail(body.purchaseOrderApprovalEmail ?? "");
+      setApprovedEmails(body.purchaseOrderApprovedEmails ?? "");
       setError("");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Email connection status is unavailable.");
@@ -99,6 +102,20 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The approval email could not be saved."); }
     finally { setBusy(""); }
   };
+  const saveApprovedEmails = async () => {
+    setBusy("approved-emails"); setError("");
+    try {
+      const response = await fetch("/api/integrations/email", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ purchaseOrderApprovedEmails: approvedEmails }),
+      });
+      const body = await response.json() as { purchaseOrderApprovedEmails?: string; error?: unknown };
+      if (!response.ok) throw new Error(errorMessage(body, "The approved PO notification emails could not be saved."));
+      await load();
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "The approved PO notification emails could not be saved."); }
+    finally { setBusy(""); }
+  };
 
   const providerName = (provider: EmailProvider) => provider === "google" ? "Google" : "Microsoft 365";
   const senderRow = (senderType: EmailSenderType, connection: ConnectionSummary | null, canManage: boolean) => {
@@ -130,6 +147,14 @@ export function EmailConnectionManager({ compact = false }: { compact?: boolean 
           <label><span className="sr-only">Draft purchase order approval email</span><input type="email" value={approvalEmail} onChange={(event) => setApprovalEmail(event.target.value)} placeholder="approvals@company.com" disabled={Boolean(busy)} /></label>
           <button type="button" className="text-button" disabled={Boolean(busy) || approvalEmail.trim() === state.purchaseOrderApprovalEmail} onClick={() => void saveApprovalEmail()}>{busy === "approval-email" ? "Saving…" : "Save"}</button>
           <small>Email this address when a new draft needs approval. Leave blank to turn alerts off.</small>
+        </div> : null}
+      </div>
+      <div className="email-sender-setting email-approval-setting">
+        <div><strong>Approved PO notifications</strong><small>{state.purchaseOrderApprovedEmails || "Creator only"}</small></div>
+        {state.canManageCompany ? <div className="email-provider-actions email-provider-choice">
+          <label><span className="sr-only">Additional approved purchase order notification emails</span><input type="text" inputMode="email" value={approvedEmails} onChange={(event) => setApprovedEmails(event.target.value)} placeholder="purchasing@company.com, owner@company.com" disabled={Boolean(busy)} /></label>
+          <button type="button" className="text-button" disabled={Boolean(busy) || approvedEmails.trim() === state.purchaseOrderApprovedEmails} onClick={() => void saveApprovedEmails()}>{busy === "approved-emails" ? "Saving…" : "Save"}</button>
+          <small>The draft creator is always included. Separate extra recipients with commas.</small>
         </div> : null}
       </div>
     </div> : null}
