@@ -3396,9 +3396,11 @@ export async function getInventorySnapshot(input: SnapshotPage = {}) {
                   ORDER BY dd.posted_at DESC,dd.number DESC) d) AS salesDeliveriesJson,
            (SELECT json_group_array(json_object('id',i.id,'number',i.number,'status',i.status,
               'issuedOn',i.issuedOn,'dueOn',i.dueOn,'amountCents',i.amountCents,'paidCents',i.paidCents,
-              'creditedCents',i.creditedCents,'currency',i.currency))
+              'creditedCents',i.creditedCents,'currency',i.currency,'qboStatus',i.qboStatus,'qboEntityId',i.qboEntityId))
             FROM (SELECT ci.id,ci.number,ci.status,ci.invoice_date AS issuedOn,ci.due_date AS dueOn,
                     ci.total_cents AS amountCents,ci.paid_cents AS paidCents,ci.currency,
+                    (SELECT qsd.status FROM qbo_sync_deliveries qsd WHERE qsd.local_entity_type='customer_invoice' AND qsd.local_entity_id=ci.id ORDER BY qsd.created_at DESC,qsd.id DESC LIMIT 1) AS qboStatus,
+                    (SELECT qsd.qbo_entity_id FROM qbo_sync_deliveries qsd WHERE qsd.local_entity_type='customer_invoice' AND qsd.local_entity_id=ci.id ORDER BY qsd.created_at DESC,qsd.id DESC LIMIT 1) AS qboEntityId,
                     COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS creditedCents
                   FROM customer_invoices ci WHERE ci.sales_order_id=so.id
                   ORDER BY ci.invoice_date DESC,ci.number DESC) i) AS customerInvoicesJson,

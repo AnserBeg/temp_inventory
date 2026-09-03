@@ -3670,10 +3670,10 @@ export async function getWorkflowSnapshot(actor?:ActorIdentity,input:SnapshotPag
   // scoped records. The lightweight core companion only supplies product rows for inventory
   // and orphaned-location reconciliation; recomputing the global operational summary here made
   // every workflow request pay the app-shell's largest analytical query a second time.
-  // Purchasing's stage queues need the full PO lifecycle, fulfillment, billing, and QBO
-  // delivery state. The narrow advanced approval query intentionally omits completed receipts
-  // and billed orders, so use the richer PO register as the queue's classification source.
-  const workflowCoreScope: Record<string,string> = { purchasing:"purchase-orders", sales:"workflow-empty", inventory:"workflow-products", "vendor-billing":"workflow-empty", "customer-billing":"workflow-empty", controls:"workflow-empty" };
+  // Purchasing and sales queues need the full order lifecycle, fulfillment, connected financial
+  // documents, and QBO delivery state. The narrow advanced queues intentionally omit completed
+  // orders, so use the richer order registers as their classification sources.
+  const workflowCoreScope: Record<string,string> = { purchasing:"purchase-orders", sales:"sales-orders", inventory:"workflow-products", "vendor-billing":"workflow-empty", "customer-billing":"workflow-empty", controls:"workflow-empty" };
   const coreInput = workflowCoreScope[String(input.scope ?? "")] ? { ...input, scope: workflowCoreScope[String(input.scope)] } : input;
   const [core,advanced]=await Promise.all([getInventorySnapshot(coreInput),getAdvancedSnapshot(actor,input)]);return{snapshot:core,advanced};}
 

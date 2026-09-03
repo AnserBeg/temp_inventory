@@ -77,6 +77,7 @@ type WorkflowOptions = { products: SelectOption[]; warehouses: SelectOption[]; l
 
 export type WorkflowState = {
   purchaseOrders: WorkflowRecord[];
+  salesOrders: WorkflowRecord[];
   revisions: WorkflowRecord[];
   transfers: WorkflowRecord[];
   traceUnits: TraceUnit[];
@@ -242,7 +243,7 @@ export function preloadOperationsWorkspace(workspace: OperationsWorkspaceKind) {
 
 function emptyWorkflowState(): WorkflowState {
   return {
-    purchaseOrders: [], revisions: [], transfers: [], traceUnits: [], reservations: [], shipments: [], dropShipDeliveries: [], vendorBills: [], customerInvoices: [], valuations: [], assets: [], approvals: [], policies: [], periodLocks: [], valuationPolicies: [], users: [], outbox: [], marginRules: [], priceLists: [], priceAssignments: [], priceEntries: [], uomConversions: [], orphanedLocations: [], audit: [], attachments: [],
+    purchaseOrders: [], salesOrders: [], revisions: [], transfers: [], traceUnits: [], reservations: [], shipments: [], dropShipDeliveries: [], vendorBills: [], customerInvoices: [], valuations: [], assets: [], approvals: [], policies: [], periodLocks: [], valuationPolicies: [], users: [], outbox: [], marginRules: [], priceLists: [], priceAssignments: [], priceEntries: [], uomConversions: [], orphanedLocations: [], audit: [], attachments: [],
     currentUser: { id: "unavailable", name: "Permission context unavailable", role: "No authenticated role", permissions: [] },
     permissions: {},
     options: emptyWorkflowOptions(),
@@ -260,7 +261,7 @@ const tabs: Record<OperationsWorkspaceKind, Array<{ key: string; label: string }
     { key: "create-bill", label: "Create bill" },
     { key: "send-qbo", label: "Send to QBO" },
   ],
-  sales: [{ key: "overview", label: "Orders" }, { key: "lifecycle", label: "Confirm / cancel" }, { key: "reservations", label: "Reservations" }, { key: "drop-ship", label: "Drop-ship deliveries" }, { key: "shipment-corrections", label: "Shipment corrections" }],
+  sales: [{ key: "overview", label: "Orders" }, { key: "lifecycle", label: "Confirm / cancel" }, { key: "reservations", label: "Reservations" }, { key: "drop-ship", label: "Drop-ship deliveries" }, { key: "shipment-corrections", label: "Shipment corrections" }, { key: "send-qbo", label: "Send to QBO" }],
   inventory: [{ key: "overview", label: "Balances" }, { key: "transfers", label: "Transfers & status" }, { key: "approvals", label: "Inventory approvals" }, { key: "traceability", label: "Traceability" }, { key: "valuation", label: "Valuation" }, { key: "returnables", label: "Returnables" }],
   "vendor-billing": [{ key: "overview", label: "All bills" }, { key: "match", label: "Match exceptions" }, { key: "billing-actions", label: "Open bill actions" }],
   // The overview lists sales orders and what is still invoiceable on them; the posted invoices
@@ -394,15 +395,10 @@ function WorkflowTab({ workspace, tab, state, canAction, openAction, refresh, on
   if (workspace === "purchasing" && tab === "approvals") return <ApprovalQueue records={purchaseQueueRecords(state.purchaseOrders, "approvals")} canAction={canAction} openAction={openAction} onOpenOrder={onOpenOrder} />;
   if (workspace === "purchasing" && ["awaiting-order", "receive", "create-bill", "send-qbo"].includes(tab)) return <PurchaseStageQueue stage={tab as PurchaseQueueStage} records={purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage)} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />;
   if (workspace === "sales" && tab === "reservations") return <Reservations records={state.reservations} canAction={canAction} openAction={openAction} />;
-  if (workspace === "sales" && tab === "lifecycle") return <SalesLifecycle records={state.options.salesOrders.map((option) => {
-    const row = option.data ?? {};
-    const currency = String(row.currency ?? "CAD");
-    return { id: option.id, number: option.label, status: String(option.status ?? "unknown").replaceAll("_", " "), version: option.version,
-      party: String(row.customerName ?? ""),
-      quantity: Number(row.orderedQuantity ?? 0) || undefined, amount: Number(row.totalCents ?? 0) / 100, currency };
-  })} canAction={canAction} openAction={openAction} />;
+  if (workspace === "sales" && tab === "lifecycle") return <SalesLifecycle records={state.salesOrders} canAction={canAction} openAction={openAction} />;
   if (workspace === "sales" && tab === "shipment-corrections") return <ShipmentCorrections records={state.shipments} canAction={canAction} openAction={openAction} />;
   if (workspace === "sales" && tab === "drop-ship") return <DropShipDeliveries records={state.dropShipDeliveries} canAction={canAction} openAction={openAction} />;
+  if (workspace === "sales" && tab === "send-qbo") return <SalesQboQueue records={salesQboQueueRecords(state.salesOrders)} onOpenOrder={onOpenOrder} onOpenQbo={onOpenQbo} />;
   if (workspace === "inventory" && tab === "transfers") return <InventoryTransfers records={state.transfers} canAction={canAction} openAction={openAction} />;
   if ((workspace === "inventory" || workspace === "controls") && tab === "approvals") return <CountApprovalInbox records={state.approvals.filter((record) => ["inventory_count_variance", "over_receipt"].includes(String(record.data?.requestType ?? "")))} canAction={canAction} openAction={openAction} />;
   if (workspace === "inventory" && tab === "traceability") return <Traceability units={state.traceUnits} state={state} canAction={canAction} openAction={openAction} />;
@@ -1022,6 +1018,10 @@ function PurchaseStageQueue({ stage, records, onOpenOrder, onOpenQbo }: { stage:
   return <Section title={copy.title} detail={copy.detail}><RecordTable records={records} columns={["number", "party", "quantity", "amount", "status", "detail"]} actions={(record) => <>{onOpenOrder ? <ActionButton kind={stage === "send-qbo" ? "quiet" : "primary"} onClick={() => onOpenOrder({ id: record.id, number: record.number })}>{copy.action}</ActionButton> : null}{stage === "send-qbo" && onOpenQbo ? <ActionButton kind="primary" onClick={onOpenQbo}>Open QBO</ActionButton> : null}</>} /></Section>;
 }
 
+function SalesQboQueue({ records, onOpenOrder, onOpenQbo }: { records: WorkflowRecord[]; onOpenOrder?: (record: { id: string; number: string }) => void; onOpenQbo?: () => void }) {
+  return <Section title="Customer invoices ready for QuickBooks Online" detail="Posted invoices stay connected to their sales order while the automatic QBO handoff is pending or needs attention."><RecordTable records={records} columns={["number", "party", "reference", "amount", "status", "detail"]} actions={(record) => <>{onOpenOrder ? <ActionButton kind="quiet" onClick={() => onOpenOrder({ id: record.id, number: record.number })}>Open sales order</ActionButton> : null}{onOpenQbo ? <ActionButton kind="primary" onClick={onOpenQbo}>Open QBO</ActionButton> : null}</>} /></Section>;
+}
+
 function CountApprovalInbox({ records, canAction, openAction }: { records: WorkflowRecord[]; canAction: (kind: WorkflowActionKind) => boolean; openAction: (action: ActionDefinition) => void }) {
   return <Section title="Inventory approvals"><RecordCards records={records} renderActions={(record) => {
     const overReceipt = String(record.data?.requestType ?? "") === "over_receipt";
@@ -1299,6 +1299,25 @@ function purchaseQueueRecord(record: WorkflowRecord, stage: PurchaseQueueStage):
 
 function purchaseQueueRecords(records: WorkflowRecord[], stage: PurchaseQueueStage) {
   return records.filter((record) => purchaseQueueStage(record) === stage).map((record) => purchaseQueueRecord(record, stage));
+}
+
+function salesInvoices(record: WorkflowRecord) {
+  const input = record.data?.customerInvoicesJson;
+  try {
+    const parsed = typeof input === "string" ? JSON.parse(input) : input;
+    return Array.isArray(parsed) ? parsed.filter((invoice): invoice is Record<string, unknown> => Boolean(invoice) && typeof invoice === "object" && !workflowStatusIs(String((invoice as Record<string, unknown>).status ?? ""), "void", "voided")) : [];
+  } catch { return []; }
+}
+
+function salesQboQueueRecords(records: WorkflowRecord[]) {
+  return records.flatMap((record) => {
+    const pending = salesInvoices(record).filter((invoice) => !workflowStatusIs(String(invoice.qboStatus ?? ""), "succeeded"));
+    if (!pending.length) return [];
+    const statuses = pending.map((invoice) => String(invoice.qboStatus ?? "").toLowerCase());
+    const failed = statuses.some((status) => ["failed", "conflict"].includes(status));
+    const amountCents = pending.reduce((sum, invoice) => sum + Number(invoice.amountCents ?? 0), 0);
+    return [{ ...record, reference: pending.map((invoice) => String(invoice.number ?? "Invoice")).join(", "), amount: amountCents / 100, status: failed ? "QBO needs attention" : statuses.some((status) => ["pending", "processing"].includes(status)) ? "QBO sync queued" : "Ready for QBO", detail: `${pending.length} connected invoice${pending.length === 1 ? "" : "s"} awaiting successful QBO delivery` }];
+  });
 }
 
 /**
@@ -1732,6 +1751,7 @@ function filterWorkflowState(state: WorkflowState, filterReference: string): Wor
   return {
     ...state,
     purchaseOrders: state.purchaseOrders.filter(matches),
+    salesOrders: state.salesOrders.filter(matches),
     revisions: state.revisions.filter(matches),
     reservations: state.reservations.filter(matches),
     shipments: state.shipments.filter(matches),
@@ -1744,6 +1764,7 @@ function filterWorkflowState(state: WorkflowState, filterReference: string): Wor
 
 function tabCount(workspace: OperationsWorkspaceKind, tab: string, state: WorkflowState) {
   if (workspace === "purchasing" && ["drafts", "approvals", "awaiting-order", "receive", "create-bill", "send-qbo"].includes(tab)) return purchaseQueueRecords(state.purchaseOrders, tab as PurchaseQueueStage).length;
+  if (workspace === "sales" && tab === "send-qbo") return salesQboQueueRecords(state.salesOrders).length;
   if (workspace === "vendor-billing" && tab === "match") return state.vendorBills.filter((record) => record.exception).length;
   if (workspace === "inventory" && tab === "returnables") return state.assets.filter((record) => !/closed/i.test(record.status)).length;
   if ((workspace === "inventory" || workspace === "controls") && tab === "approvals") return state.approvals.filter((record) => /pending/i.test(record.status) && ["inventory_count_variance", "over_receipt"].includes(String(record.data?.requestType ?? ""))).length;
@@ -1881,6 +1902,7 @@ function normalizeLiveWorkflowState(input: unknown, snapshotInput?: unknown): Wo
       const unitAmount = (number(line, "orderedUomUnitCostCents") || number(line, "unitCostCents")) / 100;
       return { id: text(line, "id") || `${text(row, "id")}-${index}`, sku: text(line, "sku"), product: text(line, "productName"), quantity, unitAmount, amount: quantity * unitAmount - number(line, "discountCents") / 100 };
     }) }));
+  const soRecords: WorkflowRecord[] = salesOrders.map((row) => ({ id: text(row, "id"), number: text(row, "number", "id"), status: human(row.lifecycleStatus), party: text(row, "customerName"), reference: text(row, "projectReference", "requestedDate"), amount: number(row, "totalCents") / 100, currency: text(row, "currency") || "CAD", quantity: number(row, "orderedQuantity") || undefined, version: number(row, "version") || undefined, issuedOn: text(row, "orderDate"), dueOn: text(row, "requestedDate"), detail: `${human(row.fulfillmentStatus)} · ${human(row.billingStatus)}`, data: row }));
   const revisionRecords: WorkflowRecord[] = rows(raw.purchaseRevisions).map((row) => {
     const snapshot = jsonRecord(row.snapshotJson);
     const order = purchaseOrders.find((candidate) => text(candidate, "id") === text(row, "purchaseOrderId"));
@@ -1929,7 +1951,7 @@ function normalizeLiveWorkflowState(input: unknown, snapshotInput?: unknown): Wo
   const attachmentRecords: AttachmentRecord[] = rows(raw.attachments).map((row) => ({ id: text(row, "id"), fileName: text(row, "fileName"), type: text(row, "category", "contentType"), document: `${text(row, "documentType")} · ${text(row, "documentId")}`, status: "Stored", uploadedBy: text(row, "ownerEmail", "ownerId"), time: text(row, "uploadedAt"), href: `/api/attachments/${encodeURIComponent(text(row, "id"))}`, ownerId: text(row, "ownerId"), documentType: text(row, "documentType"), documentId: text(row, "documentId") }));
   const salesOrderLines = salesOrders.flatMap((order) => rows(order.lines).map((line) => ({ id: text(line, "id"), label: `${text(order, "number")} · ${text(line, "sku", "productName")}${text(line, "fulfillmentRoute") ? ` · ${human(line.fulfillmentRoute)}` : ""}`, detail: text(line, "productId"), version: number(order, "version") || undefined, status: text(line, "fulfillmentRoute"), data: { ...line, salesOrderId: text(order, "id"), salesOrderVersion: number(order, "version") } })));
   const purchaseOrderLines = purchaseOrders.flatMap((order) => rows(order.lines).map((line) => ({ id: text(line, "id"), label: `${text(order, "number")} · ${text(line, "sku", "productName")}`, detail: text(order, "id"), version: number(order, "version") || undefined, data: { ...line, purchaseOrderId: text(order, "id"), purchaseOrderVersion: number(order, "version"), currency: text(order, "currency") || "CAD", exchangeRateToBase: number(order, "exchangeRateToBase", "exchange_rate_to_base") || 1, paymentTerms: text(order, "paymentTerms", "payment_terms") || "Net 30", dueDate: text(order, "dueDate", "due_date") || today() } })));
-  return { purchaseOrders: poRecords, revisions: revisionRecords, transfers: transferRecords, traceUnits: traceRecords, reservations: reservationRecords, shipments: shipmentRecords, dropShipDeliveries: dropShipRecords, vendorBills: vendorBillRecords, customerInvoices: invoiceRecords, valuations: valuationRecords, assets: assetRecords, approvals: approvalRecords, policies: policyRecords, periodLocks: periodLockRecords, valuationPolicies: valuationPolicyRecords, users: userRecords, outbox: outboxRecords, marginRules: marginRuleRecords, priceLists: priceListOptions, priceAssignments: priceAssignmentRecords, priceEntries: priceEntryRecords, uomConversions: uomConversionRecords, orphanedLocations: orphanedLocationRecords, audit: auditRecords, attachments: attachmentRecords, currentUser: actor ? { id: text(actor, "id"), name: text(actor, "name", "email"), role: human(actor.role), permissions: permissionLabels } : empty.currentUser, permissions,
+  return { purchaseOrders: poRecords, salesOrders: soRecords, revisions: revisionRecords, transfers: transferRecords, traceUnits: traceRecords, reservations: reservationRecords, shipments: shipmentRecords, dropShipDeliveries: dropShipRecords, vendorBills: vendorBillRecords, customerInvoices: invoiceRecords, valuations: valuationRecords, assets: assetRecords, approvals: approvalRecords, policies: policyRecords, periodLocks: periodLockRecords, valuationPolicies: valuationPolicyRecords, users: userRecords, outbox: outboxRecords, marginRules: marginRuleRecords, priceLists: priceListOptions, priceAssignments: priceAssignmentRecords, priceEntries: priceEntryRecords, uomConversions: uomConversionRecords, orphanedLocations: orphanedLocationRecords, audit: auditRecords, attachments: attachmentRecords, currentUser: actor ? { id: text(actor, "id"), name: text(actor, "name", "email"), role: human(actor.role), permissions: permissionLabels } : empty.currentUser, permissions,
     totals: {
       inventoryValueCents: number(summaryTotals, "inventoryValueCents"),
       landedCostAllocatedCents: number(summaryTotals, "landedCostAllocatedCents"),

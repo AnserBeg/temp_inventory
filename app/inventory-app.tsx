@@ -496,6 +496,7 @@ export type ViewKey =
   | "purchase-orders"
   | "expected-receipts"
   | "vendor-returns"
+  | "crm"
   | "sales-orders"
   | "counter-sales"
   | "fulfillment"
@@ -735,6 +736,7 @@ const navGroups: Array<{ label?: string; items: NavItem[] }> = [
     label: "Sales",
     items: [
       { key: "counter-sales", label: "Counter sale", glyph: "$" },
+      { key: "crm", label: "CRM", glyph: "C" },
       { key: "sales-orders", label: "Sales orders", glyph: "SO" },
       { key: "fulfillment", label: "Ready to fulfill", glyph: "✓" },
       { key: "customer-returns", label: "Customer returns", glyph: "↙" },
@@ -776,6 +778,7 @@ const viewTitles: Record<ViewKey, { title: string; description?: string }> = {
   "purchase-orders": { title: "Purchase orders" },
   "expected-receipts": { title: "Expected receipts" },
   "vendor-returns": { title: "Vendor returns" },
+  crm: { title: "Customer relationships", description: "See every customer alongside their open sales work, then move straight into the account or a new order." },
   "sales-orders": { title: "Sales orders" },
   "counter-sales": { title: "Counter sale", description: "Sell available stock and post the invoice in one step." },
   fulfillment: { title: "Ready to fulfill" },
@@ -885,7 +888,9 @@ function createSnapshotRequest(input: SnapshotRequestInput) {
     // Reports paginate their product table locally. Loading the complete catalog for this
     // bounded reporting view avoids stacking a second, unrelated server pager beneath it.
     pageSize: input.view === "reports" ? "500" : "50",
-    scope: input.view,
+    // CRM is a customer-first presentation of the durable partner register. Reuse that scope so
+    // search, paging, tenancy, and authorization stay identical to Customers & vendors.
+    scope: input.view === "crm" ? "partners" : input.view,
     worklistQuery: input.search,
     status: input.status,
     sort: input.sort,
@@ -945,6 +950,7 @@ const salesWorkflow: WorkflowGuideStep[] = [
   { label: "Allocate supply", detail: "Reserve or link supplier supply", view: "sales-orders", tab: "reservations" },
   { label: "Post fulfillment", detail: "Shipment or supplier delivery", view: "fulfillment" },
   { label: "Create invoice", detail: "Only fulfilled quantity", view: "customer-invoices" },
+  { label: "Send to QBO", detail: "Push the connected invoice", view: "sales-orders", tab: "send-qbo" },
   { label: "Collect or credit", detail: "Close the receivable", view: "customer-invoices", tab: "billing-actions" },
 ];
 
@@ -973,7 +979,7 @@ const closeReopenReasons = ["Vendor confirmed partial availability", "Vendor can
 /** What each worklist actually searches, for the search box's own placeholder. */
 const worklistNoun: Partial<Record<ViewKey, string>> = {
   "purchase-orders": "purchase orders", "expected-receipts": "expected receipts", "vendor-returns": "purchase orders",
-  "sales-orders": "sales orders", fulfillment: "sales orders", "customer-returns": "sales orders",
+  crm: "customers", "sales-orders": "sales orders", fulfillment: "sales orders", "customer-returns": "sales orders",
   "customer-invoices": "sales orders", stock: "products", products: "products", counts: "location balances",
   movements: "movements", "vendor-bills": "vendor bills", partners: "customers and vendors",
 };
@@ -981,6 +987,7 @@ const worklistNoun: Partial<Record<ViewKey, string>> = {
 /** Worklist views that should open pre-filtered to the queue they exist to clear. */
 const defaultWorklistStatus: Partial<Record<ViewKey, string>> = {
   "expected-receipts": "open",
+  crm: "customer",
   fulfillment: "reserved",
   "vendor-returns": "returnable",
   "customer-returns": "shipped",
@@ -1002,6 +1009,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
   const [creatingProduct, setCreatingProduct] = useState(false);
   const [activeCommand, setActiveCommand] = useState<ActiveCommand | null>(null);
   const [createOrder, setCreateOrder] = useState<"purchaseOrder" | "salesOrder" | null>(null);
+  const [createOrderPartner, setCreateOrderPartner] = useState<Partner | null>(null);
   const [editingPurchaseOrder, setEditingPurchaseOrder] = useState<PurchaseOrder | null>(null);
   const [editingSalesOrder, setEditingSalesOrder] = useState<SalesOrder | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1171,6 +1179,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
       setCreatingProduct(false);
       setActiveCommand(null);
       setCreateOrder(null);
+      setCreateOrderPartner(null);
       setEditingPurchaseOrder(null);
       setEditingSalesOrder(null);
       setSearchOpen(false);
@@ -1222,6 +1231,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
     setCreatingProduct(false);
     setActiveCommand(null);
     setCreateOrder(null);
+    setCreateOrderPartner(null);
     setEditingPurchaseOrder(null);
     setEditingSalesOrder(null);
     setSearchOpen(false);
@@ -1357,7 +1367,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
   const pageTotalKey: Partial<Record<ViewKey, string>> = {
     "purchase-orders": "purchaseOrders", "expected-receipts": "purchaseOrders", "vendor-returns": "purchaseOrders",
     "sales-orders": "salesOrders", fulfillment: "salesOrders", "customer-returns": "salesOrders", "customer-invoices": "salesOrders",
-    stock: "products", products: "products", partners: "partners", counts: "countBalances", movements: "movements", reports: "products", "vendor-bills": "bills",
+    stock: "products", products: "products", partners: "partners", crm: "partners", counts: "countBalances", movements: "movements", reports: "products", "vendor-bills": "bills",
   };
   const pageTotal = snapshot.pagination.filteredTotal ?? snapshot.pagination.totals[pageTotalKey[view] ?? ""] ?? 0;
   const pageCount = Math.max(1, Math.ceil(pageTotal / snapshot.pagination.pageSize));
@@ -1587,6 +1597,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
     setSource("server");
     setToast(result.message || "Order created.");
     setCreateOrder(null);
+    setCreateOrderPartner(null);
     // A new draft sorts to the back of a worklist thousands of rows long, so navigating alone
     // dropped the user on a list that did not contain the order they had just keyed. Scoping
     // the worklist to its document number puts it on screen and lets the detail open.
@@ -1743,9 +1754,9 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
                 onComplete={(message) => { setToast(message); navigate("customer-invoices", undefined, "billing-actions"); }}
               />}
               {view === "sales-orders" && (
-                <OperationsWorkspace workspace="sales" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("salesOrder")}>
+                <OperationsWorkspace workspace="sales" initialTab={workspaceTab} onTabChange={(tab) => { setSelectedSoId(null); changeWorkspaceTab(tab); }} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("salesOrder")} onOpenOrder={(record) => { setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedSoId(record.id); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} detailOpen={Boolean(selectedSo)}>
                 {selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("customer-invoices", undefined, tab); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("customer-invoices", undefined, tab); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1753,7 +1764,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               )}
               {view === "fulfillment" && (
                 selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("customer-invoices", undefined, tab); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("customer-invoices", undefined, tab); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "drop-ship")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )
@@ -1779,6 +1790,15 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InventoryCountSessions warehouseId={warehouseId} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} canAdminister={snapshot.viewer.permissions.canAdminister} onDurableRefresh={loadSnapshot} /></OperationsWorkspace>}
               {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenPurchaseOrder={(bill) => { if (!bill.purchaseOrderId) return; navigate("purchase-orders"); setWorklistQuery(bill.po); setAppliedWorklistQuery(bill.po); setSelectedPoId(bill.purchaseOrderId); }} /></OperationsWorkspace>}
               {view === "customer-invoices" && <OperationsWorkspace workspace="customer-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><InvoicesView salesOrders={snapshot.salesOrders} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenSalesOrder={(so) => { navigate("sales-orders"); setWorklistQuery(so.number); setAppliedWorklistQuery(so.number); setSelectedSoId(so.id); }} /></OperationsWorkspace>}
+              {view === "crm" && <CustomerCrmView
+                customers={snapshot.partners}
+                totalCustomers={pageTotal}
+                tenantId={snapshot.viewer.tenant.id}
+                canOperate={snapshot.viewer.permissions.canOperate}
+                onOpenCustomer={(customer) => { navigate("partners", "customer"); setWorklistQuery(customer.name); setAppliedWorklistQuery(customer.name); setSelectedPartnerId(customer.id); }}
+                onCreateSalesOrder={(customer) => { setCreateOrderPartner(customer); setCreateOrder("salesOrder"); }}
+                onOpenSalesOrders={(customer) => { navigate("sales-orders"); setWorklistQuery(customer.name); setAppliedWorklistQuery(customer.name); }}
+              />}
               {view === "partners" && <PartnersView partners={snapshot.partners} selectedId={selectedPartnerId} canApprove={snapshot.viewer.permissions.canApprove} canOperate={snapshot.viewer.permissions.canOperate} canAdminister={snapshot.viewer.permissions.canAdminister} onOpen={setSelectedPartnerId} onEdit={setEditingPartner} onChanged={(message) => { setToast(message); void loadSnapshot(); }} onOpenOrder={(order) => { navigate(order.kind === "sales" ? "sales-orders" : "purchase-orders"); setWorklistQuery(order.number); setAppliedWorklistQuery(order.number); if (order.kind === "sales") setSelectedSoId(order.id); else setSelectedPoId(order.id); }} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />}
               {view === "reports" && <OperationsWorkspace workspace="controls" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><ReportsView snapshot={snapshot} warehouseId={warehouseId} /></OperationsWorkspace>}
               {view === "warehouse" && <WarehouseView snapshot={snapshot} source={source} canOperate={snapshot.viewer.permissions.canOperate} navigate={navigate} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} />}
@@ -1853,7 +1873,8 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
           warehouseId={warehouseId}
           defaultTaxRateBps={snapshot.configuration.taxDefaultRateBps}
           canFastTrack={snapshot.viewer.permissions.canApprove}
-          onClose={() => setCreateOrder(null)}
+          initialPartner={createOrder === "salesOrder" ? createOrderPartner ?? undefined : undefined}
+          onClose={() => { setCreateOrder(null); setCreateOrderPartner(null); }}
           onSubmit={(payload) => createOperationalOrder(createOrder, payload)}
         />
       )}
@@ -1940,6 +1961,7 @@ function PageActions({ view, source, canOperate, canApprove, onNavigate, onCreat
   // which is the wrong place to look when you are standing on the catalog. Master data is an
   // approver's job, matching the permission the create command itself checks.
   if (view === "products") return canApprove ? <button className="button primary" onClick={onCreateProduct}>Add product</button> : null;
+  if (view === "crm") return canApprove ? <button className="button primary" onClick={onCreatePartner}>Add customer</button> : null;
   if (view === "partners") return canApprove ? <button className="button primary" onClick={onCreatePartner}>Add customer / vendor</button> : null;
   return null;
 }
@@ -2169,7 +2191,7 @@ function WorkflowGuide({ view, workspaceTab, onNavigate }: { view: ViewKey; work
   } else if (["sales-orders", "fulfillment", "customer-invoices"].includes(view)) {
     title = "Order to cash";
     steps = salesWorkflow;
-    active = view === "sales-orders" ? (workspaceTab === "reservations" ? 1 : workspaceTab === "drop-ship" || workspaceTab === "shipment-corrections" ? 2 : 0) : view === "fulfillment" ? 2 : workspaceTab === "billing-actions" ? 4 : 3;
+    active = view === "sales-orders" ? (workspaceTab === "reservations" ? 1 : workspaceTab === "drop-ship" || workspaceTab === "shipment-corrections" ? 2 : workspaceTab === "send-qbo" ? 4 : 0) : view === "fulfillment" ? 2 : workspaceTab === "billing-actions" ? 5 : 3;
   } else if (view === "vendor-returns") {
     title = "Vendor return";
     steps = vendorReturnWorkflow;
@@ -2464,7 +2486,7 @@ function SalesOrdersView({ orders, canOperate, onOpen, onShip, sort, setSort }: 
   return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Sales orders</caption><thead><tr><SortableHeader label="Exception" column="exception" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="SO" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Customer / project" column="customer" sort={sort} setSort={setSort} /><SortableHeader label="Requested" column="requested" sort={sort} setSort={setSort} /><SortableHeader label="Availability" column="availability" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="Fulfillment" column="fulfillment" sort={sort} setSort={setSort} /><SortableHeader label="Invoice" column="billing" sort={sort} setSort={setSort} /><SortableHeader label="Total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{orders.map((so) => <tr key={so.id}><td>{so.exception ? <span className={`exception-cell ${so.shortage > 0 ? "danger" : "warning"}`}>!</span> : "—"}</td><td><button className="table-link" onClick={() => onOpen(so.id)}>{so.number}</button><small>{so.route}</small></td><td><strong>{so.customer}</strong>{so.project ? <small>{so.project}</small> : null}</td><td>{formatDate(so.requestedDate)}</td><td><div className="availability-mini"><strong>{so.availableNow} now</strong><span>{so.incomingBeforeDate} incoming</span>{so.shortage > 0 && <b>{so.shortage} short</b>}</div></td><td><StatusBadge>{so.fulfillment}</StatusBadge></td><td><StatusBadge>{so.billing}</StatusBadge></td><td className="numeric strong">{formatDocumentMoney(so.total, so.currency, false)}</td><td>{canOperate && so.lifecycle.toLowerCase() === "confirmed" && so.reserved > 0 ? <button className="row-action" onClick={() => onShip(so)}>Post shipment</button> : <button className="row-action" onClick={() => onOpen(so.id)}>View</button>}</td></tr>)}{!orders.length ? <tr><td colSpan={9}><div className="empty-inline">No sales order matches this filter.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
-function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onOpenCustomerBilling, onOpenDropShip, onCreateLinkedPurchaseOrder, onOpenLinkedPurchaseOrder, onConfirm }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onOpenCustomerBilling: (tab?: string) => void; onOpenDropShip: () => void; onCreateLinkedPurchaseOrder: () => void; onOpenLinkedPurchaseOrder: () => void; onConfirm: (reason: string) => Promise<void> }) {
+function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onOpenCustomerBilling, onOpenQbo, onOpenDropShip, onCreateLinkedPurchaseOrder, onOpenLinkedPurchaseOrder, onConfirm }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onOpenCustomerBilling: (tab?: string) => void; onOpenQbo: () => void; onOpenDropShip: () => void; onCreateLinkedPurchaseOrder: () => void; onOpenLinkedPurchaseOrder: () => void; onConfirm: (reason: string) => Promise<void> }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   // Confirmation is an audited decision, so the note is typed rather than defaulted — a
@@ -2500,6 +2522,9 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   const canceled = lifecycle === "canceled";
   const activeInvoices = so.invoices.filter((invoice) => invoice.status.toLowerCase() !== "void");
   const invoiceOutstanding = activeInvoices.reduce((sum, invoice) => sum + invoice.outstanding, 0);
+  const qboFailed = activeInvoices.some((invoice) => ["failed", "conflict"].includes(invoice.qboStatus?.toLowerCase() ?? ""));
+  const qboComplete = activeInvoices.length > 0 && activeInvoices.every((invoice) => invoice.qboStatus?.toLowerCase() === "succeeded");
+  const qboPending = activeInvoices.length > 0 && !qboComplete && !qboFailed;
   const billingComplete = ["invoiced", "fully invoiced"].includes(so.billing.toLowerCase());
   const fulfillmentDocuments: RecordProgressDocument[] = [
     ...so.shipments.map((shipment) => ({ number: shipment.number, detail: `${formatDocumentDate(shipment.postedAt)}${shipment.trackingNumber ? ` · tracking ${shipment.trackingNumber}` : ""}` })),
@@ -2507,7 +2532,7 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   ];
   const invoiceDocuments: RecordProgressDocument[] = activeInvoices.map((invoice) => ({
     number: invoice.number,
-    detail: `${formatDocumentMoney(invoice.amount, invoice.currency)} · due ${formatDocumentDate(invoice.dueOn)}${invoice.outstanding > 0 ? ` · ${formatDocumentMoney(invoice.outstanding, invoice.currency)} outstanding` : " · settled"}`,
+    detail: `${formatDocumentMoney(invoice.amount, invoice.currency)} · due ${formatDocumentDate(invoice.dueOn)}${invoice.outstanding > 0 ? ` · ${formatDocumentMoney(invoice.outstanding, invoice.currency)} outstanding` : " · settled"}${invoice.qboStatus ? ` · QBO ${invoice.qboStatus}` : " · QBO pending"}`,
     href: `/api/documents/pdf?documentType=customer_invoice&documentId=${encodeURIComponent(invoice.id)}`,
   }));
   const settlementDocuments: RecordProgressDocument[] = so.settlements.map((settlement) => ({
@@ -2520,7 +2545,8 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
     { label: "Supply & allocation", state: canceled ? "stopped" : supplyAttention ? "attention" : !confirmed ? "upcoming" : so.open <= 0 || so.reserved >= so.open ? "complete" : "current", summary: missingDedicatedSupply ? "A linked purchase order is missing for dedicated supply" : linkedSupplyAwaitingApproval ? "Linked purchasing commitment is awaiting approval" : specialOrderAwaitingReceipt ? "Linked special-order supply must be received" : so.open <= 0 ? "Supply consumed by completed fulfillment" : `${so.reserved} reserved · ${so.availableNow} available now · ${so.incomingBeforeDate} incoming` },
     { label: "Customer fulfillment", state: canceled ? "stopped" : so.open <= 0 && confirmed ? "complete" : confirmed ? "current" : "upcoming", summary: `${so.fulfilled} of ${so.ordered} fulfilled · ${so.open} open`, documents: fulfillmentDocuments },
     { label: "Customer invoice", state: canceled ? "stopped" : billingComplete && activeInvoices.length > 0 ? "complete" : billingComplete && !activeInvoices.length ? "attention" : invoiceable > 0 || activeInvoices.length > 0 ? "current" : "upcoming", summary: activeInvoices.length ? `${activeInvoices.length} connected invoice${activeInvoices.length === 1 ? "" : "s"} · ${so.billing}` : billingComplete ? "Billing status is complete, but no connected invoice was found" : `${invoiceable} fulfilled unit${invoiceable === 1 ? "" : "s"} ready to invoice`, documents: invoiceDocuments },
-    { label: "Payment / credit", state: canceled ? "stopped" : activeInvoices.length && invoiceOutstanding <= 0 ? "complete" : activeInvoices.length ? "current" : "upcoming", summary: activeInvoices.length ? `${formatDocumentMoney(invoiceOutstanding, so.currency)} outstanding across connected invoices` : "Begins after an invoice is posted", documents: settlementDocuments },
+    { label: "Sent to QBO", state: canceled ? "stopped" : qboFailed ? "attention" : qboComplete ? "complete" : activeInvoices.length ? "current" : "upcoming", summary: qboComplete ? "Customer invoice is in QuickBooks Online" : qboFailed ? "QBO delivery needs attention" : qboPending ? "Automatic QBO delivery is in progress" : "Begins after a customer invoice is posted" },
+    { label: "Payment / credit", state: canceled ? "stopped" : qboComplete ? invoiceOutstanding <= 0 ? "complete" : "current" : "upcoming", summary: !activeInvoices.length ? "Begins after an invoice is posted" : !qboComplete ? "Begins after the invoice reaches QBO" : `${formatDocumentMoney(invoiceOutstanding, so.currency)} outstanding across connected invoices`, documents: settlementDocuments },
   ];
   const nextAction: RecordNextAction = canceled
     ? { title: "No action — order canceled", detail: "This progression is retained as history.", tone: "success" }
@@ -2542,8 +2568,12 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
                     ? { title: "Reserve available stock", detail: "Allocate usable stock to make the order ready for shipment.", label: "Reserve available stock", onClick: onReserve }
                     : billingComplete && !activeInvoices.length
                       ? { title: "Reconcile the missing invoice link", detail: "The order says invoiced, but no customer invoice is connected to it.", label: "Review customer billing", onClick: () => onOpenCustomerBilling("billing-actions"), tone: "warning" }
-                      : invoiceOutstanding > 0
-                        ? { title: `Collect ${formatDocumentMoney(invoiceOutstanding, so.currency)}`, detail: "Record payment or issue a credit against the connected invoice.", label: "Open invoice actions", onClick: () => onOpenCustomerBilling("billing-actions") }
+                      : qboFailed
+                        ? { title: "QBO invoice delivery needs attention", detail: "Review the connected invoice sync before accounting continues.", label: "Review QBO sync", onClick: onOpenQbo, tone: "warning" }
+                        : qboPending
+                          ? { title: "Sending invoice to QBO", detail: "Automatic delivery is in progress for the connected customer invoice.", label: "View QBO status", onClick: onOpenQbo }
+                          : invoiceOutstanding > 0
+                            ? { title: `Collect ${formatDocumentMoney(invoiceOutstanding, so.currency)}`, detail: "Record payment or issue a credit against the connected invoice.", label: "Open invoice actions", onClick: () => onOpenCustomerBilling("billing-actions") }
                         : reserveBlocked
                           ? { title: "Resolve the supply shortage", detail: "Review incoming supply or create a purchasing commitment before reserving stock.", tone: "warning" }
                           : { title: "Order-to-cash complete", detail: "The order, fulfillment, invoice, and settlement are complete.", tone: "success" };
@@ -2941,6 +2971,87 @@ function MovementsTable({ movements, onOpenOrder, sort, setSort }: { movements: 
     <td className={`numeric strong ${movement.quantity < 0 ? "text-danger" : "text-success"}`}>{movement.quantity > 0 ? "+" : ""}{movement.quantity}</td>
     <td>{movement.from}</td><td>{movement.to}</td><td title={movement.user}>{actorName(movement.user)}</td>
   </tr>)}{!movements.length ? <tr><td colSpan={9}><div className="empty-inline">No posted movement matches this filter.</div></td></tr> : null}</tbody></table></div>;
+}
+
+type CrmSalesAccount = {
+  customerId: string;
+  orderCount: number;
+  openQuantity: number;
+  openBaseValueCents: number;
+  earliestRequestedDate: string;
+};
+
+/** Customer master data and open demand meet here; sales remains the system of record for orders. */
+function CustomerCrmView({ customers, totalCustomers, tenantId, canOperate, onOpenCustomer, onCreateSalesOrder, onOpenSalesOrders }: {
+  customers: Partner[];
+  totalCustomers: number;
+  tenantId: string;
+  canOperate: boolean;
+  onOpenCustomer: (customer: Partner) => void;
+  onCreateSalesOrder: (customer: Partner) => void;
+  onOpenSalesOrders: (customer: Partner) => void;
+}) {
+  const [salesAccounts, setSalesAccounts] = useState<CrmSalesAccount[]>([]);
+  const [pipelineTotalCents, setPipelineTotalCents] = useState(0);
+  const [loadingSales, setLoadingSales] = useState(true);
+  const [salesError, setSalesError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      setLoadingSales(true);
+      setSalesAccounts([]);
+      setPipelineTotalCents(0);
+      setSalesError("");
+      const response = await fetch("/api/reports?type=open-orders", { cache: "no-store", signal: controller.signal });
+      const result = await response.json() as Record<string, unknown>;
+      if (!response.ok) throw new Error(text(asRecord(result.error).message, "Open sales activity could not be loaded."));
+      setSalesAccounts(asRows(result.rows).map((row) => ({
+        customerId: text(row.customerId),
+        orderCount: Number(row.orderCount ?? 0),
+        openQuantity: Number(row.openQuantity ?? 0),
+        openBaseValueCents: Number(row.openBaseValueCents ?? 0),
+        earliestRequestedDate: text(row.earliestRequestedDate),
+      })));
+      setPipelineTotalCents(Number(asRecord(result.totals).openBaseValueCents ?? 0));
+      setSalesError("");
+    })().catch((caught) => {
+      if (!(caught instanceof DOMException && caught.name === "AbortError")) setSalesError(caught instanceof Error ? caught.message : "Open sales activity could not be loaded.");
+    }).finally(() => { if (!controller.signal.aborted) setLoadingSales(false); });
+    return () => controller.abort();
+  }, [tenantId]);
+
+  const salesByCustomer = useMemo(() => new Map(salesAccounts.map((account) => [account.customerId, account])), [salesAccounts]);
+  const openOrderCount = salesAccounts.reduce((sum, account) => sum + account.orderCount, 0);
+  const activeCustomerCount = salesAccounts.length;
+
+  return <div className="crm-overview">
+    <section className="metric-row crm-metrics" aria-label="Customer sales summary">
+      <article className="metric-card success"><span>Customer accounts</span><strong>{totalCustomers}</strong><small>Active customer relationships</small><b>Shared with sales</b></article>
+      <article className="metric-card info"><span>Customers with open demand</span><strong>{loadingSales ? "—" : activeCustomerCount}</strong><small>Accounts with work in progress</small><b>From open sales orders</b></article>
+      <article className="metric-card warning"><span>Open sales orders</span><strong>{loadingSales ? "—" : openOrderCount}</strong><small>Draft or confirmed orders</small><b>Fulfillment still outstanding</b></article>
+      <article className="metric-card"><span>Open pipeline</span><strong>{loadingSales ? "—" : formatDocumentMoney(pipelineTotalCents / 100, "CAD", false)}</strong><small>Unfulfilled item value in base currency</small><b>Live sales commitment</b></article>
+    </section>
+    {salesError ? <div className="connection-error" role="alert"><div><strong>Sales summary unavailable.</strong><p>{salesError} Customer accounts remain available.</p></div></div> : null}
+    <section className="panel worklist crm-worklist">
+      <PanelHeading title="Customer accounts" detail="Contact context, credit status, and the open sales relationship in one place" />
+      <div className="responsive-table"><table><caption className="sr-only">Customer relationship accounts and open sales activity</caption><thead><tr><th>Customer</th><th>Contact</th><th>Relationship</th><th className="numeric">Open orders</th><th className="numeric">Open pipeline</th><th>Next requested delivery</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>
+        {customers.map((customer) => {
+          const sales = salesByCustomer.get(customer.id);
+          return <tr key={customer.id}>
+            <td><div className="crm-account"><span className="crm-account-mark" aria-hidden="true">{initials(customer.name)}</span><div><button className="table-link" onClick={() => onOpenCustomer(customer)}>{customer.name}</button><small>{customer.code}</small></div></div></td>
+            <td>{customer.email || "No email"}<small>{customer.phone || "No phone recorded"}</small></td>
+            <td>{customer.creditHold ? <StatusBadge tone="danger">Credit hold</StatusBadge> : <StatusBadge tone="success">Active</StatusBadge>}</td>
+            <td className="numeric strong">{loadingSales ? "—" : sales?.orderCount ?? 0}<small>{sales ? `${formatQuantity(sales.openQuantity)} units open` : "No open demand"}</small></td>
+            <td className="numeric strong">{loadingSales ? "—" : formatDocumentMoney((sales?.openBaseValueCents ?? 0) / 100, "CAD", false)}</td>
+            <td>{sales?.earliestRequestedDate ? formatDocumentDate(sales.earliestRequestedDate) : "No open delivery"}</td>
+            <td><div className="crm-row-actions"><button className="row-action" onClick={() => onOpenCustomer(customer)}>Open account</button>{canOperate ? <button className="button primary" onClick={() => onCreateSalesOrder(customer)}>New sales order</button> : null}{sales ? <button className="row-action" onClick={() => onOpenSalesOrders(customer)}>View sales</button> : null}</div></td>
+          </tr>;
+        })}
+        {!customers.length ? <tr><td colSpan={7}><div className="empty-inline">No customer matches this view. Add a customer to start the sales relationship.</div></td></tr> : null}
+      </tbody></table></div>
+    </section>
+  </div>;
 }
 
 function PartnersView({ partners, selectedId, canApprove, canOperate, canAdminister, onOpen, onEdit, onChanged, onOpenOrder, sort, setSort }: { partners: Partner[]; selectedId: string | null; canApprove: boolean; canOperate: boolean; canAdminister: boolean; onOpen: (id: string | null) => void; onEdit: (partner: Partner) => void; onChanged: (message: string) => void; onOpenOrder: (order: PartnerOrder) => void } & WorklistSortProps) {
@@ -3786,16 +3897,17 @@ function composerDraft(order: SalesOrder | PurchaseOrder | undefined, isPurchase
   };
 }
 
-function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, warehouseId, defaultTaxRateBps, canFastTrack = false, onClose, onSubmit }: { type: "purchaseOrder" | "salesOrder"; initialOrder?: SalesOrder | PurchaseOrder; partners: Partner[]; products: Product[]; warehouseId: string; defaultTaxRateBps: number; canFastTrack?: boolean; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
+function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partners, products, warehouseId, defaultTaxRateBps, canFastTrack = false, onClose, onSubmit }: { type: "purchaseOrder" | "salesOrder"; initialOrder?: SalesOrder | PurchaseOrder; initialPartner?: Partner; partners: Partner[]; products: Product[]; warehouseId: string; defaultTaxRateBps: number; canFastTrack?: boolean; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
   const isPurchase = type === "purchaseOrder";
   const editing = Boolean(initialOrder);
   // One composer serves both documents, so the order being edited is flattened to a single
   // shape first. A purchase order carries a vendor and an expected date where a sales order
   // carries a customer, a requested date, and a ship-to block.
   const draft = composerDraft(initialOrder, isPurchase);
+  const seededPartner = isPurchase ? undefined : initialPartner;
   const partnerRole = isPurchase ? "vendor" : "customer";
   const eligiblePartners = partners.filter((partner) => partner.type === partnerRole || partner.type === "both");
-  const initialPartnerOptions: LookupOption[] = eligiblePartners.map((partner) => ({ id: partner.id, label: partner.name, detail: [partner.email, titleCase(partner.type)].filter(Boolean).join(" · "), addressLine1: partner.addressLine1, addressLine2: partner.addressLine2, city: partner.city, region: partner.region, postalCode: partner.postalCode, country: partner.country, currency: partner.currency, paymentTerms: partner.paymentTerms }));
+  const initialPartnerOptions: LookupOption[] = eligiblePartners.map((partner) => ({ id: partner.id, label: partner.name, detail: [partner.email, titleCase(partner.type)].filter(Boolean).join(" · "), addressLine1: partner.addressLine1, addressLine2: partner.addressLine2, city: partner.city, region: partner.region, postalCode: partner.postalCode, country: partner.country, currency: partner.currency, paymentTerms: partner.paymentTerms, creditHold: partner.creditHold, creditLimitCents: partner.creditLimitCents }));
   if (draft?.partnerId && !initialPartnerOptions.some((option) => option.id === draft.partnerId)) initialPartnerOptions.unshift({ id: draft.partnerId, label: draft.partnerLabel, detail: isPurchase ? "Current vendor" : "Current customer", addressLine1: draft.shipToAddressLine1, addressLine2: draft.shipToAddressLine2, city: draft.shipToCity, region: draft.shipToRegion, postalCode: draft.shipToPostalCode, country: draft.shipToCountry, currency: draft.currency, paymentTerms: draft.paymentTerms });
   const initialProductOptions: LookupOption[] = products.map((product) => ({
     id: product.id,
@@ -3820,24 +3932,25 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
     route: line.route.replaceAll("_", "-"), projectReference: line.projectReference || draft?.projectReference || "",
     sourceSalesOrderLineId: line.sourceSalesOrderLineId, supplyAllocations: line.supplyAllocations, linkedPurchaseOrderLineId: line.linkedPurchaseOrderLineId,
   }));
-  // No partner is pre-selected: the first alphabetical account is never a safe guess.
-  const [partnerId, setPartnerId] = useState(draft?.partnerId ?? "");
+  // No arbitrary account is selected. CRM may deliberately seed the customer the rep acted on.
+  const [partnerId, setPartnerId] = useState(draft?.partnerId ?? seededPartner?.id ?? "");
   // The hold is enforced when the order is confirmed. Carrying it here means a rep learns about
   // it before keying the lines rather than after.
-  const [partnerCreditHold, setPartnerCreditHold] = useState(false);
+  const [partnerCreditHold, setPartnerCreditHold] = useState(seededPartner?.creditHold ?? false);
   // `||` rather than `??`: an order saved without an expected date reopens with the default.
   const [date, setDate] = useState(draft?.date || futureDate(isPurchase ? 14 : 21));
-  const [currency, setCurrency] = useState(draft?.currency ?? "CAD");
-  const [exchangeRate, setExchangeRate] = useState(draft?.exchangeRateToBase ?? 1);
-  const [terms, setTerms] = useState(draft?.paymentTerms ?? (isPurchase ? "Net 30" : "Net 15"));
-  const [dueDate, setDueDate] = useState(draft?.dueDate ?? futureDate(isPurchase ? 44 : 36));
-  const [shipToName, setShipToName] = useState(draft?.shipToName ?? draft?.partnerLabel ?? "");
-  const [shipToAddressLine1, setShipToAddressLine1] = useState(draft?.shipToAddressLine1 ?? "");
-  const [shipToAddressLine2, setShipToAddressLine2] = useState(draft?.shipToAddressLine2 ?? "");
-  const [shipToCity, setShipToCity] = useState(draft?.shipToCity ?? "");
-  const [shipToRegion, setShipToRegion] = useState(draft?.shipToRegion ?? "");
-  const [shipToPostalCode, setShipToPostalCode] = useState(draft?.shipToPostalCode ?? "");
-  const [shipToCountry, setShipToCountry] = useState(draft?.shipToCountry ?? "CA");
+  const [currency, setCurrency] = useState(draft?.currency ?? seededPartner?.currency ?? "CAD");
+  const [exchangeRate, setExchangeRate] = useState(draft?.exchangeRateToBase ?? (seededPartner?.currency && seededPartner.currency !== "CAD" ? 0 : 1));
+  const seededTerms = draft?.paymentTerms ?? seededPartner?.paymentTerms ?? (isPurchase ? "Net 30" : "Net 15");
+  const [terms, setTerms] = useState(seededTerms);
+  const [dueDate, setDueDate] = useState(draft?.dueDate ?? dueDateForTerms(draft?.date || futureDate(isPurchase ? 14 : 21), seededTerms));
+  const [shipToName, setShipToName] = useState(draft?.shipToName ?? draft?.partnerLabel ?? seededPartner?.name ?? "");
+  const [shipToAddressLine1, setShipToAddressLine1] = useState(draft?.shipToAddressLine1 ?? seededPartner?.addressLine1 ?? "");
+  const [shipToAddressLine2, setShipToAddressLine2] = useState(draft?.shipToAddressLine2 ?? seededPartner?.addressLine2 ?? "");
+  const [shipToCity, setShipToCity] = useState(draft?.shipToCity ?? seededPartner?.city ?? "");
+  const [shipToRegion, setShipToRegion] = useState(draft?.shipToRegion ?? seededPartner?.region ?? "");
+  const [shipToPostalCode, setShipToPostalCode] = useState(draft?.shipToPostalCode ?? seededPartner?.postalCode ?? "");
+  const [shipToCountry, setShipToCountry] = useState(draft?.shipToCountry ?? seededPartner?.country ?? "CA");
   const [deliveryInstructions, setDeliveryInstructions] = useState(draft?.deliveryInstructions ?? "");
   const [fastTrack, setFastTrack] = useState(false);
   const [approvalReason, setApprovalReason] = useState("");
@@ -3868,7 +3981,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, partners, products, war
    */
   const formSignature = JSON.stringify({ partnerId, date, currency, exchangeRate, terms, dueDate, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, freight, freightTaxRate, fees, feeTaxRate, deposit, lines: lines.map((line) => [line.productId, line.quantity, line.unitAmount, line.uomId, line.discountRate, line.taxCode, line.taxRate, line.route, line.projectReference, line.supplyAllocations.map((allocation) => [allocation.salesOrderLineId, allocation.quantity])]) });
   const [openedWith] = useState(formSignature);
-  const dirty = editing ? formSignature !== openedWith : Boolean(partnerId) || lines.some((line) => line.productId) || freight > 0 || fees > 0 || deposit > 0;
+  const dirty = (editing || Boolean(seededPartner)) ? formSignature !== openedWith : Boolean(partnerId) || lines.some((line) => line.productId) || freight > 0 || fees > 0 || deposit > 0;
   // Not memoized by hand: the dismiss hook reads the latest handler through a ref.
   const requestClose = () => { if (dirty) setConfirmingDiscard(true); else onClose(); };
   useDialogDismiss(requestClose, submitting);

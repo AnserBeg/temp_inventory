@@ -200,6 +200,16 @@ test("core workflows show their cross-page handoffs and continue after invoice p
   assert.match(sources.css, /\.process-guide li\.current/);
 });
 
+test("sales orders expose the connected invoice QBO handoff", () => {
+  assert.match(sources.suite, /\{ key: "send-qbo", label: "Send to QBO" \}/);
+  assert.match(sources.suite, /function SalesQboQueue/);
+  assert.match(sources.suite, /salesQboQueueRecords\(state\.salesOrders\)/);
+  assert.match(sources.app, /\{ label: "Send to QBO", detail: "Push the connected invoice", view: "sales-orders", tab: "send-qbo" \}/);
+  assert.match(sources.app, /\{ label: "Sent to QBO"/);
+  assert.match(sources.app, /QBO invoice delivery needs attention/);
+  assert.match(sources.app, /Begins after the invoice reaches QBO/);
+});
+
 test("remote dropdown loading does not flash stale states or lose a newer request", () => {
   assert.match(sources.picker, /const beginLookup = \(nextQuery: string\) => \{\s*setQuery\(nextQuery\);\s*setLookupError\(""\);\s*setLoading\(true\);\s*setOpen\(true\);/);
   assert.match(sources.picker, /let current = true;[\s\S]*if \(current\) setLoading\(false\);[\s\S]*current = false; controller\.abort\(\);/);
