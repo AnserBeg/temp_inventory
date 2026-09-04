@@ -199,10 +199,13 @@ function marker(command: WorkflowCommand) {
 }
 
 function auditStatement(command: WorkflowCommand, entityType: string, entityId: string, action: string, summary: string, metadata: unknown, when = new Date().toISOString()) {
+  const auditMetadata = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    ? { ...(metadata as Record<string, unknown>), notes: documentNotes(command.payload ?? {}) }
+    : { detail: metadata, notes: documentNotes(command.payload ?? {}) };
   return commandD1(command).prepare(`INSERT INTO audit_events
     (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
     SELECT ?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
-    .bind(newId("audit"), entityType, entityId, action, summary, command.actor.label, command.actor.id, command.actor.email, JSON.stringify(metadata), when);
+    .bind(newId("audit"), entityType, entityId, action, summary, command.actor.label, command.actor.id, command.actor.email, JSON.stringify(auditMetadata), when);
 }
 
 function outboxStatement(command: WorkflowCommand, eventType: string, aggregateType: string, aggregateId: string, payload: unknown, when = new Date().toISOString()) {
@@ -1009,8 +1012,8 @@ async function moveInventory(command: WorkflowCommand, movementType: "internal_t
       SELECT ?,?,?,?,?,?,? FROM inventory_balances WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${traceClaim.sql} ${locationClaimSql}`).bind(...claimValues(command, result, transferId), productId, fromLocationId, quantity, ...traceClaim.bindings, ...locationClaimBindings),
     db.prepare(`UPDATE inventory_balances SET on_hand_qty=on_hand_qty-?,version=version+1 WHERE product_id=? AND location_id=? AND on_hand_qty-reserved_qty>=? AND ${marker(command)}`).bind(quantity, productId, fromLocationId, quantity),
     db.prepare(`INSERT INTO inventory_balances (product_id,location_id,on_hand_qty,reserved_qty,version) SELECT ?,?,?,0,1 WHERE ${marker(command)} ON CONFLICT(product_id,location_id) DO UPDATE SET on_hand_qty=on_hand_qty+excluded.on_hand_qty,version=version+1`).bind(productId, destinationId, quantity),
-    db.prepare(`INSERT INTO inventory_transfers (id,number,transfer_type,status,from_warehouse_id,to_warehouse_id,in_transit_location_id,posted_at,posted_by,version)
-      SELECT ?,?,?,?, ?,?,?,?, ?,1 WHERE ${marker(command)}`).bind(transferId, transferNumber, interWarehouse ? "inter_warehouse" : "intra_warehouse", interWarehouse ? "in_transit" : "posted", from.warehouseId, to.warehouseId, interWarehouse ? destinationId : null, postedAt, command.actor.label),
+    db.prepare(`INSERT INTO inventory_transfers (id,number,transfer_type,status,from_warehouse_id,to_warehouse_id,in_transit_location_id,notes,posted_at,posted_by,version)
+      SELECT ?,?,?,?, ?,?,?,?, ?,?,1 WHERE ${marker(command)}`).bind(transferId, transferNumber, interWarehouse ? "inter_warehouse" : "intra_warehouse", interWarehouse ? "in_transit" : "posted", from.warehouseId, to.warehouseId, interWarehouse ? destinationId : null, documentNotes(payload), postedAt, command.actor.label),
     db.prepare(`INSERT INTO inventory_transfer_lines (id,transfer_id,product_id,from_location_id,to_location_id,quantity,lot_id,inventory_unit_id)
       SELECT ?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("transfer-line"), transferId, productId, fromLocationId, requestedTo, quantity, trace.lotId, trace.unitId),
     db.prepare(`INSERT INTO stock_movements (id,movement_type,product_id,quantity,from_location_id,inventory_status,source_document_type,source_document_id,posted_at,posted_by,idempotency_key,lot_id,inventory_unit_id)
@@ -1443,9 +1446,9 @@ async function issueReturnable(command: WorkflowCommand) {
     outboxStatement(command, "returnable.issued", "returnable_obligation", obligationId, { quantity, deposit, paymentId }, when),
   ];
   if (paymentId && paymentNumber) statements.push(
-    db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`)
-      .bind(paymentId,paymentNumber,direction==="customer_holds"?"inbound":"outbound",partnerId,"returnable_deposit_collection",obligationId,deposit,postingDate,paymentMethod,paymentReference,when,command.actor.label,"CAD",deposit),
+    db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,notes,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`)
+      .bind(paymentId,paymentNumber,direction==="customer_holds"?"inbound":"outbound",partnerId,"returnable_deposit_collection",obligationId,deposit,postingDate,paymentMethod,paymentReference,documentNotes(payload),when,command.actor.label,"CAD",deposit),
     auditStatement(command,"payment",paymentId,"returnable_deposit_collection_posted",`${paymentNumber} linked to returnable obligation ${obligationId}.`,{obligationId,partnerId,direction,amount:deposit,paymentMethod,paymentReference},when),
   );
   await db.batch(statements); return finish(command);
@@ -1480,7 +1483,7 @@ async function updateReturnable(command: WorkflowCommand, eventType: "return" | 
     auditStatement(command,"returnable_obligation",id,`returnable_${eventType}`,result.message,{quantity,amount,reason,paymentId},when),outboxStatement(command,`returnable.${eventType}`,"returnable_obligation",id,{quantity,amount,paymentId},when),
   ];
   if (paymentId && paymentNumber) statements.push(
-    db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(paymentId,paymentNumber,obligation.direction==="customer_holds"?"outbound":"inbound",obligation.partnerId,"returnable_deposit_refund",id,amount,postingDate,"returnable_deposit_refund",reason,when,command.actor.label,"CAD",amount),
+    db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,notes,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE ${marker(command)}`).bind(paymentId,paymentNumber,obligation.direction==="customer_holds"?"outbound":"inbound",obligation.partnerId,"returnable_deposit_refund",id,amount,postingDate,"returnable_deposit_refund",reason,documentNotes(payload),when,command.actor.label,"CAD",amount),
     auditStatement(command,"payment",paymentId,"returnable_deposit_refund_posted",`${paymentNumber} linked to returnable obligation ${id}.`,{obligationId:id,partnerId:obligation.partnerId,direction:obligation.direction,amount},when),
   );
   await db.batch(statements); return finish(command);
@@ -1572,9 +1575,9 @@ async function createVendorBill(command: WorkflowCommand, fastTrack = false) {
       SELECT ?,?,?,?,?,?,? FROM purchase_orders WHERE id=? AND version=? AND lifecycle_status='approved' AND ordered_at IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM vendor_bills WHERE vendor_id=? AND vendor_invoice_number=?) AND ${lineClaims}`)
       .bind(...claimValues(command, result, billId), purchaseOrderId, order.version, order.vendorId, vendorInvoiceNumber, ...lineClaimBindings),
-    db.prepare(`INSERT INTO vendor_bills (id,number,vendor_id,purchase_order_id,status,match_status,total_cents,due_date,currency,vendor_invoice_number,invoice_date,posted_at,approved_at,approved_by,subtotal_cents,tax_cents,paid_cents,hold_reason,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,version)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,1 WHERE ${marker(command)}`)
-      .bind(billId, number, order.vendorId, purchaseOrderId, hold ? "on_hold" : "approved", matchStatus, total, dueDate, currency, vendorInvoiceNumber, invoiceDate, when, fastTrack ? when : null, fastTrack ? command.actor.label : null, subtotal, tax, hold ? JSON.stringify(exceptions) : null, exchange, baseTotal, taxRate, optionalText(payload, "taxCode"), optionalText(payload, "paymentTerms")),
+    db.prepare(`INSERT INTO vendor_bills (id,number,vendor_id,purchase_order_id,status,match_status,total_cents,due_date,currency,vendor_invoice_number,invoice_date,posted_at,approved_at,approved_by,subtotal_cents,tax_cents,paid_cents,hold_reason,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,notes,version)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,1 WHERE ${marker(command)}`)
+      .bind(billId, number, order.vendorId, purchaseOrderId, hold ? "on_hold" : "approved", matchStatus, total, dueDate, currency, vendorInvoiceNumber, invoiceDate, when, fastTrack ? when : null, fastTrack ? command.actor.label : null, subtotal, tax, hold ? JSON.stringify(exceptions) : null, exchange, baseTotal, taxRate, optionalText(payload, "taxCode"), optionalText(payload, "paymentTerms"), documentNotes(payload)),
   ];
   normalized.forEach((line) => statements.push(db.prepare(`INSERT INTO vendor_bill_lines (id,vendor_bill_id,purchase_order_line_id,product_id,quantity,unit_cost_cents,line_total_cents,match_status,match_details_json) SELECT ?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("vendor-bill-line"), billId, line.poLineId, line.productId, line.quantity, line.unitCost, line.lineTotal, line.status, JSON.stringify(line.details))));
   charges.forEach((charge) => statements.push(db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,'vendor_bill',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("charge"), billId, charge.chargeType, charge.description, charge.amount, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRate, charge.taxAmount, when)));
@@ -1777,7 +1780,7 @@ async function allocateLandedCost(command: WorkflowCommand) {
           AND ROUND(COALESCE((SELECT SUM(CASE WHEN dc.direction='subtract' THEN -dc.amount_cents ELSE dc.amount_cents END) FROM document_charges dc WHERE dc.document_type='vendor_bill' AND dc.document_id=vb.id AND dc.refundable=0 AND dc.charge_type IN ('freight','fuel_surcharge','handling','customs','brokerage')),0)*vb.exchange_rate_to_base)>=?)
         AND (SELECT COUNT(*) FROM cost_layers cl JOIN stock_movements sm ON sm.id=cl.receipt_movement_id JOIN purchase_order_lines pol ON pol.id=sm.purchase_order_line_id WHERE cl.id IN (SELECT value FROM json_each(?)) AND cl.remaining_qty=cl.received_qty AND cl.remaining_qty>0 AND pol.purchase_order_id=?)=?`)
       .bind(...claimValues(command, result, id), sourceDocumentType, sourceDocumentId, sourceDocumentId, source.purchaseOrderId, amount, layerIdsJson, source.purchaseOrderId, layerIds.length),
-    db.prepare(`INSERT INTO landed_cost_allocations (id,number,source_document_type,source_document_id,amount_cents,allocation_basis,posted_at,posted_by) SELECT ?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(id, number, sourceDocumentType, sourceDocumentId, amount, basis, postedAt, command.actor.label),
+    db.prepare(`INSERT INTO landed_cost_allocations (id,number,source_document_type,source_document_id,amount_cents,allocation_basis,notes,posted_at,posted_by) SELECT ?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(id, number, sourceDocumentType, sourceDocumentId, amount, basis, documentNotes(payload), postedAt, command.actor.label),
   ];
   shares.forEach((share) => {
     statements.push(
@@ -3297,8 +3300,8 @@ async function postDropShipDelivery(command: WorkflowCommand) {
         AND sol.ordered_qty-sol.canceled_qty-COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)>=?
         AND pol.ordered_qty-COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.purchase_order_line_id=pol.id),0)>=?`)
       .bind(...claimValues(command, result, id), salesLineId, source.salesVersion, source.purchaseVersion, source.allocationVersion, quantity, quantity, quantity),
-    db.prepare(`INSERT INTO drop_ship_deliveries (id,number,purchase_order_id,purchase_order_line_id,sales_order_id,sales_order_line_id,product_id,quantity,reversed_qty,status,delivery_date,external_reference,posted_at,posted_by,version)
-      SELECT ?,?,?,?,?,?,?,?,0,'posted',?,?,?,?,1 WHERE ${marker(command)}`).bind(id, number, source.purchaseOrderId, source.purchaseLineId, source.salesOrderId, salesLineId, source.productId, quantity, deliveryDate, externalReference, postedAt, command.actor.label),
+    db.prepare(`INSERT INTO drop_ship_deliveries (id,number,purchase_order_id,purchase_order_line_id,sales_order_id,sales_order_line_id,product_id,quantity,reversed_qty,status,delivery_date,external_reference,notes,posted_at,posted_by,version)
+      SELECT ?,?,?,?,?,?,?,?,0,'posted',?,?,?,?,?,1 WHERE ${marker(command)}`).bind(id, number, source.purchaseOrderId, source.purchaseLineId, source.salesOrderId, salesLineId, source.productId, quantity, deliveryDate, externalReference, documentNotes(payload), postedAt, command.actor.label),
     db.prepare(`UPDATE sales_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(source.salesOrderId, source.salesVersion),
     db.prepare(`UPDATE purchase_orders SET version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(source.purchaseOrderId, source.purchaseVersion),
     db.prepare(`UPDATE supply_allocations SET received_qty=received_qty+?,updated_at=?,version=version+1 WHERE id=? AND version=? AND allocated_qty-received_qty>=? AND ${marker(command)}`)
@@ -3482,8 +3485,8 @@ async function recordPaymentV2(command:WorkflowCommand){
         AND document.status NOT IN ('void','paid','credited'${customer ? "" : ",'on_hold'"})
         AND document.paid_cents+?+COALESCE((SELECT SUM(amount_cents) FROM ${creditsTable} WHERE ${creditsColumn}=document.id AND status='posted'),0)<=document.total_cents`)
       .bind(...claimValues(command, result, id), documentId, row.version, amount),
-    db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
-      .bind(id, number, customer ? "inbound" : "outbound", row.partnerId, documentType, documentId, amount, paymentDate, method, reference, when, command.actor.label, row.currency, exchange, base),
+    db.prepare(`INSERT INTO payments (id,number,direction,partner_id,document_type,document_id,amount_cents,payment_date,method,reference,notes,posted_at,posted_by,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
+      .bind(id, number, customer ? "inbound" : "outbound", row.partnerId, documentType, documentId, amount, paymentDate, method, reference, documentNotes(payload), when, command.actor.label, row.currency, exchange, base),
     db.prepare(`UPDATE ${table} SET paid_cents=paid_cents+?,status=CASE WHEN paid_cents+?+COALESCE((SELECT SUM(amount_cents) FROM ${creditsTable} WHERE ${creditsColumn}=${table}.id AND status='posted'),0)>=total_cents THEN 'paid' ELSE 'partially_paid' END,version=version+1
       WHERE id=? AND version=? AND paid_cents+?+COALESCE((SELECT SUM(amount_cents) FROM ${creditsTable} WHERE ${creditsColumn}=${table}.id AND status='posted'),0)<=total_cents AND ${marker(command)}`)
       .bind(amount, amount, documentId, row.version, amount),
@@ -3502,7 +3505,7 @@ async function createFinancialCreditV2(command:WorkflowCommand,type:"vendor"|"cu
     SELECT ?,?,?,?,?,?,? FROM ${documentTable} document WHERE document.id=? AND document.version=?
       AND document.status NOT IN ('void','paid','credited'${type==="vendor"?",'on_hold'":""})
       AND document.paid_cents+?+COALESCE((SELECT SUM(amount_cents) FROM ${table} WHERE ${documentCol}=document.id AND status='posted'),0)<=document.total_cents`)
-    .bind(...claimValues(command,result,id),documentId,document.version,amount),db.prepare(`INSERT INTO ${table} (id,number,${partnerCol},${documentCol},${orderCol},amount_cents,reason,status,posted_at,posted_by,version,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,'posted',?,?,1,?,?,? WHERE ${marker(command)}`).bind(id,number,document.partnerId,documentId,document.orderId,amount,reason,postedAt,command.actor.label,document.currency,exchange,base),db.prepare(`UPDATE ${documentTable} SET status=CASE WHEN paid_cents+COALESCE((SELECT SUM(amount_cents) FROM ${table} WHERE ${documentCol}=${documentTable}.id AND status='posted'),0)>=total_cents THEN 'credited' WHEN paid_cents>0 THEN 'partially_paid' ELSE status END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(documentId,document.version),auditStatement(command,`${type}_credit`,id,`${type}_credit_posted`,result.message,{documentId,partnerId:document.partnerId,currency:document.currency,amount,base,reason,postingDate},when),outboxStatement(command,`${type}_credit.posted`,`${type}_credit`,id,{documentId,amount,base,postingDate},when)]);return finish(command);
+    .bind(...claimValues(command,result,id),documentId,document.version,amount),db.prepare(`INSERT INTO ${table} (id,number,${partnerCol},${documentCol},${orderCol},amount_cents,reason,notes,status,posted_at,posted_by,version,currency,exchange_rate_to_base,base_amount_cents) SELECT ?,?,?,?,?,?,?,?,'posted',?,?,1,?,?,? WHERE ${marker(command)}`).bind(id,number,document.partnerId,documentId,document.orderId,amount,reason,documentNotes(payload),postedAt,command.actor.label,document.currency,exchange,base),db.prepare(`UPDATE ${documentTable} SET status=CASE WHEN paid_cents+COALESCE((SELECT SUM(amount_cents) FROM ${table} WHERE ${documentCol}=${documentTable}.id AND status='posted'),0)>=total_cents THEN 'credited' WHEN paid_cents>0 THEN 'partially_paid' ELSE status END,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`).bind(documentId,document.version),auditStatement(command,`${type}_credit`,id,`${type}_credit_posted`,result.message,{documentId,partnerId:document.partnerId,currency:document.currency,amount,base,reason,postingDate},when),outboxStatement(command,`${type}_credit.posted`,`${type}_credit`,id,{documentId,amount,base,postingDate},when)]);return finish(command);
 }
 
 async function voidCustomerInvoice(command: WorkflowCommand) {
@@ -3597,7 +3600,7 @@ async function createCustomerInvoiceV2(command:WorkflowCommand){
   const lineClaimBindings = lines.flatMap((line) => [line.id, salesOrderId, line.quantity]);
   const statements: D1PreparedStatement[] = [
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM sales_orders WHERE id=? AND version=? AND lifecycle_status IN ('confirmed','canceled') AND ${lineClaims}`).bind(...claimValues(command, result, id), salesOrderId, order.version, ...lineClaimBindings),
-    db.prepare(`INSERT INTO customer_invoices (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) SELECT ?,?,?,?,'posted',?,?,?,?,?,0,?,?,?,?,?,?,?, ?,1 WHERE ${marker(command)}`).bind(id, number, order.customerId, salesOrderId, invoiceDate, dueDate, subtotal, tax, total, order.currency, exchange, base, headerTaxRate, headerTaxCode, optionalText(payload, "paymentTerms"), when, command.actor.label),
+    db.prepare(`INSERT INTO customer_invoices (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,notes,posted_at,posted_by,version) SELECT ?,?,?,?,'posted',?,?,?,?,?,0,?,?,?,?,?,?,?,?, ?,1 WHERE ${marker(command)}`).bind(id, number, order.customerId, salesOrderId, invoiceDate, dueDate, subtotal, tax, total, order.currency, exchange, base, headerTaxRate, headerTaxCode, optionalText(payload, "paymentTerms"), documentNotes(payload), when, command.actor.label),
   ];
   lines.forEach((row) => statements.push(db.prepare(`INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,bin_location_id,quantity,unit_price_cents,line_total_cents) SELECT ?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("invoice-line"), id, row.id, row.productId, row.binLocationId, row.quantity, row.unitPrice, row.total)));
   orderCharges.forEach((row) => statements.push(db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,'customer_invoice',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("charge"), id, row.chargeType, row.description, row.amount, row.direction, row.taxable, row.refundable, row.taxCode, row.taxRate, Math.abs(row.taxAmount), when)));

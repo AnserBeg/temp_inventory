@@ -2475,7 +2475,7 @@ function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBac
   const qboComplete = activeVendorBills.length > 0 && activeVendorBills.every((bill) => bill.qboStatus?.toLowerCase() === "succeeded");
   const qboPending = activeVendorBills.length > 0 && !qboComplete && !qboFailed;
   const fulfillmentDocuments: RecordProgressDocument[] = [
-    ...po.receipts.map((receipt) => ({ number: receipt.number, detail: `${receipt.quantity} received · ${formatDocumentDate(receipt.postedAt)}${receipt.packingSlipNumber ? ` · slip ${receipt.packingSlipNumber}` : ""}` })),
+    ...po.receipts.map((receipt) => ({ number: receipt.number, detail: `${receipt.quantity} received · ${formatDocumentDate(receipt.postedAt)}${receipt.packingSlipNumber ? ` · slip ${receipt.packingSlipNumber}` : ""}${receipt.notes ? ` · ${receipt.notes}` : ""}` })),
     ...po.supplierDeliveries.map((delivery) => ({ number: delivery.number, detail: `${delivery.quantity} delivered · ${formatDocumentDate(delivery.deliveryDate)}${delivery.externalReference ? ` · ${delivery.externalReference}` : ""}` })),
   ];
   const billDocuments: RecordProgressDocument[] = activeVendorBills.map((bill) => ({
@@ -2580,6 +2580,7 @@ function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBac
         ["Supplier quote", po.supplierQuoteNumber ?? "Not imported"],
         ["Supplier reference", po.supplierReference ?? "Not recorded"],
         ["Project reference", po.projectReference ?? "Stock replenishment"],
+        ["Notes", po.notes ?? "None"],
       ]} />
       <DocumentTotalsPanel totals={totals} currency={po.currency} />
     </div>
@@ -2845,6 +2846,7 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
         ["Currency", so.exchangeRateToBase === 1 ? so.currency : `${so.currency} · rate ${so.exchangeRateToBase} to CAD`],
         ["Salesperson", so.salesPerson],
         ["Project reference", so.project || "—"],
+        ["Notes", so.notes ?? "None"],
       ]} />
       <DocumentTotalsPanel totals={totals} currency={so.currency} />
     </div>
@@ -2852,7 +2854,7 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
     {/* Carrier paperwork was required at posting and then invisible, so "where is my order"
         had no answer on any screen. */}
     <section className="panel"><PanelHeading title="Shipments" detail={so.shipments.length ? `${so.shipments.length} posted` : undefined} />
-      {so.shipments.length ? <div className="responsive-table"><table><caption className="sr-only">Posted shipments and carrier references</caption><thead><tr><SortableHeader label="Shipment" column="number" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Posted" column="posted" sort={shipmentTable.sort} setSort={shipmentTable.setSort} defaultDirection="desc" /><SortableHeader label="Status" column="status" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Carrier" column="carrier" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Service level" column="service" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Tracking" column="tracking" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Bill of lading" column="billOfLading" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /></tr></thead><tbody>{shipmentTable.rows.map((shipment) => <tr key={shipment.number}><td><strong>{shipment.number}</strong></td><td>{formatDocumentDate(shipment.postedAt)}</td><td><StatusBadge>{shipment.status}</StatusBadge></td><td>{shipment.carrier || <span className="muted">Not recorded</span>}</td><td>{shipment.serviceLevel || <span className="muted">—</span>}</td><td>{shipment.trackingNumber || <span className="muted">—</span>}</td><td>{shipment.billOfLadingNumber || <span className="muted">—</span>}</td></tr>)}</tbody></table></div>
+      {so.shipments.length ? <div className="responsive-table"><table><caption className="sr-only">Posted shipments and carrier references</caption><thead><tr><SortableHeader label="Shipment" column="number" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Posted" column="posted" sort={shipmentTable.sort} setSort={shipmentTable.setSort} defaultDirection="desc" /><SortableHeader label="Status" column="status" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Carrier" column="carrier" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Service level" column="service" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Tracking" column="tracking" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><SortableHeader label="Bill of lading" column="billOfLading" sort={shipmentTable.sort} setSort={shipmentTable.setSort} /><th>Notes</th></tr></thead><tbody>{shipmentTable.rows.map((shipment) => <tr key={shipment.number}><td><strong>{shipment.number}</strong></td><td>{formatDocumentDate(shipment.postedAt)}</td><td><StatusBadge>{shipment.status}</StatusBadge></td><td>{shipment.carrier || <span className="muted">Not recorded</span>}</td><td>{shipment.serviceLevel || <span className="muted">—</span>}</td><td>{shipment.trackingNumber || <span className="muted">—</span>}</td><td>{shipment.billOfLadingNumber || <span className="muted">—</span>}</td><td>{shipment.notes || <span className="muted">—</span>}</td></tr>)}</tbody></table></div>
         : <div className="empty-inline">No shipment has been posted against this order.</div>}
     </section>
   </div>;
@@ -3988,6 +3990,7 @@ function CounterSaleScreen({ warehouseId, salesPeople, taxDefaultRateBps, canPos
   const [paymentMethod, setPaymentMethod] = useState("cash");
   const [paymentReference, setPaymentReference] = useState("");
   const [projectReference, setProjectReference] = useState("");
+  const [notes, setNotes] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   // Set when the server reports the attempt key already belongs to a posted sale.
@@ -4043,7 +4046,7 @@ function CounterSaleScreen({ warehouseId, salesPeople, taxDefaultRateBps, canPos
       customerId, salesPersonId, postingDate, settlement, currency, exchangeRateToBase: exchangeRate,
       paymentTerms: settlement === "pay_now" ? "Due on receipt" : paymentTerms,
       dueDate: settlement === "pay_now" ? postingDate : dueDate,
-      paymentMethod, paymentReference, projectReference,
+      paymentMethod, paymentReference, projectReference, notes: notes.trim() || undefined,
       shipToName: customer?.label,
       shipToAddressLine1: customer?.addressLine1,
       shipToAddressLine2: customer?.addressLine2,
@@ -4208,6 +4211,7 @@ function CounterSaleScreen({ warehouseId, salesPeople, taxDefaultRateBps, canPos
         <label>Customer / job reference<input value={projectReference} onChange={(event) => setProjectReference(event.target.value)} placeholder="Optional" /></label>
         <label>Currency<select value={currency} onChange={(event) => { const next = event.target.value; setCurrency(next); setExchangeRate(next === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>
         {currency !== "CAD" ? <label>Exchange rate to CAD<input type="number" min="0.0001" step="0.0001" value={exchangeRate || ""} onChange={(event) => setExchangeRate(Number(event.target.value))} required /></label> : null}
+        <label className="project-field">Notes<textarea value={notes} onChange={(event) => setNotes(event.target.value)} maxLength={4000} rows={3} placeholder="Optional details for this sale" /><small>Saved on the counter sale, pickup shipment, invoice, and payment.</small></label>
       </div>
       {customer?.creditHold ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>Customer is on credit hold.</strong><p>{settlement === "pay_now" ? "Payment now is still available; charging the account is blocked." : "Switch to payment now or clear the credit hold."}</p></div></div> : null}
     </section>
@@ -4388,6 +4392,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
   const [shipToPostalCode, setShipToPostalCode] = useState(draft?.shipToPostalCode ?? seededPartner?.postalCode ?? "");
   const [shipToCountry, setShipToCountry] = useState(draft?.shipToCountry ?? seededPartner?.country ?? "CA");
   const [deliveryInstructions, setDeliveryInstructions] = useState(draft?.deliveryInstructions ?? "");
+  const [notes, setNotes] = useState(draft?.notes ?? "");
   const [fastTrack, setFastTrack] = useState(false);
   const [approvalReason, setApprovalReason] = useState("");
   const [shipToAddressId, setShipToAddressId] = useState("");
@@ -4415,7 +4420,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
    * silently discard a twelve-line order. An existing draft compares against what it opened
    * with, so closing it untouched does not warn about losing changes that were never made.
    */
-  const formSignature = JSON.stringify({ partnerId, salesPersonId, date, currency, exchangeRate, terms, dueDate, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, freight, freightTaxRate, fees, feeTaxRate, deposit, lines: lines.map((line) => [line.productId, line.binLocationId, line.quantity, line.unitAmount, line.uomId, line.discountRate, line.taxCode, line.taxRate, line.route, line.projectReference, line.supplyAllocations.map((allocation) => [allocation.salesOrderLineId, allocation.quantity])]) });
+  const formSignature = JSON.stringify({ partnerId, salesPersonId, date, currency, exchangeRate, terms, dueDate, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, notes, freight, freightTaxRate, fees, feeTaxRate, deposit, lines: lines.map((line) => [line.productId, line.binLocationId, line.quantity, line.unitAmount, line.uomId, line.discountRate, line.taxCode, line.taxRate, line.route, line.projectReference, line.supplyAllocations.map((allocation) => [allocation.salesOrderLineId, allocation.quantity])]) });
   const [openedWith] = useState(formSignature);
   const dirty = (editing || Boolean(seededPartner)) ? formSignature !== openedWith : Boolean(partnerId) || lines.some((line) => line.productId) || freight > 0 || fees > 0 || deposit > 0;
   // Not memoized by hand: the dismiss hook reads the latest handler through a ref.
@@ -4569,7 +4574,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
         fees > 0 ? { kind: "charge", chargeType: "fee", description: "Other fees", amountCents: Math.round(fees * 100), direction: "add", taxable: feeTaxRate > 0, refundable: false, taxCode: feeTaxRate > 0 ? "GST" : "Zero", taxRateBps: Math.round(feeTaxRate * 100) } : null,
         deposit > 0 ? { kind: "charge", chargeType: "returnable_deposit", description: "Refundable core / empty deposit", amountCents: Math.round(deposit * 100), direction: "add", taxable: false, refundable: true, taxCode: "EXEMPT", taxRateBps: 0 } : null,
       ].filter(Boolean);
-      await onSubmit({ ...(isPurchase ? { vendorId: partnerId, expectedDate: date } : { customerId: partnerId, salesPersonId, requestedDate: date, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions }), warehouseId, lines: [...normalizedLines, ...chargeLines], currency, exchangeRateToBase: exchangeRate, paymentTerms: terms, dueDate, projectReference: draft?.projectReference, fastTrack, ...(fastTrack ? { approvalReason: approvalReason.trim() } : {}) });
+      await onSubmit({ ...(isPurchase ? { vendorId: partnerId, expectedDate: date } : { customerId: partnerId, salesPersonId, requestedDate: date, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions }), warehouseId, lines: [...normalizedLines, ...chargeLines], currency, exchangeRateToBase: exchangeRate, paymentTerms: terms, dueDate, projectReference: draft?.projectReference, notes: notes.trim() || undefined, fastTrack, ...(fastTrack ? { approvalReason: approvalReason.trim() } : {}) });
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The order could not be created. Your entries are still here."); }
     finally { setSubmitting(false); }
   };
@@ -4587,6 +4592,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
     {error || shownProblems.length ? <div className="error-summary" role="alert" tabIndex={-1}><strong>Review the order</strong>{error ? <p>{error}</p> : null}{shownProblems.length ? <ul className="error-list">{shownProblems.map((problem) => <li key={problem.field}><button type="button" className="text-button" onClick={() => focusField(problem.field)}>{problem.message}</button></li>)}</ul> : null}</div> : null}
     {!isPurchase && partnerCreditHold ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>This customer is on credit hold</strong><p>The draft can be saved, but it cannot be confirmed until accounting releases the hold.</p></div></div> : null}
     <div className="command-form form-grid composer-header-fields"><label data-field="partnerId"><span>{isPurchase ? "Vendor" : "Customer"}{requiredMark}</span><ReferenceSearchSelect kind="partners" role={partnerRole} value={partnerId} initialOptions={initialPartnerOptions} quickCreate={partnerRole} onSelect={(option) => { setPartnerId(option.id); setPartnerCreditHold(option.creditHold === true); const nextCurrency = option.currency || "CAD"; const nextTerms = option.paymentTerms || (isPurchase ? "Net 30" : "Net 15"); setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); if (!isPurchase) { setShipToName(option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); } }} placeholder={`Search ${partnerRole} name, code, or email`} />{fieldError("partnerId")}</label>{!isPurchase ? <label data-field="salesPersonId"><span>Salesperson{requiredMark}</span><select value={salesPersonId} onChange={(event) => setSalesPersonId(event.target.value)} {...fieldProps("salesPersonId")}><option value="">Select salesperson</option>{salesPeople.filter((person) => person.active || person.id === salesPersonId).map((person) => <option key={person.id} value={person.id}>{person.name} · {person.code}</option>)}</select>{fieldError("salesPersonId")}</label> : null}<label data-field="date"><span>{isPurchase ? "Expected delivery" : "Requested delivery"}{requiredMark}</span><input type="date" value={date} {...fieldProps("date")} onChange={(event) => { const nextDate = event.target.value; setDate(nextDate); setDueDate(dueDateForTerms(nextDate, terms)); }} />{fieldError("date")}</label><label>Currency<select value={currency} onChange={(event) => { const nextCurrency = event.target.value; setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>{currency !== "CAD" && <label data-field="exchangeRate"><span>Exchange rate to CAD{requiredMark}</span><NumberField min="0.0001" step="0.0001" value={exchangeRate} onChange={setExchangeRate} {...fieldProps("exchangeRate")} />{fieldError("exchangeRate")}</label>}<label>Payment terms<select value={terms} onChange={(event) => { const nextTerms = event.target.value; setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label data-field="dueDate"><span>Due date{requiredMark}</span><input type="date" value={dueDate} {...fieldProps("dueDate")} onChange={(event) => setDueDate(event.target.value)} />{fieldError("dueDate")}</label></div>
+    <fieldset className="composer-lines composer-document-notes"><legend>Document notes</legend><label>Notes (optional)<textarea value={notes} onChange={(event) => setNotes(event.target.value)} maxLength={4000} rows={4} placeholder={`Details to keep with this ${isPurchase ? "purchase order" : "sales order"}`} /><small>Visible on the order and its printable document.</small></label></fieldset>
     {!isPurchase ? <fieldset className="composer-lines"><legend>Ship-to address</legend><div className="command-form form-grid composer-header-fields"><label className="project-field" data-field="shipToAddressLine1"><span>Business or street address{requiredMark}</span><AddressAutocomplete value={shipToAddressLine1} country={shipToCountry} onChange={setShipToAddressLine1} onAddressSelected={(selected) => { setShipToAddressLine1(selected.addressLine1); setShipToAddressLine2(selected.addressLine2); setShipToCity(selected.city); setShipToRegion(selected.region); setShipToPostalCode(selected.postalCode); setShipToCountry(selected.country || shipToCountry); if (selected.placeName) setShipToName(selected.placeName); }} required ariaInvalid={Boolean(fieldMessage("shipToAddressLine1"))} ariaDescribedBy={fieldMessage("shipToAddressLine1") ? `${errorId}-shipToAddressLine1` : undefined} />{fieldError("shipToAddressLine1")}</label><label data-field="shipToName"><span>Recipient / business{requiredMark}</span><input value={shipToName} onChange={(event) => setShipToName(event.target.value)} required {...fieldProps("shipToName")} />{fieldError("shipToName")}</label><label>Address line 2<input value={shipToAddressLine2} onChange={(event) => setShipToAddressLine2(event.target.value)} autoComplete="address-line2" /></label><label data-field="shipToCity"><span>City{requiredMark}</span><input value={shipToCity} onChange={(event) => setShipToCity(event.target.value)} required autoComplete="address-level2" {...fieldProps("shipToCity")} />{fieldError("shipToCity")}</label><label data-field="shipToRegion"><span>Province / region{requiredMark}</span><input value={shipToRegion} onChange={(event) => setShipToRegion(event.target.value)} required autoComplete="address-level1" {...fieldProps("shipToRegion")} />{fieldError("shipToRegion")}</label><label data-field="shipToPostalCode"><span>Postal code{requiredMark}</span><input value={shipToPostalCode} onChange={(event) => setShipToPostalCode(event.target.value)} required autoComplete="postal-code" {...fieldProps("shipToPostalCode")} />{fieldError("shipToPostalCode")}</label><label data-field="shipToCountry"><span>Country{requiredMark}</span><input value={shipToCountry} onChange={(event) => setShipToCountry(event.target.value.toUpperCase())} required autoComplete="country" {...fieldProps("shipToCountry")} />{fieldError("shipToCountry")}</label><label>Delivery instructions<input value={deliveryInstructions} onChange={(event) => setDeliveryInstructions(event.target.value)} placeholder="Dock, access, or appointment details" /></label><label className="project-field">Use a saved customer delivery address<ReferenceSearchSelect kind="partnerAddresses" partnerId={partnerId} value={shipToAddressId} initialOptions={[]} onSelect={(option) => { setShipToAddressId(option.id); setShipToName(option.contactName || option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); if (option.deliveryInstructions) setDeliveryInstructions(option.deliveryInstructions); }} placeholder={partnerId ? "Search saved delivery addresses" : "Select a customer first"} /><small>These are customer destinations. The Ship-from bin or yard is shown on each product line.</small></label></div><div className="composer-address-actions"><button type="button" className="button secondary" disabled={savingAddress || !partnerId || !shipToAddressLine1.trim() || !shipToCity.trim()} onClick={() => void saveShipToAddress()}>{savingAddress ? "Saving…" : "Save to this customer's address book"}</button>{addressNotice ? <span className="read-only-label" role="status">{addressNotice}</span> : null}</div></fieldset> : null}
     <section className="composer-lines" aria-labelledby="composer-lines-title">
       <div className="composer-section-heading"><div><strong id="composer-lines-title">Product lines</strong></div><button type="button" className="button secondary" onClick={() => setLines((current) => [...current, initialLine()])}>Add product line</button></div>
@@ -4673,6 +4679,7 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
   const [quantity, setQuantity] = useState(command.kind === "count" ? initialBalance?.recordedQuantity ?? 0 : defaults.quantity);
   const [secondaryQuantity, setSecondaryQuantity] = useState(defaults.secondaryQuantity);
   const [reason, setReason] = useState("");
+  const [notes, setNotes] = useState("");
   const [disposition, setDisposition] = useState(defaults.disposition);
   const [expectedDate, setExpectedDate] = useState(futureDate(7));
   const [carrier, setCarrier] = useState(command.kind === "immediate-sale" ? "Customer pickup" : "");
@@ -4731,7 +4738,7 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
   const countPayload = () => {
     // The batch receipt builds its own payload, so the truck's paperwork has to be attached
     // here too — otherwise the fields above post nothing on a multi-line receipt.
-    if (isBatchReceipt) return { lines: receiptLines.filter((line) => line.quantity > 0), warehouseId, quarantineLocationId, postingDate: receiptDate, ...(packingSlipNumber.trim() ? { packingSlipNumber: packingSlipNumber.trim() } : {}) };
+    if (isBatchReceipt) return { lines: receiptLines.filter((line) => line.quantity > 0), warehouseId, quarantineLocationId, postingDate: receiptDate, notes: notes.trim() || undefined, ...(packingSlipNumber.trim() ? { packingSlipNumber: packingSlipNumber.trim() } : {}) };
     const lineId = ["receive", "close", "reopen", "reverse", "vendor-return"].includes(command.kind)
       ? selectedPoLine?.id
       : ["reserve", "ship", "immediate-sale", "customer-return"].includes(command.kind)
@@ -4739,7 +4746,7 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
         : undefined;
     const lineUomId = ["receive", "close", "reopen", "reverse", "vendor-return"].includes(command.kind) ? selectedPoLine?.orderedUomId : ["reserve", "ship", "immediate-sale", "customer-return"].includes(command.kind) ? selectedSoLine?.orderedUomId : undefined;
     const locationId = command.kind === "count" ? selectedCountBalance?.locationId : ["receive", "vendor-return", "immediate-sale", "customer-return"].includes(command.kind) ? (command.kind === "customer-return" && disposition !== "available" ? quarantineLocationId : postingLocationId) : undefined;
-    return { quantity, quarantineQuantity: secondaryQuantity, reason, disposition, expectedDate, carrier, serviceLevel, trackingNumber, billOfLadingNumber, locationId, quarantineLocationId, uomId: lineUomId, recordedQuantity: selectedCountBalance?.recordedQuantity, balanceVersion: selectedCountBalance?.version,
+    return { quantity, quarantineQuantity: secondaryQuantity, reason, notes: notes.trim() || undefined, disposition, expectedDate, carrier, serviceLevel, trackingNumber, billOfLadingNumber, locationId, quarantineLocationId, uomId: lineUomId, recordedQuantity: selectedCountBalance?.recordedQuantity, balanceVersion: selectedCountBalance?.version,
       // Goods that arrived on Friday and are keyed on Monday belong to Friday's period, and the
       // vendor's packing slip is what the receipt gets reconciled against.
       ...(["receive", "immediate-sale"].includes(command.kind) ? { postingDate: receiptDate, warehouseId, ...(packingSlipNumber.trim() ? { packingSlipNumber: packingSlipNumber.trim() } : {}) } : {}), ...(lotNumber.trim() ? { lotNumber: lotNumber.trim() } : {}), ...(serialNumber.trim() ? { serialNumber: serialNumber.trim() } : {}), ...(lotId ? { lotId } : {}), ...(inventoryUnitId ? { inventoryUnitId } : {}), ...(overReceiptApprovalId.trim() ? { approvalId: overReceiptApprovalId.trim() } : {}), ...(lineId ? { lineId } : {}) };
@@ -4831,6 +4838,7 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
     {error && <div className="error-summary" role="alert"><strong>Review the highlighted information</strong><p>{error}</p></div>}
     <fieldset className="command-fields-lock" disabled={command.kind === "count" && Boolean(countApproval)}>
       <CommandFields receiptDate={receiptDate} setReceiptDate={setReceiptDate} packingSlipNumber={packingSlipNumber} setPackingSlipNumber={setPackingSlipNumber} warehouseId={warehouseId} kind={command.kind} po={effectivePo} so={effectiveSo} purchaseLines={po?.lines ?? []} salesLines={so?.lines ?? []} selectedPoLineId={selectedPoLine?.id ?? ""} selectedSoLineId={selectedSoLine?.id ?? ""} setSelectedPoLineId={choosePoLine} setSelectedSoLineId={chooseSoLine} quantity={quantity} secondaryQuantity={secondaryQuantity} setQuantity={setQuantity} setSecondaryQuantity={setSecondaryQuantity} receiptLines={receiptLines} updateReceiptLine={updateReceiptLine} receiveAllOpenLines={receiveAllOpenLines} canPostFinancial={canPostFinancial} lotNumber={lotNumber} setLotNumber={setLotNumber} serialNumber={serialNumber} setSerialNumber={setSerialNumber} lotId={lotId} setLotId={setLotId} inventoryUnitId={inventoryUnitId} setInventoryUnitId={setInventoryUnitId} overReceiptApprovalId={overReceiptApprovalId} setOverReceiptApprovalId={setOverReceiptApprovalId} reason={reason} setReason={setReason} disposition={disposition} setDisposition={setDisposition} expectedDate={expectedDate} setExpectedDate={setExpectedDate} carrier={carrier} setCarrier={setCarrier} serviceLevel={serviceLevel} setServiceLevel={setServiceLevel} trackingNumber={trackingNumber} setTrackingNumber={setTrackingNumber} billOfLadingNumber={billOfLadingNumber} setBillOfLadingNumber={setBillOfLadingNumber} max={max} countBalances={countBalances} countLocationId={countLocationId} setCountLocationId={chooseCountLocation} usableLocations={usableLocations} quarantineLocations={quarantineLocations} postingLocationId={postingLocationId} setPostingLocationId={setPostingLocationId} quarantineLocationId={quarantineLocationId} setQuarantineLocationId={setQuarantineLocationId} />
+      <div className="command-form form-grid"><label className="project-field">Document notes (optional)<textarea value={notes} onChange={(event) => setNotes(event.target.value)} maxLength={4000} rows={3} placeholder="Details to keep with this document" /><small>Saved with this posting and included in its audit history.</small></label></div>
     </fieldset>
     {command.kind === "count" && approvalRequired ? <div className={`count-approval-status ${countApproval?.status ?? "required"}`} role="status"><strong>{countApproval ? `Approval ${countApproval.status}` : "Manager approval required"}</strong><p>{approvalMessage}</p>{countApproval ? <small>Request ID: {countApproval.id} · Version {countApproval.version}</small> : null}</div> : null}
     <ImpactPreview lines={impact} />
@@ -5111,6 +5119,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
       paymentTerms: text(item.paymentTerms) || undefined,
       dueDate: text(item.dueDate) || undefined,
       projectReference: text(item.projectReference) || undefined,
+      notes: text(item.notes) || undefined,
       supplierQuoteNumber: text(item.supplierQuoteNumber) || undefined,
       supplierReference: text(item.supplierReference) || undefined,
       freightCents: number(item.freightCents),
@@ -5235,6 +5244,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
       exchangeRateToBase: number(item.exchangeRateToBase, 1),
       paymentTerms: text(item.paymentTerms) || undefined,
       dueDate: text(item.dueDate) || undefined,
+      notes: text(item.notes) || undefined,
       freightCents: number(item.freightCents),
       freightTaxRateBps: number(item.freightTaxRateBps),
       feeCents: number(item.feeCents),
@@ -5518,6 +5528,7 @@ function parseShipments(value: unknown): ShipmentRecord[] {
     serviceLevel: text(row.serviceLevel),
     trackingNumber: text(row.trackingNumber),
     billOfLadingNumber: text(row.billOfLadingNumber),
+    notes: text(row.notes) || undefined,
   }));
 }
 
@@ -5528,6 +5539,7 @@ function parsePurchaseReceipts(value: unknown): PurchaseReceiptRecord[] {
     postedAt: text(row.postedAt),
     status: titleCase(text(row.status, "posted")),
     packingSlipNumber: text(row.packingSlipNumber) || undefined,
+    notes: text(row.notes) || undefined,
     quantity: number(row.quantity),
   }));
 }

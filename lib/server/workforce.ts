@@ -9,6 +9,7 @@ type WorkOrderRow = {
   id: string;
   number: string;
   title: string;
+  notes: string | null;
   status: WorkOrderStatus;
   partnerId: string | null;
   partnerName: string | null;
@@ -112,7 +113,7 @@ async function audit(actor: ActorIdentity, entityType: string, entityId: string,
 
 export async function getWorkforceSnapshot(actor: ActorIdentity) {
   const [workOrders, links, labourItems, timeEntries, workers, workerTotals, partners, salesOrders, purchaseOrders] = await Promise.all([
-    all<WorkOrderRow>(`SELECT wo.id,wo.number,wo.title,wo.status,wo.partner_id AS partnerId,
+    all<WorkOrderRow>(`SELECT wo.id,wo.number,wo.title,wo.notes,wo.status,wo.partner_id AS partnerId,
       bp.name AS partnerName,bp.partner_type AS partnerType,wo.created_by_name AS createdByName,
       wo.version,wo.created_at AS createdAt,wo.updated_at AS updatedAt
       FROM work_orders wo LEFT JOIN business_partners bp ON bp.id=wo.partner_id
@@ -196,6 +197,7 @@ export async function getWorkforceSnapshot(actor: ActorIdentity) {
 
 async function createWorkOrder(actor: ActorIdentity, input: Record<string, unknown>) {
   const title = requiredText(input, "title");
+  const notes = optionalText(input, "notes", 4_000);
   const partnerId = optionalText(input, "partnerId", 200);
   const salesOrderIds = stringArray(input.salesOrderIds);
   const purchaseOrderIds = stringArray(input.purchaseOrderIds);
@@ -210,8 +212,8 @@ async function createWorkOrder(actor: ActorIdentity, input: Record<string, unkno
   const number = await nextDocumentNumber("WO");
   const db = getD1();
   const statements = [db.prepare(`INSERT INTO work_orders
-    (id,number,title,status,partner_id,created_by_id,created_by_name,version,created_at,updated_at)
-    VALUES (?,?,?,'open',?,?,?,1,?,?)`).bind(id, number, title, partnerId || null, actor.id, actor.name, now, now)];
+    (id,number,title,notes,status,partner_id,created_by_id,created_by_name,version,created_at,updated_at)
+    VALUES (?,?,?,?,'open',?,?,?,1,?,?)`).bind(id, number, title, notes || null, partnerId || null, actor.id, actor.name, now, now)];
   for (const document of salesDocuments) statements.push(db.prepare(`INSERT INTO work_order_document_links
     (id,work_order_id,document_type,document_id,document_number,created_at) VALUES (?,?,'sales_order',?,?,?)`)
     .bind(newId("work-order-link"), id, document.id, document.number, now));
@@ -222,7 +224,7 @@ async function createWorkOrder(actor: ActorIdentity, input: Record<string, unkno
     (id,work_order_id,title,status,created_by_id,version,created_at,updated_at) VALUES (?,? ,?,'open',?,1,?,?)`)
     .bind(newId("labour-item"), id, labourTitle, actor.id, now, now));
   await db.batch(statements);
-  await audit(actor, "work_order", id, "work_order_created", `${number} created: ${title}`, { partnerId: partnerId || null, salesOrderIds, purchaseOrderIds, labourItems: labourTitles.length });
+  await audit(actor, "work_order", id, "work_order_created", `${number} created: ${title}`, { partnerId: partnerId || null, notes: notes || null, salesOrderIds, purchaseOrderIds, labourItems: labourTitles.length });
   return { message: `${number} created.`, workOrderId: id };
 }
 
@@ -308,6 +310,7 @@ async function updateTimeEntry(actor: ActorIdentity, input: Record<string, unkno
 async function updateWorkOrder(actor: ActorIdentity, input: Record<string, unknown>) {
   const workOrderId = requiredText(input, "workOrderId", 200);
   const title = requiredText(input, "title");
+  const notes = optionalText(input, "notes", 4_000);
   const status = requiredText(input, "status", 40) as WorkOrderStatus;
   const partnerId = optionalText(input, "partnerId", 200);
   const version = Number(input.version);
@@ -326,8 +329,8 @@ async function updateWorkOrder(actor: ActorIdentity, input: Record<string, unkno
   ]);
   const now = new Date().toISOString();
   const db = getD1();
-  const update = await db.prepare(`UPDATE work_orders SET title=?,status=?,partner_id=?,version=version+1,updated_at=? WHERE id=? AND version=?`)
-    .bind(title, status, partnerId || null, now, workOrderId, version).run();
+  const update = await db.prepare(`UPDATE work_orders SET title=?,notes=?,status=?,partner_id=?,version=version+1,updated_at=? WHERE id=? AND version=?`)
+    .bind(title, notes || null, status, partnerId || null, now, workOrderId, version).run();
   if (Number(update.meta?.changes ?? 0) !== 1) throw new WorkforceError("VERSION_CONFLICT", "The work order changed. Refresh before saving.", 409);
   const statements = [db.prepare("DELETE FROM work_order_document_links WHERE work_order_id=?").bind(workOrderId)];
   for (const document of salesDocuments) statements.push(db.prepare(`INSERT INTO work_order_document_links
@@ -337,7 +340,7 @@ async function updateWorkOrder(actor: ActorIdentity, input: Record<string, unkno
     (id,work_order_id,document_type,document_id,document_number,created_at) VALUES (?,?,'purchase_order',?,?,?)`)
     .bind(newId("work-order-link"), workOrderId, document.id, document.number, now));
   await db.batch(statements);
-  await audit(actor, "work_order", workOrderId, "work_order_updated", `${actor.name} updated the work order.`, { status, partnerId: partnerId || null, salesOrderIds, purchaseOrderIds });
+  await audit(actor, "work_order", workOrderId, "work_order_updated", `${actor.name} updated the work order.`, { status, partnerId: partnerId || null, notes: notes || null, salesOrderIds, purchaseOrderIds });
   return { message: "Work order updated." };
 }
 

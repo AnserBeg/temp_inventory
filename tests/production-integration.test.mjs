@@ -15,6 +15,7 @@ let auth;
 let exportsModule;
 let reportsModule;
 let countSessions;
+let workforce;
 
 async function applyMigrations() {
   const directory = new URL("../drizzle/", import.meta.url);
@@ -42,6 +43,7 @@ before(async () => {
   exportsModule = await import("../lib/server/exports.ts");
   reportsModule = await import("../lib/server/reports.ts");
   countSessions = await import("../lib/server/inventory-count-sessions.ts");
+  workforce = await import("../lib/server/workforce.ts");
 });
 
 after(() => db.close());
@@ -318,6 +320,34 @@ test("host headers cannot enable local auth and email mappings cannot transfer r
   await advancedDomain.executeWorkflow({ command: "updatePolicy", entityId: "security.defaultRole", version: restoreVersion, idempotencyKey: "restore-default-viewer-role", actor: administrator, payload: { key: "security.defaultRole", value: "viewer", reason: "Restore secure test default" } });
 });
 
+test("work-order notes survive creation, editing, and snapshot reads", async () => {
+  const manager = { id: "work-order-manager", email: "work-orders@example.com", name: "Work Order Manager", role: "manager", label: "Work Order Manager <work-orders@example.com>", localDevelopment: false };
+  await run("INSERT INTO app_users (user_id,email,full_name,role,active,version,created_at,updated_at) VALUES (?,?,?,'manager',1,1,datetime('now'),datetime('now'))", manager.id, manager.email, manager.name);
+  await run("INSERT INTO tenant_memberships (tenant_id,user_id,role,active,is_default,version,created_at,updated_at) VALUES ('tenant-default',?,'manager',1,1,1,datetime('now'),datetime('now'))", manager.id);
+  const created = await workforce.executeWorkforceCommand(manager, {
+    command: "createWorkOrder",
+    title: "Prepare custom order",
+    notes: "Confirm the final dimensions before fabrication.",
+    salesOrderIds: [],
+    purchaseOrderIds: [],
+    labourTitles: [],
+  });
+  assert.equal(db.sqlite.prepare("SELECT notes FROM work_orders WHERE id=?").get(created.workOrderId).notes, "Confirm the final dimensions before fabrication.");
+
+  await workforce.executeWorkforceCommand(manager, {
+    command: "updateWorkOrder",
+    workOrderId: created.workOrderId,
+    version: 1,
+    title: "Prepare custom order",
+    notes: "Dimensions confirmed; package the finished piece carefully.",
+    status: "open",
+    salesOrderIds: [],
+    purchaseOrderIds: [],
+  });
+  const snapshot = await workforce.getWorkforceSnapshot(manager);
+  assert.equal(snapshot.workOrders.find((item) => item.id === created.workOrderId)?.notes, "Dimensions confirmed; package the finished piece carefully.");
+});
+
 test("posting dates enforce the caller's locked period and quoted idempotency keys stay bound", async () => {
   await run("INSERT INTO warehouses (id,code,name,timezone,active,version) VALUES ('wh-test','TEST','Test warehouse','UTC',1,1)");
   await run("INSERT INTO locations (id,code,name,location_type,inventory_status,warehouse_id,active,version) VALUES ('loc-a','A','A','storage','usable','wh-test',1,1)");
@@ -402,12 +432,12 @@ test("batch receiving posts one document and independent PO lines do not conflic
   await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('prod-b','SKU-B','Product B','test','test','test','test','quantity','stocked',150,300,0,'uom-each','uom-each','uom-each',1,1,'2026-08-01')");
   await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,ordered_at,ordered_by,version,created_at) VALUES ('po-batch','PO-BATCH','vendor-receipt','approved','not_billed','2026-08-10','CAD',1,2500,2500,'2026-08-01T08:00:00Z','Test buyer',1,'2026-08-01')");
   await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,fulfillment_route,version) VALUES ('pol-batch-a','po-batch','prod-a',10,0,100,'stock',1),('pol-batch-b','po-batch','prod-b',10,0,150,'stock',1)");
-  const batch = await inventoryDomain.executeInventoryCommand({ command: "postReceiptBatch", entityId: "po-batch", version: 1, idempotencyKey: "batch-receipt", payload: { postingDate: "2026-08-01", actor: "Tester", lines: [
+  const batch = await inventoryDomain.executeInventoryCommand({ command: "postReceiptBatch", entityId: "po-batch", version: 1, idempotencyKey: "batch-receipt", payload: { postingDate: "2026-08-01", notes: "Two pallets arrived together.", actor: "Tester", lines: [
     { lineId: "pol-batch-a", lineVersion: 1, quantity: 2, locationId: "loc-a" },
     { lineId: "pol-batch-b", lineVersion: 1, quantity: 3, locationId: "loc-a" },
   ] } });
   assert.match(batch.message, /2 lines and 5 units as one receipt/);
-  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM receipts WHERE purchase_order_id='po-batch'").get().count, 1);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT COUNT(*) AS count,MAX(notes) AS notes FROM receipts WHERE purchase_order_id='po-batch'").get() }, { count: 1, notes: "Two pallets arrived together." });
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM receipt_lines rl JOIN receipts r ON r.id=rl.receipt_id WHERE r.purchase_order_id='po-batch'").get().count, 2);
   assert.deepEqual(db.sqlite.prepare("SELECT id,version FROM purchase_order_lines WHERE purchase_order_id='po-batch' ORDER BY id").all().map((row) => ({ ...row })), [{ id: "pol-batch-a", version: 2 }, { id: "pol-batch-b", version: 2 }]);
 
@@ -489,17 +519,17 @@ test("draft sales orders can replace lines and pricing before confirmation", asy
   await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,total_cents,version,created_at) VALUES ('so-draft','SO-DRAFT','customer-draft','draft','not_invoiced','2026-08-10','CAD',1,200,200,1,'2026-08-01')");
   await run("INSERT INTO sales_order_lines (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,fulfillment_route,discount_cents,taxable,tax_rate_bps) VALUES ('sol-draft-old','so-draft','prod-a',1,0,200,'stock',0,1,0)");
   const actor = { id: "operator", email: "operator@example.com", name: "Operator", role: "operator", label: "Operator <operator@example.com>", localDevelopment: false };
-  const createCommand = { command: "createSalesOrderDraft", entityId: "new", version: 0, idempotencyKey: "create-addressed-draft", actor, payload: { customerId: "customer-draft", requestedDate: "2026-08-20", currency: "CAD", exchangeRateToBase: 1, paymentTerms: "Net 30", dueDate: "2026-09-19", shipToName: "Created Job Site", shipToAddressLine1: "21 Site Road", shipToCity: "Edmonton", shipToRegion: "AB", shipToPostalCode: "T5J 0N8", shipToCountry: "CA", lines: [{ kind: "item", productId: "prod-a", quantity: 1, unitPriceCents: 250, taxable: true, taxRateBps: 500 }] } };
+  const createCommand = { command: "createSalesOrderDraft", entityId: "new", version: 0, idempotencyKey: "create-addressed-draft", actor, payload: { customerId: "customer-draft", requestedDate: "2026-08-20", currency: "CAD", exchangeRateToBase: 1, paymentTerms: "Net 30", dueDate: "2026-09-19", notes: "Call the site before delivery.", shipToName: "Created Job Site", shipToAddressLine1: "21 Site Road", shipToCity: "Edmonton", shipToRegion: "AB", shipToPostalCode: "T5J 0N8", shipToCountry: "CA", lines: [{ kind: "item", productId: "prod-a", quantity: 1, unitPriceCents: 250, taxable: true, taxRateBps: 500 }] } };
   const created = await advancedDomain.executeWorkflow(createCommand);
   assert.deepEqual(await advancedDomain.executeWorkflow(createCommand), created);
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM sales_orders WHERE id=?").get(created.recordId).count, 1);
-  assert.deepEqual({ ...db.sqlite.prepare("SELECT ship_to_name,ship_to_address_line_1,ship_to_postal_code FROM sales_orders WHERE id=?").get(created.recordId) }, { ship_to_name: "Created Job Site", ship_to_address_line_1: "21 Site Road", ship_to_postal_code: "T5J 0N8" });
-  const result = await advancedDomain.executeWorkflow({ command: "updateSalesOrderDraft", entityId: "so-draft", version: 1, idempotencyKey: "edit-so-draft", actor, payload: { customerId: "customer-draft", requestedDate: "2026-08-20", currency: "CAD", exchangeRateToBase: 1, paymentTerms: "Net 30", dueDate: "2026-09-19", shipToName: "Draft Job Site", shipToAddressLine1: "20 Site Road", shipToCity: "Edmonton", shipToRegion: "AB", shipToPostalCode: "T5J 0N4", shipToCountry: "CA", lines: [
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT ship_to_name,ship_to_address_line_1,ship_to_postal_code,notes FROM sales_orders WHERE id=?").get(created.recordId) }, { ship_to_name: "Created Job Site", ship_to_address_line_1: "21 Site Road", ship_to_postal_code: "T5J 0N8", notes: "Call the site before delivery." });
+  const result = await advancedDomain.executeWorkflow({ command: "updateSalesOrderDraft", entityId: "so-draft", version: 1, idempotencyKey: "edit-so-draft", actor, payload: { customerId: "customer-draft", requestedDate: "2026-08-20", currency: "CAD", exchangeRateToBase: 1, paymentTerms: "Net 30", dueDate: "2026-09-19", notes: "Use the north loading door.", shipToName: "Draft Job Site", shipToAddressLine1: "20 Site Road", shipToCity: "Edmonton", shipToRegion: "AB", shipToPostalCode: "T5J 0N4", shipToCountry: "CA", lines: [
     { kind: "item", productId: "prod-a", quantity: 2, unitPriceCents: 250, taxable: true, taxRateBps: 500 },
     { kind: "item", productId: "prod-b", quantity: 1, unitPriceCents: 300, taxable: false, taxRateBps: 0 },
   ] } });
   assert.match(result.message, /draft updated with 2 item lines/);
-  assert.deepEqual({ ...db.sqlite.prepare("SELECT requested_date,total_cents,version FROM sales_orders WHERE id='so-draft'").get() }, { requested_date: "2026-08-20", total_cents: 825, version: 2 });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT requested_date,total_cents,notes,version FROM sales_orders WHERE id='so-draft'").get() }, { requested_date: "2026-08-20", total_cents: 825, notes: "Use the north loading door.", version: 2 });
   assert.deepEqual(db.sqlite.prepare("SELECT product_id,ordered_qty,unit_price_cents,tax_code FROM sales_order_lines WHERE sales_order_id='so-draft' ORDER BY product_id").all().map((row) => ({ ...row })), [
     { product_id: "prod-a", ordered_qty: 2, unit_price_cents: 250, tax_code: "GST" },
     { product_id: "prod-b", ordered_qty: 1, unit_price_cents: 300, tax_code: "EXEMPT" },
@@ -1002,7 +1032,7 @@ test("counter sale creates its hidden order, shipment, invoice, and full payment
 
   const command = { command: "postCounterSale", entityId: "counter-sale-request-1", version: 1, idempotencyKey: "post-counter-sale", payload: {
     customerId: "customer-walk-in", postingDate: "2026-08-25", settlement: "pay_now", currency: "CAD", exchangeRateToBase: 1,
-    paymentMethod: "cash", paymentReference: "TILL-0042", actor: "Tester", actorId: "tester", actorEmail: "tester@example.com",
+    paymentMethod: "cash", paymentReference: "TILL-0042", notes: "Customer requested a printed receipt.", actor: "Tester", actorId: "tester", actorEmail: "tester@example.com",
     lines: [
       { kind: "item", productId: "prod-counter", quantity: 1, uomId: "uom-each", unitPriceCents: 1000, discountCents: 0, taxable: true, taxCode: "GST", taxRateBps: 500, fulfillmentRoute: "stock", locationId: "loc-a" },
       { kind: "item", productId: "prod-counter", quantity: 2, uomId: "uom-each", unitPriceCents: 1000, discountCents: 200, taxable: true, taxCode: "GST", taxRateBps: 500, fulfillmentRoute: "stock", locationId: "loc-a" },
@@ -1020,6 +1050,10 @@ test("counter sale creates its hidden order, shipment, invoice, and full payment
   assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM sales_order_lines WHERE sales_order_id=?").get(result.salesOrderId).count, 2);
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,paid_cents,subtotal_cents,tax_cents,total_cents,payment_terms FROM customer_invoices WHERE id=?").get(result.invoiceId) }, { status: "paid", paid_cents: 2940, subtotal_cents: 2800, tax_cents: 140, total_cents: 2940, payment_terms: "Due on receipt" });
   assert.deepEqual({ ...db.sqlite.prepare("SELECT direction,amount_cents,method,reference FROM payments WHERE id=?").get(result.paymentId) }, { direction: "inbound", amount_cents: 2940, method: "cash", reference: "TILL-0042" });
+  assert.equal(db.sqlite.prepare("SELECT notes FROM sales_orders WHERE id=?").get(result.salesOrderId).notes, command.payload.notes);
+  assert.equal(db.sqlite.prepare("SELECT notes FROM shipments WHERE id=?").get(result.shipmentId).notes, command.payload.notes);
+  assert.equal(db.sqlite.prepare("SELECT notes FROM customer_invoices WHERE id=?").get(result.invoiceId).notes, command.payload.notes);
+  assert.equal(db.sqlite.prepare("SELECT notes FROM payments WHERE id=?").get(result.paymentId).notes, command.payload.notes);
   assert.deepEqual({ ...db.sqlite.prepare("SELECT on_hand_qty,reserved_qty FROM inventory_balances WHERE product_id='prod-counter' AND location_id='loc-a'").get() }, { on_hand_qty: 2, reserved_qty: 0 });
   assert.deepEqual({ ...db.sqlite.prepare("SELECT COUNT(*) AS lines,COALESCE(SUM(quantity),0) AS quantity FROM shipment_lines WHERE shipment_id=?").get(result.shipmentId) }, { lines: 2, quantity: 3 });
   assert.deepEqual({ ...db.sqlite.prepare("SELECT COALESCE(SUM(quantity),0) AS quantity,COALESCE(SUM(value_cents),0) AS value FROM inventory_value_entries WHERE reference_id=?").get(result.shipmentId) }, { quantity: -3, value: -1200 });

@@ -25,6 +25,7 @@ type DocumentHeader = {
   preparedBy: string | null;
   supplierQuoteNumber: string | null;
   supplierReference: string | null;
+  notes: string | null;
   addressLine1: string | null;
   addressLine2: string | null;
   city: string | null;
@@ -76,7 +77,7 @@ async function documentHeader(type: PrintableDocumentType, id: string) {
     return first<DocumentHeader>(`SELECT po.id,po.number,po.lifecycle_status AS status,bp.name AS partyName,bp.email AS partyEmail,
       bp.phone AS partyPhone,po.currency,po.total_cents AS totalCents,NULL AS subtotalCents,NULL AS taxCents,NULL AS paidCents,NULL AS creditedCents,substr(po.created_at,1,10) AS documentDate,
       po.expected_date AS dueOrExpectedDate,po.payment_terms AS paymentTerms,po.project_reference AS reference,
-      po.buyer_name AS preparedBy,po.supplier_quote_number AS supplierQuoteNumber,po.supplier_reference AS supplierReference,
+      po.buyer_name AS preparedBy,po.supplier_quote_number AS supplierQuoteNumber,po.supplier_reference AS supplierReference,po.notes,
       bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
       FROM purchase_orders po JOIN business_partners bp ON bp.id=po.vendor_id WHERE po.id=? LIMIT 1`, id);
   }
@@ -84,7 +85,7 @@ async function documentHeader(type: PrintableDocumentType, id: string) {
     return first<DocumentHeader>(`SELECT so.id,so.number,so.lifecycle_status AS status,bp.name AS partyName,bp.email AS partyEmail,
       bp.phone AS partyPhone,so.currency,so.total_cents AS totalCents,NULL AS subtotalCents,NULL AS taxCents,NULL AS paidCents,NULL AS creditedCents,substr(so.created_at,1,10) AS documentDate,
       so.requested_date AS dueOrExpectedDate,so.payment_terms AS paymentTerms,so.project_reference AS reference,
-      so.owner_name AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,
+      so.owner_name AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,so.notes,
       COALESCE(so.ship_to_address_line_1,bp.address_line_1) AS addressLine1,COALESCE(so.ship_to_address_line_2,bp.address_line_2) AS addressLine2,
       COALESCE(so.ship_to_city,bp.city) AS city,COALESCE(so.ship_to_region,bp.region) AS region,
       COALESCE(so.ship_to_postal_code,bp.postal_code) AS postalCode,COALESCE(so.ship_to_country,bp.country) AS country
@@ -95,7 +96,7 @@ async function documentHeader(type: PrintableDocumentType, id: string) {
       bp.phone AS partyPhone,vb.currency,vb.total_cents AS totalCents,vb.subtotal_cents AS subtotalCents,vb.tax_cents AS taxCents,
       vb.paid_cents AS paidCents,COALESCE((SELECT SUM(vc.amount_cents) FROM vendor_credits vc WHERE vc.vendor_bill_id=vb.id AND vc.status='posted'),0) AS creditedCents,
       vb.invoice_date AS documentDate,vb.due_date AS dueOrExpectedDate,vb.payment_terms AS paymentTerms,po.number AS reference,
-      vb.approved_by AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,
+      vb.approved_by AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,vb.notes,
       bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
       FROM vendor_bills vb JOIN business_partners bp ON bp.id=vb.vendor_id
       LEFT JOIN purchase_orders po ON po.id=vb.purchase_order_id WHERE vb.id=? LIMIT 1`, id);
@@ -104,7 +105,7 @@ async function documentHeader(type: PrintableDocumentType, id: string) {
     bp.phone AS partyPhone,ci.currency,ci.total_cents AS totalCents,ci.subtotal_cents AS subtotalCents,ci.tax_cents AS taxCents,
     ci.paid_cents AS paidCents,COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS creditedCents,
     ci.invoice_date AS documentDate,ci.due_date AS dueOrExpectedDate,ci.payment_terms AS paymentTerms,so.number AS reference,
-    COALESCE(sp.name,so.owner_name,ci.posted_by) AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,
+    COALESCE(sp.name,so.owner_name,ci.posted_by) AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,ci.notes,
     bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
     FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id
     LEFT JOIN sales_orders so ON so.id=ci.sales_order_id LEFT JOIN sales_people sp ON sp.id=so.sales_person_id WHERE ci.id=? LIMIT 1`, id);
@@ -524,7 +525,8 @@ function summaryRows(document: LoadedDocument) {
 function drawSummary(commands: string[], document: LoadedDocument, top: number, companyName: string, senderEmail?: string) {
   const leftWidth = 292;
   pdfText(commands, "TERMS & NOTES", PDF.margin, top - 4, { size: 7.5, bold: true, color: PDF.accent });
-  const noteLines = wrapPdfText(documentNote(document.type, document.header.number), leftWidth, 8.5, 4);
+  const noteText = [document.header.notes, documentNote(document.type, document.header.number)].filter(Boolean).join(" · ");
+  const noteLines = wrapPdfText(noteText, leftWidth, 8.5, 4);
   noteLines.forEach((line, index) => pdfText(commands, line, PDF.margin, top - 21 - index * 11, { size: 8.5, color: PDF.muted }));
   if (senderEmail) pdfText(commands, `Sent by ${senderEmail}`, PDF.margin, top - 76, { size: 7.5, color: PDF.muted, maxWidth: leftWidth });
 
