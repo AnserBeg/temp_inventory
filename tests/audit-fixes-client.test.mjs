@@ -231,9 +231,11 @@ test("sales orders use one linear queue and keep customer invoices inside it", (
   }
 });
 
-test("remote dropdown loading does not flash stale states or lose a newer request", () => {
-  assert.match(sources.picker, /const beginLookup = \(nextQuery: string\) => \{\s*setQuery\(nextQuery\);\s*setLookupError\(""\);\s*setLoading\(true\);\s*setOpen\(true\);/);
-  assert.match(sources.picker, /let current = true;[\s\S]*if \(current\) setLoading\(false\);[\s\S]*current = false; controller\.abort\(\);/);
+test("remote dropdown loading reuses recent results without losing a newer request", () => {
+  assert.match(sources.picker, /const LOOKUP_CACHE_TTL_MS = 30_000;[\s\S]*const lookupRequests = new Map/);
+  assert.match(sources.picker, /const beginLookup = \(nextQuery: string\) => \{[\s\S]*cachedLookupItems\(lookupParams\(nextQuery\)\.toString\(\)\)[\s\S]*setLoading\(!cached && !fallback\.length\);\s*setOpen\(true\);/);
+  assert.match(sources.picker, /let current = true;[\s\S]*if \(current\) setLoading\(false\);[\s\S]*current = false; window\.clearTimeout\(timer\);/);
+  assert.match(sources.picker, /query\.trim\(\) \? 120 : 0/);
   assert.match(sources.picker, /aria-busy=\{loading\}/);
   assert.match(sources.css, /\.reference-results \{[^}]*scrollbar-gutter: stable;/);
 });

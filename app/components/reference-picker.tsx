@@ -26,6 +26,66 @@ export type LookupKind =
   | "salesOrders" | "purchaseOrders" | "salesOrderLines" | "purchaseOrderLines"
   | "customerInvoices" | "vendorBills" | "costLayers" | "partnerAddresses" | "inventoryLots" | "inventoryUnits";
 
+type RawLookupItem = Record<string, unknown>;
+type LookupCacheEntry = { expiresAt: number; items: RawLookupItem[] };
+
+// A picker is opened repeatedly while an order is entered. Keep the last few server results in
+// memory so returning to the same customer, vendor, or item search is instant. The short lifetime
+// still lets live price and availability changes flow through without turning browser state into
+// an authoritative copy of inventory.
+const LOOKUP_CACHE_TTL_MS = 30_000;
+const LOOKUP_CACHE_LIMIT = 100;
+const lookupCache = new Map<string, LookupCacheEntry>();
+const lookupRequests = new Map<string, Promise<RawLookupItem[]>>();
+
+function cachedLookupItems(key: string) {
+  const cached = lookupCache.get(key);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) { lookupCache.delete(key); return undefined; }
+  // Refresh insertion order so the least-recently used result is discarded first.
+  lookupCache.delete(key);
+  lookupCache.set(key, cached);
+  return cached.items;
+}
+
+function storeLookupItems(key: string, items: RawLookupItem[]) {
+  lookupCache.set(key, { items, expiresAt: Date.now() + LOOKUP_CACHE_TTL_MS });
+  while (lookupCache.size > LOOKUP_CACHE_LIMIT) {
+    const oldest = lookupCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    lookupCache.delete(oldest);
+  }
+}
+
+async function fetchLookupItems(params: URLSearchParams) {
+  const key = params.toString();
+  const cached = cachedLookupItems(key);
+  if (cached) return cached;
+  const pending = lookupRequests.get(key);
+  if (pending) return pending;
+  const request = (async () => {
+    const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store" });
+    const raw = await response.json() as { items?: RawLookupItem[]; error?: { message?: string } };
+    if (!response.ok) throw new Error(raw.error?.message ?? "Reference lookup unavailable.");
+    const items = raw.items ?? [];
+    storeLookupItems(key, items);
+    return items;
+  })();
+  lookupRequests.set(key, request);
+  try { return await request; }
+  finally { if (lookupRequests.get(key) === request) lookupRequests.delete(key); }
+}
+
+const quickCreateLookupKind: Record<QuickCreateKind, LookupKind> = {
+  customer: "partners", vendor: "partners", partner: "partners", product: "products", location: "locations",
+  uom: "uoms", priceList: "priceLists", assetType: "assetTypes",
+};
+
+function invalidateLookupKind(kind: LookupKind) {
+  const prefix = `lookup=${encodeURIComponent(kind)}&`;
+  for (const key of lookupCache.keys()) if (key.startsWith(prefix)) lookupCache.delete(key);
+}
+
 /** Offered anywhere an order, bill, or partner records terms, so the lists cannot drift apart. */
 export const PAYMENT_TERMS = ["Due on receipt", "Net 15", "Net 30", "Net 45", "Net 60"];
 
@@ -273,38 +333,48 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
   // would otherwise restart the lookup — a refetch per keystroke in a neighbouring field.
   useEffect(() => { mapRef.current = mapItem; fallbackRef.current = initialOptions; });
 
+  const lookupParams = (nextQuery: string) => {
+    const params = new URLSearchParams({ lookup: kind, q: nextQuery, limit: "25" });
+    if (role) params.set("role", role);
+    if (partnerId) params.set("partnerId", partnerId);
+    if (productId) params.set("productId", productId);
+    if (lineId) params.set("lineId", lineId);
+    if (locationId) params.set("locationId", locationId);
+    if (warehouseId) params.set("warehouseId", warehouseId);
+    if (kind === "products") {
+      params.set("quantity", String(Math.max(quantity ?? 1, 1)));
+      if (currency) params.set("currency", currency);
+      if (exchangeRateToBase != null) params.set("exchangeRateToBase", String(exchangeRateToBase));
+    }
+    return params;
+  };
+
   useEffect(() => {
     if (!open) return;
     let current = true;
-    const controller = new AbortController();
-    // Enter the pending state before the debounce elapses. Otherwise the list paints its old
-    // rows (or an empty message), flashes to "Searching…", and then paints the response.
-    const pendingTimer = window.setTimeout(() => { if (current) setLoading(true); }, 0);
+    const params = lookupParams(query);
+    const cached = cachedLookupItems(params.toString());
+    const fallback = query.trim() ? [] : fallbackRef.current.slice(0, 25);
+    if (cached) {
+      const mapped = cached.map((item) => mapRef.current(item));
+      setOptions(mapped);
+      setLookupError("");
+      setLoading(false);
+      setKnown((knownOptions) => ({ ...knownOptions, ...Object.fromEntries(mapped.map((option) => [option.id, option])) }));
+      return;
+    }
+    if (fallback.length) { setOptions(fallback); setLoading(false); }
+    else setLoading(true);
     const timer = window.setTimeout(async () => {
       try {
-        const params = new URLSearchParams({ lookup: kind, q: query, limit: "25" });
-        if (role) params.set("role", role);
-        if (partnerId) params.set("partnerId", partnerId);
-        if (productId) params.set("productId", productId);
-        if (lineId) params.set("lineId", lineId);
-        if (locationId) params.set("locationId", locationId);
-        if (warehouseId) params.set("warehouseId", warehouseId);
-        if (kind === "products") {
-          params.set("quantity", String(Math.max(quantity ?? 1, 1)));
-          if (currency) params.set("currency", currency);
-          if (exchangeRateToBase != null) params.set("exchangeRateToBase", String(exchangeRateToBase));
-        }
-        const response = await fetch(`/api/snapshot?${params}`, { cache: "no-store", signal: controller.signal });
-        const raw = await response.json() as { items?: Array<Record<string, unknown>>; error?: { message?: string } };
-        if (!response.ok) throw new Error(raw.error?.message ?? "Reference lookup unavailable.");
-        const mapped = (raw.items ?? []).map((item) => mapRef.current(item));
+        const mapped = (await fetchLookupItems(params)).map((item) => mapRef.current(item));
         if (current) {
           setOptions(mapped);
           setLookupError("");
           setKnown((knownOptions) => ({ ...knownOptions, ...Object.fromEntries(mapped.map((option) => [option.id, option])) }));
         }
       } catch (error) {
-        if (current && !(error instanceof DOMException && error.name === "AbortError")) {
+        if (current) {
           setOptions(fallbackRef.current.slice(0, 25));
           setLookupError(error instanceof Error ? error.message : "Reference lookup unavailable.");
         }
@@ -312,14 +382,18 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
         // A superseded request must not clear the pending state of the newer query.
         if (current) setLoading(false);
       }
-    }, 180);
-    return () => { current = false; controller.abort(); window.clearTimeout(pendingTimer); window.clearTimeout(timer); };
+    }, query.trim() ? 120 : 0);
+    return () => { current = false; window.clearTimeout(timer); };
   }, [currency, exchangeRateToBase, kind, lineId, locationId, open, partnerId, productId, quantity, query, role, warehouseId]);
 
   const beginLookup = (nextQuery: string) => {
+    const cached = cachedLookupItems(lookupParams(nextQuery).toString());
+    const fallback = nextQuery.trim() ? [] : fallbackRef.current.slice(0, 25);
+    if (cached) setOptions(cached.map((item) => mapRef.current(item)));
+    else if (fallback.length) setOptions(fallback);
     setQuery(nextQuery);
     setLookupError("");
-    setLoading(true);
+    setLoading(!cached && !fallback.length);
     setOpen(true);
   };
 
@@ -360,7 +434,7 @@ export function RemoteSearchSelect({ kind, role, partnerId, productId, lineId, l
   </div>;
 
   return <>{label && !hideLabel ? <label className="reference-field"><span>{label}{required ? <span className="required-mark" aria-hidden="true"> *</span> : null}</span>{field}</label> : field}
-    {creating && offerCreate ? <QuickCreateDialog kind={offerCreate} onClose={() => setCreating(false)} onCreated={async (option) => { choose(option); setCreating(false); await onCreated?.(); }} /> : null}</>;
+    {creating && offerCreate ? <QuickCreateDialog kind={offerCreate} onClose={() => setCreating(false)} onCreated={async (option) => { invalidateLookupKind(quickCreateLookupKind[offerCreate]); choose(option); setCreating(false); await onCreated?.(); }} /> : null}</>;
 }
 
 /** Minimal create form for the records people discover they are missing mid-task. */
