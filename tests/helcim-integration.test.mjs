@@ -41,6 +41,9 @@ before(async () => {
   await run("INSERT INTO customer_invoices (id,number,customer_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) VALUES ('helcim-invoice','INV-HELCIM','helcim-customer','posted','2026-09-01','2026-10-01',10000,500,10500,0,'CAD',1,10500,500,'GST','Net 30',?,'Billing',1)", now);
   await run("INSERT INTO customer_invoices (id,number,customer_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) VALUES ('helcim-hosted-invoice','INV-HOSTED','helcim-customer','posted','2026-09-01','2026-10-01',2000,100,2100,0,'CAD',1,2100,500,'GST','Net 30',?,'Billing',1)", now);
   await run("INSERT INTO customer_invoices (id,number,customer_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) VALUES ('helcim-polled-invoice','INV-POLLED','helcim-customer','posted','2026-09-01','2026-10-01',3000,150,3150,0,'CAD',1,3150,500,'GST','Net 30',?,'Billing',1)", now);
+  await run("INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,total_cents,version,created_at) VALUES ('helcim-counter-order','SO-HELCIM-COUNTER','helcim-customer','confirmed','invoiced','2026-09-02',2100,1,?)", now);
+  await run("INSERT INTO shipments (id,number,sales_order_id,status,service_level,posted_at,version) VALUES ('helcim-counter-shipment','SHP-HELCIM-COUNTER','helcim-counter-order','posted','Counter sale',?,1)", now);
+  await run("INSERT INTO customer_invoices (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) VALUES ('helcim-counter-invoice','INV-HELCIM-COUNTER','helcim-customer','helcim-counter-order','posted','2026-09-02','2026-09-02',2000,100,2100,0,'CAD',1,2100,500,'GST','Due on receipt',?,'Counter',1)", now);
 });
 
 after(() => db.close());
@@ -60,6 +63,39 @@ test("webhook verification uses Helcim's base64 HMAC signing contract", async ()
   const signed = Buffer.from(await crypto.subtle.sign("HMAC", key, Buffer.from(signedContent))).toString("base64");
   assert.equal(await helcimCrypto.verifyHelcimWebhookSignature({ verifierToken: env.HELCIM_WEBHOOK_VERIFIER_TOKEN, webhookId, timestamp, rawBody, signatureHeader: `v1,${signed}` }), true);
   assert.equal(await helcimCrypto.verifyHelcimWebhookSignature({ verifierToken: env.HELCIM_WEBHOOK_VERIFIER_TOKEN, webhookId, timestamp, rawBody: `${rawBody} `, signatureHeader: `v1,${signed}` }), false);
+});
+
+test("counter sale checkout is card-only and posts only after the signed Helcim approval", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v2/invoices" && init.method === "POST") {
+        const body = JSON.parse(init.body);
+        assert.equal(body.invoiceNumber, "PF-default-INV-HELCIM-COUNTER");
+        return Response.json({ invoiceId: 9010, invoiceNumber: body.invoiceNumber, token: "counter-invoice-token" });
+      }
+      if (url.pathname === "/v2/helcim-pay/initialize" && init.method === "POST") {
+        const body = JSON.parse(init.body);
+        assert.equal(body.amount, 21);
+        assert.equal(body.currency, "CAD");
+        assert.equal(body.paymentMethod, "cc");
+        return Response.json({ checkoutToken: "counter-checkout", secretToken: "counter-checkout-secret" });
+      }
+      throw new Error(`Unexpected counter Helcim fetch ${init.method ?? "GET"} ${url}`);
+    };
+    const checkout = await helcim.createCounterSaleHelcimCheckout("helcim-counter-invoice", administrator);
+    assert.equal(checkout.invoiceNumber, "INV-HELCIM-COUNTER");
+    assert.ok(checkout.paymentLinkToken);
+    assert.equal(db.sqlite.prepare("SELECT status FROM customer_invoices WHERE id='helcim-counter-invoice'").get().status, "posted");
+
+    const transaction = { transactionId: "7010", dateCreated: "2026-09-02 12:30:00", status: "APPROVED", type: "purchase", amount: "21.00", currency: "CAD", invoiceNumber: "PF-default-INV-HELCIM-COUNTER" };
+    const hash = await helcimCrypto.sha256Hex(`${JSON.stringify(transaction)}counter-checkout-secret`);
+    const completed = await helcim.completeHelcimCheckout({ paymentLinkToken: checkout.paymentLinkToken, checkoutToken: checkout.checkoutToken, eventMessage: { data: transaction, hash } });
+    assert.equal(completed.status, "paid");
+    assert.deepEqual({ ...db.sqlite.prepare("SELECT status,paid_cents AS paid FROM customer_invoices WHERE id='helcim-counter-invoice'").get() }, { status: "paid", paid: 2100 });
+    assert.deepEqual({ ...db.sqlite.prepare("SELECT method,reference FROM payments WHERE document_id='helcim-counter-invoice'").get() }, { method: "helcim_card", reference: "Helcim 7010" });
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test("card posts once, ACH waits for clearing, and QBO uses Helcim clearing", async () => {

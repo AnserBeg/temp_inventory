@@ -37,6 +37,8 @@ type DocumentLine = {
   sku: string;
   productName: string;
   description: string | null;
+  binLocationCode: string | null;
+  binLocationName: string | null;
   quantity: number;
   uomCode: string | null;
   unitAmountCents: number;
@@ -102,10 +104,10 @@ async function documentHeader(type: PrintableDocumentType, id: string) {
     bp.phone AS partyPhone,ci.currency,ci.total_cents AS totalCents,ci.subtotal_cents AS subtotalCents,ci.tax_cents AS taxCents,
     ci.paid_cents AS paidCents,COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS creditedCents,
     ci.invoice_date AS documentDate,ci.due_date AS dueOrExpectedDate,ci.payment_terms AS paymentTerms,so.number AS reference,
-    ci.posted_by AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,
+    COALESCE(sp.name,so.owner_name,ci.posted_by) AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,
     bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country
     FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id
-    LEFT JOIN sales_orders so ON so.id=ci.sales_order_id WHERE ci.id=? LIMIT 1`, id);
+    LEFT JOIN sales_orders so ON so.id=ci.sales_order_id LEFT JOIN sales_people sp ON sp.id=so.sales_person_id WHERE ci.id=? LIMIT 1`, id);
 }
 
 async function documentLines(type: PrintableDocumentType, id: string) {
@@ -113,32 +115,36 @@ async function documentLines(type: PrintableDocumentType, id: string) {
     return all<DocumentLine>(`SELECT p.sku,p.name AS productName,pol.configuration_snapshot AS description,
       COALESCE(pol.ordered_uom_qty,pol.ordered_qty) AS quantity,u.code AS uomCode,
       COALESCE(pol.ordered_uom_unit_cost_cents,pol.unit_cost_cents) AS unitAmountCents,pol.discount_cents AS discountCents,
-      pol.tax_rate_bps AS taxRateBps,pol.taxable,NULL AS lineTotalCents
+      pol.tax_rate_bps AS taxRateBps,pol.taxable,NULL AS lineTotalCents,bin.code AS binLocationCode,bin.name AS binLocationName
       FROM purchase_order_lines pol JOIN products p ON p.id=pol.product_id
-      LEFT JOIN units_of_measure u ON u.id=pol.ordered_uom_id WHERE pol.purchase_order_id=? ORDER BY pol.rowid`, id);
+      LEFT JOIN units_of_measure u ON u.id=pol.ordered_uom_id
+      LEFT JOIN locations bin ON bin.id=pol.bin_location_id WHERE pol.purchase_order_id=? ORDER BY pol.rowid`, id);
   }
   if (type === "sales_order") {
     return all<DocumentLine>(`SELECT p.sku,p.name AS productName,sol.configuration_snapshot AS description,
       COALESCE(sol.ordered_uom_qty,sol.ordered_qty) AS quantity,u.code AS uomCode,
       COALESCE(sol.ordered_uom_unit_price_cents,sol.unit_price_cents) AS unitAmountCents,sol.discount_cents AS discountCents,
-      sol.tax_rate_bps AS taxRateBps,sol.taxable,NULL AS lineTotalCents
+      sol.tax_rate_bps AS taxRateBps,sol.taxable,NULL AS lineTotalCents,bin.code AS binLocationCode,bin.name AS binLocationName
       FROM sales_order_lines sol JOIN products p ON p.id=sol.product_id
-      LEFT JOIN units_of_measure u ON u.id=sol.ordered_uom_id WHERE sol.sales_order_id=? ORDER BY sol.rowid`, id);
+      LEFT JOIN units_of_measure u ON u.id=sol.ordered_uom_id
+      LEFT JOIN locations bin ON bin.id=sol.bin_location_id WHERE sol.sales_order_id=? ORDER BY sol.rowid`, id);
   }
   if (type === "vendor_bill") {
     return all<DocumentLine>(`SELECT p.sku,p.name AS productName,pol.configuration_snapshot AS description,
       vbl.quantity,u.code AS uomCode,vbl.unit_cost_cents AS unitAmountCents,0 AS discountCents,
-      0 AS taxRateBps,0 AS taxable,vbl.line_total_cents AS lineTotalCents
+      0 AS taxRateBps,0 AS taxable,vbl.line_total_cents AS lineTotalCents,bin.code AS binLocationCode,bin.name AS binLocationName
       FROM vendor_bill_lines vbl JOIN products p ON p.id=vbl.product_id
       LEFT JOIN purchase_order_lines pol ON pol.id=vbl.purchase_order_line_id
-      LEFT JOIN units_of_measure u ON u.id=pol.ordered_uom_id WHERE vbl.vendor_bill_id=? ORDER BY vbl.rowid`, id);
+      LEFT JOIN units_of_measure u ON u.id=pol.ordered_uom_id
+      LEFT JOIN locations bin ON bin.id=pol.bin_location_id WHERE vbl.vendor_bill_id=? ORDER BY vbl.rowid`, id);
   }
   return all<DocumentLine>(`SELECT p.sku,p.name AS productName,sol.configuration_snapshot AS description,
     cil.quantity,NULL AS uomCode,cil.unit_price_cents AS unitAmountCents,
     MAX(ROUND(cil.quantity*cil.unit_price_cents)-cil.line_total_cents,0) AS discountCents,
-    0 AS taxRateBps,0 AS taxable,cil.line_total_cents AS lineTotalCents
+    0 AS taxRateBps,0 AS taxable,cil.line_total_cents AS lineTotalCents,bin.code AS binLocationCode,bin.name AS binLocationName
     FROM customer_invoice_lines cil JOIN products p ON p.id=cil.product_id
-    JOIN sales_order_lines sol ON sol.id=cil.sales_order_line_id WHERE cil.customer_invoice_id=? ORDER BY cil.rowid`, id);
+    JOIN sales_order_lines sol ON sol.id=cil.sales_order_line_id
+    LEFT JOIN locations bin ON bin.id=COALESCE(cil.bin_location_id,sol.bin_location_id) WHERE cil.customer_invoice_id=? ORDER BY cil.rowid`, id);
 }
 
 function documentLabel(type: PrintableDocumentType) {
@@ -372,7 +378,7 @@ function metadataRows(type: PrintableDocumentType, header: DocumentHeader) {
     ["Currency", header.currency],
   ];
   if (header.reference) rows.push([type === "customer_invoice" || type === "vendor_bill" ? "Related order" : "Project reference", header.reference]);
-  if (header.preparedBy) rows.push([type === "purchase_order" ? "Buyer" : type === "sales_order" ? "Sales owner" : "Prepared by", header.preparedBy]);
+  if (header.preparedBy) rows.push([type === "purchase_order" ? "Buyer" : type === "sales_order" || type === "customer_invoice" ? "Salesperson" : "Prepared by", header.preparedBy]);
   if (header.supplierQuoteNumber || header.supplierReference) rows.push(["Supplier quote / ref", [header.supplierQuoteNumber, header.supplierReference].filter(Boolean).join(" / ")]);
   return rows.slice(0, 7);
 }
@@ -390,7 +396,8 @@ function prepareLines(document: LoadedDocument): PreparedLine[] {
   return document.lines.map((line, index) => {
     const amount = lineAmount(line);
     const description = printableDescription(line.description);
-    const details = [line.sku, ...(description ? wrapPdfText(description, 252, 8, 3) : []), ...(line.discountCents ? [`Discount: -${money(Number(line.discountCents), document.header.currency)}`] : [])];
+    const bin = line.binLocationCode ? `Bin: ${line.binLocationCode}${line.binLocationName ? ` · ${line.binLocationName}` : ""}` : "";
+    const details = [line.sku, ...(bin ? [bin] : []), ...(description ? wrapPdfText(description, 252, 8, 3) : []), ...(line.discountCents ? [`Discount: -${money(Number(line.discountCents), document.header.currency)}`] : [])];
     const name = wrapPdfText(line.productName, 252, 9.5, 2);
     return {
       index: index + 1,

@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: paneflow-operations
+    runtime: node
+    plan: 0.5c-512mb
+    numInstances: 1
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start:render
+    healthCheckPath: /healthz
+    maxShutdownDelaySeconds: 30
+    disk:
+      name: paneflow-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 24.14.1
+      - key: DATABASE_URL
+        value: file:/var/data/paneflow.sqlite
+      - key: ATTACHMENTS_DIR
+        value: /var/data/files
+      - key: ALLOW_LOCAL_DEV_AUTH
+        value: "false"
+      - key: BOOTSTRAP_DEMO_DATA
+        value: "false"

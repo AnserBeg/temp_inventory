@@ -15,6 +15,7 @@ export type TenantContext = {
 export const TENANT_OWNED_TABLES = [
   "approvals",
   "attachments",
+  "attachment_line_items",
   "audit_events",
   "business_partners",
   "catalog_price_history",
@@ -46,6 +47,7 @@ export const TENANT_OWNED_TABLES = [
   "inventory_value_entries",
   "landed_cost_allocation_lines",
   "landed_cost_allocations",
+  "labour_items",
   "locations",
   "margin_rules",
   "master_record_merges",
@@ -82,6 +84,7 @@ export const TENANT_OWNED_TABLES = [
   "returnable_obligations",
   "sales_order_lines",
   "sales_orders",
+  "sales_people",
   "shipment_lines",
   "shipments",
   "stock_movements",
@@ -89,6 +92,7 @@ export const TENANT_OWNED_TABLES = [
   "supply_allocations",
   "system_settings",
   "tenant_memberships",
+  "time_entries",
   "units_of_measure",
   "uom_conversions",
   "valuation_policies",
@@ -97,6 +101,8 @@ export const TENANT_OWNED_TABLES = [
   "vendor_credits",
   "vendor_returns",
   "warehouses",
+  "work_order_document_links",
+  "work_orders",
 ] as const;
 
 const tenantStorage = new AsyncLocalStorage<TenantContext>();

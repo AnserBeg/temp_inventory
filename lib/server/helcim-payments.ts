@@ -161,6 +161,15 @@ export async function getHelcimConfigurationStatus() {
   };
 }
 
+/** Fail before a counter sale is posted when this company cannot open a card checkout. */
+export async function requireHelcimCounterCardConfiguration() {
+  const configuration = await requiredConfiguration();
+  if (!configuration.paymentMethod.includes("cc")) {
+    throw new HelcimPaymentError("HELCIM_CARD_NOT_ENABLED", "Enable card payments on the Helcim company connection before taking a counter-sale card payment.", 409);
+  }
+  return { configured: true as const };
+}
+
 async function requiredConfiguration() {
   const status = await resolvedConfiguration();
   if (!status.configured) throw new HelcimPaymentError("HELCIM_NOT_CONFIGURED", status.message, 503);
@@ -477,7 +486,7 @@ async function ensureHelcimInvoice(invoice: InvoiceForPayment) {
   return { helcimInvoiceId: remote.id, helcimInvoiceNumber: remote.number, helcimInvoiceToken: remote.token, localVersion: invoice.version };
 }
 
-export async function createHelcimCheckout(input: { paymentLinkToken: string; amountCents?: unknown }) {
+export async function createHelcimCheckout(input: { paymentLinkToken: string; amountCents?: unknown; paymentMethod?: "cc" }) {
   await ensureDatabase();
   const config = await requiredConfiguration();
   const link = await paymentLinkByToken(input.paymentLinkToken);
@@ -488,7 +497,7 @@ export async function createHelcimCheckout(input: { paymentLinkToken: string; am
   if (requestedAmount > invoice.outstandingCents) throw new HelcimPaymentError("OVERPAYMENT", "The payment amount exceeds the current invoice balance.", 409);
   const mirror = await ensureHelcimInvoice(invoice);
   const id = newId("helcim-checkout");
-  const paymentMethod = invoice.currency.toUpperCase() === "CAD" ? config.paymentMethod : "cc";
+  const paymentMethod = input.paymentMethod ?? (invoice.currency.toUpperCase() === "CAD" ? config.paymentMethod : "cc");
   const response = await helcimRequest("/helcim-pay/initialize", {
     method: "POST",
     body: JSON.stringify({
@@ -517,6 +526,43 @@ export async function createHelcimCheckout(input: { paymentLinkToken: string; am
     getD1().prepare("UPDATE invoice_payment_links SET last_viewed_at=? WHERE id=?").bind(createdAt.toISOString(), link.paymentLinkId),
   ]);
   return { checkoutToken, amountCents: requestedAmount, currency: invoice.currency.toUpperCase(), expiresAt: expiresAt.toISOString() };
+}
+
+/**
+ * Create an authenticated, short-lived card-only checkout for an already-posted counter invoice.
+ * The bearer token is returned to the current browser but, like emailed payment links, only its
+ * digest is stored. The ordinary completion path then verifies Helcim's signed response and posts
+ * the receivable payment exactly once.
+ */
+export async function createCounterSaleHelcimCheckout(invoiceId: string, actor: ActorIdentity) {
+  await ensureDatabase();
+  await requireHelcimCounterCardConfiguration();
+  const counterSale = await first<{ id: string }>(`SELECT ci.id FROM customer_invoices ci
+    JOIN sales_orders so ON so.id=ci.sales_order_id
+    JOIN shipments s ON s.sales_order_id=so.id
+    WHERE ci.id=? AND LOWER(s.service_level)='counter sale' LIMIT 1`, invoiceId);
+  if (!counterSale) throw new HelcimPaymentError("COUNTER_SALE_INVOICE_REQUIRED", "This invoice is not attached to a counter sale.", 404);
+  const invoice = assertCollectible(await invoiceById(invoiceId));
+  const token = randomUrlSafeString(32);
+  const tokenHash = await sha256Hex(token);
+  const linkId = newId("payment-link");
+  const createdAt = new Date();
+  const expiresAt = new Date(createdAt.getTime() + checkoutLifetimeMs);
+  await getD1().batch([
+    getD1().prepare(`INSERT INTO invoice_payment_links (id,customer_invoice_id,token_hash,status,created_by,created_at,expires_at,last_viewed_at)
+      VALUES (?,?,?,'active',?,?,?,?)`).bind(linkId, invoice.id, tokenHash, actor.label, createdAt.toISOString(), expiresAt.toISOString(), createdAt.toISOString()),
+    getD1().prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
+      VALUES (?,'customer_invoice',?,'counter_card_checkout_started',?,?,?,?,?,?)`)
+      .bind(newId("audit"), invoice.id, `Secure Helcim card checkout started for ${invoice.number}.`, actor.label, actor.id, actor.email,
+        JSON.stringify({ paymentLinkId: linkId, amountCents: invoice.outstandingCents, expiresAt: expiresAt.toISOString() }), createdAt.toISOString()),
+  ]);
+  try {
+    const checkout = await createHelcimCheckout({ paymentLinkToken: token, amountCents: invoice.outstandingCents, paymentMethod: "cc" });
+    return { ...checkout, paymentLinkToken: token, invoiceId: invoice.id, invoiceNumber: invoice.number };
+  } catch (error) {
+    await getD1().prepare("UPDATE invoice_payment_links SET status='revoked' WHERE id=? AND status='active'").bind(linkId).run();
+    throw error;
+  }
 }
 
 function jsonForHelcimHash(value: Row) {

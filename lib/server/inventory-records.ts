@@ -5,6 +5,8 @@ import { prepareApprovedPurchaseCostStatements } from "./catalog-pricing";
 export type CreateOrderLine = {
   kind?: "item" | "charge";
   productId?: string;
+  /** Preferred receiving/picking bin captured on the commercial line. */
+  binLocationId?: string;
   quantity?: number;
   uomId?: string;
   unitCostCents?: number;
@@ -31,6 +33,7 @@ export type CreateOrderInput = {
   idempotencyKey: string;
   vendorId?: string;
   customerId?: string;
+  salesPersonId?: string;
   productId?: string;
   quantity?: number;
   unitCostCents?: number;
@@ -42,6 +45,7 @@ export type CreateOrderInput = {
   actorId?: string;
   actorEmail?: string;
   projectReference?: string;
+  notes?: string;
   supplierQuoteNumber?: string;
   supplierReference?: string;
   sourceDocumentHash?: string;
@@ -57,6 +61,8 @@ export type CreateOrderInput = {
   shipToPostalCode?: string;
   shipToCountry?: string;
   deliveryInstructions?: string;
+  /** Active warehouse used to resolve each product's configured default bin. */
+  warehouseId?: string;
   freightCents?: number;
   feeCents?: number;
   refundableDepositCents?: number;
@@ -92,6 +98,7 @@ type CreateOrderResult = {
 export type NormalizedItem = {
   productId: string;
   productName: string;
+  binLocationId: string | null;
   quantity: number;
   enteredQuantity: number;
   uomId: string;
@@ -133,6 +140,12 @@ function requiredText(value: unknown, field: string) {
   const normalized = typeof value === "string" ? value.trim() : "";
   if (!normalized) throw new RecordValidationError("VALIDATION_ERROR", `${field} is required.`);
   return normalized;
+}
+
+function optionalDocumentNotes(value: unknown) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (normalized.length > 4000) throw new RecordValidationError("VALIDATION_ERROR", "Notes must be 4,000 characters or fewer.");
+  return normalized || null;
 }
 
 function positiveNumber(value: unknown, field: string) {
@@ -235,6 +248,30 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
     if (!(["stock", "special_order", "drop_ship"] as const).includes(route)) {
       throw new RecordValidationError("VALIDATION_ERROR", `lines[${index}].fulfillmentRoute is invalid.`);
     }
+    const warehouseId = typeof input.warehouseId === "string" ? input.warehouseId.trim() : "";
+    const requestedBinLocationId = typeof line.binLocationId === "string" ? line.binLocationId.trim() : "";
+    let binLocationId: string | null = null;
+    if (route !== "drop_ship") {
+      if (requestedBinLocationId) {
+        const selectedBin = await first<{ id: string }>(`SELECT id FROM locations
+          WHERE id=? AND active=1 AND inventory_status='usable' AND (?='' OR warehouse_id=?)`, requestedBinLocationId, warehouseId, warehouseId);
+        if (!selectedBin) throw new RecordValidationError("INVALID_BIN_LOCATION", `Line ${index + 1} must use an active usable bin in the selected warehouse.`, 409);
+        binLocationId = selectedBin.id;
+      } else if (warehouseId) {
+        const preferredBin = await first<{ id: string }>(`SELECT l.id FROM product_default_locations pdl
+          JOIN locations l ON l.id=pdl.location_id
+          WHERE pdl.product_id=? AND pdl.warehouse_id=? AND l.active=1 AND l.inventory_status='usable'`, productId, warehouseId);
+        if (preferredBin) binLocationId = preferredBin.id;
+        else {
+          const onlyStockedBin = await first<{ id: string }>(`SELECT MIN(l.id) AS id FROM inventory_balances ib
+            JOIN locations l ON l.id=ib.location_id JOIN warehouses w ON w.id=l.warehouse_id
+            WHERE ib.product_id=? AND l.warehouse_id=? AND l.active=1 AND w.active=1
+              AND l.inventory_status='usable' AND ib.on_hand_qty-ib.reserved_qty>0
+            HAVING COUNT(*)=1`, productId, warehouseId);
+          binLocationId = onlyStockedBin?.id ?? null;
+        }
+      }
+    }
     const enteredUnitAmount = input.type === "purchaseOrder"
       ? cents(line.unitCostCents, `lines[${index}].unitCostCents`, true)
       : cents(line.unitPriceCents, `lines[${index}].unitPriceCents`, true);
@@ -303,7 +340,7 @@ export async function normalizeOrderLines(input: CreateOrderInput) {
     const taxable = line.taxable !== false;
     const taxRateBps = basisPoints(line.taxRateBps, `lines[${index}].taxRateBps`);
     items.push({
-      productId, productName: product.name, quantity, enteredQuantity, uomId: normalizedQuantity.fromUomId,
+      productId, productName: product.name, binLocationId, quantity, enteredQuantity, uomId: normalizedQuantity.fromUomId,
       uomCode: normalizedQuantity.fromUomCode, factorToBase: normalizedQuantity.factorToBase,
       unitAmountCents: unitAmount, enteredUnitAmountCents: enteredUnitAmount,
       discountCents, taxable, taxCode: normalizedTaxCode(line.taxCode, taxable, taxRateBps),
@@ -379,6 +416,7 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     : null;
   const fastTrack = fastTrackApprovalReason !== null;
   const projectReference = typeof input.projectReference === "string" && input.projectReference.trim() ? input.projectReference.trim() : null;
+  const notes = optionalDocumentNotes(input.notes);
   const currency = typeof input.currency === "string" && input.currency.trim() ? input.currency.trim().toUpperCase() : "CAD";
   if (!/^[A-Z]{3}$/.test(currency)) throw new RecordValidationError("VALIDATION_ERROR", "currency must be a three-letter ISO code.");
   if (currency !== "CAD" && input.exchangeRateToBase == null) throw new RecordValidationError("EXCHANGE_RATE_REQUIRED", `Enter the ${currency}-to-CAD exchange rate.`);
@@ -436,16 +474,16 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     statements = [
       db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at)
         SELECT ?, 'create_purchase_order', ?, ?, ?, ?, ? WHERE 1=1${allocationClaims}`).bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now, ...allocationClaimValues),
-      db.prepare(`INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,buyer_name,project_reference,supplier_quote_number,supplier_reference,source_document_hash,revision_number,version,created_at)
-        SELECT ?,?,?,?,'not_billed',?,?,?,?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-        .bind(recordId, number, vendorId, fastTrack ? "approved" : "draft", expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, supplierQuoteNumber, supplierReference, sourceDocumentHash, now, idempotencyKey, recordId, claimToken),
+      db.prepare(`INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,buyer_name,project_reference,notes,supplier_quote_number,supplier_reference,source_document_hash,revision_number,version,created_at)
+        SELECT ?,?,?,?,'not_billed',?,?,?,?,?,?,?,?,?,?,?,?,?,1,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(recordId, number, vendorId, fastTrack ? "approved" : "draft", expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, notes, supplierQuoteNumber, supplierReference, sourceDocumentHash, now, idempotencyKey, recordId, claimToken),
     ];
     const purchaseLines = items.map((line) => ({ line, lineId: newId("po-line") }));
     purchaseLines.forEach(({ line, lineId }) => {
       statements.push(db.prepare(`INSERT INTO purchase_order_lines
-        (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
-        SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-        .bind(lineId, recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId,line.discountCents,line.taxable ? 1 : 0,line.taxCode,line.taxRateBps, idempotencyKey, recordId, claimToken));
+        (id,purchase_order_id,product_id,bin_location_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
+        SELECT ?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(lineId, recordId, line.productId, line.binLocationId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute,line.sourceSalesOrderLineId,line.discountCents,line.taxable ? 1 : 0,line.taxCode,line.taxRateBps, idempotencyKey, recordId, claimToken));
       for (const allocation of line.supplyAllocations) {
         statements.push(db.prepare(`INSERT INTO supply_allocations
           (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version)
@@ -458,7 +496,7 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     });
     statements.push(db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
       SELECT ?,?,1,?,?,?, ?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("revision"), recordId, fastTrack ? "approved" : "draft", JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase, supplierQuoteNumber, supplierReference, sourceDocumentHash }), fastTrackApprovalReason ?? "Initial draft", actor, now, idempotencyKey, recordId, claimToken));
+      .bind(newId("revision"), recordId, fastTrack ? "approved" : "draft", JSON.stringify({ number, vendorId, expectedDate, items, charges, totalCents, currency, exchangeRateToBase, notes, supplierQuoteNumber, supplierReference, sourceDocumentHash }), fastTrackApprovalReason ?? "Initial draft", actor, now, idempotencyKey, recordId, claimToken));
     if (fastTrack) statements.push(db.prepare(`INSERT INTO approvals
       (id,entity_type,entity_id,request_type,status,requested_by,requested_reason,requested_at,decided_by,decision_reason,decided_at,metadata_json,version)
       SELECT ?,'purchase_order',?,'purchase_order_fast_track','approved',?,?,?,?,?,?,?,1
@@ -479,6 +517,10 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     }));
   } else {
     const customerId = requiredText(input.customerId, "customerId");
+    const salesPersonId = typeof input.salesPersonId === "string" && input.salesPersonId.trim() ? input.salesPersonId.trim() : null;
+    const salesPerson = salesPersonId ? await first<{ name: string }>("SELECT name FROM sales_people WHERE id=? AND active=1", salesPersonId) : null;
+    if (salesPersonId && !salesPerson) throw new RecordValidationError("INVALID_SALES_PERSON", "Select a valid active salesperson.", 404);
+    const salesOwner = salesPerson?.name ?? actor;
     const requestedDate = validDate(input.requestedDate, "requestedDate");
     const customer = await first<{ name: string; addressLine1: string | null; addressLine2: string | null; city: string | null; region: string | null; postalCode: string | null; country: string | null; partnerCurrency: string; creditLimitCents: number; creditHold: number; outstandingBaseCents: number }>(`SELECT bp.name,bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country,
       bp.currency AS partnerCurrency,bp.credit_limit_cents AS creditLimitCents,bp.credit_hold AS creditHold,
@@ -518,14 +560,14 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
     };
     statements = [
       db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key, command, entity_id, response_json, request_hash, claim_token, created_at) VALUES (?, 'create_sales_order', ?, ?, ?, ?, ?)").bind(idempotencyKey, recordId, JSON.stringify(result), requestHash, claimToken, now),
-      db.prepare(`INSERT INTO sales_orders (id,number,customer_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,owner_name,project_reference,ship_to_name,ship_to_address_line_1,ship_to_address_line_2,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country,delivery_instructions,version,created_at)
-        SELECT ?,?,?,?,'not_invoiced',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-        .bind(recordId, number, customerId, fastTrack ? "confirmed" : "draft", requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, actor, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, now, idempotencyKey, recordId, claimToken),
+      db.prepare(`INSERT INTO sales_orders (id,number,customer_id,sales_person_id,lifecycle_status,billing_status,requested_date,currency,exchange_rate_to_base,base_total_cents,payment_terms,due_date,total_cents,owner_name,project_reference,ship_to_name,ship_to_address_line_1,ship_to_address_line_2,ship_to_city,ship_to_region,ship_to_postal_code,ship_to_country,delivery_instructions,notes,version,created_at)
+        SELECT ?,?,?,?,?,'not_invoiced',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+        .bind(recordId, number, customerId, salesPersonId, fastTrack ? "confirmed" : "draft", requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, salesOwner, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, notes, now, idempotencyKey, recordId, claimToken),
     ];
     items.forEach((line) => statements.push(db.prepare(`INSERT INTO sales_order_lines
-      (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
-      SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("so-line"), recordId, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.projectReference,line.linkedPurchaseOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps, idempotencyKey, recordId, claimToken)));
+      (id,sales_order_id,product_id,bin_location_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
+      SELECT ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
+      .bind(newId("so-line"), recordId, line.productId, line.binLocationId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.projectReference,line.linkedPurchaseOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps, idempotencyKey, recordId, claimToken)));
   }
 
   charges.forEach((charge) => statements.push(db.prepare(`INSERT INTO document_charges
@@ -535,7 +577,7 @@ export async function createOrderRecord(input: CreateOrderInput): Promise<Create
   statements.push(
     db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
       SELECT ?,?,?,?, ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
-      .bind(newId("audit"), input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, fastTrack ? input.type === "purchaseOrder" ? "purchase_order_fast_track_approved" : "sales_order_fast_track_confirmed" : input.type === "purchaseOrder" ? "purchase_order_draft_created" : "sales_order_draft_created", result.message, actor, actorId, actorEmail, JSON.stringify({ items, charges, totalCents, taxCents, projectReference, supplierQuoteNumber: input.supplierQuoteNumber, supplierReference: input.supplierReference, sourceDocumentHash: input.sourceDocumentHash, currency, exchangeRateToBase, paymentTerms, dueDate, fastTrack, approvalReason: fastTrackApprovalReason }), now, idempotencyKey, recordId, claimToken),
+      .bind(newId("audit"), input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, fastTrack ? input.type === "purchaseOrder" ? "purchase_order_fast_track_approved" : "sales_order_fast_track_confirmed" : input.type === "purchaseOrder" ? "purchase_order_draft_created" : "sales_order_draft_created", result.message, actor, actorId, actorEmail, JSON.stringify({ items, charges, totalCents, taxCents, projectReference, notes, salesPersonId: input.salesPersonId, supplierQuoteNumber: input.supplierQuoteNumber, supplierReference: input.supplierReference, sourceDocumentHash: input.sourceDocumentHash, currency, exchangeRateToBase, paymentTerms, dueDate, fastTrack, approvalReason: fastTrackApprovalReason }), now, idempotencyKey, recordId, claimToken),
     db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
       SELECT ?,?,?,?,?,'pending',0,?,? WHERE EXISTS (SELECT 1 FROM command_log WHERE idempotency_key=? AND entity_id=? AND claim_token=?)`)
       .bind(newId("outbox"), fastTrack ? input.type === "purchaseOrder" ? "purchase_order.approved" : "sales_order.confirmed" : input.type === "purchaseOrder" ? "purchase_order.draft_created" : "sales_order.draft_created", input.type === "purchaseOrder" ? "purchase_order" : "sales_order", recordId, JSON.stringify({ recordId, itemCount: items.length, totalCents, fastTrack }), now, now, idempotencyKey, recordId, claimToken)

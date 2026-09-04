@@ -17,6 +17,8 @@ import { AddressAutocomplete } from "./components/address-autocomplete";
 import { actorName } from "./components/format";
 import { localDatePlusDays, localDateString } from "./components/local-date";
 import { NumberField } from "./components/number-field";
+import { PlyGemImportButton } from "./components/ply-gem-import";
+import { WorkforceView } from "./components/workforce";
 import { useDialogDismiss } from "./components/use-dialog-dismiss";
 import { PAYMENT_TERMS, PickerPermissionsContext, QuickCreateDialog, RemoteSearchSelect, SearchableSelect, type LookupKind, type QuickCreateKind } from "./components/reference-picker";
 import { calculateSalesAvailability } from "@/lib/domain/sales-availability";
@@ -57,8 +59,12 @@ type PurchaseLine = {
   baseUnitCost: number;
   orderedUomId?: string;
   orderedUomCode?: string;
+  baseUomCode: string;
   uomFactorToBase: number;
   location: string;
+  binLocationId?: string;
+  binLocationCode?: string;
+  binLocationName?: string;
   fulfillmentRoute?: string;
   trackingPolicy: string;
   sourceSalesOrderLineId?: string;
@@ -98,6 +104,9 @@ type SalesLine = {
   uomFactorToBase: number;
   fulfillmentRoute: string;
   trackingPolicy: string;
+  binLocationId?: string;
+  binLocationCode?: string;
+  binLocationName?: string;
   reservationLocationId?: string;
   linkedPurchaseOrderLineId?: string;
   linkedPurchaseOrderId?: string;
@@ -137,6 +146,7 @@ type PurchaseOrder = {
   paymentTerms?: string;
   dueDate?: string;
   projectReference?: string;
+  notes?: string;
   supplierQuoteNumber?: string;
   supplierReference?: string;
   freightCents: number;
@@ -226,6 +236,9 @@ type ProductPicture = {
   uploadedAt: string;
 };
 
+type DamagePhoto = ProductPicture & { lineItemIds: string[] };
+type DamagePhotoLine = { id: string; label: string; detail: string };
+
 type LocationOption = {
   id: string;
   code: string;
@@ -256,6 +269,8 @@ type SalesOrder = {
   number: string;
   customerId: string;
   customer: string;
+  salesPersonId?: string;
+  salesPerson: string;
   project: string;
   requestedDate: string;
   lifecycle: string;
@@ -278,6 +293,7 @@ type SalesOrder = {
   exchangeRateToBase: number;
   paymentTerms?: string;
   dueDate?: string;
+  notes?: string;
   freightCents: number;
   freightTaxRateBps: number;
   feeCents: number;
@@ -314,6 +330,7 @@ type ShipmentRecord = {
   serviceLevel: string;
   trackingNumber: string;
   billOfLadingNumber: string;
+  notes?: string;
 };
 
 type Movement = {
@@ -387,6 +404,25 @@ type Partner = {
   creditHold?: boolean;
 };
 
+type SalesPerson = {
+  id: string;
+  code: string;
+  name: string;
+  email?: string;
+  phone?: string;
+  active: boolean;
+  version: number;
+  photoAttachmentId?: string;
+  photoFileName?: string;
+  photoCount: number;
+  orderCount: number;
+  openOrderCount: number;
+  bookedSalesCents: number;
+  invoicedSalesCents: number;
+  collectedSalesCents: number;
+  lastOrderAt?: string;
+};
+
 type Snapshot = {
   summary: {
     lateReceipts: number;
@@ -421,6 +457,7 @@ type Snapshot = {
   bills: Bill[];
   activities: Activity[];
   partners: Partner[];
+  salesPeople: SalesPerson[];
   locations: LocationOption[];
   configuration: { taxDefaultRateBps: number; reorderPointPercent: number };
   viewer: {
@@ -450,6 +487,7 @@ const emptySnapshot: Snapshot = {
   bills: [],
   activities: [],
   partners: [],
+  salesPeople: [],
   locations: [],
   configuration: { taxDefaultRateBps: 500, reorderPointPercent: 70 },
   viewer: { name: "", email: "", role: "", tenant: { id: "", slug: "", name: "" }, tenants: [], permissions: { canRead: false, canExport: false, canOperate: false, canPostFinancial: false, canApprove: false, canAdminister: false } },
@@ -471,6 +509,8 @@ type ComposerLine = {
   uomId: string;
   uomCode: string;
   priceSource: string;
+  binLocationId: string;
+  binLocationLabel: string;
   discountRate: number;
   taxCode: string;
   taxRate: number;
@@ -488,6 +528,7 @@ type CounterSaleLine = ComposerLine & {
   locationId: string;
   locationLabel: string;
   locationAvailable: number;
+  locationSource: "configured" | "only_stocked" | "manual" | "";
   lotId: string;
   inventoryUnitId: string;
 };
@@ -499,6 +540,8 @@ export type ViewKey =
   | "vendor-returns"
   | "crm"
   | "sales-orders"
+  | "sales-people"
+  | "work-orders"
   | "counter-sales"
   | "fulfillment"
   | "customer-returns"
@@ -521,6 +564,8 @@ type LookupOption = {
   currency?: string; paymentTerms?: string;
   creditHold?: boolean; creditLimitCents?: number;
   availableQuantity?: number; trackingPolicy?: string; inventoryPolicy?: string;
+  defaultBinLocationId?: string; defaultBinLocationLabel?: string; defaultBinAvailableQuantity?: number;
+  binLocationSource?: "configured" | "only_stocked";
   /** Catalog attributes, so an order line's configuration snapshot is built from what the product is, not its price hint. */
   dimensions?: string; finish?: string; material?: string; category?: string;
 };
@@ -739,6 +784,7 @@ const navGroups: Array<{ label?: string; items: NavItem[] }> = [
       { key: "counter-sales", label: "Counter sale", glyph: "$" },
       { key: "crm", label: "CRM", glyph: "C" },
       { key: "sales-orders", label: "Sales orders", glyph: "SO" },
+      { key: "sales-people", label: "Sales team", glyph: "SP" },
       { key: "customer-returns", label: "Customer returns", glyph: "↙" },
     ],
   },
@@ -753,9 +799,9 @@ const navGroups: Array<{ label?: string; items: NavItem[] }> = [
     ],
   },
   {
-    label: "Billing",
+    label: "Workforce",
     items: [
-      { key: "vendor-bills", label: "Vendor bills", glyph: "$" },
+      { key: "work-orders", label: "Work orders & time", glyph: "WO" },
     ],
   },
   {
@@ -779,6 +825,8 @@ const viewTitles: Record<ViewKey, { title: string; description?: string }> = {
   "vendor-returns": { title: "Vendor returns" },
   crm: { title: "Customer relationships", description: "See every customer alongside their open sales work, then move straight into the account or a new order." },
   "sales-orders": { title: "Sales orders" },
+  "sales-people": { title: "Sales team", description: "Manage salesperson profiles and see attributed bookings, invoicing, and collections." },
+  "work-orders": { title: "Work orders & time", description: "Clock into labour, see who is working, and keep every job story with its time." },
   "counter-sales": { title: "Counter sale", description: "Sell available stock and post the invoice in one step." },
   fulfillment: { title: "Ready to fulfill" },
   "customer-returns": { title: "Customer returns" },
@@ -811,6 +859,7 @@ type PurchaseReceiptRecord = {
   postedAt: string;
   status: string;
   packingSlipNumber?: string;
+  notes?: string;
   quantity: number;
 };
 
@@ -889,7 +938,7 @@ function createSnapshotRequest(input: SnapshotRequestInput) {
     pageSize: input.view === "reports" ? "500" : "50",
     // CRM is a customer-first presentation of the durable partner register. Reuse that scope so
     // search, paging, tenancy, and authorization stay identical to Customers & vendors.
-    scope: input.view === "crm" ? "partners" : input.view,
+    scope: input.view === "crm" ? "partners" : input.view === "work-orders" ? "workflow-empty" : input.view,
     worklistQuery: input.search,
     status: input.status,
     sort: input.sort,
@@ -979,7 +1028,7 @@ const closeReopenReasons = ["Vendor confirmed partial availability", "Vendor can
 /** What each worklist actually searches, for the search box's own placeholder. */
 const worklistNoun: Partial<Record<ViewKey, string>> = {
   "purchase-orders": "purchase orders", "expected-receipts": "expected receipts", "vendor-returns": "purchase orders",
-  crm: "customers", "sales-orders": "sales orders", fulfillment: "sales orders", "customer-returns": "sales orders",
+  crm: "customers", "sales-orders": "sales orders", "sales-people": "salespeople", fulfillment: "sales orders", "customer-returns": "sales orders",
   "customer-invoices": "sales orders", stock: "products", products: "products", counts: "location balances",
   movements: "movements", "vendor-bills": "vendor bills", partners: "customers and vendors",
 };
@@ -1006,6 +1055,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [selectedPartnerId, setSelectedPartnerId] = useState<string | null>(null);
   const [editingPartner, setEditingPartner] = useState<Partner | "new" | null>(null);
+  const [editingSalesPerson, setEditingSalesPerson] = useState<SalesPerson | "new" | null>(null);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [creatingProduct, setCreatingProduct] = useState(false);
   const [activeCommand, setActiveCommand] = useState<ActiveCommand | null>(null);
@@ -1368,7 +1418,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
 
   const pageTotalKey: Partial<Record<ViewKey, string>> = {
     "purchase-orders": "purchaseOrders", "expected-receipts": "purchaseOrders", "vendor-returns": "purchaseOrders",
-    "sales-orders": "salesOrders", fulfillment: "salesOrders", "customer-returns": "salesOrders", "customer-invoices": "salesOrders",
+    "sales-orders": "salesOrders", "sales-people": "salesPeople", fulfillment: "salesOrders", "customer-returns": "salesOrders", "customer-invoices": "salesOrders",
     stock: "products", products: "products", partners: "partners", crm: "partners", counts: "countBalances", movements: "movements", reports: "products", "vendor-bills": "bills",
   };
   const pageTotal = snapshot.pagination.filteredTotal ?? snapshot.pagination.totals[pageTotalKey[view] ?? ""] ?? 0;
@@ -1383,8 +1433,8 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
         .filter((item) => `${item.number} ${item.vendor} ${item.customerRef ?? ""}`.toLowerCase().includes(term))
         .map((item) => ({ type: "Purchase order", id: item.id, label: item.number, detail: item.vendor, view: "purchase-orders" as ViewKey, page })),
       ...snapshot.salesOrders
-        .filter((item) => `${item.number} ${item.customer} ${item.project}`.toLowerCase().includes(term))
-        .map((item) => ({ type: "Sales order", id: item.id, label: item.number, detail: [item.customer, item.project].filter(Boolean).join(" · "), view: "sales-orders" as ViewKey, page })),
+        .filter((item) => `${item.number} ${item.customer} ${item.salesPerson} ${item.project}`.toLowerCase().includes(term))
+        .map((item) => ({ type: "Sales order", id: item.id, label: item.number, detail: [item.customer, item.salesPerson, item.project].filter(Boolean).join(" · "), view: "sales-orders" as ViewKey, page })),
       ...snapshot.products
         .filter((item) => `${item.sku} ${item.name} ${item.specification} ${item.customerRef ?? ""}`.toLowerCase().includes(term))
         .map((item) => ({ type: "Product / unit", id: item.id, label: item.sku, detail: item.name, view: "stock" as ViewKey, page })),
@@ -1413,7 +1463,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
           asRows(raw.partners).map((item) => ({ type: "Business partner", id: text(item.id), label: text(item.name), detail: [text(item.code), titleCase(text(item.partnerType))].filter(Boolean).join(" · "), view: "partners" as ViewKey, page: number(item.page, 1) })),
           asRows(raw.products).map((item) => ({ type: "Product / unit", id: text(item.id), label: text(item.sku), detail: text(item.name), view: "stock" as ViewKey, page: number(item.page, 1) })),
           asRows(raw.purchaseOrders).map((item) => ({ type: "Purchase order", id: text(item.id), label: text(item.number), detail: text(item.vendorName), view: "purchase-orders" as ViewKey, page: number(item.page, 1) })),
-          asRows(raw.salesOrders).map((item) => ({ type: "Sales order", id: text(item.id), label: text(item.number), detail: [text(item.customerName), text(item.projectReference)].filter(Boolean).join(" · "), view: "sales-orders" as ViewKey, page: number(item.page, 1) })),
+          asRows(raw.salesOrders).map((item) => ({ type: "Sales order", id: text(item.id), label: text(item.number), detail: [text(item.customerName), text(item.salesPersonName), text(item.projectReference)].filter(Boolean).join(" · "), view: "sales-orders" as ViewKey, page: number(item.page, 1) })),
         ];
         const merged: SearchResult[] = [];
         for (let index = 0; merged.length < 10; index += 1) {
@@ -1653,7 +1703,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
           <span className="brand-mark" aria-hidden="true"><span /></span>
           <div><strong>PaneFlow</strong><small>{snapshot.viewer.tenant.name || "Loading organization…"}</small></div>
         </div>
-        {snapshot.viewer.tenants.length ? <div className="tenant-switcher"><span>Organization</span><div className="tenant-switcher-row"><select aria-label="Current organization" value={snapshot.viewer.tenant.id} disabled={snapshot.viewer.tenants.length < 2} onChange={(event) => void switchTenant(event.target.value)}>{snapshot.viewer.tenants.map((tenant) => <option key={tenant.id} value={tenant.id}>{tenant.name}</option>)}</select><button type="button" onClick={() => void createTenant()} aria-label="Create organization" title="Create organization">+</button>{snapshot.viewer.permissions.canAdminister ? <button type="button" onClick={() => void addTenantMember()} aria-label="Add organization member" title="Add organization member">+👤</button> : null}</div></div> : null}
+        {snapshot.viewer.tenants.length ? <div className="tenant-switcher"><span>Organization · {snapshot.viewer.tenant.slug}</span><div className="tenant-switcher-row"><select aria-label="Current organization" value={snapshot.viewer.tenant.id} disabled={snapshot.viewer.tenants.length < 2} onChange={(event) => void switchTenant(event.target.value)}>{snapshot.viewer.tenants.map((tenant) => <option key={tenant.id} value={tenant.id}>{tenant.name}</option>)}</select><button type="button" onClick={() => void createTenant()} aria-label="Create organization" title="Create organization">+</button>{snapshot.viewer.permissions.canAdminister ? <button type="button" onClick={() => void addTenantMember()} aria-label="Add organization member" title="Add organization member">+👤</button> : null}</div></div> : null}
         <nav className="nav-groups">
           {navGroups.map((group, index) => (
             <div className="nav-group" key={group.label ?? index}>
@@ -1710,7 +1760,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
             {!visibleNotifications.length ? <div className="empty-inline">No current undismissed exceptions.</div> : null}
           </section>
         )}
-        {accountOpen && <section className="popover account-panel" aria-label="Account menu"><div className="account-summary"><div className="user-avatar" aria-hidden="true">{initials(snapshot.viewer.name)}</div><div><strong>{snapshot.viewer.name}</strong><small>{snapshot.viewer.email}</small><span>{titleCase(snapshot.viewer.role)}</span></div></div><EmailConnectionManager compact /><a className="button secondary" href="/signout-with-chatgpt?return_to=%2F">Sign out</a></section>}
+        {accountOpen && <section className="popover account-panel" aria-label="Account menu"><div className="account-summary"><div className="user-avatar" aria-hidden="true">{initials(snapshot.viewer.name)}</div><div><strong>{snapshot.viewer.name}</strong><small>{snapshot.viewer.email}</small><span>{titleCase(snapshot.viewer.role)}</span></div></div><EmailConnectionManager compact /><a className="button secondary" href="/api/auth/logout">Sign out</a></section>}
 
         <main id="main-content" tabIndex={-1} className="main-content">
           <div className="page-heading">
@@ -1719,7 +1769,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               <h1>{view === "reports" ? reportsPageTitle(workspaceTab) : viewTitles[view].title}</h1>
               {viewTitles[view].description ? <p>{viewTitles[view].description}</p> : null}
             </div>
-            <PageActions view={view} source={source} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} onNavigate={navigate} onCreate={setCreateOrder} onCreatePartner={() => setEditingPartner("new")} onCreateProduct={() => setCreatingProduct(true)} />
+            <PageActions view={view} source={source} canRead={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} onNavigate={navigate} onCreate={setCreateOrder} onCreatePartner={() => setEditingPartner("new")} onCreateSalesPerson={() => setEditingSalesPerson("new")} onCreateProduct={() => setCreatingProduct(true)} onPurchaseOrderImported={async () => { await loadSnapshot(); setWorkflowRefreshToken((current) => current + 1); }} />
           </div>
           <WorkflowGuide view={view} workspaceTab={workspaceTab} onNavigate={navigate} />
           {source === "unavailable" ? <div className="connection-error" role="alert"><div><strong>Couldn&apos;t refresh operations data.</strong><p>{sourceError || "The last successfully loaded records remain on screen; no sample data was substituted."}</p></div><button className="button secondary" onClick={() => void loadSnapshot()}>Retry</button></div> : null}
@@ -1735,7 +1785,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               {view === "purchase-orders" && (
                 <OperationsWorkspace workspace="purchasing" initialTab={workspaceTab} onTabChange={(tab) => { setSelectedPoId(null); changeWorkspaceTab(tab); }} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("purchaseOrder")} onOpenOrder={(record) => { setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedPoId(record.id); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} detailOpen={Boolean(selectedPo)}>
                 {selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} viewer={snapshot.viewer} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1743,7 +1793,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               )}
               {view === "expected-receipts" && (
                 selectedPo ? (
-                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />
+                  <PurchaseOrderDetail po={selectedPo} canDraft={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedPoId(null)} onEdit={() => setEditingPurchaseOrder(selectedPo)} onCommand={(kind) => setActiveCommand({ kind, entityId: selectedPo.id, entityNumber: selectedPo.number })} onOpenVendorBilling={(tab = "overview") => { navigate("vendor-bills", undefined, tab); setWorklistQuery(selectedPo.number); setAppliedWorklistQuery(selectedPo.number); }} onOpenApprovalQueue={() => navigate("purchase-orders", undefined, "approvals")} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onSubmitForApproval={(reason) => activateDraft("submitPurchaseOrder", selectedPo.id, selectedPo.version, reason, `${selectedPo.number} submitted for approval.`)} onChanged={(message) => { setToast(message); void loadSnapshot(); }} viewer={snapshot.viewer} />
                 ) : (
                   <PurchaseOrdersView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedPoId} onReceive={(po) => setActiveCommand({ kind: "receive", entityId: po.id, entityNumber: po.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} receivingOnly />
                 )
@@ -1751,14 +1801,17 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               {view === "vendor-returns" && <VendorReturnsView orders={snapshot.purchaseOrders} canOperate={snapshot.viewer.permissions.canOperate} onReturn={(po) => setActiveCommand({ kind: "vendor-return", entityId: po.id, entityNumber: po.number })} />}
               {view === "counter-sales" && <CounterSaleScreen
                 warehouseId={warehouseId}
+                salesPeople={snapshot.salesPeople}
                 taxDefaultRateBps={snapshot.configuration.taxDefaultRateBps}
                 canPost={snapshot.viewer.permissions.canOperate && snapshot.viewer.permissions.canPostFinancial}
                 onComplete={(message) => { setToast(message); navigate("sales-orders", undefined, "send-qbo"); }}
               />}
+              {view === "sales-people" && <SalesPeopleView salesPeople={snapshot.salesPeople} canManage={snapshot.viewer.permissions.canApprove} canUpload={snapshot.viewer.permissions.canOperate} onEdit={setEditingSalesPerson} onChanged={(message) => { setToast(message); void loadSnapshot(); }} />}
+              {view === "work-orders" && <WorkforceView />}
               {view === "sales-orders" && (
                 <OperationsWorkspace workspace="sales" initialTab={workspaceTab} onTabChange={(tab) => { setSelectedSoId(null); changeWorkspaceTab(tab); }} onDurableRefresh={loadSnapshot} refreshToken={workflowRefreshToken} filterReference={appliedWorklistQuery} onCreateOrder={() => setCreateOrder("salesOrder")} onOpenOrder={(record) => { setWorklistQuery(record.number); setAppliedWorklistQuery(record.number); setSelectedSoId(record.id); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} detailOpen={Boolean(selectedSo)}>
                 {selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("sales-orders", undefined, tab === "billing-actions" ? "collect" : "create-invoice"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("sales-orders", undefined, tab === "billing-actions" ? "collect" : "create-invoice"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} viewer={snapshot.viewer} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )}
@@ -1766,7 +1819,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               )}
               {view === "fulfillment" && (
                 selectedSo ? (
-                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("sales-orders", undefined, tab === "billing-actions" ? "collect" : "create-invoice"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} />
+                  <SalesOrderDetail so={selectedSo} canOperate={snapshot.viewer.permissions.canOperate} canPostFinancial={snapshot.viewer.permissions.canPostFinancial} onBack={() => setSelectedSoId(null)} onEdit={() => setEditingSalesOrder(selectedSo)} onReserve={() => setActiveCommand({ kind: "reserve", entityId: selectedSo.id, entityNumber: selectedSo.number })} onShip={() => setActiveCommand({ kind: "ship", entityId: selectedSo.id, entityNumber: selectedSo.number })} onImmediateSale={() => setActiveCommand({ kind: "immediate-sale", entityId: selectedSo.id, entityNumber: selectedSo.number })} onOpenCustomerBilling={(tab = "overview") => { navigate("sales-orders", undefined, tab === "billing-actions" ? "collect" : "create-invoice"); setWorklistQuery(selectedSo.number); setAppliedWorklistQuery(selectedSo.number); }} onOpenQbo={() => navigate("reports", undefined, "integrations")} onOpenDropShip={() => navigate("sales-orders", undefined, "fulfill")} onCreateLinkedPurchaseOrder={() => setCreateOrder("purchaseOrder")} onOpenLinkedPurchaseOrder={() => { const line = selectedSo.lines?.find((candidate) => candidate.linkedPurchaseOrderId); navigate("purchase-orders"); if (line?.linkedPurchaseOrderNumber) { setWorklistQuery(line.linkedPurchaseOrderNumber); setAppliedWorklistQuery(line.linkedPurchaseOrderNumber); } if (line?.linkedPurchaseOrderId) setSelectedPoId(line.linkedPurchaseOrderId); }} onConfirm={(reason) => activateDraft("confirmSalesOrder", selectedSo.id, selectedSo.version, reason, `${selectedSo.number} confirmed.`)} viewer={snapshot.viewer} />
                 ) : (
                   <SalesOrdersView orders={snapshot.salesOrders} canOperate={snapshot.viewer.permissions.canOperate} onOpen={setSelectedSoId} onShip={(so) => setActiveCommand({ kind: "ship", entityId: so.id, entityNumber: so.number })} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} />
                 )
@@ -1869,6 +1922,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
       {createOrder && (
         <AdvancedCreateOrderDialog
           type={createOrder}
+          salesPeople={snapshot.salesPeople}
           partners={snapshot.partners}
           products={snapshot.products}
           warehouseId={warehouseId}
@@ -1883,6 +1937,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
       {editingSalesOrder && (
         <AdvancedCreateOrderDialog
           type="salesOrder"
+          salesPeople={snapshot.salesPeople}
           initialOrder={editingSalesOrder}
           partners={snapshot.partners}
           products={snapshot.products}
@@ -1896,6 +1951,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
       {editingPurchaseOrder && (
         <AdvancedCreateOrderDialog
           type="purchaseOrder"
+          salesPeople={snapshot.salesPeople}
           initialOrder={editingPurchaseOrder}
           partners={snapshot.partners}
           products={snapshot.products}
@@ -1924,6 +1980,14 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
         />
       )}
 
+      {editingSalesPerson && (
+        <SalesPersonEditor
+          salesPerson={editingSalesPerson}
+          onClose={() => setEditingSalesPerson(null)}
+          onSaved={(message) => { setEditingSalesPerson(null); setToast(message); void loadSnapshot(); }}
+        />
+      )}
+
       {editingProduct && (
         <EditProductDialog
           product={editingProduct}
@@ -1949,14 +2013,15 @@ function isTypingTarget(target: EventTarget | null) {
  * snapshot has confirmed which role that is. Showing "Create sales order" to a viewer just
  * moves the refusal from the button to a server error after they have keyed the whole order.
  */
-function PageActions({ view, source, canOperate, canApprove, onNavigate, onCreate, onCreatePartner, onCreateProduct }: { view: ViewKey; source: "loading" | "server" | "unavailable"; canOperate: boolean; canApprove: boolean; onNavigate: (view: ViewKey) => void; onCreate: (type: "purchaseOrder" | "salesOrder") => void; onCreatePartner: () => void; onCreateProduct: () => void }) {
+function PageActions({ view, source, canRead, canOperate, canApprove, onNavigate, onCreate, onCreatePartner, onCreateSalesPerson, onCreateProduct, onPurchaseOrderImported }: { view: ViewKey; source: "loading" | "server" | "unavailable"; canRead: boolean; canOperate: boolean; canApprove: boolean; onNavigate: (view: ViewKey) => void; onCreate: (type: "purchaseOrder" | "salesOrder") => void; onCreatePartner: () => void; onCreateSalesPerson: () => void; onCreateProduct: () => void; onPurchaseOrderImported: () => void | Promise<void> }) {
   const ready = source === "server";
   if (view === "home") return <button className="button secondary" onClick={() => onNavigate("reports")}>View reports</button>;
   // Warehouse mode used to repeat the connection pill here, a few pixels from the identical one
   // the page eyebrow already renders for every view.
   if (!ready) return null;
-  if (view === "purchase-orders") return <button className="button primary" onClick={() => onCreate("purchaseOrder")}>Create purchase order</button>;
+  if (view === "purchase-orders") return <div className="page-actions"><PlyGemImportButton className="button secondary" label="Import PDFs" disabled={!canRead} onImported={onPurchaseOrderImported} /><button className="button primary" onClick={() => onCreate("purchaseOrder")}>Create purchase order</button></div>;
   if (view === "sales-orders") return canOperate ? <button className="button primary" onClick={() => onCreate("salesOrder")}>Create sales order</button> : null;
+  if (view === "sales-people") return canApprove ? <button className="button primary" onClick={onCreateSalesPerson}>Add salesperson</button> : null;
   if (view === "stock") return canOperate ? <button className="button secondary" onClick={() => onNavigate("counts")}>Start inventory count</button> : null;
   // Adding a SKU used to be reachable only from inside an order line or the master-data tab,
   // which is the wrong place to look when you are standing on the catalog. Master data is an
@@ -2133,7 +2198,7 @@ function purchaseOrderStage(po: PurchaseOrder) {
 const worklistColumnLabels: Partial<Record<ViewKey, Record<string, string>>> = {
   "purchase-orders": { exception: "Exception", number: "PO", vendor: "Vendor", status: "Status", expected: "Expected", ordered: "Ordered", received: "Supplier fulfilled", closed: "Closed", open: "Open fulfillment", billing: "Billing", total: "Total" },
   "expected-receipts": { exception: "Exception", number: "PO", vendor: "Vendor", status: "Status", expected: "Expected", ordered: "Ordered", received: "Net received", closed: "Closed", open: "Open", billing: "Billing", total: "Total" },
-  "sales-orders": { exception: "Exception", number: "SO", customer: "Customer", requested: "Requested", availability: "Availability", fulfillment: "Fulfillment", billing: "Invoice", total: "Total" },
+  "sales-orders": { exception: "Exception", number: "SO", customer: "Customer", salesPerson: "Salesperson", requested: "Requested", availability: "Availability", fulfillment: "Fulfillment", billing: "Invoice", total: "Total" },
   fulfillment: { exception: "Exception", number: "SO", customer: "Customer", requested: "Requested", availability: "Availability", fulfillment: "Fulfillment", billing: "Invoice", total: "Total" },
   stock: { product: "Product", location: "Warehouse location", onHand: "On hand", usable: "Usable", reserved: "Reserved", available: "Available", incoming: "Incoming", demand: "Demand", projected: "Projected", exception: "Exception" },
   products: { product: "Product", configuration: "Configuration", policy: "Policy", units: "Units", standardCost: "Standard cost", lastUnitCost: "Last PO cost", sellingPrice: "Selling price", pricingMode: "Pricing", margin: "Margin", reorderPoint: "Reorder point", maxStockLevel: "Reorder up to" },
@@ -2242,6 +2307,113 @@ function RecordProgress({ title, steps, next }: { title: string; steps: RecordPr
   </section>;
 }
 
+function DamagePhotos({ documentType, documentId, documentNumber, lines, canManage, viewerEmail, viewerRole }: {
+  documentType: "purchase_order" | "sales_order";
+  documentId: string;
+  documentNumber: string;
+  lines: DamagePhotoLine[];
+  canManage: boolean;
+  viewerEmail: string;
+  viewerRole: string;
+}) {
+  const [photos, setPhotos] = useState<DamagePhoto[]>([]);
+  const [selectedLineIds, setSelectedLineIds] = useState<string[]>(lines.length === 1 ? [lines[0].id] : []);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const loadPhotos = useCallback(async (signal?: AbortSignal) => {
+    setLoading(true); setError("");
+    try {
+      const params = new URLSearchParams({ documentType, documentId });
+      const response = await fetch(`/api/attachments?${params}`, { cache: "no-store", signal });
+      const result = await response.json() as { attachments?: Array<Record<string, unknown>>; error?: { message?: string } };
+      if (!response.ok) throw new Error(result.error?.message ?? "Damage photos could not be loaded.");
+      setPhotos((result.attachments ?? []).filter((item) => text(item.category) === "damage_photo" && text(item.contentType).startsWith("image/")).map((item) => ({
+        id: text(item.id),
+        fileName: text(item.fileName),
+        contentType: text(item.contentType),
+        sizeBytes: number(item.sizeBytes),
+        ownerEmail: text(item.ownerEmail),
+        uploadedAt: text(item.uploadedAt),
+        lineItemIds: Array.isArray(item.lineItemIds) ? item.lineItemIds.filter((value): value is string => typeof value === "string") : [],
+      })));
+    } catch (caught) {
+      if (!(caught instanceof DOMException && caught.name === "AbortError")) setError(caught instanceof Error ? caught.message : "Damage photos could not be loaded.");
+    } finally { if (!signal?.aborted) setLoading(false); }
+  }, [documentId, documentType]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => void loadPhotos(controller.signal), 0);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [loadPhotos]);
+
+  const toggleLine = (lineId: string) => setSelectedLineIds((current) => current.includes(lineId) ? current.filter((id) => id !== lineId) : [...current, lineId]);
+  const upload = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!selectedLineIds.length) return setError("Select at least one affected line.");
+    if (!selectedFiles.length) return setError("Take or choose at least one photo.");
+    const oversized = selectedFiles.find((file) => file.size > 10 * 1024 * 1024);
+    if (oversized) return setError(`${oversized.name} exceeds the 10 MB limit.`);
+    setBusy(true); setError(""); setMessage("");
+    let uploaded = 0;
+    try {
+      for (const file of selectedFiles) {
+        const form = new FormData();
+        form.set("documentType", documentType); form.set("documentId", documentId); form.set("category", "damage_photo"); form.set("file", file);
+        selectedLineIds.forEach((lineId) => form.append("lineItemIds", lineId));
+        const response = await fetch("/api/attachments", { method: "POST", body: form });
+        const result = await response.json() as { error?: { message?: string } };
+        if (!response.ok) throw new Error(result.error?.message ?? `${file.name} could not be uploaded.`);
+        uploaded += 1;
+      }
+      setSelectedFiles([]);
+      if (inputRef.current) inputRef.current.value = "";
+      await loadPhotos();
+      setMessage(`${uploaded} damage photo${uploaded === 1 ? "" : "s"} linked to ${selectedLineIds.length} line${selectedLineIds.length === 1 ? "" : "s"}.`);
+    } catch (caught) {
+      if (uploaded) await loadPhotos();
+      setError(caught instanceof Error ? caught.message : "The damage photos could not be uploaded.");
+    } finally { setBusy(false); }
+  };
+  const remove = async (photo: DamagePhoto) => {
+    if (!window.confirm(`Remove ${photo.fileName} from ${documentNumber}? The removal will remain in the audit trail.`)) return;
+    setBusy(true); setError(""); setMessage("");
+    try {
+      const response = await fetch(`/api/attachments/${encodeURIComponent(photo.id)}`, { method: "DELETE" });
+      const result = await response.json() as { error?: { message?: string } };
+      if (!response.ok) throw new Error(result.error?.message ?? `${photo.fileName} could not be removed.`);
+      setPhotos((current) => current.filter((item) => item.id !== photo.id));
+      setMessage(`${photo.fileName} removed.`);
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "The photo could not be removed."); }
+    finally { setBusy(false); }
+  };
+
+  const lineById = new Map(lines.map((line) => [line.id, line]));
+  const canRemoveAny = /manager|administrator/i.test(viewerRole);
+  return <section className="panel damage-photos">
+    <PanelHeading title="Damage photos" detail={`${photos.length} photo${photos.length === 1 ? "" : "s"} · ${documentNumber}`} />
+    {canManage ? <form className="damage-photo-upload" onSubmit={upload}>
+      <fieldset><legend>Affected line items</legend><div className="damage-line-actions"><span>Link each new photo to one or more lines.</span>{lines.length > 1 ? <span><button type="button" className="text-button" onClick={() => setSelectedLineIds(lines.map((line) => line.id))}>Select all</button><button type="button" className="text-button" onClick={() => setSelectedLineIds([])}>Clear</button></span> : null}</div>
+        <div className="damage-line-options">{lines.map((line) => <label key={line.id} className={selectedLineIds.includes(line.id) ? "selected" : undefined}><input type="checkbox" checked={selectedLineIds.includes(line.id)} onChange={() => toggleLine(line.id)} /><span><strong>{line.label}</strong><small>{line.detail}</small></span></label>)}</div>
+      </fieldset>
+      <div className="damage-photo-file-row"><label><span>Photos</span><input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp" capture="environment" multiple disabled={busy} onChange={(event) => setSelectedFiles(Array.from(event.target.files ?? []))} /></label><button className="button primary" type="submit" disabled={busy || !selectedFiles.length || !selectedLineIds.length}>{busy ? "Uploading…" : selectedFiles.length > 1 ? `Add ${selectedFiles.length} photos` : "Add damage photo"}</button></div>
+      <small>Use the camera on a phone or choose JPEG, PNG, or WebP files · up to 10 MB each.</small>
+    </form> : <p className="read-only-label product-picture-readonly">Read-only access: damage-photo uploads are hidden.</p>}
+    {error ? <div className="product-picture-feedback error" role="alert">{error}</div> : null}
+    {message ? <div className="product-picture-feedback success" role="status">{message}</div> : null}
+    {loading ? <div className="empty-inline">Loading damage photos…</div> : photos.length ? <div className="damage-photo-grid">{photos.map((photo, index) => {
+      const linkedLines = photo.lineItemIds.map((id) => lineById.get(id)).filter((line): line is DamagePhotoLine => Boolean(line));
+      const canRemove = canManage && (canRemoveAny || photo.ownerEmail.toLowerCase() === viewerEmail.toLowerCase());
+      return <article key={photo.id} className="damage-photo-card"><a className="damage-photo-preview" href={`/api/attachments/${encodeURIComponent(photo.id)}`} target="_blank" rel="noreferrer" aria-label={`Open ${photo.fileName} full size`}><img src={`/api/attachments/${encodeURIComponent(photo.id)}`} alt={`${documentNumber} damage photo ${index + 1}`} loading="lazy" /></a><div className="damage-photo-meta"><div><strong title={photo.fileName}>{photo.fileName}</strong><small>{formatDocumentDate(photo.uploadedAt)} · {(photo.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div>{canRemove ? <button className="text-button danger-text" type="button" disabled={busy} onClick={() => void remove(photo)}>Remove</button> : null}</div><div className="damage-photo-lines" aria-label="Linked order lines">{linkedLines.length ? linkedLines.map((line) => <span key={line.id}>{line.label}</span>) : <span className="unassigned">Order-level photo</span>}</div></article>;
+    })}</div> : <div className="damage-photo-empty"><strong>No damage photos recorded</strong><p>Take a photo, then select every line item shown in that image.</p></div>}
+  </section>;
+}
+
 function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSort, receivingOnly = false }: { orders: PurchaseOrder[]; canOperate: boolean; onOpen: (id: string) => void; onReceive: (po: PurchaseOrder) => void; receivingOnly?: boolean } & WorklistSortProps) {
   // Scoped server-side by the worklist status filter; see SalesOrdersView.
   return <section className="panel worklist">
@@ -2263,7 +2435,7 @@ function PurchaseOrdersView({ orders, canOperate, onOpen, onReceive, sort, setSo
   </section>;
 }
 
-function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBack, onEdit, onCommand, onOpenVendorBilling, onOpenApprovalQueue, onOpenQbo, onOpenDropShip, onSubmitForApproval, onChanged }: { po: PurchaseOrder; canDraft: boolean; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: (tab?: string) => void; onOpenApprovalQueue: () => void; onOpenQbo: () => void; onOpenDropShip: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void }) {
+function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBack, onEdit, onCommand, onOpenVendorBilling, onOpenApprovalQueue, onOpenQbo, onOpenDropShip, onSubmitForApproval, onChanged, viewer }: { po: PurchaseOrder; canDraft: boolean; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onCommand: (kind: CommandKind) => void; onOpenVendorBilling: (tab?: string) => void; onOpenApprovalQueue: () => void; onOpenQbo: () => void; onOpenDropShip: () => void; onSubmitForApproval: (reason: string) => Promise<void>; onChanged: (message: string) => void; viewer: Snapshot["viewer"] }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   const [submitNote, setSubmitNote] = useState("");
@@ -2293,7 +2465,7 @@ function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBac
     finally { setOrdering(false); }
   };
   const totals = documentTotals(po.lines.map((line) => ({ quantity: line.ordered, unitAmount: line.unitCost, discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps })), po);
-  const lineTable = useLocalTableSort(po.lines, { line: (row) => po.lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, customer: (row) => row.customerRef ?? "Stock", ordered: (row) => row.ordered, received: (row) => row.received - row.returned, returned: (row) => row.returned, closed: (row) => row.closed, open: (row) => row.open, unitCost: (row) => row.unitCost, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitCost, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitCost, row.discountCents) });
+  const lineTable = useLocalTableSort(po.lines, { line: (row) => po.lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, bin: (row) => row.binLocationCode ?? "", customer: (row) => row.customerRef ?? "Stock", ordered: (row) => row.ordered, received: (row) => row.received - row.returned, returned: (row) => row.returned, closed: (row) => row.closed, open: (row) => row.open, unitCost: (row) => row.unitCost, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitCost, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitCost, row.discountCents) });
   const activeVendorBills = po.vendorBills.filter((bill) => bill.status.toLowerCase() !== "void");
   const vendorBillOutstanding = activeVendorBills.reduce((sum, bill) => sum + bill.outstanding, 0);
   const billNeedsAttention = activeVendorBills.some((bill) => bill.status.toLowerCase().includes("hold") || bill.matchStatus?.toLowerCase().includes("exception"));
@@ -2394,8 +2566,9 @@ function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBac
       <MetricDisplay label="Open fulfillment" value={po.open} tone={po.open > 0 ? "info" : "neutral"} />
     </section>
     <section className="panel"><PanelHeading title="Order lines" detail={`${po.lines.length} line${po.lines.length === 1 ? "" : "s"} · amounts in ${po.currency}`} />
-      <div className="responsive-table"><table><caption className="sr-only">Purchase order lines, quantity breakdown, and extended amounts</caption><thead><tr><SortableHeader label="#" column="line" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" /><SortableHeader label="Product / configuration" column="product" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Customer / project" column="customer" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Ordered" column="ordered" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Supplier fulfilled" column="received" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Returned" column="returned" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Closed" column="closed" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Unit cost" column="unitCost" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Discount" column="discount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Amount" column="amount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{lineTable.rows.map((line) => <tr key={line.id}><td className="numeric muted">{po.lines.indexOf(line) + 1}</td><td><strong>{line.product}</strong><small>{line.sku} · {line.specification}</small></td><td>{line.customerRef ? <span className="allocation-tag">{line.customerRef}</span> : <span className="muted">Stock</span>}</td><td className="numeric">{line.ordered}{line.orderedUomCode ? <small>{line.orderedUomCode}</small> : null}</td><td className="numeric strong">{line.fulfilled}</td><td className="numeric">{line.returned}</td><td className="numeric">{line.closed}</td><td className="numeric strong">{line.open}</td><td className="numeric">{formatDocumentMoney(line.unitCost, po.currency)}</td><td className="numeric">{line.discountCents ? `−${formatDocumentMoney(line.discountCents / 100, po.currency)}` : "—"}</td><td className="numeric">{line.taxable ? formatDocumentMoney(lineTaxAmount(line.ordered, line.unitCost, line.discountCents, line.taxable, line.taxRateBps), po.currency) : "Exempt"}</td><td className="numeric strong">{formatDocumentMoney(lineNetAmount(line.ordered, line.unitCost, line.discountCents), po.currency)}</td></tr>)}</tbody></table></div>
+      <div className="responsive-table"><table><caption className="sr-only">Purchase order lines, bin locations, quantity breakdown, and extended amounts</caption><thead><tr><SortableHeader label="#" column="line" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" /><SortableHeader label="Product / configuration" column="product" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Bin" column="bin" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Customer / project" column="customer" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Ordered" column="ordered" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Supplier fulfilled" column="received" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Returned" column="returned" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Closed" column="closed" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Unit cost" column="unitCost" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Discount" column="discount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Amount" column="amount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{lineTable.rows.map((line) => <tr key={line.id}><td className="numeric muted">{po.lines.indexOf(line) + 1}</td><td><strong>{line.product}</strong><small>{line.sku} · {line.specification}</small></td><td>{line.binLocationCode ? <><strong>{line.binLocationCode}</strong><small>{line.binLocationName}</small></> : <span className="muted">—</span>}</td><td>{line.customerRef ? <span className="allocation-tag">{line.customerRef}</span> : <span className="muted">Stock</span>}</td><td className="numeric">{line.ordered}{line.orderedUomCode ? <small>{line.orderedUomCode}</small> : null}</td><td className="numeric strong">{line.fulfilled}</td><td className="numeric">{line.returned}</td><td className="numeric">{line.closed}</td><td className="numeric strong">{line.open}</td><td className="numeric">{formatDocumentMoney(line.unitCost, po.currency)}</td><td className="numeric">{line.discountCents ? `−${formatDocumentMoney(line.discountCents / 100, po.currency)}` : "—"}</td><td className="numeric">{line.taxable ? formatDocumentMoney(lineTaxAmount(line.ordered, line.unitCost, line.discountCents, line.taxable, line.taxRateBps), po.currency) : "Exempt"}</td><td className="numeric strong">{formatDocumentMoney(lineNetAmount(line.ordered, line.unitCost, line.discountCents), po.currency)}</td></tr>)}</tbody></table></div>
     </section>
+    <DamagePhotos key={po.id} documentType="purchase_order" documentId={po.id} documentNumber={po.number} canManage={canOperate} viewerEmail={viewer.email} viewerRole={viewer.role} lines={po.lines.map((line, index) => ({ id: line.id, label: `Line ${index + 1} · ${line.sku}`, detail: line.product }))} />
     <div className="detail-columns">
       <DocumentFacts title="Order details" facts={[
         ["Order date", formatDocumentDate(po.orderDate)],
@@ -2486,10 +2659,83 @@ function VendorReturnsView({ orders, canOperate, onReturn }: { orders: PurchaseO
 function SalesOrdersView({ orders, canOperate, onOpen, onShip, sort, setSort }: { orders: SalesOrder[]; canOperate: boolean; onOpen: (id: string) => void; onShip: (so: SalesOrder) => void } & WorklistSortProps) {
   // No client-side trim: the worklist status filter scopes this server-side, so the row
   // count on screen always equals the record count reported above it.
-  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Sales orders</caption><thead><tr><SortableHeader label="Exception" column="exception" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="SO" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Customer / project" column="customer" sort={sort} setSort={setSort} /><SortableHeader label="Requested" column="requested" sort={sort} setSort={setSort} /><SortableHeader label="Availability" column="availability" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="Fulfillment" column="fulfillment" sort={sort} setSort={setSort} /><SortableHeader label="Invoice" column="billing" sort={sort} setSort={setSort} /><SortableHeader label="Total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{orders.map((so) => <tr key={so.id}><td>{so.exception ? <span className={`exception-cell ${so.shortage > 0 ? "danger" : "warning"}`}>!</span> : "—"}</td><td><button className="table-link" onClick={() => onOpen(so.id)}>{so.number}</button><small>{so.route}</small></td><td><strong>{so.customer}</strong>{so.project ? <small>{so.project}</small> : null}</td><td>{formatDate(so.requestedDate)}</td><td><div className="availability-mini"><strong>{so.availableNow} now</strong><span>{so.incomingBeforeDate} incoming</span>{so.shortage > 0 && <b>{so.shortage} short</b>}</div></td><td><StatusBadge>{so.fulfillment}</StatusBadge></td><td><StatusBadge>{so.billing}</StatusBadge></td><td className="numeric strong">{formatDocumentMoney(so.total, so.currency, false)}</td><td>{canOperate && so.lifecycle.toLowerCase() === "confirmed" && so.reserved > 0 ? <button className="row-action" onClick={() => onShip(so)}>Post shipment</button> : <button className="row-action" onClick={() => onOpen(so.id)}>View</button>}</td></tr>)}{!orders.length ? <tr><td colSpan={9}><div className="empty-inline">No sales order matches this filter.</div></td></tr> : null}</tbody></table></div></section>;
+  return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Sales orders</caption><thead><tr><SortableHeader label="Exception" column="exception" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="SO" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Customer / project" column="customer" sort={sort} setSort={setSort} /><SortableHeader label="Salesperson" column="salesPerson" sort={sort} setSort={setSort} /><SortableHeader label="Requested" column="requested" sort={sort} setSort={setSort} /><SortableHeader label="Availability" column="availability" sort={sort} setSort={setSort} defaultDirection="desc" /><SortableHeader label="Fulfillment" column="fulfillment" sort={sort} setSort={setSort} /><SortableHeader label="Invoice" column="billing" sort={sort} setSort={setSort} /><SortableHeader label="Total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><th><span className="sr-only">Action</span></th></tr></thead><tbody>{orders.map((so) => <tr key={so.id}><td>{so.exception ? <span className={`exception-cell ${so.shortage > 0 ? "danger" : "warning"}`}>!</span> : "—"}</td><td><button className="table-link" onClick={() => onOpen(so.id)}>{so.number}</button><small>{so.route}</small></td><td><strong>{so.customer}</strong>{so.project ? <small>{so.project}</small> : null}</td><td><strong>{so.salesPerson}</strong></td><td>{formatDate(so.requestedDate)}</td><td><div className="availability-mini"><strong>{so.availableNow} now</strong><span>{so.incomingBeforeDate} incoming</span>{so.shortage > 0 && <b>{so.shortage} short</b>}</div></td><td><StatusBadge>{so.fulfillment}</StatusBadge></td><td><StatusBadge>{so.billing}</StatusBadge></td><td className="numeric strong">{formatDocumentMoney(so.total, so.currency, false)}</td><td>{canOperate && so.lifecycle.toLowerCase() === "confirmed" && so.reserved > 0 ? <button className="row-action" onClick={() => onShip(so)}>Post shipment</button> : <button className="row-action" onClick={() => onOpen(so.id)}>View</button>}</td></tr>)}{!orders.length ? <tr><td colSpan={10}><div className="empty-inline">No sales order matches this filter.</div></td></tr> : null}</tbody></table></div></section>;
 }
 
-function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onOpenCustomerBilling, onOpenQbo, onOpenDropShip, onCreateLinkedPurchaseOrder, onOpenLinkedPurchaseOrder, onConfirm }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onOpenCustomerBilling: (tab?: string) => void; onOpenQbo: () => void; onOpenDropShip: () => void; onCreateLinkedPurchaseOrder: () => void; onOpenLinkedPurchaseOrder: () => void; onConfirm: (reason: string) => Promise<void> }) {
+function SalesPeopleView({ salesPeople, canManage, canUpload, onEdit, onChanged }: {
+  salesPeople: SalesPerson[];
+  canManage: boolean;
+  canUpload: boolean;
+  onEdit: (salesPerson: SalesPerson) => void;
+  onChanged: (message: string) => void;
+}) {
+  const [uploadingId, setUploadingId] = useState("");
+  const [uploadError, setUploadError] = useState("");
+  const activePeople = salesPeople.filter((person) => person.active);
+  const totals = activePeople.reduce((sum, person) => ({
+    orders: sum.orders + person.orderCount,
+    open: sum.open + person.openOrderCount,
+    booked: sum.booked + person.bookedSalesCents,
+    invoiced: sum.invoiced + person.invoicedSalesCents,
+    collected: sum.collected + person.collectedSalesCents,
+  }), { orders: 0, open: 0, booked: 0, invoiced: 0, collected: 0 });
+  const uploadPhoto = async (person: SalesPerson, file: File | undefined) => {
+    if (!file) return;
+    setUploadingId(person.id);
+    setUploadError("");
+    try {
+      const form = new FormData();
+      form.set("documentType", "sales_person");
+      form.set("documentId", person.id);
+      form.set("category", "sales_person_photo");
+      form.set("file", file);
+      const response = await fetch("/api/attachments", { method: "POST", body: form });
+      const result = await response.json() as { error?: string | { message?: string } };
+      if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "The profile picture could not be uploaded.");
+      onChanged(`${person.name}'s profile picture was uploaded.`);
+    } catch (caught) {
+      setUploadError(caught instanceof Error ? caught.message : "The profile picture could not be uploaded.");
+    } finally {
+      setUploadingId("");
+    }
+  };
+  return <div className="sales-team-page">
+    <section className="panel sales-team-summary" aria-label="Sales team totals">
+      <MetricDisplay label="Active salespeople" value={activePeople.length} />
+      <MetricDisplay label="Attributed orders" value={totals.orders} />
+      <MetricDisplay label="Open orders" value={totals.open} tone={totals.open ? "info" : "neutral"} />
+      <MetricDisplay label="Booked sales · CAD" value={formatDocumentMoney(totals.booked / 100, "CAD", false)} tone="success" />
+      <MetricDisplay label="Invoiced · CAD" value={formatDocumentMoney(totals.invoiced / 100, "CAD", false)} />
+      <MetricDisplay label="Collected · CAD" value={formatDocumentMoney(totals.collected / 100, "CAD", false)} />
+    </section>
+    {uploadError ? <div className="error-summary" role="alert"><strong>Picture not uploaded</strong><p>{uploadError}</p></div> : null}
+    <section className="sales-person-grid" aria-label="Salesperson performance">
+      {salesPeople.map((person) => <article className={`panel sales-person-card${person.active ? "" : " inactive"}`} key={person.id}>
+        <div className="sales-person-identity">
+          <div className="sales-person-photo">{person.photoAttachmentId ? <img src={`/api/attachments/${encodeURIComponent(person.photoAttachmentId)}`} alt={`${person.name} profile`} loading="lazy" /> : <span aria-hidden="true">{initials(person.name)}</span>}</div>
+          <div><span className="section-kicker">{person.code}</span><h2>{person.name}</h2><p>{[person.email, person.phone].filter(Boolean).join(" · ") || "No contact details"}</p></div>
+          <StatusBadge tone={person.active ? "success" : "neutral"}>{person.active ? "Active" : "Inactive"}</StatusBadge>
+        </div>
+        <dl className="sales-person-stats">
+          <div><dt>Booked</dt><dd>{formatDocumentMoney(person.bookedSalesCents / 100, "CAD", false)}</dd></div>
+          <div><dt>Invoiced</dt><dd>{formatDocumentMoney(person.invoicedSalesCents / 100, "CAD", false)}</dd></div>
+          <div><dt>Collected</dt><dd>{formatDocumentMoney(person.collectedSalesCents / 100, "CAD", false)}</dd></div>
+          <div><dt>Orders</dt><dd>{person.orderCount}</dd></div>
+          <div><dt>Open</dt><dd>{person.openOrderCount}</dd></div>
+          <div><dt>Last order</dt><dd>{person.lastOrderAt ? formatDate(person.lastOrderAt) : "—"}</dd></div>
+        </dl>
+        <div className="sales-person-actions">
+          {canUpload ? <label className={`button secondary${uploadingId === person.id ? " disabled" : ""}`}>{uploadingId === person.id ? "Uploading…" : person.photoAttachmentId ? "Replace picture" : "Upload picture"}<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" disabled={Boolean(uploadingId)} onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; void uploadPhoto(person, file); }} /></label> : null}
+          {canManage ? <button className="button secondary" type="button" onClick={() => onEdit(person)}>Edit profile</button> : null}
+          {person.photoCount > 1 ? <small>{person.photoCount} uploaded pictures · newest shown</small> : null}
+        </div>
+      </article>)}
+      {!salesPeople.length ? <section className="panel empty-state sales-team-empty"><span className="empty-glyph" aria-hidden="true">SP</span><h2>No salespeople yet</h2><p>Add the team members who should be credited on sales orders and counter sales.</p></section> : null}
+    </section>
+  </div>;
+}
+
+function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, onReserve, onShip, onImmediateSale, onOpenCustomerBilling, onOpenQbo, onOpenDropShip, onCreateLinkedPurchaseOrder, onOpenLinkedPurchaseOrder, onConfirm, viewer }: { so: SalesOrder; canOperate: boolean; canPostFinancial: boolean; onBack: () => void; onEdit: () => void; onReserve: () => void; onShip: () => void; onImmediateSale: () => void; onOpenCustomerBilling: (tab?: string) => void; onOpenQbo: () => void; onOpenDropShip: () => void; onCreateLinkedPurchaseOrder: () => void; onOpenLinkedPurchaseOrder: () => void; onConfirm: (reason: string) => Promise<void>; viewer: Snapshot["viewer"] }) {
   const [activating, setActivating] = useState(false);
   const [activateError, setActivateError] = useState("");
   // Confirmation comments are optional. When supplied they remain part of the audit trail,
@@ -2509,7 +2755,8 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   const canShip = confirmed && so.openToShip > 0 && so.reserved > 0;
   const canReserve = confirmed && (so.lines?.some((line) => line.fulfillmentRoute === "stock" && line.open > line.reserved) ?? false);
   const canPostDropShipDelivery = confirmed && (so.lines?.some((line) => line.fulfillmentRoute === "drop_ship" && line.open > 0 && line.linkedPurchaseOrderLifecycle === "approved") ?? false);
-  const invoiceable = Math.max(so.fulfilled - (so.invoiced ?? 0), 0);
+  const invoiced = so.invoiced ?? 0;
+  const invoiceable = Math.max(so.fulfilled - invoiced, 0);
   const reserveBlocked = canReserve && so.availableNow <= 0;
   const confirm = async (event: FormEvent) => {
     event.preventDefault();
@@ -2519,7 +2766,7 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
   };
   const lines = so.lines ?? [];
   const totals = documentTotals(lines.map((line) => ({ quantity: line.ordered, unitAmount: line.unitPrice, discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps })), so);
-  const lineTable = useLocalTableSort(lines, { line: (row) => lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, route: (row) => `${row.fulfillmentRoute} ${row.projectReference ?? ""}`, ordered: (row) => row.ordered, reserved: (row) => row.reserved, shipped: (row) => row.shipped, returned: (row) => row.returned, open: (row) => row.open, unitPrice: (row) => row.unitPrice, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitPrice, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitPrice, row.discountCents) });
+  const lineTable = useLocalTableSort(lines, { line: (row) => lines.indexOf(row), product: (row) => `${row.product} ${row.sku}`, bin: (row) => `${row.binLocationCode ?? ""} ${row.binLocationName ?? ""}`, route: (row) => `${row.fulfillmentRoute} ${row.projectReference ?? ""}`, ordered: (row) => row.ordered, reserved: (row) => row.reserved, shipped: (row) => row.shipped, returned: (row) => row.returned, open: (row) => row.open, unitPrice: (row) => row.unitPrice, discount: (row) => row.discountCents, tax: (row) => lineTaxAmount(row.ordered, row.unitPrice, row.discountCents, row.taxable, row.taxRateBps), amount: (row) => lineNetAmount(row.ordered, row.unitPrice, row.discountCents) });
   const shipmentTable = useLocalTableSort(so.shipments, { number: (row) => row.number, posted: (row) => row.postedAt, status: (row) => row.status, carrier: (row) => row.carrier, service: (row) => row.serviceLevel, tracking: (row) => row.trackingNumber, billOfLading: (row) => row.billOfLadingNumber });
   const lifecycle = so.lifecycle.toLowerCase();
   const canceled = lifecycle === "canceled";
@@ -2586,8 +2833,9 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
     {/* The lines are the order. Without them this page showed a total for goods it never named,
         so nobody could check what the customer actually bought. */}
     <section className="panel"><PanelHeading title="Order lines" detail={`${lines.length} line${lines.length === 1 ? "" : "s"} · amounts in ${so.currency}`} />
-      <div className="responsive-table"><table><caption className="sr-only">Sales order lines, fulfillment quantities, and extended amounts</caption><thead><tr><SortableHeader label="#" column="line" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" /><SortableHeader label="Product" column="product" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Route / project" column="route" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Ordered" column="ordered" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reserved" column="reserved" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Fulfilled" column="shipped" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Returned" column="returned" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Unit price" column="unitPrice" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Discount" column="discount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Amount" column="amount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{lineTable.rows.map((line) => <tr key={line.id}><td className="numeric muted">{lines.indexOf(line) + 1}</td><td><strong>{line.product}</strong><small>{line.sku}</small></td><td>{titleCase(line.fulfillmentRoute)}{line.projectReference ? <small>{line.projectReference}</small> : null}</td><td className="numeric">{line.ordered}{line.orderedUomCode ? <small>{line.orderedUomCode}</small> : null}</td><td className="numeric">{line.reserved}</td><td className="numeric strong">{line.fulfilled}</td><td className="numeric">{line.returned}</td><td className="numeric strong">{line.open}</td><td className="numeric">{formatDocumentMoney(line.unitPrice, so.currency)}</td><td className="numeric">{line.discountCents ? `−${formatDocumentMoney(line.discountCents / 100, so.currency)}` : "—"}</td><td className="numeric">{line.taxable ? formatDocumentMoney(lineTaxAmount(line.ordered, line.unitPrice, line.discountCents, line.taxable, line.taxRateBps), so.currency) : "Exempt"}</td><td className="numeric strong">{formatDocumentMoney(lineNetAmount(line.ordered, line.unitPrice, line.discountCents), so.currency)}</td></tr>)}{!lines.length ? <tr><td colSpan={12}><div className="empty-inline">This order has no lines recorded.</div></td></tr> : null}</tbody></table></div>
+      <div className="responsive-table"><table><caption className="sr-only">Sales order lines, preferred bins, fulfillment quantities, and extended amounts</caption><thead><tr><SortableHeader label="#" column="line" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" /><SortableHeader label="Product" column="product" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Bin" column="bin" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Route / project" column="route" sort={lineTable.sort} setSort={lineTable.setSort} /><SortableHeader label="Ordered" column="ordered" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Reserved" column="reserved" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Fulfilled" column="shipped" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Returned" column="returned" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Open" column="open" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Unit price" column="unitPrice" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Discount" column="discount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Amount" column="amount" sort={lineTable.sort} setSort={lineTable.setSort} className="numeric" defaultDirection="desc" /></tr></thead><tbody>{lineTable.rows.map((line) => <tr key={line.id}><td className="numeric muted">{lines.indexOf(line) + 1}</td><td><strong>{line.product}</strong><small>{line.sku}</small></td><td>{line.binLocationCode ? <><strong>{line.binLocationCode}</strong>{line.binLocationName ? <small>{line.binLocationName}</small> : null}</> : "—"}</td><td>{titleCase(line.fulfillmentRoute)}{line.projectReference ? <small>{line.projectReference}</small> : null}</td><td className="numeric">{line.ordered}{line.orderedUomCode ? <small>{line.orderedUomCode}</small> : null}</td><td className="numeric">{line.reserved}</td><td className="numeric strong">{line.fulfilled}</td><td className="numeric">{line.returned}</td><td className="numeric strong">{line.open}</td><td className="numeric">{formatDocumentMoney(line.unitPrice, so.currency)}</td><td className="numeric">{line.discountCents ? `−${formatDocumentMoney(line.discountCents / 100, so.currency)}` : "—"}</td><td className="numeric">{line.taxable ? formatDocumentMoney(lineTaxAmount(line.ordered, line.unitPrice, line.discountCents, line.taxable, line.taxRateBps), so.currency) : "Exempt"}</td><td className="numeric strong">{formatDocumentMoney(lineNetAmount(line.ordered, line.unitPrice, line.discountCents), so.currency)}</td></tr>)}{!lines.length ? <tr><td colSpan={13}><div className="empty-inline">This order has no lines recorded.</div></td></tr> : null}</tbody></table></div>
     </section>
+    <DamagePhotos key={so.id} documentType="sales_order" documentId={so.id} documentNumber={so.number} canManage={canOperate} viewerEmail={viewer.email} viewerRole={viewer.role} lines={lines.map((line, index) => ({ id: line.id, label: `Line ${index + 1} · ${line.sku}`, detail: line.product }))} />
     <div className="detail-columns">
       <DocumentFacts title="Order details" facts={[
         ["Order date", formatDocumentDate(so.orderDate)],
@@ -2595,7 +2843,7 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
         ["Payment terms", so.paymentTerms ?? "Not recorded"],
         ["Payment due", formatDocumentDate(so.dueDate)],
         ["Currency", so.exchangeRateToBase === 1 ? so.currency : `${so.currency} · rate ${so.exchangeRateToBase} to CAD`],
-        ["Sales owner", so.owner],
+        ["Salesperson", so.salesPerson],
         ["Project reference", so.project || "—"],
       ]} />
       <DocumentTotalsPanel totals={totals} currency={so.currency} />
@@ -2781,7 +3029,7 @@ function ProductBinDialog({ product, warehouse, onClose, onSaved }: { product: P
   const [locationId, setLocationId] = useState(warehouse.locationId ?? ""); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
   useDialogDismiss(onClose, busy);
   const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); setError(""); try { onSaved(await postWorkflow("setProductDefaultLocation", product.id, product.productVersion, { warehouseId: warehouse.warehouseId, locationId })); } catch (caught) { setError(caught instanceof Error ? caught.message : "The preferred bin could not be saved."); } finally { setBusy(false); } };
-  return <div className="modal-overlay" role="presentation"><section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label="Set preferred warehouse bin"><div className="dialog-header"><div><span className="section-kicker">{product.sku} · {warehouse.warehouseCode}</span><h2>Set preferred bin</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div><form className="command-form" onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<label><span>Usable bin in {warehouse.warehouseName}</span><ReferenceSearchSelect kind="locations" role="bin" warehouseId={warehouse.warehouseId} value={locationId} initialOptions={warehouse.locationId ? [{ id: warehouse.locationId, label: `${warehouse.locationCode} · ${warehouse.locationName}`, detail: warehouse.warehouseName }] : []} onSelect={(option) => setLocationId(option.id)} placeholder="Search bins in this warehouse" /></label><p className="formula-note">Future receipts of this product into {warehouse.warehouseCode} will start with this bin selected.</p><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button type="submit" className="button primary" disabled={busy || !locationId}>{busy ? "Saving…" : "Save preferred bin"}</button></div></form></section></div>;
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label="Set preferred warehouse bin"><div className="dialog-header"><div><span className="section-kicker">{product.sku} · {warehouse.warehouseCode}</span><h2>Set preferred bin</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose}>×</button></div><form className="command-form" onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<label><span>Usable bin in {warehouse.warehouseName}</span><ReferenceSearchSelect kind="locations" role="bin" warehouseId={warehouse.warehouseId} value={locationId} initialOptions={warehouse.locationId ? [{ id: warehouse.locationId, label: `${warehouse.locationCode} · ${warehouse.locationName}`, detail: warehouse.warehouseName }] : []} onSelect={(option) => setLocationId(option.id)} placeholder="Search bins in this warehouse" /></label><p className="formula-note">Selecting this item on a purchase order, sales order, counter sale, or invoice in {warehouse.warehouseCode} will fill this bin automatically.</p><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button type="submit" className="button primary" disabled={busy || !locationId}>{busy ? "Saving…" : "Save preferred bin"}</button></div></form></section></div>;
 }
 
 function MergeProductDialog({ product, onClose, onSaved }: { product: Product; onClose: () => void; onSaved: (message: string) => void }) {
@@ -3325,6 +3573,41 @@ function PartnerEditor({ partner, onClose, onSaved }: { partner: Partner | "new"
   </section></div>;
 }
 
+function SalesPersonEditor({ salesPerson, onClose, onSaved }: { salesPerson: SalesPerson | "new"; onClose: () => void; onSaved: (message: string) => void }) {
+  const editing = salesPerson !== "new";
+  const source = editing ? salesPerson : null;
+  const [form, setForm] = useState({ code: source?.code ?? "", name: source?.name ?? "", email: source?.email ?? "", phone: source?.phone ?? "", active: source?.active ?? true });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useDialogDismiss(onClose, busy);
+  const set = (patch: Partial<typeof form>) => setForm((current) => ({ ...current, ...patch }));
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true); setError("");
+    const idempotencyKey = crypto.randomUUID();
+    try {
+      const response = await fetch("/api/workflows", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": idempotencyKey }, body: JSON.stringify({
+        command: editing ? "updateSalesPerson" : "createSalesPerson",
+        entityId: source?.id, version: source?.version, idempotencyKey, payload: form,
+      }) });
+      const result = await response.json() as { message?: string; error?: string | { message?: string } };
+      if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : result.error?.message ?? "The salesperson could not be saved.");
+      onSaved(result.message ?? `${form.name} saved.`);
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "The salesperson could not be saved."); }
+    finally { setBusy(false); }
+  };
+  return <div className="modal-overlay" role="presentation"><section className="command-dialog quick-create-dialog" role="dialog" aria-modal="true" aria-label={editing ? `Edit ${source?.name}` : "New salesperson"}>
+    <div className="dialog-header"><div><span className="section-kicker">Sales team</span><h2>{editing ? `Edit ${source?.name}` : "Add salesperson"}</h2></div><button type="button" className="icon-button" aria-label="Close" onClick={onClose} disabled={busy}>×</button></div>
+    <form onSubmit={submit}>{error ? <div className="error-summary" role="alert"><p>{error}</p></div> : null}<div className="command-form form-grid">
+      <label><span>Salesperson code{requiredMark}</span><input value={form.code} maxLength={32} onChange={(event) => set({ code: event.target.value.toUpperCase() })} required /></label>
+      <label><span>Name{requiredMark}</span><input value={form.name} maxLength={120} onChange={(event) => set({ name: event.target.value })} required /></label>
+      <label>Email<input type="email" value={form.email} onChange={(event) => set({ email: event.target.value })} /></label>
+      <label>Phone<input value={form.phone} onChange={(event) => set({ phone: event.target.value })} /></label>
+      {editing ? <label className="radio-row"><input type="checkbox" checked={form.active} onChange={(event) => set({ active: event.target.checked })} /><span>Available for new sales</span></label> : null}
+    </div><div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="button primary" disabled={busy || !form.code.trim() || !form.name.trim()}>{busy ? "Saving…" : editing ? "Save profile" : "Add salesperson"}</button></div></form>
+  </section></div>;
+}
+
 
 
 function VendorBillsView({ bills, sort, setSort, onOpenPurchaseOrder }: { bills: Bill[]; onOpenPurchaseOrder: (bill: Bill) => void } & WorklistSortProps) {
@@ -3569,6 +3852,10 @@ function ReferenceSearchSelect({ kind, role, partnerId, productId, lineId, locat
     priceSource: text(item.priceSource) || undefined,
     factorToBase: number(item.factorToBase, 1),
     availableQuantity: number(item.availableQuantity),
+    defaultBinLocationId: text(item.defaultBinLocationId) || undefined,
+    defaultBinLocationLabel: text(item.defaultBinLocationId) ? [text(item.defaultBinLocationCode), text(item.defaultBinLocationName)].filter(Boolean).join(" · ") : undefined,
+    defaultBinAvailableQuantity: number(item.defaultBinAvailableQuantity),
+    binLocationSource: ["configured", "only_stocked"].includes(text(item.binLocationSource)) ? text(item.binLocationSource) as "configured" | "only_stocked" : undefined,
     trackingPolicy: text(item.trackingPolicy, "quantity"),
     inventoryPolicy: text(item.inventoryPolicy, "stocked"),
     dimensions: text(item.dimensions) || undefined,
@@ -3643,8 +3930,40 @@ const WALK_IN_CUSTOMER: LookupOption = {
   creditLimitCents: 0,
 };
 
-function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete }: {
+type CounterSalePostedResult = { message?: string; invoiceId?: string; invoiceNumber?: string };
+type CounterHelcimCheckout = {
+  checkoutToken?: string;
+  paymentLinkToken?: string;
+  invoiceId?: string;
+  invoiceNumber?: string;
+  status?: "paid" | "processing" | "failed";
+  message?: string;
+  sale?: CounterSalePostedResult | null;
+  error?: { code?: string; message?: string };
+};
+
+function loadCounterHelcimPay() {
+  if (window.appendHelcimPayIframe) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>('script[data-helcim-pay="true"]');
+    if (existing) {
+      existing.addEventListener("load", () => resolve(), { once: true });
+      existing.addEventListener("error", () => reject(new Error("Helcim secure checkout could not be loaded.")), { once: true });
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://secure.helcim.app/helcim-pay/services/start.js";
+    script.async = true;
+    script.dataset.helcimPay = "true";
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Helcim secure checkout could not be loaded."));
+    document.head.append(script);
+  });
+}
+
+function CounterSaleScreen({ warehouseId, salesPeople, taxDefaultRateBps, canPost, onComplete }: {
   warehouseId: string;
+  salesPeople: SalesPerson[];
   taxDefaultRateBps: number;
   canPost: boolean;
   onComplete: (message: string) => void;
@@ -3653,11 +3972,12 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
     id: crypto.randomUUID(), productId: "", quantity: 1, unitAmount: 0, uomId: "", uomCode: "",
     priceSource: "Select a product", discountRate: 0, taxCode: taxDefaultRateBps > 0 ? "GST" : "EXEMPT",
     taxRate: taxDefaultRateBps / 100, route: "stock", projectReference: "", sourceSalesOrderLineId: "", supplyAllocations: [],
-    linkedPurchaseOrderLineId: "", factorToBase: 1, trackingPolicy: "quantity", availableQuantity: 0,
-    locationId: "", locationLabel: "", locationAvailable: 0, lotId: "", inventoryUnitId: "",
+    linkedPurchaseOrderLineId: "", binLocationId: "", binLocationLabel: "", factorToBase: 1, trackingPolicy: "quantity", availableQuantity: 0,
+    locationId: "", locationLabel: "", locationAvailable: 0, locationSource: "", lotId: "", inventoryUnitId: "",
   });
   const [customerId, setCustomerId] = useState(WALK_IN_CUSTOMER_ID);
   const [customer, setCustomer] = useState<LookupOption | null>(WALK_IN_CUSTOMER);
+  const [salesPersonId, setSalesPersonId] = useState("");
   const [lines, setLines] = useState<CounterSaleLine[]>(() => [newLine()]);
   const [postingDate, setPostingDate] = useState(() => localDateString());
   const [currency, setCurrency] = useState("CAD");
@@ -3672,7 +3992,11 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
   const [error, setError] = useState("");
   // Set when the server reports the attempt key already belongs to a posted sale.
   const [alreadyPosted, setAlreadyPosted] = useState(false);
+  const [pendingHelcimSale, setPendingHelcimSale] = useState<CounterSalePostedResult | null>(null);
+  const [helcimState, setHelcimState] = useState<"opening" | "open" | "retry" | "review">("opening");
   const attemptKey = useRef("");
+  const helcimCheckout = useRef<{ checkoutToken: string; paymentLinkToken: string } | null>(null);
+  const helcimCompletionInFlight = useRef(false);
 
   const updateLine = (id: string, patch: Partial<CounterSaleLine>) => setLines((current) => current.map((line) => line.id === id ? { ...line, ...patch } : line));
   const lineAmounts = lines.map((line) => {
@@ -3690,8 +4014,9 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
   const lineReady = (line: CounterSaleLine) => Boolean(line.productId && line.locationId && line.quantity > 0 && line.unitAmount > 0
     && (line.trackingPolicy !== "lot" || line.lotId) && (line.trackingPolicy !== "serial" || line.inventoryUnitId));
   const overAvailable = lines.some((line) => line.locationId && line.quantity * line.factorToBase > line.locationAvailable);
-  const ready = Boolean(customerId && lines.length && lines.every(lineReady) && !overAvailable && total > 0
-    && (currency === "CAD" || exchangeRate > 0) && (settlement !== "pay_now" || paymentReference.trim()));
+  const ready = Boolean(customerId && salesPersonId && lines.length && lines.every(lineReady) && !overAvailable && total > 0
+    && (currency === "CAD" || exchangeRate > 0)
+    && (settlement !== "pay_now" || (paymentMethod === "helcim_card" ? total >= 100 && ["CAD", "USD"].includes(currency) : Boolean(paymentReference.trim()))));
 
   const chooseCustomer = (option: LookupOption) => {
     setCustomerId(option.id);
@@ -3709,6 +4034,119 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
     } else setError("");
   };
 
+  const commandForAttempt = (idempotencyKey: string) => ({
+    command: "postCounterSale",
+    entityId: `counter-sale-${idempotencyKey}`,
+    idempotencyKey,
+    version: 1,
+    payload: {
+      customerId, salesPersonId, postingDate, settlement, currency, exchangeRateToBase: exchangeRate,
+      paymentTerms: settlement === "pay_now" ? "Due on receipt" : paymentTerms,
+      dueDate: settlement === "pay_now" ? postingDate : dueDate,
+      paymentMethod, paymentReference, projectReference,
+      shipToName: customer?.label,
+      shipToAddressLine1: customer?.addressLine1,
+      shipToAddressLine2: customer?.addressLine2,
+      shipToCity: customer?.city,
+      shipToRegion: customer?.region,
+      shipToPostalCode: customer?.postalCode,
+      shipToCountry: customer?.country,
+      lines: lines.map((line, index) => ({
+        kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId || undefined,
+        unitPriceCents: Math.round(line.unitAmount * 100), discountCents: lineAmounts[index].discount,
+        taxable: line.taxRate > 0, taxCode: line.taxRate > 0 ? line.taxCode || "GST" : "EXEMPT",
+        taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: "stock", locationId: line.locationId,
+        lotId: line.lotId || undefined, inventoryUnitId: line.inventoryUnitId || undefined,
+      })),
+    },
+  });
+
+  const openHelcimCheckout = async (command?: ReturnType<typeof commandForAttempt>) => {
+    setSaving(true);
+    setError("");
+    setHelcimState("opening");
+    try {
+      // Loading Pay.js first ensures a browser/network failure cannot post the sale before the
+      // secure card modal is available on this device.
+      await loadCounterHelcimPay();
+      const response = await fetch("/api/payments/helcim/counter-sales/checkout", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command ? { command } : { invoiceId: pendingHelcimSale?.invoiceId }),
+      });
+      const result = await response.json() as CounterHelcimCheckout;
+      if (result.sale?.invoiceId) setPendingHelcimSale(result.sale);
+      if (!response.ok || !result.checkoutToken || !result.paymentLinkToken) {
+        if (result.sale?.invoiceId) setHelcimState("retry");
+        throw new Error(result.error?.message ?? "Helcim card checkout could not be started.");
+      }
+      const posted = result.sale?.invoiceId ? result.sale : pendingHelcimSale ?? { invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber };
+      setPendingHelcimSale(posted);
+      helcimCheckout.current = { checkoutToken: result.checkoutToken, paymentLinkToken: result.paymentLinkToken };
+      helcimCompletionInFlight.current = false;
+      setHelcimState("open");
+      if (!window.appendHelcimPayIframe) throw new Error("Helcim secure checkout did not initialize.");
+      window.appendHelcimPayIframe(result.checkoutToken, true);
+    } catch (caught) {
+      setHelcimState((current) => current === "review" ? current : "retry");
+      setError(caught instanceof Error ? caught.message : "Helcim card checkout could not be started.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    const onHelcimMessage = async (event: MessageEvent) => {
+      const active = helcimCheckout.current;
+      if (!active || event.origin !== "https://secure.helcim.app") return;
+      const payload = event.data as { eventName?: string; eventStatus?: string; eventMessage?: unknown } | null;
+      if (!payload || payload.eventName !== `helcim-pay-js-${active.checkoutToken}`) return;
+      if (payload.eventStatus === "HIDE" || payload.eventStatus === "ABORTED") {
+        if (!helcimCompletionInFlight.current) {
+          setHelcimState("retry");
+          setError(typeof payload.eventMessage === "string" ? payload.eventMessage : "Card payment was not completed. The posted invoice remains unpaid and can be retried safely.");
+        }
+        return;
+      }
+      if (payload.eventStatus !== "SUCCESS") return;
+      helcimCompletionInFlight.current = true;
+      setSaving(true);
+      setError("");
+      try {
+        const response = await fetch("/api/payments/helcim/complete", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paymentLinkToken: active.paymentLinkToken, checkoutToken: active.checkoutToken, eventMessage: payload.eventMessage }),
+        });
+        const result = await response.json() as CounterHelcimCheckout;
+        if (!response.ok) throw new Error(result.error?.message ?? "The approved card payment could not be posted.");
+        window.removeHelcimPayIframe?.();
+        helcimCheckout.current = null;
+        if (result.status === "paid") {
+          attemptKey.current = "";
+          onComplete(`${pendingHelcimSale?.invoiceNumber ?? "Counter-sale invoice"} paid by Helcim card.`);
+          return;
+        }
+        if (result.status === "failed") {
+          helcimCompletionInFlight.current = false;
+          setHelcimState("retry");
+          setError(result.message ?? "Helcim did not approve the card. You can retry the unpaid invoice.");
+          return;
+        }
+        setHelcimState("review");
+        setError(result.message ?? "Helcim is still processing this card payment. Check the invoice before attempting another charge.");
+      } catch (caught) {
+        window.removeHelcimPayIframe?.();
+        setHelcimState("review");
+        setError(caught instanceof Error ? caught.message : "The card was accepted but the invoice payment needs review. Do not charge the card again.");
+      } finally {
+        setSaving(false);
+      }
+    };
+    window.addEventListener("message", onHelcimMessage);
+    return () => window.removeEventListener("message", onHelcimMessage);
+  }, [onComplete, pendingHelcimSale?.invoiceNumber]);
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!ready || saving) return;
@@ -3716,36 +4154,16 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
     setError("");
     if (!attemptKey.current) attemptKey.current = crypto.randomUUID();
     const idempotencyKey = attemptKey.current;
+    const command = commandForAttempt(idempotencyKey);
+    if (settlement === "pay_now" && paymentMethod === "helcim_card") {
+      await openHelcimCheckout(command);
+      return;
+    }
     try {
       const response = await fetch("/api/commands", {
         method: "POST",
         headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
-        body: JSON.stringify({
-          command: "postCounterSale",
-          entityId: `counter-sale-${idempotencyKey}`,
-          idempotencyKey,
-          version: 1,
-          payload: {
-            customerId, postingDate, settlement, currency, exchangeRateToBase: exchangeRate,
-            paymentTerms: settlement === "pay_now" ? "Due on receipt" : paymentTerms,
-            dueDate: settlement === "pay_now" ? postingDate : dueDate,
-            paymentMethod, paymentReference, projectReference,
-            shipToName: customer?.label,
-            shipToAddressLine1: customer?.addressLine1,
-            shipToAddressLine2: customer?.addressLine2,
-            shipToCity: customer?.city,
-            shipToRegion: customer?.region,
-            shipToPostalCode: customer?.postalCode,
-            shipToCountry: customer?.country,
-            lines: lines.map((line, index) => ({
-              kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId || undefined,
-              unitPriceCents: Math.round(line.unitAmount * 100), discountCents: lineAmounts[index].discount,
-              taxable: line.taxRate > 0, taxCode: line.taxRate > 0 ? line.taxCode || "GST" : "EXEMPT",
-              taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: "stock", locationId: line.locationId,
-              lotId: line.lotId || undefined, inventoryUnitId: line.inventoryUnitId || undefined,
-            })),
-          },
-        }),
+        body: JSON.stringify(command),
       });
       const result = await response.json() as { message?: string; error?: string | { code?: string; message?: string } };
       if (!response.ok) {
@@ -3770,12 +4188,22 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
 
   if (!canPost) return <section className="panel empty-state"><span className="empty-glyph" aria-hidden="true">$</span><h2>Counter-sale posting is restricted</h2><p>This action moves inventory and posts a receivable in one step. A manager or administrator with both inventory and financial posting access must complete it.</p></section>;
 
+  if (pendingHelcimSale?.invoiceId) return <section className="panel counter-helcim-status" aria-live="polite">
+    <span className="section-kicker">Helcim card payment</span>
+    <h2>{helcimState === "open" ? "Secure checkout is open" : helcimState === "review" ? "Payment needs review" : helcimState === "opening" ? "Opening secure checkout…" : "Card payment not completed"}</h2>
+    <p>{pendingHelcimSale.invoiceNumber ?? "The counter-sale invoice"} has been posted and remains unpaid until Helcim confirms the card charge. Keep the goods at the counter until approval is shown.</p>
+    {error ? <div className="error-summary" role="alert"><strong>{helcimState === "review" ? "Do not charge the card again" : "No approved payment recorded"}</strong><p>{error}</p></div> : null}
+    {helcimState === "retry" ? <button type="button" className="button primary" disabled={saving} onClick={() => void openHelcimCheckout()}>{saving ? "Opening Helcim…" : "Retry Helcim card payment"}</button> : null}
+    {helcimState === "review" ? <small>Open Customer invoices to verify the Helcim payment and resolve the review before trying another payment.</small> : null}
+  </section>;
+
   return <form className="counter-sale-workspace" onSubmit={submit}>
     {error ? <div className="error-summary" role="alert"><strong>Counter sale not completed</strong><p>{error}</p>{alreadyPosted ? <div className="dialog-actions"><button type="button" className="button secondary" onClick={() => { attemptKey.current = ""; setAlreadyPosted(false); setError(""); setLines([newLine()]); }}>Start a new sale</button></div> : null}</div> : null}
     <section className="panel counter-sale-customer" aria-labelledby="counter-customer-heading">
       <div className="panel-heading"><div><span className="section-kicker">1 · Customer</span><h2 id="counter-customer-heading">Who is buying?</h2></div><StatusBadge tone="success">{customerId === WALK_IN_CUSTOMER_ID ? "Walk-in selected" : "Selected"}</StatusBadge></div>
       <div className="command-form form-grid composer-header-fields">
         <label className="project-field">Customer<ReferenceSearchSelect kind="partners" role="customer" value={customerId} initialOptions={[WALK_IN_CUSTOMER]} quickCreate="customer" onSelect={chooseCustomer} placeholder="Search customer name, code, or email" /><small>{customerId === WALK_IN_CUSTOMER_ID ? "Selected automatically for a pay-now sale. Search here to use a customer account instead." : "Customer pricing and account terms apply."}</small></label>
+        <label>Salesperson<select value={salesPersonId} onChange={(event) => setSalesPersonId(event.target.value)} required><option value="">Select salesperson</option>{salesPeople.filter((person) => person.active).map((person) => <option key={person.id} value={person.id}>{person.name} · {person.code}</option>)}</select><small>Credits this sale to the selected team member.</small></label>
         <label>Sale date<input type="date" value={postingDate} onChange={(event) => { const next = event.target.value; setPostingDate(next); setDueDate(dueDateForTerms(next, settlement === "pay_now" ? "Due on receipt" : paymentTerms)); }} required /></label>
         <label>Customer / job reference<input value={projectReference} onChange={(event) => setProjectReference(event.target.value)} placeholder="Optional" /></label>
         <label>Currency<select value={currency} onChange={(event) => { const next = event.target.value; setCurrency(next); setExchangeRate(next === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>
@@ -3801,7 +4229,8 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
             updateLine(line.id, { productId: option.id, quantity: serial ? 1 : line.quantity, unitAmount: option.unitAmount ?? 0,
               uomId: option.uomId ?? "", uomCode: option.uomCode ?? "", priceSource: option.priceSource ?? "Catalog price",
               factorToBase: option.factorToBase ?? 1, trackingPolicy: option.trackingPolicy ?? "quantity", availableQuantity: option.availableQuantity ?? 0,
-              locationId: "", locationLabel: "", locationAvailable: 0, lotId: "", inventoryUnitId: "" });
+              binLocationId: option.defaultBinLocationId ?? "", binLocationLabel: option.defaultBinLocationLabel ?? "",
+              locationId: option.defaultBinLocationId ?? "", locationLabel: option.defaultBinLocationLabel ?? "", locationAvailable: option.defaultBinAvailableQuantity ?? 0, locationSource: option.binLocationSource ?? "", lotId: "", inventoryUnitId: "" });
             setError("");
           }} placeholder="Search SKU, name, manufacturer code, or dimensions" /><small>{line.productId ? `${line.availableQuantity} available in scope · ${line.priceSource}` : "Price and availability appear with each result."}</small></label>
           {/* The chosen location, lot, and serial survive a quantity change; the free-stock check beside the location flags a shortfall instead. */}
@@ -3810,7 +4239,7 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
           <label>Unit price<input type="number" min="0.01" step="0.01" value={line.unitAmount || ""} onChange={(event) => updateLine(line.id, { unitAmount: Number(event.target.value) })} required /></label>
           <label>Discount %<input type="number" min="0" max="100" step="0.01" value={line.discountRate} onChange={(event) => updateLine(line.id, { discountRate: Number(event.target.value) })} /></label>
           <label>Tax %<input type="number" min="0" max="100" step="0.01" value={line.taxRate} onChange={(event) => updateLine(line.id, { taxRate: Number(event.target.value), taxCode: Number(event.target.value) > 0 ? "GST" : "EXEMPT" })} /></label>
-          <label className="location-field">Source location<ReferenceSearchSelect kind="locations" role="usable" productId={line.productId} quantity={baseQuantity} warehouseId={warehouseId} value={line.locationId} initialOptions={[]} onSelect={(option) => updateLine(line.id, { locationId: option.id, locationLabel: option.label, locationAvailable: option.availableQuantity ?? 0, lotId: "", inventoryUnitId: "" })} placeholder={line.productId ? "Search locations with free stock" : "Select a product first"} /><small className={short ? "text-danger" : undefined}>{line.locationId ? `${line.locationAvailable} base units free${short ? " — not enough" : ""}` : "Required for immediate handover."}</small></label>
+          <label className="location-field">Source location<ReferenceSearchSelect kind="locations" role="usable" productId={line.productId} quantity={baseQuantity} warehouseId={warehouseId} value={line.locationId} initialOptions={line.locationId ? [{ id: line.locationId, label: line.locationLabel || line.locationId, detail: line.locationSource === "configured" ? "Item default bin" : line.locationSource === "only_stocked" ? "Only stocked bin" : "Selected handover location", availableQuantity: line.locationAvailable }] : []} onSelect={(option) => updateLine(line.id, { locationId: option.id, locationLabel: option.label, locationAvailable: option.availableQuantity ?? 0, locationSource: "manual", lotId: "", inventoryUnitId: "" })} placeholder={line.productId ? "Search locations with free stock" : "Select a product first"} /><small className={short ? "text-danger" : undefined}>{line.locationId ? `${line.locationAvailable} base units free${short ? " — not enough" : ""}${line.locationSource === "configured" ? " · item default" : line.locationSource === "only_stocked" ? " · only stocked bin" : ""}` : "Select the handover location."}</small></label>
           {line.trackingPolicy === "lot" ? <label className="identity-field">Lot<ReferenceSearchSelect kind="inventoryLots" productId={line.productId} locationId={line.locationId} value={line.lotId} initialOptions={[]} onSelect={(option) => updateLine(line.id, { lotId: option.id })} placeholder={line.locationId ? "Search lots at this location" : "Select a location first"} /></label> : null}
           {line.trackingPolicy === "serial" ? <label className="identity-field">Serial number<ReferenceSearchSelect kind="inventoryUnits" productId={line.productId} locationId={line.locationId} value={line.inventoryUnitId} initialOptions={[]} onSelect={(option) => updateLine(line.id, { inventoryUnitId: option.id })} placeholder={line.locationId ? "Search serials at this location" : "Select a location first"} /></label> : null}
           <div className="counter-line-total"><span>Line total</span><strong>{formatDocumentMoney(lineAmounts[index].total / 100, currency, true)}</strong></div>
@@ -3824,19 +4253,19 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
         <div className="panel-heading"><div><span className="section-kicker">3 · Settlement</span><h2 id="counter-payment-heading">How is this sale being paid?</h2></div></div>
         <div className="segmented-control" role="group" aria-label="Settlement method"><button type="button" className={settlement === "pay_now" ? "active" : ""} onClick={() => { setSettlement("pay_now"); setDueDate(postingDate); }}>Pay now</button><button type="button" className={settlement === "on_account" ? "active" : ""} disabled={customerId === WALK_IN_CUSTOMER_ID} title={customerId === WALK_IN_CUSTOMER_ID ? "Select a customer account before charging the sale." : undefined} onClick={() => { setSettlement("on_account"); setDueDate(dueDateForTerms(postingDate, paymentTerms)); }}>Charge account</button></div>
         {customerId === WALK_IN_CUSTOMER_ID ? <p className="formula-note">Walk-in sales are collected now. Select an account customer above to offer payment terms.</p> : null}
-        {settlement === "pay_now" ? <div className="command-form form-grid counter-payment-fields"><label>Payment method<select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}><option value="cash">Cash</option><option value="credit_card">Credit card</option><option value="debit_card">Debit card</option><option value="bank_transfer">Bank transfer</option><option value="cheque">Cheque</option></select></label><label>Receipt / payment reference<input value={paymentReference} onChange={(event) => setPaymentReference(event.target.value)} placeholder="Till receipt, terminal, or cheque no." required /></label></div> : <div className="command-form form-grid counter-payment-fields"><label>Payment terms<select value={paymentTerms} onChange={(event) => { const next = event.target.value; setPaymentTerms(next); setDueDate(dueDateForTerms(postingDate, next)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label>Due date<input type="date" min={postingDate} value={dueDate} onChange={(event) => setDueDate(event.target.value)} required /></label></div>}
+        {settlement === "pay_now" ? <div className="command-form form-grid counter-payment-fields"><label>Payment method<select value={paymentMethod} onChange={(event) => { setPaymentMethod(event.target.value); setPaymentReference(""); }}><option value="cash">Cash</option><option value="helcim_card">Card · Helcim secure checkout</option><option value="debit_card">External debit terminal</option><option value="bank_transfer">Bank transfer</option><option value="cheque">Cheque</option></select></label>{paymentMethod === "helcim_card" ? <div className="helcim-counter-note"><strong>Card details stay with Helcim</strong><small>A card-only secure modal opens after the sale is validated. The invoice is marked paid only after Helcim approval.</small>{!["CAD", "USD"].includes(currency) ? <small className="text-danger">Helcim card checkout supports CAD or USD sales.</small> : total > 0 && total < 100 ? <small className="text-danger">The Helcim minimum is 1.00.</small> : null}</div> : <label>Receipt / payment reference<input value={paymentReference} onChange={(event) => setPaymentReference(event.target.value)} placeholder="Till receipt, terminal, or cheque no." required /></label>}</div> : <div className="command-form form-grid counter-payment-fields"><label>Payment terms<select value={paymentTerms} onChange={(event) => { const next = event.target.value; setPaymentTerms(next); setDueDate(dueDateForTerms(postingDate, next)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label>Due date<input type="date" min={postingDate} value={dueDate} onChange={(event) => setDueDate(event.target.value)} required /></label></div>}
         <ImpactPreview lines={[
           { category: "Physical", label: "Usable on-hand", after: `−${lines.reduce((sum, line) => sum + line.quantity * line.factorToBase, 0)} base units`, tone: "warning" },
           { category: "Commercial", label: "Internal records", after: "Confirmed order + posted pickup shipment" },
-          { category: "Financial", label: settlement === "pay_now" ? "Invoice and payment" : "Accounts receivable", after: settlement === "pay_now" ? "Posted and fully paid" : `Due ${formatDate(dueDate)}`, tone: settlement === "pay_now" ? "success" : "info" },
+          { category: "Financial", label: settlement === "pay_now" ? "Invoice and payment" : "Accounts receivable", after: settlement === "pay_now" ? paymentMethod === "helcim_card" ? "Paid after verified Helcim approval" : "Posted and fully paid" : `Due ${formatDate(dueDate)}`, tone: settlement === "pay_now" ? "success" : "info" },
         ]} />
       </section>
       <aside className="panel counter-sale-summary" aria-label="Counter sale total">
         <span className="section-kicker">Sale summary</span>
         <dl className="composer-totals"><div><dt>Items</dt><dd>{formatDocumentMoney(itemGross / 100, currency, true)}</dd></div><div><dt>Discounts</dt><dd>−{formatDocumentMoney(discountTotal / 100, currency, true)}</dd></div><div><dt>Subtotal</dt><dd>{formatDocumentMoney(subtotal / 100, currency, true)}</dd></div><div><dt>Tax</dt><dd>{formatDocumentMoney(taxTotal / 100, currency, true)}</dd></div><div className="total"><dt>{settlement === "pay_now" ? "Amount to collect" : "Invoice total"}</dt><dd>{formatDocumentMoney(total / 100, currency, true)}</dd></div></dl>
         {overAvailable ? <p className="text-danger">A line exceeds the free stock at its selected location.</p> : null}
-        <button className="button primary counter-sale-submit" disabled={!ready || saving}>{saving ? "Completing sale…" : settlement === "pay_now" ? `Collect ${formatDocumentMoney(total / 100, currency, true)} & complete` : "Post to customer account"}</button>
-        <small>One click posts the hidden sales order, pickup shipment, invoice, and {settlement === "pay_now" ? "payment" : "receivable"} together.</small>
+        <button className="button primary counter-sale-submit" disabled={!ready || saving}>{saving ? settlement === "pay_now" && paymentMethod === "helcim_card" ? "Opening Helcim…" : "Completing sale…" : settlement === "pay_now" ? paymentMethod === "helcim_card" ? `Pay ${formatDocumentMoney(total / 100, currency, true)} with Helcim` : `Collect ${formatDocumentMoney(total / 100, currency, true)} & complete` : "Post to customer account"}</button>
+        <small>{settlement === "pay_now" && paymentMethod === "helcim_card" ? "The pickup shipment and invoice are posted before checkout; the payment posts only after Helcim verifies the approved card transaction." : `One click posts the hidden sales order, pickup shipment, invoice, and ${settlement === "pay_now" ? "payment" : "receivable"} together.`}</small>
       </aside>
     </div>
   </form>;
@@ -3845,15 +4274,17 @@ function CounterSaleScreen({ warehouseId, taxDefaultRateBps, canPost, onComplete
 type ComposerDraftLine = {
   id: string; productId: string; label: string; quantity: number; unitAmount: number;
   uomId: string; uomCode: string; route: string; projectReference: string;
+  binLocationId: string; binLocationLabel: string;
   discountCents: number; taxable: boolean; taxRateBps: number;
   sourceSalesOrderLineId: string; supplyAllocations: Array<{ id: string; salesOrderLineId: string; quantity: number; label: string }>; linkedPurchaseOrderLineId: string;
 };
 type ComposerDraft = {
   number: string; partnerId: string; partnerLabel: string; date: string;
+  salesPersonId?: string;
   currency: string; exchangeRateToBase: number; paymentTerms?: string; dueDate?: string;
   projectReference: string; shipToName?: string; shipToAddressLine1?: string; shipToAddressLine2?: string;
   shipToCity?: string; shipToRegion?: string; shipToPostalCode?: string; shipToCountry?: string;
-  deliveryInstructions?: string; freightCents: number; freightTaxRateBps: number; feeCents: number; feeTaxRateBps: number; depositCents: number; lines: ComposerDraftLine[];
+  deliveryInstructions?: string; notes?: string; freightCents: number; freightTaxRateBps: number; feeCents: number; feeTaxRateBps: number; depositCents: number; lines: ComposerDraftLine[];
 };
 
 /**
@@ -3867,10 +4298,11 @@ function composerDraft(order: SalesOrder | PurchaseOrder | undefined, isPurchase
     return {
       number: po.number, partnerId: po.vendorId, partnerLabel: po.vendor, date: po.expectedDate,
       currency: po.currency, exchangeRateToBase: po.exchangeRateToBase, paymentTerms: po.paymentTerms, dueDate: po.dueDate,
-      projectReference: po.projectReference ?? "", freightCents: po.freightCents, freightTaxRateBps: po.freightTaxRateBps, feeCents: po.feeCents, feeTaxRateBps: po.feeTaxRateBps, depositCents: po.depositCents,
+      projectReference: po.projectReference ?? "", notes: po.notes, freightCents: po.freightCents, freightTaxRateBps: po.freightTaxRateBps, feeCents: po.feeCents, feeTaxRateBps: po.feeTaxRateBps, depositCents: po.depositCents,
       lines: po.lines.map((line) => ({
         id: line.id, productId: line.productId ?? "", label: `${line.sku} · ${line.product}`,
         quantity: line.ordered, unitAmount: line.unitCost, uomId: line.orderedUomId ?? "", uomCode: line.orderedUomCode ?? "",
+        binLocationId: line.binLocationId ?? "", binLocationLabel: [line.binLocationCode, line.binLocationName].filter(Boolean).join(" · "),
         route: line.fulfillmentRoute ?? "stock", projectReference: "",
         discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps,
         sourceSalesOrderLineId: line.sourceSalesOrderLineId ?? "",
@@ -3881,14 +4313,15 @@ function composerDraft(order: SalesOrder | PurchaseOrder | undefined, isPurchase
   }
   const so = order as SalesOrder;
   return {
-    number: so.number, partnerId: so.customerId, partnerLabel: so.customer, date: so.requestedDate,
+    number: so.number, partnerId: so.customerId, partnerLabel: so.customer, date: so.requestedDate, salesPersonId: so.salesPersonId,
     currency: so.currency, exchangeRateToBase: so.exchangeRateToBase, paymentTerms: so.paymentTerms, dueDate: so.dueDate,
-    projectReference: so.project, freightCents: so.freightCents, freightTaxRateBps: so.freightTaxRateBps, feeCents: so.feeCents, feeTaxRateBps: so.feeTaxRateBps, depositCents: so.depositCents, shipToName: so.shipToName, shipToAddressLine1: so.shipToAddressLine1,
+    projectReference: so.project, notes: so.notes, freightCents: so.freightCents, freightTaxRateBps: so.freightTaxRateBps, feeCents: so.feeCents, feeTaxRateBps: so.feeTaxRateBps, depositCents: so.depositCents, shipToName: so.shipToName, shipToAddressLine1: so.shipToAddressLine1,
     shipToAddressLine2: so.shipToAddressLine2, shipToCity: so.shipToCity, shipToRegion: so.shipToRegion,
     shipToPostalCode: so.shipToPostalCode, shipToCountry: so.shipToCountry, deliveryInstructions: so.deliveryInstructions,
     lines: (so.lines ?? []).map((line) => ({
       id: line.id, productId: line.productId, label: `${line.sku} · ${line.product}`,
       quantity: line.ordered, unitAmount: line.unitPrice, uomId: line.orderedUomId ?? "", uomCode: line.orderedUomCode ?? "",
+      binLocationId: line.binLocationId ?? "", binLocationLabel: [line.binLocationCode, line.binLocationName].filter(Boolean).join(" · "),
       route: line.fulfillmentRoute, projectReference: line.projectReference ?? "",
       discountCents: line.discountCents, taxable: line.taxable, taxRateBps: line.taxRateBps,
       sourceSalesOrderLineId: "", supplyAllocations: [], linkedPurchaseOrderLineId: line.linkedPurchaseOrderLineId ?? "",
@@ -3896,7 +4329,7 @@ function composerDraft(order: SalesOrder | PurchaseOrder | undefined, isPurchase
   };
 }
 
-function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partners, products, warehouseId, defaultTaxRateBps, canFastTrack = false, onClose, onSubmit }: { type: "purchaseOrder" | "salesOrder"; initialOrder?: SalesOrder | PurchaseOrder; initialPartner?: Partner; partners: Partner[]; products: Product[]; warehouseId: string; defaultTaxRateBps: number; canFastTrack?: boolean; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
+function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partners, salesPeople, products, warehouseId, defaultTaxRateBps, canFastTrack = false, onClose, onSubmit }: { type: "purchaseOrder" | "salesOrder"; initialOrder?: SalesOrder | PurchaseOrder; initialPartner?: Partner; partners: Partner[]; salesPeople: SalesPerson[]; products: Product[]; warehouseId: string; defaultTaxRateBps: number; canFastTrack?: boolean; onClose: () => void; onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
   const isPurchase = type === "purchaseOrder";
   const editing = Boolean(initialOrder);
   // One composer serves both documents, so the order being edited is flattened to a single
@@ -3916,16 +4349,19 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
     uomId: isPurchase ? product.purchaseUomId : product.salesUomId,
     uomCode: isPurchase ? product.purchaseUomCode : product.salesUomCode,
     priceSource: isPurchase ? product.lastUnitCost != null ? `Last approved PO cost${product.lastUnitCostSourcePoNumber ? ` · ${product.lastUnitCostSourcePoNumber}` : ""}` : "Catalog standard cost fallback" : "Catalog selling price",
+    defaultBinLocationId: product.defaultLocations.find((location) => location.warehouseId === warehouseId)?.locationId,
+    defaultBinLocationLabel: (() => { const location = product.defaultLocations.find((item) => item.warehouseId === warehouseId); return location?.locationId ? [location.locationCode, location.locationName].filter(Boolean).join(" · ") : undefined; })(),
   }));
   draft?.lines.forEach((line) => { if (!initialProductOptions.some((option) => option.id === line.productId)) initialProductOptions.push({ id: line.productId, label: line.label, detail: line.projectReference || "Current draft line" }); });
   // Lines start empty: pre-filling an arbitrary catalog product is how the wrong SKU
   // gets ordered when someone tabs past it.
-  const initialLine = (): ComposerLine => ({ id: crypto.randomUUID(), productId: "", quantity: 1, unitAmount: 0, uomId: "", uomCode: "", priceSource: "Select a product", discountRate: 0, taxCode: defaultTaxRateBps > 0 ? "GST" : "Zero", taxRate: defaultTaxRateBps / 100, route: "stock", projectReference: "", sourceSalesOrderLineId: "", supplyAllocations: [], linkedPurchaseOrderLineId: "" });
+  const initialLine = (): ComposerLine => ({ id: crypto.randomUUID(), productId: "", quantity: 1, unitAmount: 0, uomId: "", uomCode: "", priceSource: "Select a product", binLocationId: "", binLocationLabel: "", discountRate: 0, taxCode: defaultTaxRateBps > 0 ? "GST" : "Zero", taxRate: defaultTaxRateBps / 100, route: "stock", projectReference: "", sourceSalesOrderLineId: "", supplyAllocations: [], linkedPurchaseOrderLineId: "" });
   const existingLines: ComposerLine[] = (draft?.lines ?? []).map((line) => ({
     id: line.id, productId: line.productId, quantity: line.quantity, unitAmount: line.unitAmount,
     uomId: line.uomId || products.find((product) => product.id === line.productId)?.[isPurchase ? "purchaseUomId" : "salesUomId"] || "",
     uomCode: line.uomCode || products.find((product) => product.id === line.productId)?.[isPurchase ? "purchaseUomCode" : "salesUomCode"] || "",
     priceSource: "Saved order price",
+    binLocationId: line.binLocationId, binLocationLabel: line.binLocationLabel,
     discountRate: line.quantity * line.unitAmount > 0 ? line.discountCents / (line.quantity * line.unitAmount) : 0,
     taxCode: line.taxable ? "GST" : "Exempt", taxRate: line.taxRateBps / 100,
     route: line.route.replaceAll("_", "-"), projectReference: line.projectReference || draft?.projectReference || "",
@@ -3933,6 +4369,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
   }));
   // No arbitrary account is selected. CRM may deliberately seed the customer the rep acted on.
   const [partnerId, setPartnerId] = useState(draft?.partnerId ?? seededPartner?.id ?? "");
+  const [salesPersonId, setSalesPersonId] = useState(draft?.salesPersonId ?? "");
   // The hold is enforced when the order is confirmed. Carrying it here means a rep learns about
   // it before keying the lines rather than after.
   const [partnerCreditHold, setPartnerCreditHold] = useState(seededPartner?.creditHold ?? false);
@@ -3978,7 +4415,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
    * silently discard a twelve-line order. An existing draft compares against what it opened
    * with, so closing it untouched does not warn about losing changes that were never made.
    */
-  const formSignature = JSON.stringify({ partnerId, date, currency, exchangeRate, terms, dueDate, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, freight, freightTaxRate, fees, feeTaxRate, deposit, lines: lines.map((line) => [line.productId, line.quantity, line.unitAmount, line.uomId, line.discountRate, line.taxCode, line.taxRate, line.route, line.projectReference, line.supplyAllocations.map((allocation) => [allocation.salesOrderLineId, allocation.quantity])]) });
+  const formSignature = JSON.stringify({ partnerId, salesPersonId, date, currency, exchangeRate, terms, dueDate, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, freight, freightTaxRate, fees, feeTaxRate, deposit, lines: lines.map((line) => [line.productId, line.binLocationId, line.quantity, line.unitAmount, line.uomId, line.discountRate, line.taxCode, line.taxRate, line.route, line.projectReference, line.supplyAllocations.map((allocation) => [allocation.salesOrderLineId, allocation.quantity])]) });
   const [openedWith] = useState(formSignature);
   const dirty = (editing || Boolean(seededPartner)) ? formSignature !== openedWith : Boolean(partnerId) || lines.some((line) => line.productId) || freight > 0 || fees > 0 || deposit > 0;
   // Not memoized by hand: the dismiss hook reads the latest handler through a ref.
@@ -4065,6 +4502,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
     const problems: Array<{ field: string; message: string }> = [];
     const add = (field: string, message: string) => { if (!problems.some((problem) => problem.field === field)) problems.push({ field, message }); };
     if (!partnerId) add("partnerId", `Select a ${isPurchase ? "vendor" : "customer"}.`);
+    if (!isPurchase && !salesPersonId) add("salesPersonId", "Select the salesperson responsible for this order.");
     if (!lines.length) add("lines", "Add at least one product line.");
     lines.forEach((line, index) => {
       if (!line.productId) add(`line-${line.id}-product`, `Line ${index + 1}: choose a product.`);
@@ -4124,14 +4562,14 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
     try {
       const normalizedLines = lines.map((line) => {
         const supplyAllocations = isPurchase && line.route !== "stock" ? line.supplyAllocations.map((allocation) => ({ salesOrderLineId: allocation.salesOrderLineId.trim(), quantity: allocation.quantity })) : undefined;
-        return { kind: "item", productId: line.productId, quantity: line.quantity, uomId: line.uomId, unitCostCents: isPurchase ? Math.round(line.unitAmount * 100) : undefined, unitPriceCents: isPurchase ? undefined : Math.round(line.unitAmount * 100), discountCents: Math.round(line.quantity * line.unitAmount * line.discountRate), taxable: line.taxRate > 0, taxCode: line.taxCode, taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: line.route.replaceAll("-", "_"), projectReference: line.projectReference, sourceSalesOrderLineId: supplyAllocations?.[0]?.salesOrderLineId, supplyAllocations, configurationSnapshot: configurationSnapshotFor(line.productId) };
+        return { kind: "item", productId: line.productId, binLocationId: line.route === "drop-ship" ? undefined : line.binLocationId || undefined, quantity: line.quantity, uomId: line.uomId, unitCostCents: isPurchase ? Math.round(line.unitAmount * 100) : undefined, unitPriceCents: isPurchase ? undefined : Math.round(line.unitAmount * 100), discountCents: Math.round(line.quantity * line.unitAmount * line.discountRate), taxable: line.taxRate > 0, taxCode: line.taxCode, taxRateBps: Math.round(line.taxRate * 100), fulfillmentRoute: line.route.replaceAll("-", "_"), projectReference: line.projectReference, sourceSalesOrderLineId: supplyAllocations?.[0]?.salesOrderLineId, supplyAllocations, configurationSnapshot: configurationSnapshotFor(line.productId) };
       });
       const chargeLines = [
         freight > 0 ? { kind: "charge", chargeType: "freight", description: "Freight", amountCents: Math.round(freight * 100), direction: "add", taxable: freightTaxRate > 0, refundable: false, taxCode: freightTaxRate > 0 ? "GST" : "Zero", taxRateBps: Math.round(freightTaxRate * 100) } : null,
         fees > 0 ? { kind: "charge", chargeType: "fee", description: "Other fees", amountCents: Math.round(fees * 100), direction: "add", taxable: feeTaxRate > 0, refundable: false, taxCode: feeTaxRate > 0 ? "GST" : "Zero", taxRateBps: Math.round(feeTaxRate * 100) } : null,
         deposit > 0 ? { kind: "charge", chargeType: "returnable_deposit", description: "Refundable core / empty deposit", amountCents: Math.round(deposit * 100), direction: "add", taxable: false, refundable: true, taxCode: "EXEMPT", taxRateBps: 0 } : null,
       ].filter(Boolean);
-      await onSubmit({ ...(isPurchase ? { vendorId: partnerId, expectedDate: date } : { customerId: partnerId, requestedDate: date, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions }), lines: [...normalizedLines, ...chargeLines], currency, exchangeRateToBase: exchangeRate, paymentTerms: terms, dueDate, projectReference: draft?.projectReference, fastTrack, ...(fastTrack ? { approvalReason: approvalReason.trim() } : {}) });
+      await onSubmit({ ...(isPurchase ? { vendorId: partnerId, expectedDate: date } : { customerId: partnerId, salesPersonId, requestedDate: date, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions }), warehouseId, lines: [...normalizedLines, ...chargeLines], currency, exchangeRateToBase: exchangeRate, paymentTerms: terms, dueDate, projectReference: draft?.projectReference, fastTrack, ...(fastTrack ? { approvalReason: approvalReason.trim() } : {}) });
     } catch (caught) { setError(caught instanceof Error ? caught.message : "The order could not be created. Your entries are still here."); }
     finally { setSubmitting(false); }
   };
@@ -4148,15 +4586,16 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
   return <div className="modal-overlay" role="presentation"><section className="command-dialog create-order-dialog commercial-composer" role="dialog" aria-modal="true" aria-labelledby="create-order-title"><div className="dialog-header"><div><span className="section-kicker">{editing ? draft?.number : "New commercial commitment"}</span><h2 id="create-order-title">{editing ? `Edit ${isPurchase ? "purchase" : "sales"} order draft` : `Create multi-line ${isPurchase ? "purchase order" : "sales order"}`}</h2></div><button ref={closeRef} type="button" className="icon-button" aria-label="Close dialog" onClick={requestClose}>×</button></div><form ref={formRef} onSubmit={submit} noValidate>
     {error || shownProblems.length ? <div className="error-summary" role="alert" tabIndex={-1}><strong>Review the order</strong>{error ? <p>{error}</p> : null}{shownProblems.length ? <ul className="error-list">{shownProblems.map((problem) => <li key={problem.field}><button type="button" className="text-button" onClick={() => focusField(problem.field)}>{problem.message}</button></li>)}</ul> : null}</div> : null}
     {!isPurchase && partnerCreditHold ? <div className="exception-banner"><span aria-hidden="true">!</span><div><strong>This customer is on credit hold</strong><p>The draft can be saved, but it cannot be confirmed until accounting releases the hold.</p></div></div> : null}
-    <div className="command-form form-grid composer-header-fields"><label data-field="partnerId"><span>{isPurchase ? "Vendor" : "Customer"}{requiredMark}</span><ReferenceSearchSelect kind="partners" role={partnerRole} value={partnerId} initialOptions={initialPartnerOptions} quickCreate={partnerRole} onSelect={(option) => { setPartnerId(option.id); setPartnerCreditHold(option.creditHold === true); const nextCurrency = option.currency || "CAD"; const nextTerms = option.paymentTerms || (isPurchase ? "Net 30" : "Net 15"); setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); if (!isPurchase) { setShipToName(option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); } }} placeholder={`Search ${partnerRole} name, code, or email`} />{fieldError("partnerId")}</label><label data-field="date"><span>{isPurchase ? "Expected delivery" : "Requested delivery"}{requiredMark}</span><input type="date" value={date} {...fieldProps("date")} onChange={(event) => { const nextDate = event.target.value; setDate(nextDate); setDueDate(dueDateForTerms(nextDate, terms)); }} />{fieldError("date")}</label><label>Currency<select value={currency} onChange={(event) => { const nextCurrency = event.target.value; setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>{currency !== "CAD" && <label data-field="exchangeRate"><span>Exchange rate to CAD{requiredMark}</span><NumberField min="0.0001" step="0.0001" value={exchangeRate} onChange={setExchangeRate} {...fieldProps("exchangeRate")} />{fieldError("exchangeRate")}</label>}<label>Payment terms<select value={terms} onChange={(event) => { const nextTerms = event.target.value; setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label data-field="dueDate"><span>Due date{requiredMark}</span><input type="date" value={dueDate} {...fieldProps("dueDate")} onChange={(event) => setDueDate(event.target.value)} />{fieldError("dueDate")}</label></div>
-    {!isPurchase ? <fieldset className="composer-lines"><legend>Ship-to address</legend><div className="command-form form-grid composer-header-fields"><label className="project-field">Saved job site / ship-to<ReferenceSearchSelect kind="partnerAddresses" partnerId={partnerId} value={shipToAddressId} initialOptions={[]} onSelect={(option) => { setShipToAddressId(option.id); setShipToName(option.contactName || option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); if (option.deliveryInstructions) setDeliveryInstructions(option.deliveryInstructions); }} placeholder={partnerId ? "Search this customer's saved addresses" : "Select a customer first"} /></label><label data-field="shipToName"><span>Recipient{requiredMark}</span><input value={shipToName} onChange={(event) => setShipToName(event.target.value)} required {...fieldProps("shipToName")} />{fieldError("shipToName")}</label><label data-field="shipToAddressLine1"><span>Street address{requiredMark}</span><AddressAutocomplete value={shipToAddressLine1} country={shipToCountry} onChange={setShipToAddressLine1} onAddressSelected={(selected) => { setShipToAddressLine1(selected.addressLine1); setShipToAddressLine2(selected.addressLine2); setShipToCity(selected.city); setShipToRegion(selected.region); setShipToPostalCode(selected.postalCode); setShipToCountry(selected.country || shipToCountry); }} required ariaInvalid={Boolean(fieldMessage("shipToAddressLine1"))} ariaDescribedBy={fieldMessage("shipToAddressLine1") ? `${errorId}-shipToAddressLine1` : undefined} />{fieldError("shipToAddressLine1")}</label><label>Address line 2<input value={shipToAddressLine2} onChange={(event) => setShipToAddressLine2(event.target.value)} autoComplete="address-line2" /></label><label data-field="shipToCity"><span>City{requiredMark}</span><input value={shipToCity} onChange={(event) => setShipToCity(event.target.value)} required autoComplete="address-level2" {...fieldProps("shipToCity")} />{fieldError("shipToCity")}</label><label data-field="shipToRegion"><span>Province / region{requiredMark}</span><input value={shipToRegion} onChange={(event) => setShipToRegion(event.target.value)} required autoComplete="address-level1" {...fieldProps("shipToRegion")} />{fieldError("shipToRegion")}</label><label data-field="shipToPostalCode"><span>Postal code{requiredMark}</span><input value={shipToPostalCode} onChange={(event) => setShipToPostalCode(event.target.value)} required autoComplete="postal-code" {...fieldProps("shipToPostalCode")} />{fieldError("shipToPostalCode")}</label><label data-field="shipToCountry"><span>Country{requiredMark}</span><input value={shipToCountry} onChange={(event) => setShipToCountry(event.target.value.toUpperCase())} required autoComplete="country" {...fieldProps("shipToCountry")} />{fieldError("shipToCountry")}</label><label>Delivery instructions<input value={deliveryInstructions} onChange={(event) => setDeliveryInstructions(event.target.value)} placeholder="Dock, access, or appointment details" /></label></div><div className="composer-address-actions"><button type="button" className="button secondary" disabled={savingAddress || !partnerId || !shipToAddressLine1.trim() || !shipToCity.trim()} onClick={() => void saveShipToAddress()}>{savingAddress ? "Saving…" : "Save to this customer's address book"}</button>{addressNotice ? <span className="read-only-label" role="status">{addressNotice}</span> : null}</div></fieldset> : null}
+    <div className="command-form form-grid composer-header-fields"><label data-field="partnerId"><span>{isPurchase ? "Vendor" : "Customer"}{requiredMark}</span><ReferenceSearchSelect kind="partners" role={partnerRole} value={partnerId} initialOptions={initialPartnerOptions} quickCreate={partnerRole} onSelect={(option) => { setPartnerId(option.id); setPartnerCreditHold(option.creditHold === true); const nextCurrency = option.currency || "CAD"; const nextTerms = option.paymentTerms || (isPurchase ? "Net 30" : "Net 15"); setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); if (!isPurchase) { setShipToName(option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); } }} placeholder={`Search ${partnerRole} name, code, or email`} />{fieldError("partnerId")}</label>{!isPurchase ? <label data-field="salesPersonId"><span>Salesperson{requiredMark}</span><select value={salesPersonId} onChange={(event) => setSalesPersonId(event.target.value)} {...fieldProps("salesPersonId")}><option value="">Select salesperson</option>{salesPeople.filter((person) => person.active || person.id === salesPersonId).map((person) => <option key={person.id} value={person.id}>{person.name} · {person.code}</option>)}</select>{fieldError("salesPersonId")}</label> : null}<label data-field="date"><span>{isPurchase ? "Expected delivery" : "Requested delivery"}{requiredMark}</span><input type="date" value={date} {...fieldProps("date")} onChange={(event) => { const nextDate = event.target.value; setDate(nextDate); setDueDate(dueDateForTerms(nextDate, terms)); }} />{fieldError("date")}</label><label>Currency<select value={currency} onChange={(event) => { const nextCurrency = event.target.value; setCurrency(nextCurrency); setExchangeRate(nextCurrency === "CAD" ? 1 : 0); }}><option>CAD</option><option>USD</option><option>EUR</option></select></label>{currency !== "CAD" && <label data-field="exchangeRate"><span>Exchange rate to CAD{requiredMark}</span><NumberField min="0.0001" step="0.0001" value={exchangeRate} onChange={setExchangeRate} {...fieldProps("exchangeRate")} />{fieldError("exchangeRate")}</label>}<label>Payment terms<select value={terms} onChange={(event) => { const nextTerms = event.target.value; setTerms(nextTerms); setDueDate(dueDateForTerms(date, nextTerms)); }}>{PAYMENT_TERMS.map((term) => <option key={term}>{term}</option>)}</select></label><label data-field="dueDate"><span>Due date{requiredMark}</span><input type="date" value={dueDate} {...fieldProps("dueDate")} onChange={(event) => setDueDate(event.target.value)} />{fieldError("dueDate")}</label></div>
+    {!isPurchase ? <fieldset className="composer-lines"><legend>Ship-to address</legend><div className="command-form form-grid composer-header-fields"><label className="project-field" data-field="shipToAddressLine1"><span>Business or street address{requiredMark}</span><AddressAutocomplete value={shipToAddressLine1} country={shipToCountry} onChange={setShipToAddressLine1} onAddressSelected={(selected) => { setShipToAddressLine1(selected.addressLine1); setShipToAddressLine2(selected.addressLine2); setShipToCity(selected.city); setShipToRegion(selected.region); setShipToPostalCode(selected.postalCode); setShipToCountry(selected.country || shipToCountry); if (selected.placeName) setShipToName(selected.placeName); }} required ariaInvalid={Boolean(fieldMessage("shipToAddressLine1"))} ariaDescribedBy={fieldMessage("shipToAddressLine1") ? `${errorId}-shipToAddressLine1` : undefined} />{fieldError("shipToAddressLine1")}</label><label data-field="shipToName"><span>Recipient / business{requiredMark}</span><input value={shipToName} onChange={(event) => setShipToName(event.target.value)} required {...fieldProps("shipToName")} />{fieldError("shipToName")}</label><label>Address line 2<input value={shipToAddressLine2} onChange={(event) => setShipToAddressLine2(event.target.value)} autoComplete="address-line2" /></label><label data-field="shipToCity"><span>City{requiredMark}</span><input value={shipToCity} onChange={(event) => setShipToCity(event.target.value)} required autoComplete="address-level2" {...fieldProps("shipToCity")} />{fieldError("shipToCity")}</label><label data-field="shipToRegion"><span>Province / region{requiredMark}</span><input value={shipToRegion} onChange={(event) => setShipToRegion(event.target.value)} required autoComplete="address-level1" {...fieldProps("shipToRegion")} />{fieldError("shipToRegion")}</label><label data-field="shipToPostalCode"><span>Postal code{requiredMark}</span><input value={shipToPostalCode} onChange={(event) => setShipToPostalCode(event.target.value)} required autoComplete="postal-code" {...fieldProps("shipToPostalCode")} />{fieldError("shipToPostalCode")}</label><label data-field="shipToCountry"><span>Country{requiredMark}</span><input value={shipToCountry} onChange={(event) => setShipToCountry(event.target.value.toUpperCase())} required autoComplete="country" {...fieldProps("shipToCountry")} />{fieldError("shipToCountry")}</label><label>Delivery instructions<input value={deliveryInstructions} onChange={(event) => setDeliveryInstructions(event.target.value)} placeholder="Dock, access, or appointment details" /></label><label className="project-field">Use a saved customer delivery address<ReferenceSearchSelect kind="partnerAddresses" partnerId={partnerId} value={shipToAddressId} initialOptions={[]} onSelect={(option) => { setShipToAddressId(option.id); setShipToName(option.contactName || option.label); setShipToAddressLine1(option.addressLine1 ?? ""); setShipToAddressLine2(option.addressLine2 ?? ""); setShipToCity(option.city ?? ""); setShipToRegion(option.region ?? ""); setShipToPostalCode(option.postalCode ?? ""); setShipToCountry(option.country ?? "CA"); if (option.deliveryInstructions) setDeliveryInstructions(option.deliveryInstructions); }} placeholder={partnerId ? "Search saved delivery addresses" : "Select a customer first"} /><small>These are customer destinations. The Ship-from bin or yard is shown on each product line.</small></label></div><div className="composer-address-actions"><button type="button" className="button secondary" disabled={savingAddress || !partnerId || !shipToAddressLine1.trim() || !shipToCity.trim()} onClick={() => void saveShipToAddress()}>{savingAddress ? "Saving…" : "Save to this customer's address book"}</button>{addressNotice ? <span className="read-only-label" role="status">{addressNotice}</span> : null}</div></fieldset> : null}
     <section className="composer-lines" aria-labelledby="composer-lines-title">
       <div className="composer-section-heading"><div><strong id="composer-lines-title">Product lines</strong></div><button type="button" className="button secondary" onClick={() => setLines((current) => [...current, initialLine()])}>Add product line</button></div>
       {lines.map((line, index) => {
         const selected = productOptions[line.productId];
         return <fieldset key={line.id} className="composer-line">
           <legend>Line {index + 1}</legend>
-          <label className="product-field" data-field={`line-${line.id}-product`}><span>Product / configuration{requiredMark}</span><ReferenceSearchSelect kind="products" role={partnerRole} partnerId={partnerId} quantity={line.quantity} warehouseId={warehouseId} currency={currency} exchangeRateToBase={exchangeRate} value={line.productId} initialOptions={line.productId && productOptions[line.productId] ? [productOptions[line.productId]] : []} quickCreate="product" onSelect={(option) => { setProductOptions((current) => ({ ...current, [option.id]: option })); updateLine(line.id, { productId: option.id, ...(option.unitAmount != null ? { unitAmount: option.unitAmount } : {}), uomId: option.uomId ?? "", uomCode: option.uomCode ?? "", priceSource: option.priceSource ?? "Catalog price" }); }} placeholder="Search SKU, name, manufacturer SKU, or dimensions" /><small>{selected?.detail}</small>{fieldError(`line-${line.id}-product`)}</label>
+          <label className="product-field" data-field={`line-${line.id}-product`}><span>Product / configuration{requiredMark}</span><ReferenceSearchSelect kind="products" role={partnerRole} partnerId={partnerId} quantity={line.quantity} warehouseId={warehouseId} currency={currency} exchangeRateToBase={exchangeRate} value={line.productId} initialOptions={line.productId && productOptions[line.productId] ? [productOptions[line.productId]] : []} quickCreate="product" onSelect={(option) => { setProductOptions((current) => ({ ...current, [option.id]: option })); updateLine(line.id, { productId: option.id, ...(option.unitAmount != null ? { unitAmount: option.unitAmount } : {}), uomId: option.uomId ?? "", uomCode: option.uomCode ?? "", priceSource: option.priceSource ?? "Catalog price", binLocationId: option.defaultBinLocationId ?? "", binLocationLabel: option.defaultBinLocationLabel ?? "" }); }} placeholder="Search SKU, name, manufacturer SKU, or dimensions" /><small>{selected?.detail}</small>{fieldError(`line-${line.id}-product`)}</label>
+          <label><span>{isPurchase ? "Receive-to bin / yard" : "Ship-from bin / yard"}</span><input value={line.route === "drop-ship" ? "No internal bin · supplier delivery" : line.binLocationLabel || "No bin selected"} readOnly /><small>{line.route === "drop-ship" ? "Drop-ship lines do not move through warehouse stock." : line.binLocationId ? selected?.binLocationSource === "only_stocked" ? "Filled automatically because this item is stocked in only one bin." : "Filled from this item's configured bin." : "Set a preferred bin, or stock the item in one bin, to fill this automatically."}</small></label>
           <label data-field={`line-${line.id}-quantity`}><span>Quantity ({line.uomCode || "unit"}){requiredMark}</span><NumberField min="1" value={line.quantity} onChange={(quantity) => updateLine(line.id, { quantity })} {...fieldProps(`line-${line.id}-quantity`)} />{line.uomCode ? null : <small>Select a configured product unit</small>}{fieldError(`line-${line.id}-quantity`)}</label>
           <label data-field={`line-${line.id}-unitAmount`}>Unit {isPurchase ? "cost" : "price"}<NumberField min="0" step="0.01" value={line.unitAmount} onChange={(unitAmount) => updateLine(line.id, { unitAmount, priceSource: "Manual override" })} {...fieldProps(`line-${line.id}-unitAmount`)} /><small>{line.priceSource}</small>{fieldError(`line-${line.id}-unitAmount`)}</label>
           <label>Discount %<NumberField min="0" max="100" step="0.1" value={line.discountRate} onChange={(discountRate) => updateLine(line.id, { discountRate })} /></label>
@@ -4166,7 +4605,7 @@ function AdvancedCreateOrderDialog({ type, initialOrder, initialPartner, partner
             const route = event.target.value as ComposerLine["route"];
             const existing = route === "stock" ? [] : route === "drop-ship" ? line.supplyAllocations.slice(0, 1) : line.supplyAllocations;
             const supplyAllocations = route !== "stock" && !existing.length ? [{ id: crypto.randomUUID(), salesOrderLineId: "", quantity: line.quantity, label: "" }] : existing;
-            updateLine(line.id, { route, supplyAllocations, sourceSalesOrderLineId: supplyAllocations[0]?.salesOrderLineId ?? "" });
+             updateLine(line.id, { route, supplyAllocations, sourceSalesOrderLineId: supplyAllocations[0]?.salesOrderLineId ?? "", ...(route === "drop-ship" ? { binLocationId: "", binLocationLabel: "" } : !line.binLocationId && selected?.defaultBinLocationId ? { binLocationId: selected.defaultBinLocationId, binLocationLabel: selected.defaultBinLocationLabel ?? "" } : {}) });
           }}><option value="stock">Stock</option><option value="special-order">Special order</option><option value="drop-ship">Drop ship</option></select></label>
           <label className="project-field">Customer / project / opening<input value={line.projectReference} onChange={(event) => updateLine(line.id, { projectReference: event.target.value })} placeholder="Optional allocation" /></label>
           {isPurchase && line.route !== "stock" ? <div className="project-field supply-allocation-editor" data-field={`line-${line.id}-allocations`}>
@@ -4263,7 +4702,7 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
     ? (scopedUsable.find((location) => location.locationType === "receiving") ?? (scopedUsable.length === 1 ? scopedUsable[0] : undefined))
     : (usableLocations.length === 1 ? usableLocations[0] : undefined);
   const preferredLocation = (line?: PurchaseLine) => line?.defaultLocations.find((item) => item.warehouseId === warehouseId)?.locationId;
-  const [postingLocationId, setPostingLocationId] = useState(command.kind === "immediate-sale" ? "" : preferredLocation(initialPoLine) ?? defaultPostingLocation?.id ?? "");
+  const [postingLocationId, setPostingLocationId] = useState(command.kind === "immediate-sale" ? initialSoLine?.binLocationId ?? "" : preferredLocation(initialPoLine) ?? defaultPostingLocation?.id ?? "");
   const [quarantineLocationId, setQuarantineLocationId] = useState(quarantineLocations.length === 1 ? quarantineLocations[0].id : "");
   const [lotNumber, setLotNumber] = useState("");
   const [serialNumber, setSerialNumber] = useState("");
@@ -4307,7 +4746,7 @@ function CommandPanel({ command, warehouseId, po, so, locations, countBalances, 
   };
   const chooseCountLocation = (locationId: string) => { const balance = countBalances.find((item) => item.locationId === locationId); setCountLocationId(locationId); setQuantity(balance?.recordedQuantity ?? 0); setApprovalRequired(false); setCountApproval(null); setApprovedCountPayload(null); setApprovalMessage(""); };
   const choosePoLine = (lineId: string) => { const line = po?.lines.find((item) => item.id === lineId); setSelectedPoLineId(lineId); setLotNumber(""); setSerialNumber(""); setLotId(""); setInventoryUnitId(""); if (po && line) { setPostingLocationId(preferredLocation(line) ?? defaultPostingLocation?.id ?? ""); setQuantity(commandDefaults(command.kind, { ...po, ordered: line.ordered, received: line.received, returned: line.returned, closed: line.closed, open: line.open, lines: [line] }, effectiveSo).quantity); } };
-  const chooseSoLine = (lineId: string) => { const line = so?.lines?.find((item) => item.id === lineId); if (!so || !line) return; const factor = line.uomFactorToBase || 1; const availability = calculateSalesAvailability(line.open, line.reserved, line.productAvailable / factor, line.productIncoming / factor); setSelectedSoLineId(lineId); setLotId(""); setInventoryUnitId(""); setQuantity(commandDefaults(command.kind, effectivePo, { ...so, ordered: line.ordered, reserved: line.reserved, shipped: line.shipped, returned: line.returned, open: line.open, availableNow: availability.availableNow, incomingBeforeDate: availability.incomingBeforeDate, shortage: availability.shortage, route: titleCase(line.fulfillmentRoute), lines: [line] }).quantity); };
+  const chooseSoLine = (lineId: string) => { const line = so?.lines?.find((item) => item.id === lineId); if (!so || !line) return; const factor = line.uomFactorToBase || 1; const availability = calculateSalesAvailability(line.open, line.reserved, line.productAvailable / factor, line.productIncoming / factor); setSelectedSoLineId(lineId); setLotId(""); setInventoryUnitId(""); if (command.kind === "immediate-sale") setPostingLocationId(line.binLocationId ?? ""); setQuantity(commandDefaults(command.kind, effectivePo, { ...so, ordered: line.ordered, reserved: line.reserved, shipped: line.shipped, returned: line.returned, open: line.open, availableNow: availability.availableNow, incomingBeforeDate: availability.incomingBeforeDate, shortage: availability.shortage, route: titleCase(line.fulfillmentRoute), lines: [line] }).quantity); };
   const updateReceiptLine = (lineId: string, patch: Partial<{ quantity: number; damagedQuantity: number; locationId: string; uomId?: string; approvalId: string; lotNumber: string; serialNumber: string }>) => setReceiptLines((current) => current.map((line) => line.lineId === lineId ? { ...line, ...patch } : line));
 
   const submit = async (event: FormEvent) => {
@@ -4436,9 +4875,9 @@ function CommandFields({ receiptDate, setReceiptDate, packingSlipNumber, setPack
   const receiptPaperworkFields = <><label>Received on<input type="date" max={localDateString()} value={receiptDate} onChange={(event) => setReceiptDate(event.target.value)} /></label><label>Packing slip / delivery note<input value={packingSlipNumber} onChange={(event) => setPackingSlipNumber(event.target.value)} placeholder="Vendor's document number" /></label></>;
   const incomingIdentityFields = purchasePolicy === "lot" ? <label><span>Received lot number{requiredMark}</span><input value={lotNumber} onChange={(event) => setLotNumber(event.target.value)} placeholder="Required lot number" required aria-required="true" /></label> : purchasePolicy === "serial" ? <label><span>Received serial number{requiredMark}</span><input value={serialNumber} onChange={(event) => setSerialNumber(event.target.value)} placeholder="One serial per receipt posting" required aria-required="true" /></label> : null;
   const outgoingIdentityFields = (policy: string, productId?: string, salesLineId?: string, locationId?: string, shipped = false) => policy === "lot" ? <label>Lot identity<ReferenceSearchSelect kind="inventoryLots" role={shipped ? "shipped" : "on_hand"} productId={productId} lineId={salesLineId} locationId={locationId} value={lotId} initialOptions={[]} onSelect={(option) => setLotId(option.id)} placeholder="Search available lots" /></label> : policy === "serial" ? <label>Serial identity<ReferenceSearchSelect kind="inventoryUnits" role={shipped ? "shipped" : "on_hand"} productId={productId} lineId={salesLineId} locationId={locationId} value={inventoryUnitId} initialOptions={[]} onSelect={(option) => setInventoryUnitId(option.id)} placeholder="Search eligible serial numbers" /></label> : null;
-  if (kind === "receive" && receiptLines.length > 1) return <div className="command-form"><div className="line-context"><span>Multi-line truck receipt</span><strong>{receiptLines.length} PO lines on one receipt document</strong><small>Every line starts at zero. Key what actually arrived, or fill every line with its open quantity.</small></div><div className="batch-receipt-actions"><button type="button" className="button secondary" onClick={receiveAllOpenLines}>Receive all open lines</button></div><div className="form-grid">{receiptPaperworkFields}</div>{receiptLines.some((line) => line.damagedQuantity > 0) ? quarantineLocationField : null}<div className="batch-receipt-lines">{receiptLines.map((receiptLine) => { const line = purchaseLines.find((item) => item.id === receiptLine.lineId); const excess = Math.max(receiptLine.quantity - (line?.open ?? 0), 0); return <div className="batch-receipt-line" key={receiptLine.lineId}><div><strong>{line?.sku} · {line?.product}</strong><small>{line?.open} {line?.orderedUomCode ?? "unit"} open</small></div><label>Preferred bin<ReferenceSearchSelect kind="locations" role="bin" warehouseId={warehouseId} value={receiptLine.locationId} initialOptions={usableLocations.filter((location) => !warehouseId || location.warehouseId === warehouseId).map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => updateReceiptLine(receiptLine.lineId, { locationId: option.id })} placeholder="Search usable bins in this warehouse" /></label><label>Arrived at dock ({line?.orderedUomCode ?? "unit"})<NumberField min="0" max={line?.trackingPolicy === "serial" ? 1 : undefined} step={line?.uomFactorToBase === 1 ? "1" : "0.001"} value={receiptLine.quantity} onChange={(quantity) => updateReceiptLine(receiptLine.lineId, { quantity })} /></label>{/* Named as a subset: side by side, "Arrived" and "Quarantine" read as two buckets that
+  if (kind === "receive" && receiptLines.length > 1) return <div className="command-form"><div className="line-context"><span>Multi-line truck receipt</span><strong>{receiptLines.length} PO lines on one receipt document</strong><small>Every line starts at zero. Key what actually arrived, or fill every line with its open quantity.</small></div><div className="batch-receipt-actions"><button type="button" className="button secondary" onClick={receiveAllOpenLines}>Receive all open lines</button></div><div className="form-grid">{receiptPaperworkFields}</div>{receiptLines.some((line) => line.damagedQuantity > 0) ? quarantineLocationField : null}<div className="batch-receipt-lines">{receiptLines.map((receiptLine) => { const line = purchaseLines.find((item) => item.id === receiptLine.lineId); const excess = Math.max(receiptLine.quantity - (line?.open ?? 0), 0); const convertedQuantity = receiptLine.quantity * (line?.uomFactorToBase ?? 1); return <div className="batch-receipt-line" key={receiptLine.lineId}><div><strong>{line?.sku} · {line?.product}</strong><small>{line?.open} {line?.orderedUomCode ?? "unit"} open{line && line.uomFactorToBase !== 1 ? ` · 1 ${line.orderedUomCode ?? "unit"} = ${formatQuantity(line.uomFactorToBase)} ${line.baseUomCode}` : ""}</small></div><label>Preferred bin<ReferenceSearchSelect kind="locations" role="bin" warehouseId={warehouseId} value={receiptLine.locationId} initialOptions={usableLocations.filter((location) => !warehouseId || location.warehouseId === warehouseId).map((location) => ({ id: location.id, label: `${location.warehouseName} · ${location.code} · ${location.name}`, detail: "Usable inventory" }))} onSelect={(option) => updateReceiptLine(receiptLine.lineId, { locationId: option.id })} placeholder="Search usable bins in this warehouse" /></label><label>Arrived at dock ({line?.orderedUomCode ?? "unit"})<NumberField min="0" max={line?.trackingPolicy === "serial" ? 1 : undefined} step={line?.uomFactorToBase === 1 ? "1" : "0.001"} value={receiptLine.quantity} onChange={(quantity) => updateReceiptLine(receiptLine.lineId, { quantity })} />{line && line.uomFactorToBase !== 1 && receiptLine.quantity > 0 ? <small>Adds {formatQuantity(convertedQuantity)} {line.baseUomCode} to inventory.</small> : null}</label>{/* Named as a subset: side by side, "Arrived" and "Quarantine" read as two buckets that
       add up, so a clerk logging 13 units with 3 damaged keyed 10 and 3 and short-received the line. */}<label>Of which quarantined ({line?.orderedUomCode ?? "unit"})<NumberField min="0" step={line?.uomFactorToBase === 1 ? "1" : "0.001"} max={receiptLine.quantity} value={receiptLine.damagedQuantity} onChange={(damagedQuantity) => updateReceiptLine(receiptLine.lineId, { damagedQuantity })} /></label>{line?.trackingPolicy === "lot" ? <label>Lot number<input value={receiptLine.lotNumber} onChange={(event) => updateReceiptLine(receiptLine.lineId, { lotNumber: event.target.value })} placeholder="Required lot number" /></label> : line?.trackingPolicy === "serial" ? <label>Serial number<input value={receiptLine.serialNumber} onChange={(event) => updateReceiptLine(receiptLine.lineId, { serialNumber: event.target.value })} placeholder="Exactly one serial" /></label> : null}{excess > 0 ? <label>Approval ID (if above tolerance)<input value={receiptLine.approvalId} onChange={(event) => updateReceiptLine(receiptLine.lineId, { approvalId: event.target.value })} placeholder={`${excess} excess; paste approved request ID when required`} /></label> : null}</div>; })}</div><p className="formula-note">Lines with zero arrived quantity are skipped. Tracked lines require their lot or serial identity; the server applies the configured over-receipt policy per line.</p></div>;
-  if (kind === "receive") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{po?.open ?? 0} {po?.lines[0]?.orderedUomCode ?? "units"} open to receive</strong><small>{po?.lines[0]?.specification}</small></div><div className="form-grid"><label>Arrived at dock ({po?.lines[0]?.orderedUomCode ?? "unit"})<NumberField min="1" max={purchasePolicy === "serial" ? 1 : undefined} step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} value={quantity} onChange={setQuantity} /></label><label>Of which quarantined<NumberField min="0" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={quantity} value={secondaryQuantity} onChange={setSecondaryQuantity} /></label>{receiptPaperworkFields}{incomingIdentityFields}{quantity > (po?.open ?? 0) ? <label>Approval ID (if above tolerance)<input value={overReceiptApprovalId} onChange={(event) => setOverReceiptApprovalId(event.target.value)} placeholder="Paste the approved line-scoped request ID" /></label> : null}{usableLocationField}{secondaryQuantity > 0 ? quarantineLocationField : null}</div></div>;
+  if (kind === "receive") { const line = po?.lines[0]; const convertedQuantity = quantity * (line?.uomFactorToBase ?? 1); return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{line?.product}</span><strong>{po?.open ?? 0} {line?.orderedUomCode ?? "units"} open to receive</strong><small>{line && line.uomFactorToBase !== 1 ? `Configured conversion: 1 ${line.orderedUomCode ?? "unit"} = ${formatQuantity(line.uomFactorToBase)} ${line.baseUomCode}` : line?.specification}</small></div><div className="form-grid"><label>Arrived at dock ({line?.orderedUomCode ?? "unit"})<NumberField min="1" max={purchasePolicy === "serial" ? 1 : undefined} step={line?.uomFactorToBase === 1 ? "1" : "0.001"} value={quantity} onChange={setQuantity} />{line && line.uomFactorToBase !== 1 ? <small>This receipt adds {formatQuantity(convertedQuantity)} {line.baseUomCode} to inventory.</small> : null}</label><label>Of which quarantined<NumberField min="0" step={line?.uomFactorToBase === 1 ? "1" : "0.001"} max={quantity} value={secondaryQuantity} onChange={setSecondaryQuantity} /></label>{receiptPaperworkFields}{incomingIdentityFields}{quantity > (po?.open ?? 0) ? <label>Approval ID (if above tolerance)<input value={overReceiptApprovalId} onChange={(event) => setOverReceiptApprovalId(event.target.value)} placeholder="Paste the approved line-scoped request ID" /></label> : null}{usableLocationField}{secondaryQuantity > 0 ? quarantineLocationField : null}</div></div>; }
   if (kind === "ship" || kind === "reserve") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{[so?.lines?.[0]?.product ?? so?.customer, so?.project].filter(Boolean).join(" · ")}</span><strong>{kind === "reserve" ? `${so?.availableNow ?? 0} available now` : `${so?.reserved ?? 0} reserved`}</strong><small>{so?.route}</small></div><label>{kind === "reserve" ? "Quantity to reserve" : "Quantity to ship"}<NumberField min="1" max={max} value={quantity} onChange={setQuantity} /></label>{kind === "ship" ? outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, so?.lines?.[0]?.reservationLocationId) : null}<div className="line-context"><span>{kind === "reserve" ? "Location selection" : "Ship-to address"}</span><strong>{kind === "reserve" ? "Best available usable location is selected at posting" : `${so?.shipToName ?? so?.customer}`}</strong><small>{kind === "reserve" ? "The committed location is recorded on the reservation." : [so?.shipToAddressLine1, so?.shipToCity, so?.shipToRegion, so?.shipToPostalCode, so?.shipToCountry].filter(Boolean).join(", ")}</small></div>{kind === "ship" ? <><label><span>Carrier{requiredMark}</span><input value={carrier} onChange={(event) => setCarrier(event.target.value)} placeholder="Required carrier" required aria-required="true" /></label><label>Service level<input value={serviceLevel} onChange={(event) => setServiceLevel(event.target.value)} placeholder="Ground, LTL, same day…" /></label><label>Tracking number<input value={trackingNumber} onChange={(event) => setTrackingNumber(event.target.value)} placeholder="Tracking or PRO number" /></label><label>Bill of lading<input value={billOfLadingNumber} onChange={(event) => setBillOfLadingNumber(event.target.value)} placeholder="Required when no tracking number" /></label></> : null}</div>;
   if (kind === "immediate-sale") return <div className="command-form">{salesLineSelector}<div className="line-context"><span>{so?.lines?.[0]?.product ?? so?.customer}</span><strong>{so?.availableNow ?? 0} unreserved units available now</strong><small>No reservation is created. Shipment, COGS, and customer invoice post together.</small></div><label>Quantity sold now<NumberField min="1" max={max} value={quantity} onChange={setQuantity} /></label><label>Sale and invoice date<input type="date" max={localDateString()} value={receiptDate} onChange={(event) => setReceiptDate(event.target.value)} /></label>{immediateSourceLocationField}{outgoingIdentityFields(salesPolicy, so?.lines?.[0]?.productId, so?.lines?.[0]?.id, postingLocationId)}<div className="line-context"><span>Invoice handoff</span><strong>Posted immediately for {so?.customer}</strong><small>{so?.paymentTerms || "Due on receipt"} · you will be taken to Posted invoices after posting.</small></div><label>Fulfillment method<input value={carrier} onChange={(event) => setCarrier(event.target.value)} placeholder="Customer pickup" /></label><label>Reference (optional)<input value={trackingNumber} onChange={(event) => setTrackingNumber(event.target.value)} placeholder="Receipt, pickup, or delivery reference" /></label></div>;
   if (kind === "vendor-return") return <div className="command-form">{purchaseLineSelector}<div className="line-context"><span>{po?.lines[0]?.product}</span><strong>{max} {po?.lines[0]?.orderedUomCode ?? "units"} eligible to return</strong><small>Source: {po?.number}</small></div><label>Quantity to return<NumberField min="1" step={po?.lines[0]?.uomFactorToBase === 1 ? "1" : "0.001"} max={max} value={quantity} onChange={setQuantity} /></label>{disposition !== "allowance" ? <>{vendorSourceLocationField}{outgoingIdentityFields(purchasePolicy, po?.lines[0]?.productId, undefined, postingLocationId)}</> : null}<fieldset><legend>What should happen after the vendor receives these goods?</legend>{[["replacement", "Replace the returned quantity"], ["refund", "Issue a credit; no replacement"], ["repair", "Repair and return the same unit"], ["allowance", "No physical return; issue a price allowance"]].map(([value, label]) => { const financialOnly = value === "allowance" && !canPostFinancial; return <label className={`radio-row ${financialOnly ? "disabled" : ""}`} key={value} title={financialOnly ? "A price allowance posts a vendor credit, which needs financial posting permission." : undefined}><input type="radio" name="disposition" value={value} checked={disposition === value} disabled={financialOnly} onChange={(e) => setDisposition(e.target.value)} /><span>{label}{financialOnly ? <small className="field-hint"> Needs financial posting permission.</small> : null}</span></label>; })}</fieldset><SearchableSelect label="Return reason" allowCustom value={reason} setValue={setReason} placeholder="Search or type a reason" options={vendorReturnReasons.map((label) => ({ id: label, label }))} /></div>;
@@ -4513,6 +4952,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
   const rawProducts = asRows(raw.products);
   const rawPurchaseOrders = asRows(raw.purchaseOrders);
   const rawSalesOrders = asRows(raw.salesOrders);
+  const rawSalesPeople = asRows(raw.salesPeople);
 
   const products: Product[] = rawProducts.map((item, index) => {
     const demand = number(item.demand);
@@ -4618,8 +5058,12 @@ function normalizeSnapshot(input: unknown): Snapshot {
       baseUnitCost: number(line.unitCostCents) / 100,
       orderedUomId: text(line.orderedUomId) || undefined,
       orderedUomCode: text(line.orderedUomCode) || undefined,
+      baseUomCode: text(line.baseUomCode) || products.find((product) => product.id === text(line.productId))?.baseUomCode || "EA",
       uomFactorToBase: factor,
-      location: text(line.fulfillmentRoute, "stock") === "drop_ship" ? "Drop ship · no internal stock" : "Destination selected at receipt",
+      location: text(line.fulfillmentRoute, "stock") === "drop_ship" ? "Drop ship · no internal stock" : text(line.binLocationCode) ? `${text(line.binLocationCode)} · ${text(line.binLocationName)}` : "Destination selected at receipt",
+      binLocationId: text(line.binLocationId) || undefined,
+      binLocationCode: text(line.binLocationCode) || undefined,
+      binLocationName: text(line.binLocationName) || undefined,
       fulfillmentRoute: text(line.fulfillmentRoute, "stock"),
       trackingPolicy: text(line.trackingPolicy, "quantity"),
       // Stored per line since 0012. The composer collects a discount and tax rate on every
@@ -4728,8 +5172,11 @@ function normalizeSnapshot(input: unknown): Snapshot {
         orderedUomCode: text(line.orderedUomCode) || undefined,
         uomFactorToBase: factor,
         fulfillmentRoute: text(line.fulfillmentRoute, "stock"),
-        trackingPolicy: text(line.trackingPolicy, "quantity"),
-        reservationLocationId: text(line.reservationLocationId) || undefined,
+      trackingPolicy: text(line.trackingPolicy, "quantity"),
+      binLocationId: text(line.binLocationId) || undefined,
+      binLocationCode: text(line.binLocationCode) || undefined,
+      binLocationName: text(line.binLocationName) || undefined,
+      reservationLocationId: text(line.reservationLocationId) || undefined,
         linkedPurchaseOrderLineId: text(line.linkedPurchaseOrderLineId) || undefined,
         linkedPurchaseOrderId: text(line.linkedPurchaseOrderId) || undefined,
         linkedPurchaseOrderNumber: text(line.linkedPurchaseOrderNumber) || undefined,
@@ -4760,6 +5207,8 @@ function normalizeSnapshot(input: unknown): Snapshot {
       number: text(item.number, "Sales order"),
       customerId: text(item.customerId),
       customer: text(item.customerName, "Unnamed customer"),
+      salesPersonId: text(item.salesPersonId) || undefined,
+      salesPerson: text(item.salesPersonName, text(item.ownerName, "Unassigned")),
       // Left empty when the order has no project reference rather than carrying placeholder
       // prose. As a default it printed "No project reference" on every row of a 1,300-row
       // worklist, and reopening such a draft in the composer saved that sentence as the
@@ -4896,6 +5345,25 @@ function normalizeSnapshot(input: unknown): Snapshot {
     };
   });
 
+  const salesPeople: SalesPerson[] = rawSalesPeople.map((item) => ({
+    id: text(item.id),
+    code: text(item.code),
+    name: text(item.name),
+    email: text(item.email) || undefined,
+    phone: text(item.phone) || undefined,
+    active: number(item.active, 1) !== 0,
+    version: number(item.version, 1),
+    photoAttachmentId: text(item.photoAttachmentId) || undefined,
+    photoFileName: text(item.photoFileName) || undefined,
+    photoCount: number(item.photoCount),
+    orderCount: number(item.orderCount),
+    openOrderCount: number(item.openOrderCount),
+    bookedSalesCents: number(item.bookedSalesCents),
+    invoicedSalesCents: number(item.invoicedSalesCents),
+    collectedSalesCents: number(item.collectedSalesCents),
+    lastOrderAt: text(item.lastOrderAt) || undefined,
+  })).filter((person) => person.id && person.code && person.name);
+
   const inventoryBalances: InventoryLocationBalance[] = asRows(raw.inventoryBalances).map((item) => ({
     productId: text(item.productId),
     locationId: text(item.locationId),
@@ -4964,6 +5432,7 @@ function normalizeSnapshot(input: unknown): Snapshot {
     bills,
     activities,
     partners,
+    salesPeople,
     locations,
     configuration: { taxDefaultRateBps: number(asRecord(raw.configuration).taxDefaultRateBps, 500), reorderPointPercent: number(asRecord(raw.configuration).reorderPointPercent, 70) },
     viewer: {

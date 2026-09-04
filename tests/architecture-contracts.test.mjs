@@ -99,6 +99,8 @@ test("runtime storage preserves inventory, upload, and onboarding invariants", a
   assert.match(attachments, /attachment\.delete_requested/);
   assert.match(attachments, /product:\s*["']products["']/);
   assert.match(attachments, /product_photo/);
+  assert.match(attachments, /sales_person:\s*["']sales_people["']/);
+  assert.match(attachments, /sales_person_photo/);
 });
 
 test("stock item detail supports durable product picture galleries", async () => {
@@ -108,6 +110,40 @@ test("stock item detail supports durable product picture galleries", async () =>
   assert.match(source, /category",\s*"product_photo"/);
   assert.match(source, /multiple/);
   assert.match(source, /image\/jpeg,image\/png,image\/webp/);
+});
+
+test("purchase and sales lines share durable damage photos without duplicating image storage", async () => {
+  const [source, attachments, schema, tenancy, migration] = await Promise.all([
+    read("app/inventory-app.tsx"), read("lib/server/attachments.ts"), read("db/schema.ts"),
+    read("lib/server/tenancy.ts"), read("drizzle/0041_line_item_damage_photos.sql"),
+  ]);
+  assert.match(source, /function DamagePhotos/);
+  assert.match(source, /documentType="purchase_order"/);
+  assert.match(source, /documentType="sales_order"/);
+  assert.match(source, /capture="environment"/);
+  assert.match(source, /form\.append\("lineItemIds", lineId\)/);
+  assert.match(attachments, /form\.getAll\("lineItemIds"\)/);
+  assert.match(attachments, /LINE_ITEMS_REQUIRED/);
+  assert.match(attachments, /purchase_order_lines/);
+  assert.match(attachments, /sales_order_lines/);
+  assert.match(attachments, /INSERT INTO attachment_line_items/);
+  assert.match(attachments, /Damage photos must be JPEG, PNG, or WebP images/);
+  assert.match(schema, /"attachment_line_items"/);
+  assert.match(tenancy, /"attachment_line_items"/);
+  assert.match(migration, /PRIMARY KEY\(`tenant_id`, `attachment_id`, `line_item_id`\)/);
+  assert.match(migration, /idx_attachment_line_items_line/);
+});
+
+test("the sales team workspace supports profile pictures and attributed performance", async () => {
+  const [source, domain] = await Promise.all([
+    read("app/inventory-app.tsx"), read("lib/server/inventory-domain.ts"),
+  ]);
+  assert.match(source, /function SalesPeopleView/);
+  assert.match(source, /documentType",\s*"sales_person"/);
+  assert.match(source, /category",\s*"sales_person_photo"/);
+  assert.match(source, /bookedSalesCents/);
+  assert.match(domain, /sales_person_id=sp\.id/);
+  assert.match(domain, /collectedSalesCents/);
 });
 
 test("multi-line order contract retains currency, tax, routes, fees, and refundable deposits", async () => {

@@ -1,10 +1,12 @@
 import { InventoryApp } from "./inventory-app";
-import { requireChatGPTUser } from "./chatgpt-auth";
+import { AuthLanding } from "./auth-landing";
+import { getChatGPTUser } from "./chatgpt-auth";
 
 export const dynamic = "force-dynamic";
 
 export default async function Home({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
-  const [, params] = await Promise.all([requireChatGPTUser("/"), searchParams]);
+  const [user, params] = await Promise.all([getChatGPTUser(), searchParams]);
+  if (!user) return <AuthLanding />;
   const initialView = typeof params.view === "string" ? params.view : undefined;
   const initialTab = typeof params.tab === "string" ? params.tab : undefined;
   const initialPurchaseOrderId = typeof params.po === "string" ? params.po : undefined;

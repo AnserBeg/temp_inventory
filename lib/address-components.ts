@@ -5,6 +5,8 @@ export type AddressFields = {
   region: string;
   postalCode: string;
   country: string;
+  /** Business or venue name returned for an establishment search. */
+  placeName?: string;
 };
 
 export type GoogleAddressComponent = {
@@ -42,4 +44,11 @@ export function addressFieldsFromGoogleComponents(components: GoogleAddressCompo
     postalCode: postalCodeSuffix ? `${postalCode}-${postalCodeSuffix}` : postalCode,
     country: componentText(components, "country", true).toUpperCase(),
   };
+}
+
+/** Preserves a selected business name while normalizing its postal address. */
+export function addressFieldsFromGooglePlace(place: { addressComponents?: GoogleAddressComponent[]; displayName?: string }): AddressFields {
+  const address = addressFieldsFromGoogleComponents(place.addressComponents ?? []);
+  const placeName = String(place.displayName ?? "").trim();
+  return placeName ? { ...address, placeName } : address;
 }

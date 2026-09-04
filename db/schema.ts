@@ -59,6 +59,26 @@ export const businessPartners = sqliteTable(
   ]
 );
 
+export const salesPeople = sqliteTable(
+  "sales_people",
+  {
+    tenantId: text("tenant_id").notNull().default("tenant-default"),
+    id: text("id").primaryKey(),
+    code: text("code").notNull(),
+    name: text("name").notNull(),
+    email: text("email"),
+    phone: text("phone"),
+    active: integer("active", { mode: "boolean" }).notNull().default(true),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_sales_people_code").on(table.tenantId, table.code),
+    index("idx_sales_people_active_name").on(table.tenantId, table.active, table.name),
+  ]
+);
+
 export const products = sqliteTable(
   "products",
   {
@@ -144,6 +164,7 @@ export const purchaseOrders = sqliteTable(
     orderedAt: text("ordered_at"),
     orderedBy: text("ordered_by"),
     projectReference: text("project_reference"),
+    notes: text("notes"),
     supplierQuoteNumber: text("supplier_quote_number"),
     supplierReference: text("supplier_reference"),
     sourceDocumentHash: text("source_document_hash"),
@@ -167,6 +188,8 @@ export const purchaseOrderLines = sqliteTable(
     id: text("id").primaryKey(),
     purchaseOrderId: text("purchase_order_id").notNull(),
     productId: text("product_id").notNull(),
+    /** Preferred warehouse bin captured when the line is entered. */
+    binLocationId: text("bin_location_id").references(() => locations.id),
     orderedQty: real("ordered_qty").notNull(),
     closedQty: real("closed_qty").notNull().default(0),
     unitCostCents: integer("unit_cost_cents").notNull(),
@@ -185,6 +208,7 @@ export const purchaseOrderLines = sqliteTable(
   (table) => [
     index("idx_purchase_order_lines_order").on(table.tenantId, table.purchaseOrderId),
     index("idx_purchase_order_lines_product").on(table.tenantId, table.productId),
+    index("idx_purchase_order_lines_bin_location").on(table.tenantId, table.binLocationId),
     index("idx_purchase_order_lines_source_sales_line").on(table.tenantId, table.sourceSalesOrderLineId),
   ]
 );
@@ -203,6 +227,7 @@ export const receipts = sqliteTable(
      * against that document, and without somewhere to record it the number lived on paper only.
      */
     packingSlipNumber: text("packing_slip_number"),
+    notes: text("notes"),
     version: integer("version").notNull().default(1),
   },
   (table) => [
@@ -233,6 +258,7 @@ export const salesOrders = sqliteTable(
     id: text("id").primaryKey(),
     number: text("number").notNull(),
     customerId: text("customer_id").notNull(),
+    salesPersonId: text("sales_person_id").references(() => salesPeople.id),
     lifecycleStatus: text("lifecycle_status").notNull().default("confirmed"),
     billingStatus: text("billing_status").notNull().default("not_invoiced"),
     requestedDate: text("requested_date"),
@@ -252,12 +278,14 @@ export const salesOrders = sqliteTable(
     shipToPostalCode: text("ship_to_postal_code"),
     shipToCountry: text("ship_to_country"),
     deliveryInstructions: text("delivery_instructions"),
+    notes: text("notes"),
     version: integer("version").notNull().default(1),
     createdAt: text("created_at").notNull(),
   },
   (table) => [
     uniqueIndex("idx_sales_orders_number").on(table.tenantId, table.number),
     index("idx_sales_orders_customer_status").on(table.tenantId, table.customerId, table.lifecycleStatus),
+    index("idx_sales_orders_sales_person_status").on(table.tenantId, table.salesPersonId, table.lifecycleStatus),
     index("idx_sales_orders_status_requested").on(table.tenantId, table.lifecycleStatus, table.requestedDate),
   ]
 );
@@ -269,6 +297,8 @@ export const salesOrderLines = sqliteTable(
     id: text("id").primaryKey(),
     salesOrderId: text("sales_order_id").notNull(),
     productId: text("product_id").notNull(),
+    /** Preferred pick bin captured when the line is entered. */
+    binLocationId: text("bin_location_id").references(() => locations.id),
     orderedQty: real("ordered_qty").notNull(),
     canceledQty: real("canceled_qty").notNull().default(0),
     unitPriceCents: integer("unit_price_cents").notNull(),
@@ -287,6 +317,7 @@ export const salesOrderLines = sqliteTable(
   (table) => [
     index("idx_sales_order_lines_order").on(table.tenantId, table.salesOrderId),
     index("idx_sales_order_lines_product").on(table.tenantId, table.productId),
+    index("idx_sales_order_lines_bin_location").on(table.tenantId, table.binLocationId),
   ]
 );
 
@@ -306,6 +337,7 @@ export const dropShipDeliveries = sqliteTable(
     status: text("status").notNull().default("posted"),
     deliveryDate: text("delivery_date").notNull(),
     externalReference: text("external_reference").notNull(),
+    notes: text("notes"),
     postedAt: text("posted_at").notNull(),
     postedBy: text("posted_by").notNull(),
     version: integer("version").notNull().default(1),
@@ -386,6 +418,7 @@ export const shipments = sqliteTable(
     shipToRegion: text("ship_to_region"),
     shipToPostalCode: text("ship_to_postal_code"),
     shipToCountry: text("ship_to_country"),
+    notes: text("notes"),
     postedAt: text("posted_at").notNull(),
     version: integer("version").notNull().default(1),
   },
@@ -419,6 +452,7 @@ export const vendorReturns = sqliteTable("vendor_returns", {
   locationId: text("location_id").notNull(),
   quantity: real("quantity").notNull(),
   disposition: text("disposition").notNull(),
+  notes: text("notes"),
   postedAt: text("posted_at").notNull(),
 }, (table) => [uniqueIndex("idx_vendor_returns_number").on(table.tenantId, table.number)]);
 
@@ -433,6 +467,7 @@ export const customerReturns = sqliteTable("customer_returns", {
   quantity: real("quantity").notNull(),
   condition: text("condition").notNull(),
   financialResolution: text("financial_resolution").notNull().default("pending"),
+  notes: text("notes"),
   postedAt: text("posted_at").notNull(),
 }, (table) => [uniqueIndex("idx_customer_returns_number").on(table.tenantId, table.number)]);
 
@@ -528,6 +563,7 @@ export const inventoryCounts = sqliteTable("inventory_counts", {
   varianceQty: real("variance_qty").notNull(),
   status: text("status").notNull().default("posted"),
   reason: text("reason").notNull(),
+  notes: text("notes"),
   countedAt: text("counted_at").notNull(),
   countedBy: text("counted_by").notNull(),
   countSessionId: text("count_session_id"),
@@ -628,6 +664,7 @@ export const vendorBills = sqliteTable("vendor_bills", {
   taxRateBps: integer("tax_rate_bps").notNull().default(0),
   taxCode: text("tax_code"),
   paymentTerms: text("payment_terms"),
+  notes: text("notes"),
   version: integer("version").notNull().default(1),
 }, (table) => [
   uniqueIndex("idx_vendor_bills_number").on(table.tenantId, table.number),
@@ -679,6 +716,38 @@ export const appUsers = sqliteTable("app_users", {
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [check("app_users_role_check", sql`${table.role} IN ('viewer','operator','accounting','manager','administrator')`)]);
+
+export const appPasswordCredentials = sqliteTable("app_password_credentials", {
+  userId: text("user_id").primaryKey().references(() => appUsers.userId, { onDelete: "cascade" }),
+  passwordHash: text("password_hash").notNull(),
+  passwordSalt: text("password_salt").notNull(),
+  passwordIterations: integer("password_iterations").notNull().default(310000),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  lastLoginAt: text("last_login_at"),
+}, (table) => [check("app_password_credentials_iterations_check", sql`${table.passwordIterations} >= 100000`)]);
+
+export const appSessions = sqliteTable("app_sessions", {
+  id: text("id").primaryKey(),
+  tokenHash: text("token_hash").notNull(),
+  userId: text("user_id").notNull().references(() => appUsers.userId, { onDelete: "cascade" }),
+  tenantId: text("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+  expiresAt: text("expires_at").notNull(),
+  createdAt: text("created_at").notNull(),
+  lastSeenAt: text("last_seen_at").notNull(),
+}, (table) => [
+  uniqueIndex("idx_app_sessions_token_hash").on(table.tokenHash),
+  index("idx_app_sessions_user_expiry").on(table.userId, table.expiresAt),
+  index("idx_app_sessions_tenant_expiry").on(table.tenantId, table.expiresAt),
+]);
+
+export const authLoginAttempts = sqliteTable("auth_login_attempts", {
+  attemptKey: text("attempt_key").primaryKey(),
+  failureCount: integer("failure_count").notNull().default(0),
+  windowStartedAt: text("window_started_at").notNull(),
+  lockedUntil: text("locked_until"),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [index("idx_auth_login_attempts_updated").on(table.updatedAt)]);
 
 /** A mailbox belongs to a user, or to the reserved company sender identity for the tenant. */
 export const emailConnections = sqliteTable("email_connections", {
@@ -944,6 +1013,7 @@ export const vendorCredits = sqliteTable(
     purchaseOrderId: text("purchase_order_id").references(() => purchaseOrders.id),
     amountCents: integer("amount_cents").notNull(),
     reason: text("reason").notNull(),
+    notes: text("notes"),
     status: text("status").notNull().default("posted"),
     postedAt: text("posted_at").notNull(),
     postedBy: text("posted_by").notNull(),
@@ -979,6 +1049,7 @@ export const customerInvoices = sqliteTable(
     taxRateBps: integer("tax_rate_bps").notNull().default(0),
     taxCode: text("tax_code"),
     paymentTerms: text("payment_terms"),
+    notes: text("notes"),
     postedAt: text("posted_at").notNull(),
     postedBy: text("posted_by").notNull(),
     version: integer("version").notNull().default(1),
@@ -998,6 +1069,8 @@ export const customerInvoiceLines = sqliteTable(
     customerInvoiceId: text("customer_invoice_id").notNull().references(() => customerInvoices.id),
     salesOrderLineId: text("sales_order_line_id").notNull().references(() => salesOrderLines.id),
     productId: text("product_id").notNull().references(() => products.id),
+    /** Bin copied from the sales-order line so the invoice remains a durable item-location snapshot. */
+    binLocationId: text("bin_location_id").references(() => locations.id),
     quantity: real("quantity").notNull(),
     unitPriceCents: integer("unit_price_cents").notNull(),
     lineTotalCents: integer("line_total_cents").notNull(),
@@ -1005,6 +1078,7 @@ export const customerInvoiceLines = sqliteTable(
   (table) => [
     index("idx_customer_invoice_lines_invoice").on(table.tenantId, table.customerInvoiceId),
     index("idx_customer_invoice_lines_sales_line").on(table.tenantId, table.salesOrderLineId),
+    index("idx_customer_invoice_lines_bin_location").on(table.tenantId, table.binLocationId),
   ]
 );
 
@@ -1019,6 +1093,7 @@ export const customerCredits = sqliteTable(
     salesOrderId: text("sales_order_id").references(() => salesOrders.id),
     amountCents: integer("amount_cents").notNull(),
     reason: text("reason").notNull(),
+    notes: text("notes"),
     status: text("status").notNull().default("posted"),
     postedAt: text("posted_at").notNull(),
     postedBy: text("posted_by").notNull(),
@@ -1047,6 +1122,7 @@ export const payments = sqliteTable(
     paymentDate: text("payment_date").notNull(),
     method: text("method").notNull(),
     reference: text("reference"),
+    notes: text("notes"),
     postedAt: text("posted_at").notNull(),
     postedBy: text("posted_by").notNull(),
     currency: text("currency").notNull().default("CAD"),
@@ -1283,6 +1359,7 @@ export const landedCostAllocations = sqliteTable("landed_cost_allocations", {
   sourceDocumentId: text("source_document_id").notNull(),
   amountCents: integer("amount_cents").notNull(),
   allocationBasis: text("allocation_basis").notNull(),
+  notes: text("notes"),
   postedAt: text("posted_at").notNull(),
   postedBy: text("posted_by").notNull(),
 }, (table) => [uniqueIndex("idx_landed_cost_allocations_number").on(table.tenantId, table.number)]);
@@ -1565,6 +1642,26 @@ export const attachments = sqliteTable(
   ]
 );
 
+/**
+ * A damage photo is stored once on its order, then linked to every affected line here. The
+ * polymorphic line id is validated against the matching purchase/sales line table before the
+ * upload is committed.
+ */
+export const attachmentLineItems = sqliteTable(
+  "attachment_line_items",
+  {
+    tenantId: text("tenant_id").notNull().default("tenant-default"),
+    attachmentId: text("attachment_id").notNull().references(() => attachments.id, { onDelete: "cascade" }),
+    documentType: text("document_type").notNull(),
+    lineItemId: text("line_item_id").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.attachmentId, table.lineItemId] }),
+    index("idx_attachment_line_items_line").on(table.tenantId, table.documentType, table.lineItemId),
+    check("attachment_line_items_document_type_check", sql`${table.documentType} IN ('purchase_order','sales_order')`),
+  ]
+);
+
 export const warehouses = sqliteTable("warehouses", {
     tenantId: text("tenant_id").notNull().default("tenant-default"),
   id: text("id").primaryKey(),
@@ -1759,6 +1856,7 @@ export const inventoryTransfers = sqliteTable("inventory_transfers", {
   fromWarehouseId: text("from_warehouse_id").notNull().references(() => warehouses.id),
   toWarehouseId: text("to_warehouse_id").notNull().references(() => warehouses.id),
   inTransitLocationId: text("in_transit_location_id").references(() => locations.id),
+  notes: text("notes"),
   postedAt: text("posted_at").notNull(),
   postedBy: text("posted_by").notNull(),
   version: integer("version").notNull().default(1),
@@ -1891,4 +1989,95 @@ export const purchaseOrderMerges = sqliteTable(
     mergedBy: text("merged_by").notNull(),
   },
   (table) => [index("idx_purchase_order_merges_target").on(table.tenantId, table.targetPurchaseOrderId)]
+);
+
+/** Service, installation, and internal jobs that workers can book time against. */
+export const workOrders = sqliteTable(
+  "work_orders",
+  {
+    tenantId: text("tenant_id").notNull().default("tenant-default"),
+    id: text("id").primaryKey(),
+    number: text("number").notNull(),
+    title: text("title").notNull(),
+    status: text("status").notNull().default("open"),
+    partnerId: text("partner_id").references(() => businessPartners.id),
+    notes: text("notes"),
+    createdById: text("created_by_id").notNull().references(() => appUsers.userId),
+    createdByName: text("created_by_name").notNull(),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_work_orders_number").on(table.tenantId, table.number),
+    index("idx_work_orders_status_updated").on(table.tenantId, table.status, table.updatedAt),
+    index("idx_work_orders_partner").on(table.tenantId, table.partnerId, table.updatedAt),
+    check("work_orders_status_check", sql`${table.status} IN ('open','on_hold','completed')`),
+  ]
+);
+
+/** A work order may relate to several sales orders, purchase orders, or both. */
+export const workOrderDocumentLinks = sqliteTable(
+  "work_order_document_links",
+  {
+    tenantId: text("tenant_id").notNull().default("tenant-default"),
+    id: text("id").primaryKey(),
+    workOrderId: text("work_order_id").notNull().references(() => workOrders.id, { onDelete: "cascade" }),
+    documentType: text("document_type").notNull(),
+    documentId: text("document_id").notNull(),
+    documentNumber: text("document_number").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_work_order_document_unique").on(table.tenantId, table.workOrderId, table.documentType, table.documentId),
+    index("idx_work_order_document_lookup").on(table.tenantId, table.documentType, table.documentId),
+    check("work_order_document_type_check", sql`${table.documentType} IN ('sales_order','purchase_order')`),
+  ]
+);
+
+/** Named tasks within a work order, such as diagnosis, installation, or travel. */
+export const labourItems = sqliteTable(
+  "labour_items",
+  {
+    tenantId: text("tenant_id").notNull().default("tenant-default"),
+    id: text("id").primaryKey(),
+    workOrderId: text("work_order_id").notNull().references(() => workOrders.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    status: text("status").notNull().default("open"),
+    createdById: text("created_by_id").notNull().references(() => appUsers.userId),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("idx_labour_items_work_order_status").on(table.tenantId, table.workOrderId, table.status),
+    check("labour_items_status_check", sql`${table.status} IN ('open','completed')`),
+  ]
+);
+
+/** Clock sessions are the durable source of truth for labour duration and technician stories. */
+export const timeEntries = sqliteTable(
+  "time_entries",
+  {
+    tenantId: text("tenant_id").notNull().default("tenant-default"),
+    id: text("id").primaryKey(),
+    labourItemId: text("labour_item_id").notNull().references(() => labourItems.id, { onDelete: "cascade" }),
+    workerUserId: text("worker_user_id").notNull().references(() => appUsers.userId),
+    workerName: text("worker_name").notNull(),
+    workerEmail: text("worker_email").notNull(),
+    startedAt: text("started_at").notNull(),
+    endedAt: text("ended_at"),
+    techStory: text("tech_story"),
+    editedById: text("edited_by_id").references(() => appUsers.userId),
+    editedByName: text("edited_by_name"),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_time_entries_one_active_worker").on(table.tenantId, table.workerUserId).where(sql`${table.endedAt} IS NULL`),
+    index("idx_time_entries_labour_started").on(table.tenantId, table.labourItemId, table.startedAt),
+    index("idx_time_entries_worker_started").on(table.tenantId, table.workerUserId, table.startedAt),
+    check("time_entries_range_check", sql`${table.endedAt} IS NULL OR ${table.endedAt} > ${table.startedAt}`),
+  ]
 );

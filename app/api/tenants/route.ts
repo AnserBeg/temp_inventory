@@ -24,7 +24,9 @@ export async function POST(request: Request) {
     const id = `tenant-${crypto.randomUUID()}`;
     const desiredSlug = slug(String(input.slug ?? name));
     if (!desiredSlug) return Response.json({ error: { code: "INVALID_TENANT_SLUG", message: "Organization slug must contain a letter or number." } }, { status: 400 });
-    const uniqueSlug = `${desiredSlug}-${crypto.randomUUID().slice(0, 6)}`;
+    if (await getRootD1().prepare("SELECT 1 AS found FROM tenants WHERE slug=? LIMIT 1").bind(desiredSlug).first()) {
+      return Response.json({ error: { code: "TENANT_SLUG_TAKEN", message: "That organization ID is already in use." } }, { status: 409 });
+    }
     const now = new Date().toISOString();
     const root = getRootD1();
     const warehouseId = `warehouse-${id}-${crypto.randomUUID()}`;
@@ -32,7 +34,7 @@ export async function POST(request: Request) {
     const auditId = `audit-${id}-${crypto.randomUUID()}`;
     await root.batch([
       root.prepare("UPDATE tenant_memberships SET is_default=0,updated_at=? WHERE user_id=?").bind(now, actor.id),
-      root.prepare("INSERT INTO tenants (id,slug,name,status,created_by,created_at,updated_at) VALUES (?,?,?,'active',?,?,?)").bind(id, uniqueSlug, name, actor.id, now, now),
+      root.prepare("INSERT INTO tenants (id,slug,name,status,created_by,created_at,updated_at) VALUES (?,?,?,'active',?,?,?)").bind(id, desiredSlug, name, actor.id, now, now),
       root.prepare("INSERT INTO tenant_memberships (tenant_id,user_id,role,active,is_default,version,created_at,updated_at) VALUES (?,?,'administrator',1,1,1,?,?)").bind(id, actor.id, now, now),
       root.prepare("INSERT INTO warehouses (tenant_id,id,code,name,timezone,active,version) VALUES (?,?,'MAIN','Main warehouse','America/Edmonton',1,1)").bind(id, warehouseId),
       root.prepare("INSERT INTO units_of_measure (tenant_id,id,code,name,dimension,precision,active) VALUES (?,?,'EA','Each','quantity',0,1)").bind(id, uomId),
@@ -40,10 +42,10 @@ export async function POST(request: Request) {
       root.prepare("INSERT INTO system_settings (tenant_id,key,value_json,description,version,updated_by,updated_at) VALUES (?,'inventory.negativeAllowed','false','Negative on-hand inventory is blocked by default.',1,?,?)").bind(id, actor.label, now),
       root.prepare("INSERT INTO system_settings (tenant_id,key,value_json,description,version,updated_by,updated_at) VALUES (?,'valuation.defaultMethod','\"fifo\"','Default inventory valuation method.',1,?,?)").bind(id, actor.label, now),
       root.prepare(`INSERT INTO audit_events (tenant_id,id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
-        VALUES (?,?, 'tenant',?,'tenant_created',?,?,?,?,?,?)`).bind(id, auditId, id, `${name} organization created.`, actor.label, actor.id, actor.email, JSON.stringify({ slug: uniqueSlug }), now),
+        VALUES (?,?, 'tenant',?,'tenant_created',?,?,?,?,?,?)`).bind(id, auditId, id, `${name} organization created.`, actor.label, actor.id, actor.email, JSON.stringify({ slug: desiredSlug }), now),
     ]);
     const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
-    return Response.json({ tenant: { id, slug: uniqueSlug, name, role: "administrator" }, message: `${name} created.` }, {
+    return Response.json({ tenant: { id, slug: desiredSlug, name, role: "administrator" }, message: `${name} created.` }, {
       status: 201,
       headers: { "Cache-Control": "no-store", "Set-Cookie": `paneflow_tenant=${encodeURIComponent(id)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure}` },
     });

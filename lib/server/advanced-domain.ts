@@ -97,6 +97,8 @@ export const workflowCapabilities = {
   createBusinessPartner: "approve",
   updateBusinessPartner: "approve",
   deactivateBusinessPartner: "approve",
+  createSalesPerson: "approve",
+  updateSalesPerson: "approve",
   mergeBusinessPartners: "administer",
   createProduct: "approve",
   updateProduct: "approve",
@@ -108,6 +110,7 @@ export const workflowCapabilities = {
   mergePurchaseOrders: "operationalWrite",
   createUnitOfMeasure: "administer",
   createUomConversion: "administer",
+  configureProductPurchaseUnit: "administer",
   createPriceList: "administer",
   updatePriceList: "administer",
   deactivatePriceList: "administer",
@@ -372,6 +375,9 @@ async function updateSalesOrderDraft(command: WorkflowCommand) {
   const customerId = textValue(payload, "customerId");
   const customer = await first<{ name: string; addressLine1: string | null; addressLine2: string | null; city: string | null; region: string | null; postalCode: string | null; country: string | null }>("SELECT name,address_line_1 AS addressLine1,address_line_2 AS addressLine2,city,region,postal_code AS postalCode,country FROM business_partners WHERE id=? AND partner_type IN ('customer','both') AND active=1", customerId);
   if (!customer) throw new WorkflowError("INVALID_CUSTOMER", "Select a valid active customer.", 404);
+  const salesPersonId = optionalText(payload, "salesPersonId");
+  const salesPerson = salesPersonId ? await first<{ name: string }>("SELECT name FROM sales_people WHERE id=? AND active=1", salesPersonId) : null;
+  if (salesPersonId && !salesPerson) throw new WorkflowError("INVALID_SALES_PERSON", "Select a valid active salesperson.", 404);
   const requestedDate = dateValue(payload, "requestedDate");
   const currency = textValue(payload, "currency", "CAD").toUpperCase();
   if (!/^[A-Z]{3}$/.test(currency)) throw new WorkflowError("VALIDATION_ERROR", "currency must be a three-letter ISO code.");
@@ -379,6 +385,7 @@ async function updateSalesOrderDraft(command: WorkflowCommand) {
   const paymentTerms = optionalText(payload, "paymentTerms");
   const dueDate = payload.dueDate == null || payload.dueDate === "" ? null : dateValue(payload, "dueDate");
   const projectReference = optionalText(payload, "projectReference");
+  const notes = documentNotes(payload);
   const shipToName = optionalText(payload, "shipToName") ?? customer.name;
   const shipToAddressLine1 = optionalText(payload, "shipToAddressLine1") ?? customer.addressLine1 ?? "";
   const shipToAddressLine2 = optionalText(payload, "shipToAddressLine2") ?? customer.addressLine2 ?? "";
@@ -421,22 +428,22 @@ async function updateSalesOrderDraft(command: WorkflowCommand) {
       AND NOT EXISTS (SELECT 1 FROM sales_order_lines sol WHERE sol.sales_order_id=so.id
         AND EXISTS (SELECT 1 FROM supply_allocations sa WHERE sa.sales_order_line_id=sol.id AND sa.status='active'))`)
       .bind(...claimValues(command, result, id), id, version),
-    db.prepare(`UPDATE sales_orders SET customer_id=?,requested_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,ship_to_name=?,ship_to_address_line_1=?,ship_to_address_line_2=?,ship_to_city=?,ship_to_region=?,ship_to_postal_code=?,ship_to_country=?,delivery_instructions=?,version=version+1
+    db.prepare(`UPDATE sales_orders SET customer_id=?,sales_person_id=?,owner_name=?,requested_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,ship_to_name=?,ship_to_address_line_1=?,ship_to_address_line_2=?,ship_to_city=?,ship_to_region=?,ship_to_postal_code=?,ship_to_country=?,delivery_instructions=?,notes=?,version=version+1
       WHERE id=? AND version=? AND lifecycle_status='draft' AND ${marker(command)}`)
-      .bind(customerId, requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, id, version),
+      .bind(customerId, salesPersonId, salesPerson?.name ?? command.actor.label, requestedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, projectReference, shipToName, shipToAddressLine1, shipToAddressLine2, shipToCity, shipToRegion, shipToPostalCode, shipToCountry, deliveryInstructions, notes, id, version),
     db.prepare(`DELETE FROM document_charges WHERE document_type='sales_order' AND document_id=? AND charge_type IN (SELECT value FROM json_each(?)) AND ${marker(command)}`).bind(id, JSON.stringify(composerChargeKinds)),
     db.prepare(`DELETE FROM sales_order_lines WHERE sales_order_id=? AND ${marker(command)}`).bind(id),
   ];
   for (const line of prepared.items) statements.push(db.prepare(`INSERT INTO sales_order_lines
-    (id,sales_order_id,product_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
-    SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
-    .bind(newId("so-line"), id, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.projectReference, line.linkedPurchaseOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps));
+    (id,sales_order_id,product_id,bin_location_id,ordered_qty,canceled_qty,unit_price_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_price_cents,configuration_snapshot,fulfillment_route,project_reference,linked_purchase_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
+    SELECT ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${marker(command)}`)
+    .bind(newId("so-line"), id, line.productId, line.binLocationId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.projectReference, line.linkedPurchaseOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps));
   for (const charge of prepared.charges) statements.push(db.prepare(`INSERT INTO document_charges
     (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at)
     SELECT ?,'sales_order',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
     .bind(newId("charge"), id, charge.chargeType, charge.description, charge.amountCents, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRateBps, charge.taxable ? Math.round(charge.amountCents * charge.taxRateBps / 10_000) : 0, when));
   statements.push(
-    auditStatement(command, "sales_order", id, "draft_updated", result.message, { customerId, requestedDate, itemCount: prepared.items.length, totalCents, retainedChargeCount: retainedCharges.length, currency }, when),
+    auditStatement(command, "sales_order", id, "draft_updated", result.message, { customerId, salesPersonId, requestedDate, notes, itemCount: prepared.items.length, totalCents, retainedChargeCount: retainedCharges.length, currency }, when),
     outboxStatement(command, "sales_order.draft_updated", "sales_order", id, { itemCount: prepared.items.length, totalCents }, when),
   );
   await db.batch(statements);
@@ -469,6 +476,7 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
   const paymentTerms = optionalText(payload, "paymentTerms");
   const dueDate = payload.dueDate == null || payload.dueDate === "" ? null : dateValue(payload, "dueDate");
   const projectReference = optionalText(payload, "projectReference");
+  const notes = documentNotes(payload);
   let prepared: Awaited<ReturnType<typeof prepareOrderDraft>>;
   try {
     prepared = await prepareOrderDraft({ ...(payload as Omit<CreateOrderInput, "type" | "idempotencyKey">), type: "purchaseOrder", idempotencyKey: command.idempotencyKey, editingPurchaseOrderId: id });
@@ -515,9 +523,9 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
       AND NOT EXISTS (SELECT 1 FROM vendor_bills vb WHERE vb.purchase_order_id=po.id AND vb.status<>'void')
       AND NOT EXISTS (SELECT 1 FROM purchase_order_revisions rev WHERE rev.purchase_order_id=po.id AND rev.revision_number=? AND rev.lifecycle_status<>?)${allocationClaims}`)
       .bind(...claimValues(command, result, id), id, version, current.status, revisionNumber, current.status, ...allocationClaimValues),
-    db.prepare(`UPDATE purchase_orders SET vendor_id=?,expected_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,lifecycle_status='draft',revision_number=?,version=version+1
+    db.prepare(`UPDATE purchase_orders SET vendor_id=?,expected_date=?,currency=?,exchange_rate_to_base=?,base_total_cents=?,payment_terms=?,due_date=?,total_cents=?,project_reference=?,notes=?,lifecycle_status='draft',revision_number=?,version=version+1
       WHERE id=? AND version=? AND lifecycle_status=? AND ${marker(command)}`)
-      .bind(vendorId, expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, projectReference, revisionNumber, id, version, current.status),
+      .bind(vendorId, expectedDate, currency, exchangeRateToBase, baseTotalCents, paymentTerms, dueDate, totalCents, projectReference, notes, revisionNumber, id, version, current.status),
     db.prepare(`UPDATE sales_order_lines SET linked_purchase_order_line_id=NULL WHERE linked_purchase_order_line_id IN (SELECT id FROM purchase_order_lines WHERE purchase_order_id=?) AND ${marker(command)}`).bind(id),
     db.prepare(`DELETE FROM document_charges WHERE document_type='purchase_order' AND document_id=? AND charge_type IN (SELECT value FROM json_each(?)) AND ${marker(command)}`).bind(id, JSON.stringify(composerChargeKinds)),
     db.prepare(`DELETE FROM purchase_order_lines WHERE purchase_order_id=? AND ${marker(command)}`).bind(id),
@@ -525,9 +533,9 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
   for (const line of prepared.items) {
     const lineId = newId("po-line");
     statements.push(db.prepare(`INSERT INTO purchase_order_lines
-      (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
-      SELECT ?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
-      .bind(lineId, id, line.productId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.sourceSalesOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps));
+      (id,purchase_order_id,product_id,bin_location_id,ordered_qty,closed_qty,unit_cost_cents,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents,configuration_snapshot,fulfillment_route,source_sales_order_line_id,discount_cents,taxable,tax_code,tax_rate_bps)
+      SELECT ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${marker(command)}`)
+      .bind(lineId, id, line.productId, line.binLocationId, line.quantity, line.unitAmountCents, line.uomId, line.enteredQuantity, line.enteredUnitAmountCents, line.configurationSnapshot, line.fulfillmentRoute, line.sourceSalesOrderLineId, line.discountCents, line.taxable ? 1 : 0, line.taxCode, line.taxRateBps));
     for (const allocation of line.supplyAllocations) {
       statements.push(db.prepare(`INSERT INTO supply_allocations
         (id,purchase_order_line_id,sales_order_line_id,allocated_qty,received_qty,status,created_at,updated_at,version)
@@ -541,7 +549,7 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
     (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at)
     SELECT ?,'purchase_order',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`)
     .bind(newId("charge"), id, charge.chargeType, charge.description, charge.amountCents, charge.direction, charge.taxable ? 1 : 0, charge.refundable ? 1 : 0, charge.taxCode, charge.taxRateBps, charge.taxable ? Math.round(charge.amountCents * charge.taxRateBps / 10_000) : 0, when));
-  const revisionSnapshot = JSON.stringify({ number: current.number, vendorId, expectedDate, items: prepared.items, charges: prepared.charges, retainedCharges, totalCents, currency, exchangeRateToBase, previousRevision: reopeningRejected ? current.revision : null });
+  const revisionSnapshot = JSON.stringify({ number: current.number, vendorId, expectedDate, notes, items: prepared.items, charges: prepared.charges, retainedCharges, totalCents, currency, exchangeRateToBase, previousRevision: reopeningRejected ? current.revision : null });
   statements.push(
     reopeningRejected
       ? db.prepare(`INSERT INTO purchase_order_revisions (id,purchase_order_id,revision_number,lifecycle_status,snapshot_json,reason,created_by,created_at)
@@ -550,7 +558,7 @@ async function updatePurchaseOrderDraft(command: WorkflowCommand) {
       : db.prepare(`UPDATE purchase_order_revisions SET snapshot_json=?,reason='Draft edited',created_by=?,created_at=?
           WHERE purchase_order_id=? AND revision_number=? AND lifecycle_status='draft' AND ${marker(command)}`)
         .bind(revisionSnapshot, command.actor.label, when, id, current.revision),
-    auditStatement(command, "purchase_order", id, "draft_updated", result.message, { vendorId, expectedDate, itemCount: prepared.items.length, totalCents, retainedChargeCount: retainedCharges.length, currency, previousStatus: current.status, revisionNumber }, when),
+    auditStatement(command, "purchase_order", id, "draft_updated", result.message, { vendorId, expectedDate, notes, itemCount: prepared.items.length, totalCents, retainedChargeCount: retainedCharges.length, currency, previousStatus: current.status, revisionNumber }, when),
     outboxStatement(command, "purchase_order.draft_updated", "purchase_order", id, { itemCount: prepared.items.length, totalCents, previousStatus: current.status, revisionNumber }, when),
   );
   await db.batch(statements);
@@ -1866,6 +1874,7 @@ async function updateUserRole(command: WorkflowCommand) {
 }
 
 function optionalText(payload:Record<string,unknown>,key:string){return typeof payload[key]==="string"&&payload[key].trim()?payload[key].trim():null;}
+function documentNotes(payload:Record<string,unknown>){const notes=optionalText(payload,"notes");if(notes&&notes.length>4000)throw new WorkflowError("VALIDATION_ERROR","Notes must be 4,000 characters or fewer.");return notes;}
 function activeFor(command:WorkflowCommand){return !normalize(command.command).startsWith("deactivate")&&command.payload?.active!==false;}
 
 async function deactivateMaster(command:WorkflowCommand,table:"products"|"business_partners"|"warehouses"|"locations"|"returnable_asset_types",entityType:string){const id=textValue({entityId:command.entityId},"entityId"),version=command.version??0,reason=textValue(command.payload??{},"reason");const current=await first<{version:number;active:number}>(`SELECT version,active FROM ${table} WHERE id=?`,id);if(!current)throw new WorkflowError("NOT_FOUND",`${entityType} not found.`,404);if(current.version!==version)throw new WorkflowError("VERSION_CONFLICT",`${entityType} changed.`,409,current.version);if(!current.active)throw new WorkflowError("INVALID_STATE",`${entityType} is already inactive.`,409,current.version);
@@ -2020,6 +2029,41 @@ async function saveBusinessPartner(command: WorkflowCommand) {
   return finish(command);
 }
 
+async function saveSalesPerson(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const creating = normalize(command.command).startsWith("create");
+  const id = creating ? newId("sales-person") : textValue({ entityId: command.entityId }, "entityId");
+  const code = textValue(payload, "code").toUpperCase();
+  const name = textValue(payload, "name");
+  const email = optionalText(payload, "email");
+  const phone = optionalText(payload, "phone");
+  if (code.length > 32) throw new WorkflowError("VALIDATION_ERROR", "Salesperson code must be 32 characters or fewer.");
+  if (name.length > 120) throw new WorkflowError("VALIDATION_ERROR", "Salesperson name must be 120 characters or fewer.");
+  if (email && (!email.includes("@") || email.length > 254)) throw new WorkflowError("VALIDATION_ERROR", "Enter a valid salesperson email address.");
+  const version = command.version ?? 0;
+  const current = creating ? null : await first<{ version: number }>("SELECT version FROM sales_people WHERE id=?", id);
+  if (!creating && !current) throw new WorkflowError("NOT_FOUND", "Salesperson not found.", 404);
+  if (current && current.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Salesperson changed; refresh and try again.", 409, current.version);
+  if (await first("SELECT id FROM sales_people WHERE code=? AND id<>?", code, id)) throw new WorkflowError("DUPLICATE_SALES_PERSON_CODE", `Salesperson code ${code} already exists.`, 409);
+  const active = activeFor(command);
+  const result: WorkflowResult = { message: `${name} ${creating ? "added to" : "updated on"} the sales team.`, impact: { physical: "No inventory posting.", commercial: "Sales orders can be attributed to this salesperson.", onHandDelta: 0 }, recordId: id };
+  const db = commandD1(command);
+  const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [creating
+    ? db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM sales_people WHERE code=?)").bind(...claimValues(command, result, id), code)
+    : db.prepare("INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM sales_people WHERE id=? AND version=? AND NOT EXISTS (SELECT 1 FROM sales_people WHERE code=? AND id<>?)").bind(...claimValues(command, result, id), id, version, code, id)];
+  if (creating) statements.push(db.prepare(`INSERT INTO sales_people (id,code,name,email,phone,active,version,created_at,updated_at)
+    SELECT ?,?,?,?,?,?,1,?,? WHERE ${marker(command)}`).bind(id, code, name, email, phone, active ? 1 : 0, when, when));
+  else statements.push(db.prepare(`UPDATE sales_people SET code=?,name=?,email=?,phone=?,active=?,version=version+1,updated_at=? WHERE id=? AND version=? AND ${marker(command)}`)
+    .bind(code, name, email, phone, active ? 1 : 0, when, id, version));
+  statements.push(
+    auditStatement(command, "sales_person", id, creating ? "created" : "updated", result.message, { code, name, active }, when),
+    outboxStatement(command, creating ? "sales_person.created" : "sales_person.updated", "sales_person", id, { code, name, active }, when),
+  );
+  await db.batch(statements);
+  return finish(command);
+}
+
 async function createUnitOfMeasure(command: WorkflowCommand) {
   const payload = command.payload ?? {};
   const code = textValue(payload, "code").toUpperCase();
@@ -2070,6 +2114,92 @@ async function createUomConversion(command: WorkflowCommand) {
     auditStatement(command, "uom_conversion", id, "created", result.message, { productId, fromUomId, toUomId, numerator, denominator, roundingMode }, when),
     outboxStatement(command, "master.uom_conversion_created", "uom_conversion", id, { productId, fromUomId, toUomId, numerator, denominator }, when),
   ]);
+  return finish(command);
+}
+
+/**
+ * Configure the common "buy a package, stock the contents" case in one transaction. The
+ * generic conversion editor remains useful for global and fractional conversions, but making
+ * an administrator create a product conversion and then separately edit the product left a
+ * half-configured state in which purchase orders could not use the new unit.
+ */
+async function configureProductPurchaseUnit(command: WorkflowCommand) {
+  const payload = command.payload ?? {};
+  const productId = textValue({ productId: command.entityId ?? payload.productId }, "productId");
+  const purchaseUomId = textValue(payload, "purchaseUomId");
+  const unitsPerPurchaseUom = numberValue(payload, "unitsPerPurchaseUom", { positive: true, integer: true });
+  const version = command.version ?? 0;
+  const product = await first<{
+    id: string; sku: string; version: number; active: number; trackingPolicy: string;
+    baseUomId: string; baseUomCode: string; baseDimension: string;
+  }>(`SELECT p.id,p.sku,p.version,p.active,p.tracking_policy AS trackingPolicy,
+      p.base_uom_id AS baseUomId,base.code AS baseUomCode,base.dimension AS baseDimension
+    FROM products p JOIN units_of_measure base ON base.id=p.base_uom_id WHERE p.id=?`, productId);
+  if (!product) throw new WorkflowError("NOT_FOUND", "Product was not found.", 404);
+  if (!product.active) throw new WorkflowError("INVALID_PRODUCT", "Purchase packaging can only be configured for an active product.", 409, product.version);
+  if (product.version !== version) throw new WorkflowError("VERSION_CONFLICT", "Product changed; refresh before saving its purchase packaging.", 409, product.version);
+  const purchaseUom = await first<{ id: string; code: string; dimension: string; active: number }>(
+    "SELECT id,code,dimension,active FROM units_of_measure WHERE id=?", purchaseUomId,
+  );
+  if (!purchaseUom?.active) throw new WorkflowError("INVALID_UOM", "Select an active purchasing unit.", 409);
+  if (purchaseUom.dimension !== product.baseDimension) throw new WorkflowError("UOM_DIMENSION_MISMATCH", "The purchasing and base inventory units must have the same dimension.", 409);
+  if (purchaseUomId === product.baseUomId && unitsPerPurchaseUom !== 1) {
+    throw new WorkflowError("INVALID_UOM_CONVERSION", `The base unit ${product.baseUomCode} must convert to itself at 1:1.`);
+  }
+  if (product.trackingPolicy === "serial" && unitsPerPurchaseUom !== 1) {
+    throw new WorkflowError("SERIAL_PACKAGE_UNSUPPORTED", "Serial-tracked products must be received one serial at a time, so their purchasing unit must convert 1:1.", 409);
+  }
+
+  // Purchase lines retain both the entered package quantity and its base quantity. Do not
+  // reinterpret those durable documents by allowing the same UOM code to acquire a different
+  // pack size later; a genuinely different pack size should have its own UOM (for example CASE24).
+  const conflictingHistoricalLine = await first<{ orderNumber: string }>(`SELECT po.number AS orderNumber
+    FROM purchase_order_lines pol JOIN purchase_orders po ON po.id=pol.purchase_order_id
+    WHERE pol.product_id=? AND pol.ordered_uom_id=? AND pol.ordered_uom_qty>0
+      AND ABS(pol.ordered_qty/pol.ordered_uom_qty-?)>0.000001
+    ORDER BY po.created_at,pol.id LIMIT 1`, productId, purchaseUomId, unitsPerPurchaseUom);
+  if (conflictingHistoricalLine) {
+    throw new WorkflowError("UOM_CONVERSION_IN_USE", `Purchase order ${conflictingHistoricalLine.orderNumber} used a different pack size for ${purchaseUom.code}. Create a new unit code for the new pack size so receipt history stays accurate.`, 409, product.version);
+  }
+
+  const currentConversion = purchaseUomId === product.baseUomId ? null : await first<{ id: string }>(
+    "SELECT id FROM uom_conversions WHERE product_id=? AND from_uom_id=? AND to_uom_id=?",
+    productId, purchaseUomId, product.baseUomId,
+  );
+  const conversionId = currentConversion?.id ?? newId("uom-conversion");
+  const message = `${product.sku} now purchases in ${purchaseUom.code}; receiving 1 ${purchaseUom.code} adds ${unitsPerPurchaseUom} ${product.baseUomCode} to inventory.`;
+  const result: WorkflowResult = {
+    message,
+    impact: { physical: "Existing stock was not changed.", commercial: "Future purchase-order lines use the configured package unit and conversion.", onHandDelta: 0 },
+    recordId: productId,
+  };
+  const db = commandD1(command);
+  const when = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
+      SELECT ?,?,?,?,?,?,? FROM products p WHERE p.id=? AND p.version=? AND p.active=1
+        AND EXISTS (SELECT 1 FROM units_of_measure u WHERE u.id=? AND u.active=1 AND u.dimension=?)
+        AND NOT EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.product_id=p.id AND pol.ordered_uom_id=?
+          AND pol.ordered_uom_qty>0 AND ABS(pol.ordered_qty/pol.ordered_uom_qty-?)>0.000001)`)
+      .bind(...claimValues(command, result, productId), productId, version, purchaseUomId, product.baseDimension, purchaseUomId, unitsPerPurchaseUom),
+    db.prepare(`UPDATE products SET purchase_uom_id=?,version=version+1 WHERE id=? AND version=? AND ${marker(command)}`)
+      .bind(purchaseUomId, productId, version),
+  ];
+  if (purchaseUomId !== product.baseUomId) {
+    statements.push(currentConversion
+      ? db.prepare(`UPDATE uom_conversions SET numerator=?,denominator=1,rounding_mode='nearest' WHERE id=? AND product_id=? AND ${marker(command)}`)
+          .bind(unitsPerPurchaseUom, conversionId, productId)
+      : db.prepare(`INSERT INTO uom_conversions (id,product_id,from_uom_id,to_uom_id,numerator,denominator,rounding_mode)
+          SELECT ?,?,?,?,?,1,'nearest' WHERE ${marker(command)}`)
+          .bind(conversionId, productId, purchaseUomId, product.baseUomId, unitsPerPurchaseUom));
+  }
+  statements.push(
+    auditStatement(command, "product", productId, "purchase_unit_configured", message,
+      { purchaseUomId, purchaseUomCode: purchaseUom.code, baseUomId: product.baseUomId, baseUomCode: product.baseUomCode, unitsPerPurchaseUom }, when),
+    outboxStatement(command, "master.product_purchase_unit_configured", "product", productId,
+      { purchaseUomId, baseUomId: product.baseUomId, unitsPerPurchaseUom }, when),
+  );
+  await db.batch(statements);
   return finish(command);
 }
 
@@ -2254,7 +2384,7 @@ async function setProductDefaultLocation(command: WorkflowCommand) {
   const location = await first<{ code: string; name: string }>(`SELECT code,name FROM locations
     WHERE id=? AND warehouse_id=? AND active=1 AND inventory_status='usable'`, locationId, warehouseId);
   if (!location) throw new WorkflowError("INVALID_DEFAULT_LOCATION", "Select an active usable bin in the chosen warehouse.", 409, current.version);
-  const result: WorkflowResult = { recordId: productId, message: `${current.sku} will default to ${location.code} in this warehouse.`, impact: { physical: "Existing inventory did not move.", commercial: "Future receipts default to the selected bin.", onHandDelta: 0 } };
+  const result: WorkflowResult = { recordId: productId, message: `${current.sku} will default to ${location.code} in this warehouse.`, impact: { physical: "Existing inventory did not move.", commercial: "Future purchase, sales, counter-sale, and invoice lines default to the selected bin.", onHandDelta: 0 } };
   const db = commandD1(command); const when = new Date().toISOString();
   await db.batch([
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at)
@@ -3421,14 +3551,14 @@ async function createCustomerInvoiceV2(command:WorkflowCommand){
     const requestedIds = requested.map((row) => textValue(row, "salesOrderLineId"));
     if (new Set(requestedIds).size !== requestedIds.length) throw new WorkflowError("DUPLICATE_DOCUMENT_LINE", "Each sales-order line may appear only once on an invoice.");
   }
-  const sourceLines = await all<{ id: string; productId: string; ordered: number; unitPrice: number; taxable: number; taxRate: number; discount: number; shipped: number; invoiced: number; invoicedDiscount: number }>(`SELECT sol.id,sol.product_id AS productId,sol.ordered_qty AS ordered,sol.unit_price_cents AS unitPrice,sol.taxable,sol.tax_rate_bps AS taxRate,sol.discount_cents AS discount,
+  const sourceLines = await all<{ id: string; productId: string; binLocationId: string | null; ordered: number; unitPrice: number; taxable: number; taxRate: number; discount: number; shipped: number; invoiced: number; invoicedDiscount: number }>(`SELECT sol.id,sol.product_id AS productId,sol.bin_location_id AS binLocationId,sol.ordered_qty AS ordered,sol.unit_price_cents AS unitPrice,sol.taxable,sol.tax_rate_bps AS taxRate,sol.discount_cents AS discount,
       CASE WHEN sol.fulfillment_route='drop_ship'
         THEN COALESCE((SELECT SUM(d.quantity-d.reversed_qty) FROM drop_ship_deliveries d WHERE d.sales_order_line_id=sol.id),0)
         ELSE COALESCE(SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END),0) END AS shipped,
       COALESCE((SELECT SUM(cil.quantity) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sol.id AND ci.status<>'void'),0) AS invoiced,
       COALESCE((SELECT SUM(ROUND(cil.quantity*cil.unit_price_cents)-cil.line_total_cents) FROM customer_invoice_lines cil JOIN customer_invoices ci ON ci.id=cil.customer_invoice_id WHERE cil.sales_order_line_id=sol.id AND ci.status<>'void'),0) AS invoicedDiscount
     FROM sales_order_lines sol LEFT JOIN stock_movements sm ON sm.sales_order_line_id=sol.id WHERE sol.sales_order_id=? GROUP BY sol.id`, salesOrderId);
-  const lines: Array<{ id: string; productId: string; quantity: number; unitPrice: number; discount: number; total: number; tax: number; taxRate: number }> = [];
+  const lines: Array<{ id: string; productId: string; binLocationId: string | null; quantity: number; unitPrice: number; discount: number; total: number; tax: number; taxRate: number }> = [];
   for (const source of sourceLines) {
     const selected = requested?.find((row) => row.salesOrderLineId === source.id);
     if (requested && !selected) continue;
@@ -3440,7 +3570,7 @@ async function createCustomerInvoiceV2(command:WorkflowCommand){
     const gross = Math.round(quantity * source.unitPrice);
     const discount = Math.max(Math.min(cumulativeDiscount - source.invoicedDiscount, gross), 0);
     const total = gross - discount;
-    lines.push({ id: source.id, productId: source.productId, quantity, unitPrice: source.unitPrice, discount, total, tax: source.taxable ? Math.round(total * source.taxRate / 10_000) : 0, taxRate: source.taxable ? source.taxRate : 0 });
+    lines.push({ id: source.id, productId: source.productId, binLocationId: source.binLocationId, quantity, unitPrice: source.unitPrice, discount, total, tax: source.taxable ? Math.round(total * source.taxRate / 10_000) : 0, taxRate: source.taxable ? source.taxRate : 0 });
   }
   if (!lines.length) throw new WorkflowError("NOTHING_TO_INVOICE", "No selected shipped-not-yet-invoiced quantity remains.", 409);
   const previous = await first<{ count: number }>("SELECT COUNT(*) AS count FROM customer_invoices WHERE sales_order_id=? AND status<>'void'", salesOrderId);
@@ -3469,7 +3599,7 @@ async function createCustomerInvoiceV2(command:WorkflowCommand){
     db.prepare(`INSERT OR IGNORE INTO command_log (idempotency_key,command,entity_id,response_json,request_hash,claim_token,created_at) SELECT ?,?,?,?,?,?,? FROM sales_orders WHERE id=? AND version=? AND lifecycle_status IN ('confirmed','canceled') AND ${lineClaims}`).bind(...claimValues(command, result, id), salesOrderId, order.version, ...lineClaimBindings),
     db.prepare(`INSERT INTO customer_invoices (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,tax_code,payment_terms,posted_at,posted_by,version) SELECT ?,?,?,?,'posted',?,?,?,?,?,0,?,?,?,?,?,?,?, ?,1 WHERE ${marker(command)}`).bind(id, number, order.customerId, salesOrderId, invoiceDate, dueDate, subtotal, tax, total, order.currency, exchange, base, headerTaxRate, headerTaxCode, optionalText(payload, "paymentTerms"), when, command.actor.label),
   ];
-  lines.forEach((row) => statements.push(db.prepare(`INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,quantity,unit_price_cents,line_total_cents) SELECT ?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("invoice-line"), id, row.id, row.productId, row.quantity, row.unitPrice, row.total)));
+  lines.forEach((row) => statements.push(db.prepare(`INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,bin_location_id,quantity,unit_price_cents,line_total_cents) SELECT ?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("invoice-line"), id, row.id, row.productId, row.binLocationId, row.quantity, row.unitPrice, row.total)));
   orderCharges.forEach((row) => statements.push(db.prepare(`INSERT INTO document_charges (id,document_type,document_id,charge_type,description,amount_cents,direction,taxable,refundable,tax_code,tax_rate_bps,tax_amount_cents,created_at) SELECT ?,'customer_invoice',?,?,?,?,?,?,?,?,?,?,? WHERE ${marker(command)}`).bind(newId("charge"), id, row.chargeType, row.description, row.amount, row.direction, row.taxable, row.refundable, row.taxCode, row.taxRate, Math.abs(row.taxAmount), when)));
   statements.push(
     // "invoiced" means nothing is left to bill: every open ordered unit (or, on a canceled order,
@@ -3531,12 +3661,12 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
   scopedAll<Record<string,unknown>>(["vendor-billing"],"SELECT vc.*,bp.name AS vendorName FROM vendor_credits vc JOIN business_partners bp ON bp.id=vc.vendor_id ORDER BY vc.posted_at DESC"),
   // Posted invoices are the durable document register, not merely an open-receivables queue.
   // Paid counter-sale invoices must remain visible so the operator can open or resend them.
-  scopedAll<Record<string,unknown>>(["sales","customer-billing"],`SELECT ci.*,bp.name AS customerName,so.number AS salesOrderNumber,
+  scopedAll<Record<string,unknown>>(["sales","customer-billing"],`SELECT ci.*,bp.name AS customerName,so.number AS salesOrderNumber,COALESCE(sp.name,so.owner_name) AS salesPersonName,
     (SELECT COUNT(*) FROM customer_invoice_lines WHERE customer_invoice_id=ci.id) AS lineCount,
     COALESCE((SELECT SUM(cc.amount_cents) FROM customer_credits cc WHERE cc.customer_invoice_id=ci.id AND cc.status='posted'),0) AS credited_cents,
     (SELECT qsd.status FROM qbo_sync_deliveries qsd WHERE qsd.local_entity_type='customer_invoice' AND qsd.local_entity_id=ci.id ORDER BY qsd.created_at DESC,qsd.id DESC LIMIT 1) AS qboStatus,
     (SELECT qsd.qbo_entity_id FROM qbo_sync_deliveries qsd WHERE qsd.local_entity_type='customer_invoice' AND qsd.local_entity_id=ci.id ORDER BY qsd.created_at DESC,qsd.id DESC LIMIT 1) AS qboEntityId
-    FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id LEFT JOIN sales_orders so ON so.id=ci.sales_order_id
+    FROM customer_invoices ci JOIN business_partners bp ON bp.id=ci.customer_id LEFT JOIN sales_orders so ON so.id=ci.sales_order_id LEFT JOIN sales_people sp ON sp.id=so.sales_person_id
     WHERE ci.status<>'void' ORDER BY ci.posted_at DESC`),
   scopedAll<Record<string,unknown>>(["sales","customer-billing"],"SELECT cc.*,bp.name AS customerName FROM customer_credits cc JOIN business_partners bp ON bp.id=cc.customer_id ORDER BY cc.posted_at DESC"),
   scopedAll<Record<string,unknown>>(["vendor-billing","sales","customer-billing"],"SELECT * FROM payments ORDER BY posted_at DESC"),scopedAll<Record<string,unknown>>(["vendor-billing","sales","customer-billing"],"SELECT * FROM document_charges ORDER BY created_at DESC"),scopedAll<Record<string,unknown>>(["inventory","controls"],"SELECT id,code,name,asset_class AS assetClass,unit_deposit_cents AS unitDepositCents,active,version FROM returnable_asset_types ORDER BY name"),
@@ -3591,9 +3721,9 @@ export async function getAdvancedSnapshot(actor?:ActorIdentity,input:SnapshotPag
     GROUP BY po.id ORDER BY CASE po.lifecycle_status WHEN 'pending_approval' THEN 0 WHEN 'draft' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END,po.expected_date,po.number
     LIMIT ? OFFSET ?`, pageSize, offset) : [];
   const workflowSalesOrders = include("sales") ? await unpagedAll<Record<string, unknown>>(`SELECT so.id,so.number,so.lifecycle_status AS lifecycleStatus,so.requested_date AS requestedDate,
-      so.total_cents AS totalCents,so.currency,so.version,bp.name AS customerName,so.project_reference AS projectReference,
+      so.total_cents AS totalCents,so.currency,so.version,bp.name AS customerName,so.project_reference AS projectReference,so.sales_person_id AS salesPersonId,COALESCE(sp.name,so.owner_name) AS salesPersonName,
       COALESCE(SUM(sol.ordered_qty-sol.canceled_qty),0) AS orderedQuantity
-    FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id LEFT JOIN sales_order_lines sol ON sol.sales_order_id=so.id
+    FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id LEFT JOIN sales_people sp ON sp.id=so.sales_person_id LEFT JOIN sales_order_lines sol ON sol.sales_order_id=so.id
     WHERE so.lifecycle_status='draft' OR (so.lifecycle_status='confirmed' AND EXISTS (
       SELECT 1 FROM sales_order_lines open_line WHERE open_line.sales_order_id=so.id
         AND open_line.ordered_qty-open_line.canceled_qty-COALESCE((SELECT SUM(CASE WHEN sm.movement_type='sales_shipment' THEN -sm.quantity WHEN sm.movement_type='shipment_reversal' THEN -sm.quantity ELSE 0 END) FROM stock_movements sm WHERE sm.sales_order_line_id=open_line.id),0)>0))
@@ -3741,6 +3871,7 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
     case "deactivatepartneraddress": return deactivatePartnerAddress(command);
     case "createbusinesspartner": case "updatebusinesspartner": return saveBusinessPartner(command);
     case "deactivatebusinesspartner": return deactivateMaster(command,"business_partners","business_partner");
+    case "createsalesperson": case "updatesalesperson": return saveSalesPerson(command);
     case "mergebusinesspartners": return mergeBusinessPartners(command);
     case "createproduct": case "updateproduct": return saveProduct(command);
     case "deactivateproduct": return deactivateMaster(command,"products","product");
@@ -3751,6 +3882,7 @@ export async function executeWorkflow(command: WorkflowCommand): Promise<Workflo
     case "mergepurchaseorders": return mergePurchaseOrders(command);
     case "createunitofmeasure": return createUnitOfMeasure(command);
     case "createuomconversion": return createUomConversion(command);
+    case "configureproductpurchaseunit": return configureProductPurchaseUnit(command);
     case "createpricelist": case "updatepricelist": return savePriceList(command);
     case "deactivatepricelist": return deactivatePriceList(command);
     case "assignpricelist": return assignPriceList(command);

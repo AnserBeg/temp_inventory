@@ -241,7 +241,7 @@ function ImportDialog({ onClose, onImported }: { onClose: () => void; onImported
   </div>;
 }
 
-export function PlyGemImportButton({ disabled, onImported }: { disabled?: boolean; onImported: () => void | Promise<void> }) {
+export function PlyGemImportButton({ disabled, onImported, className = "workflow-action", label = "Import cost-sheet PDFs" }: { disabled?: boolean; onImported: () => void | Promise<void>; className?: string; label?: string }) {
   const [open, setOpen] = useState(false);
-  return <><button className="workflow-action" type="button" disabled={disabled} onClick={() => setOpen(true)}>Import cost-sheet PDFs</button>{open ? <ImportDialog onClose={() => setOpen(false)} onImported={onImported} /> : null}</>;
+  return <><button className={className} type="button" disabled={disabled} onClick={() => setOpen(true)}>{label}</button>{open ? <ImportDialog onClose={() => setOpen(false)} onImported={onImported} /> : null}</>;
 }

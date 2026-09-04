@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { addressFieldsFromGoogleComponents, type AddressFields, type GoogleAddressComponent } from "@/lib/address-components";
+import { addressFieldsFromGooglePlace, type AddressFields, type GoogleAddressComponent } from "@/lib/address-components";
 
 type GooglePlace = {
   addressComponents?: GoogleAddressComponent[];
+  displayName?: string;
   fetchFields(options: { fields: string[] }): Promise<void>;
 };
 
@@ -17,6 +18,7 @@ type PlaceAutocompleteElement = HTMLElement & {
   disabled: boolean;
   description?: string;
   includedPrimaryTypes?: string[];
+  locationBias?: { radius: number; center: { lat: number; lng: number } } | null;
   requestedLanguage?: string;
   requestedRegion?: string;
 };
@@ -31,6 +33,19 @@ declare global {
 
 let apiKeyPromise: Promise<string> | undefined;
 let placesLibraryPromise: Promise<PlacesLibrary> | undefined;
+let locationBiasPromise: Promise<PlaceAutocompleteElement["locationBias"]> | undefined;
+
+function currentLocationBias() {
+  if (!navigator.geolocation) return Promise.resolve(null);
+  locationBiasPromise ??= new Promise((resolve) => {
+    navigator.geolocation.getCurrentPosition(
+      ({ coords }) => resolve({ radius: 50_000, center: { lat: coords.latitude, lng: coords.longitude } }),
+      () => resolve(null),
+      { enableHighAccuracy: false, maximumAge: 5 * 60_000, timeout: 5_000 },
+    );
+  });
+  return locationBiasPromise;
+}
 
 async function googleMapsApiKey() {
   apiKeyPromise ??= fetch("/api/google-maps/config", { headers: { accept: "application/json" } })
@@ -97,7 +112,7 @@ export function AddressAutocomplete({
   onAddressSelected,
   disabled = false,
   required = false,
-  placeholder = "Start typing a street address",
+  placeholder = "Search business or street address",
   ariaInvalid,
   ariaDescribedBy,
 }: {
@@ -134,14 +149,19 @@ export function AddressAutocomplete({
       widget = new PlaceAutocompleteElement({
         value: valueRef.current,
         placeholder,
-        includedPrimaryTypes: ["street_address"],
+        includedPrimaryTypes: ["establishment", "street_address"],
         requestedLanguage: "en",
         requestedRegion: requestedRegion(country ?? ""),
       });
-      widget.description = "Street address. Start typing and choose a Google address suggestion.";
-      widget.setAttribute("aria-label", "Street address");
+      widget.description = "Search for a nearby business or street address, then choose a Google suggestion to fill the address.";
+      widget.setAttribute("aria-label", "Business or street address");
       if (required) widget.setAttribute("aria-required", "true");
 
+      // Ask once per page session. If location is denied or unavailable, the widget keeps
+      // Google's ordinary IP-based bias instead of blocking address entry.
+      void currentLocationBias().then((bias) => {
+        if (!disposed && widget && bias) widget.locationBias = bias;
+      });
       const handleInput = () => changeRef.current(widget?.value ?? "");
       const handleBlur = () => changeRef.current(widget?.value ?? "");
       const handleSelect = (event: Event) => {
@@ -149,9 +169,9 @@ export function AddressAutocomplete({
         if (!prediction) return;
         void (async () => {
           const place = prediction.toPlace();
-          await place.fetchFields({ fields: ["addressComponents"] });
+          await place.fetchFields({ fields: ["addressComponents", "displayName"] });
           if (!place.addressComponents?.length || disposed) return;
-          const address = addressFieldsFromGoogleComponents(place.addressComponents);
+          const address = addressFieldsFromGooglePlace(place);
           widget!.value = address.addressLine1;
           changeRef.current(address.addressLine1);
           selectedRef.current(address);

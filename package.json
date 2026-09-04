@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.13.0 <25"
   },
   "scripts": {
     "predev": "node scripts/apply-local-migrations.mjs",
@@ -11,6 +11,7 @@
     "build": "vinext build",
     "prestart": "node scripts/apply-local-migrations.mjs && vinext build",
     "start": "node scripts/start-local.mjs",
+    "start:render": "node --env-file-if-exists=.env --import ./scripts/register-render-loader.mjs ./scripts/start-render.mjs",
     "test": "npm run build && npm run test:production",
     "test:production": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/*.test.mjs",
     "test:domain": "node --experimental-transform-types --experimental-loader ./tests/cloudflare-loader.mjs --test tests/production-integration.test.mjs tests/workflow-envelope.test.mjs",

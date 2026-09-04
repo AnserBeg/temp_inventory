@@ -5,13 +5,18 @@ import { requireTenant } from "./tenancy";
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "application/pdf"]);
-const allowedCategories = new Set(["document","damage_photo","proof_of_delivery","packing_slip","invoice","label","product_photo","other"]);
+const allowedCategories = new Set(["document","damage_photo","proof_of_delivery","packing_slip","invoice","label","product_photo","sales_person_photo","other"]);
 const documentTables: Record<string, string> = {
   product: "products",
+  sales_person: "sales_people",
   purchase_order: "purchase_orders", receipt: "receipts", vendor_return: "vendor_returns",
   sales_order: "sales_orders", shipment: "shipments", customer_return: "customer_returns",
   vendor_bill: "vendor_bills", customer_invoice: "customer_invoices", inventory_count: "inventory_counts",
   inventory_transfer: "inventory_transfers", returnable_obligation: "returnable_obligations",
+};
+const lineItemTables: Record<string, { table: string; documentColumn: string }> = {
+  purchase_order: { table: "purchase_order_lines", documentColumn: "purchase_order_id" },
+  sales_order: { table: "sales_order_lines", documentColumn: "sales_order_id" },
 };
 
 export class AttachmentError extends Error {
@@ -39,10 +44,38 @@ async function validateDocument(documentType: string, documentId: string) {
 
 export async function listAttachments(documentType: string, documentId: string) {
   await ensureDatabase();
-  return all<Record<string, unknown>>(`SELECT id,document_type AS documentType,document_id AS documentId,
+  const records = await all<Record<string, unknown>>(`SELECT id,document_type AS documentType,document_id AS documentId,
     file_name AS fileName,content_type AS contentType,size_bytes AS sizeBytes,category,
-    owner_id AS ownerId,owner_email AS ownerEmail,uploaded_at AS uploadedAt,version
+    owner_id AS ownerId,owner_email AS ownerEmail,uploaded_at AS uploadedAt,version,
+    COALESCE((SELECT json_group_array(ali.line_item_id) FROM attachment_line_items ali WHERE ali.attachment_id=attachments.id),'[]') AS lineItemIdsJson
     FROM attachments WHERE document_type=? AND document_id=? AND deleted_at IS NULL ORDER BY uploaded_at DESC`, documentType, documentId);
+  return records.map((record) => {
+    let lineItemIds: string[] = [];
+    try {
+      const parsed = JSON.parse(String(record.lineItemIdsJson ?? "[]"));
+      if (Array.isArray(parsed)) lineItemIds = parsed.filter((value): value is string => typeof value === "string");
+    } catch { /* A malformed legacy value is treated as an unassigned document attachment. */ }
+    const attachment = { ...record };
+    delete attachment.lineItemIdsJson;
+    return { ...attachment, lineItemIds };
+  });
+}
+
+async function validateLineItems(documentType: string, documentId: string, category: string, form: FormData) {
+  const lineItemIds = [...new Set(form.getAll("lineItemIds").map((value) => String(value).trim()).filter(Boolean))];
+  if (category === "damage_photo" && lineItemTables[documentType] && !lineItemIds.length) {
+    throw new AttachmentError("LINE_ITEMS_REQUIRED", "Select at least one affected order line for a damage photo.");
+  }
+  if (!lineItemIds.length) return lineItemIds;
+  if (category !== "damage_photo") throw new AttachmentError("INVALID_LINE_ITEM_CATEGORY", "Only damage photos can be linked to order lines.");
+  const target = lineItemTables[documentType];
+  if (!target) throw new AttachmentError("INVALID_LINE_ITEM_DOCUMENT", "Line-item photos must belong to a purchase order or sales order.");
+  if (lineItemIds.length > 100) throw new AttachmentError("TOO_MANY_LINE_ITEMS", "A photo can be linked to at most 100 order lines.");
+  for (const lineItemId of lineItemIds) {
+    const line = await first(`SELECT id FROM ${target.table} WHERE id=? AND ${target.documentColumn}=?`, lineItemId, documentId);
+    if (!line) throw new AttachmentError("LINE_ITEM_NOT_FOUND", "Every selected line must belong to this order.", 404);
+  }
+  return lineItemIds;
 }
 
 export async function uploadAttachment(actor: ActorIdentity, form: FormData) {
@@ -54,10 +87,15 @@ export async function uploadAttachment(actor: ActorIdentity, form: FormData) {
   if (!(file instanceof File)) throw new AttachmentError("FILE_REQUIRED", "file is required.");
   if(!allowedCategories.has(category)) throw new AttachmentError("INVALID_CATEGORY","Unsupported attachment category.");
   if (documentType === "product" && category !== "product_photo") throw new AttachmentError("INVALID_CATEGORY", "Products accept pictures only.");
+  if (documentType === "sales_person" && category !== "sales_person_photo") throw new AttachmentError("INVALID_CATEGORY", "Salespeople accept profile pictures only.");
   if (category === "product_photo" && documentType !== "product") throw new AttachmentError("INVALID_DOCUMENT_TYPE", "Product pictures must belong to a product.");
+  if (category === "sales_person_photo" && documentType !== "sales_person") throw new AttachmentError("INVALID_DOCUMENT_TYPE", "Salesperson pictures must belong to a salesperson.");
   await validateDocument(documentType, documentId);
+  const lineItemIds = await validateLineItems(documentType, documentId, category, form);
   if (!allowedTypes.has(file.type)) throw new AttachmentError("UNSUPPORTED_CONTENT_TYPE", "Only JPEG, PNG, WebP, and PDF attachments are allowed.", 415);
   if (category === "product_photo" && !file.type.startsWith("image/")) throw new AttachmentError("UNSUPPORTED_CONTENT_TYPE", "Product pictures must be JPEG, PNG, or WebP images.", 415);
+  if (category === "sales_person_photo" && !file.type.startsWith("image/")) throw new AttachmentError("UNSUPPORTED_CONTENT_TYPE", "Salesperson pictures must be JPEG, PNG, or WebP images.", 415);
+  if (category === "damage_photo" && !file.type.startsWith("image/")) throw new AttachmentError("UNSUPPORTED_CONTENT_TYPE", "Damage photos must be JPEG, PNG, or WebP images.", 415);
   if (file.size <= 0 || file.size > MAX_BYTES) throw new AttachmentError("FILE_SIZE_INVALID", "Attachments must be between 1 byte and 10 MB.", 413);
   const bytes=await file.arrayBuffer();const header=new Uint8Array(bytes.slice(0,16));
   const detected=header[0]===0xff&&header[1]===0xd8&&header[2]===0xff?"image/jpeg":header[0]===0x89&&header[1]===0x50&&header[2]===0x4e&&header[3]===0x47?"image/png":String.fromCharCode(...header.slice(0,4))==="%PDF"?"application/pdf":String.fromCharCode(...header.slice(0,4))==="RIFF"&&String.fromCharCode(...header.slice(8,12))==="WEBP"?"image/webp":"unknown";
@@ -73,15 +111,16 @@ export async function uploadAttachment(actor: ActorIdentity, form: FormData) {
       db.prepare(`INSERT INTO attachments (id,document_type,document_id,file_name,object_key,content_type,size_bytes,category,owner_id,owner_email,uploaded_at,version)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,1)`).bind(id, documentType, documentId, safeName, objectKey, file.type, file.size, category, actor.id, actor.email, when),
       db.prepare(`INSERT INTO audit_events (id,entity_type,entity_id,action,summary,actor,actor_id,actor_email,metadata_json,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(newId("audit"), documentType, documentId, "attachment_uploaded", `${safeName} attached as ${category}.`, actor.label, actor.id, actor.email, JSON.stringify({ attachmentId: id, contentType: file.type, sizeBytes: file.size }), when),
+        VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(newId("audit"), documentType, documentId, "attachment_uploaded", `${safeName} attached as ${category}.`, actor.label, actor.id, actor.email, JSON.stringify({ attachmentId: id, contentType: file.type, sizeBytes: file.size, lineItemIds }), when),
       db.prepare(`INSERT INTO outbox_events (id,event_type,aggregate_type,aggregate_id,payload_json,status,attempts,available_at,created_at)
-        VALUES (?,'attachment.uploaded',?,?,?,'pending',0,?,?)`).bind(newId("outbox"), documentType, documentId, JSON.stringify({ attachmentId: id, category }), when, when),
+        VALUES (?,'attachment.uploaded',?,?,?,'pending',0,?,?)`).bind(newId("outbox"), documentType, documentId, JSON.stringify({ attachmentId: id, category, lineItemIds }), when, when),
+      ...lineItemIds.map((lineItemId) => db.prepare(`INSERT INTO attachment_line_items (attachment_id,document_type,line_item_id) VALUES (?,?,?)`).bind(id, documentType, lineItemId)),
     ]);
   } catch (error) {
     await bucket().delete(objectKey);
     throw error;
   }
-  return { id, documentType, documentId, fileName: safeName, contentType: file.type, sizeBytes: file.size, category, ownerId: actor.id, ownerEmail: actor.email, uploadedAt: when, version: 1 };
+  return { id, documentType, documentId, fileName: safeName, contentType: file.type, sizeBytes: file.size, category, lineItemIds, ownerId: actor.id, ownerEmail: actor.email, uploadedAt: when, version: 1 };
 }
 
 export async function downloadAttachment(id: string) {

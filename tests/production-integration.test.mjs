@@ -420,16 +420,21 @@ test("batch receiving posts one document and independent PO lines do not conflic
 test("purchasing UOM conversions post base stock and discrete inventory rejects fractions", async () => {
   const administrator = { id: "administrator", email: "admin@example.com", name: "Administrator", role: "administrator", label: "Administrator <admin@example.com>", localDevelopment: false };
   const createdUnit = await advancedDomain.executeWorkflow({ command: "createUnitOfMeasure", idempotencyKey: "create-case-uom", actor: administrator, payload: { code: "CASE", name: "Case of twelve", dimension: "quantity", precision: 0 } });
-  await advancedDomain.executeWorkflow({ command: "createUomConversion", idempotencyKey: "create-case-conversion", actor: administrator, payload: { productId: "prod-b", fromUomId: createdUnit.recordId, toUomId: "uom-each", numerator: 12, denominator: 1, roundingMode: "nearest" } });
-  await run("UPDATE products SET purchase_uom_id=? WHERE id='prod-b'", createdUnit.recordId);
+  const configured = await advancedDomain.executeWorkflow({ command: "configureProductPurchaseUnit", entityId: "prod-b", version: 1, idempotencyKey: "configure-case-purchasing", actor: administrator, payload: { purchaseUomId: createdUnit.recordId, unitsPerPurchaseUom: 12 } });
+  assert.match(configured.message, /receiving 1 CASE adds 12 EA to inventory/);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT purchase_uom_id AS purchaseUomId,version FROM products WHERE id='prod-b'").get() }, { purchaseUomId: createdUnit.recordId, version: 2 });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT numerator,denominator FROM uom_conversions WHERE product_id='prod-b' AND from_uom_id=? AND to_uom_id='uom-each'").get(createdUnit.recordId) }, { numerator: 12, denominator: 1 });
   await run("INSERT INTO purchase_orders (id,number,vendor_id,lifecycle_status,billing_status,expected_date,currency,exchange_rate_to_base,base_total_cents,total_cents,ordered_at,ordered_by,version,created_at) VALUES ('po-uom','PO-UOM','vendor-receipt','approved','not_billed','2026-08-10','CAD',1,2400,2400,'2026-08-01T08:00:00Z','Test buyer',1,'2026-08-01')");
   await run("INSERT INTO purchase_order_lines (id,purchase_order_id,product_id,ordered_qty,closed_qty,unit_cost_cents,fulfillment_route,version,ordered_uom_id,ordered_uom_qty,ordered_uom_unit_cost_cents) VALUES ('pol-uom','po-uom','prod-b',24,0,100,'stock',1,?,2,1200)", createdUnit.recordId);
   await inventoryDomain.executeInventoryCommand({ command: "postReceipt", entityId: "po-uom", version: 1, idempotencyKey: "receive-two-cases", payload: { lineId: "pol-uom", quantity: 2, uomId: createdUnit.recordId, locationId: "loc-a", postingDate: "2026-08-01", actor: "Tester" } });
   assert.equal(db.sqlite.prepare("SELECT quantity FROM receipt_lines WHERE purchase_order_line_id='pol-uom'").get().quantity, 24);
   assert.equal(db.sqlite.prepare("SELECT ordered_uom_qty FROM purchase_order_lines WHERE id='pol-uom'").get().ordered_uom_qty, 2);
+  await assert.rejects(advancedDomain.executeWorkflow({ command: "configureProductPurchaseUnit", entityId: "prod-b", version: 2, idempotencyKey: "reject-case-size-rewrite", actor: administrator, payload: { purchaseUomId: createdUnit.recordId, unitsPerPurchaseUom: 10 } }), (error) => error?.code === "UOM_CONVERSION_IN_USE");
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT numerator,denominator FROM uom_conversions WHERE product_id='prod-b' AND from_uom_id=? AND to_uom_id='uom-each'").get(createdUnit.recordId) }, { numerator: 12, denominator: 1 });
 
   const receipt = db.sqlite.prepare("SELECT id,version FROM receipts WHERE purchase_order_id='po-uom'").get();
   const beforeCorrection = await inventoryDomain.getInventorySnapshot({ scope: "purchase-orders", search: "PO-UOM", page: 1, pageSize: 10 });
+  assert.equal(beforeCorrection.purchaseOrders[0].lines[0].baseUomCode, "EA");
   assert.equal(beforeCorrection.purchaseOrders[0].lines[0].latestReceiptReversibleQuantity, 24);
   await inventoryDomain.executeInventoryCommand({ command: "reverseReceipt", entityId: receipt.id, version: receipt.version, idempotencyKey: "reverse-one-case-and-close", payload: { lineId: "pol-uom", quantity: 1, uomId: createdUnit.recordId, disposition: "close", reason: "One case was entered in error", postingDate: "2026-08-01", actor: "Tester" } });
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,version FROM receipts WHERE id=?").get(receipt.id) }, { status: "partially_reversed", version: 2 });
@@ -1043,6 +1048,16 @@ test("counter sale creates its hidden order, shipment, invoice, and full payment
   assert.deepEqual({ ...db.sqlite.prepare("SELECT status,paid_cents,payment_terms,due_date FROM customer_invoices WHERE id=?").get(accountSale.invoiceId) }, { status: "posted", paid_cents: 0, payment_terms: "Net 30", due_date: "2026-09-24" });
   assert.equal(db.sqlite.prepare("SELECT on_hand_qty FROM inventory_balances WHERE product_id='prod-counter' AND location_id='loc-a'").get().on_hand_qty, 1);
 
+  const helcimSale = await inventoryDomain.executeInventoryCommand({ ...command, entityId: "counter-sale-request-helcim", idempotencyKey: "post-counter-sale-helcim", payload: {
+    ...command.payload, settlement: "helcim_card", paymentMethod: undefined, paymentReference: undefined,
+    lines: [{ ...command.payload.lines[0], quantity: 1 }],
+  } });
+  assert.equal(helcimSale.paymentId, undefined);
+  assert.match(helcimSale.message, /awaiting Helcim card payment/u);
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT status,paid_cents,payment_terms,due_date FROM customer_invoices WHERE id=?").get(helcimSale.invoiceId) }, { status: "posted", paid_cents: 0, payment_terms: "Due on receipt", due_date: "2026-08-25" });
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM payments WHERE document_id=?").get(helcimSale.invoiceId).count, 0, "the signed Helcim completion, not the sale command, records payment");
+  assert.equal(db.sqlite.prepare("SELECT on_hand_qty FROM inventory_balances WHERE product_id='prod-counter' AND location_id='loc-a'").get().on_hand_qty, 0);
+
   await assert.rejects(inventoryDomain.executeInventoryCommand({ ...command, entityId: "counter-sale-request-walk-in-account", idempotencyKey: "post-counter-sale-walk-in-account", payload: {
     ...command.payload, settlement: "on_account", paymentMethod: undefined, paymentReference: undefined, paymentTerms: "Net 30", dueDate: "2026-09-24",
     lines: [{ ...command.payload.lines[0], quantity: 1 }],
@@ -1318,4 +1333,67 @@ test("reorder percentage rules support company followers, custom parts, and appl
     assert.deepEqual({ ...db.sqlite.prepare("SELECT reorder_point,reorder_rule_mode,reorder_rule_percent FROM products WHERE id=?").get(productId) }, { reorder_point: 11, reorder_rule_mode: "global", reorder_rule_percent: 55 });
   }
   assert.equal((await inventoryDomain.getInventorySnapshot({ scope: "products", page: 1, pageSize: 5 })).configuration.reorderPointPercent, 55);
+});
+
+test("salespeople can own sales and expose attributed performance statistics", async () => {
+  const manager = { id: "sales-manager", email: "sales-manager@example.com", name: "Sales Manager", role: "manager", label: "Sales Manager <sales-manager@example.com>", localDevelopment: false };
+  await run("INSERT INTO business_partners (id,code,name,partner_type,address_line_1,city,region,postal_code,country,currency,active,version,created_at) VALUES ('customer-salesperson-test','CUST-SP','Salesperson Test Customer','customer','14 Sales Way','Edmonton','AB','T5J 0N4','CA','CAD',1,1,'2026-09-03')");
+  await run("INSERT INTO products (id,sku,name,category,material,dimensions,finish,tracking_policy,inventory_policy,standard_cost_cents,selling_price_cents,reorder_point,base_uom_id,purchase_uom_id,sales_uom_id,active,version,created_at) VALUES ('product-salesperson-test','SP-SKU','Salesperson Test Product','test','test','test','test','quantity','stocked',100,250,0,'uom-each','uom-each','uom-each',1,1,'2026-09-03')");
+
+  const salesperson = await advancedDomain.executeWorkflow({
+    command: "createSalesPerson",
+    idempotencyKey: "create-salesperson-performance-test",
+    actor: manager,
+    payload: { code: "MORGAN", name: "Morgan Reed", email: "morgan@example.com", phone: "780-555-0142", active: true },
+  });
+  const order = await advancedDomain.executeWorkflow({
+    command: "createSalesOrderDraft",
+    idempotencyKey: "create-salesperson-owned-order-test",
+    actor: manager,
+    payload: {
+      customerId: "customer-salesperson-test",
+      salesPersonId: salesperson.recordId,
+      requestedDate: "2026-09-10",
+      currency: "CAD",
+      exchangeRateToBase: 1,
+      paymentTerms: "Net 30",
+      dueDate: "2026-10-10",
+      shipToName: "Salesperson Test Customer",
+      shipToAddressLine1: "14 Sales Way",
+      shipToCity: "Edmonton",
+      shipToRegion: "AB",
+      shipToPostalCode: "T5J 0N4",
+      shipToCountry: "CA",
+      lines: [{ kind: "item", productId: "product-salesperson-test", quantity: 2, unitPriceCents: 250, taxable: false }],
+    },
+  });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT sales_person_id,owner_name,base_total_cents FROM sales_orders WHERE id=?").get(order.recordId) }, {
+    sales_person_id: salesperson.recordId,
+    owner_name: "Morgan Reed",
+    base_total_cents: 500,
+  });
+
+  await run("INSERT INTO customer_invoices (id,number,customer_id,sales_order_id,status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,tax_rate_bps,payment_terms,posted_at,posted_by,version) VALUES ('invoice-salesperson-test','INV-SP-TEST','customer-salesperson-test',?,'posted','2026-09-04','2026-10-04',500,0,500,250,'CAD',1,500,0,'Net 30','2026-09-04T12:00:00.000Z','sales-manager',1)", order.recordId);
+  const snapshot = await inventoryDomain.getInventorySnapshot({ scope: "sales-people", search: "Morgan", page: 1, pageSize: 10 });
+  assert.equal(snapshot.salesPeople.length, 1);
+  assert.deepEqual({
+    orderCount: snapshot.salesPeople[0].orderCount,
+    bookedSalesCents: snapshot.salesPeople[0].bookedSalesCents,
+    invoicedSalesCents: snapshot.salesPeople[0].invoicedSalesCents,
+    collectedSalesCents: snapshot.salesPeople[0].collectedSalesCents,
+  }, { orderCount: 1, bookedSalesCents: 500, invoicedSalesCents: 500, collectedSalesCents: 250 });
+
+  await advancedDomain.executeWorkflow({
+    command: "updateSalesPerson",
+    entityId: salesperson.recordId,
+    version: 1,
+    idempotencyKey: "update-salesperson-performance-test",
+    actor: manager,
+    payload: { code: "MORGAN", name: "Morgan Reed", email: "morgan.reed@example.com", phone: "780-555-0199", active: true },
+  });
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT email,phone,version FROM sales_people WHERE id=?").get(salesperson.recordId) }, {
+    email: "morgan.reed@example.com",
+    phone: "780-555-0199",
+    version: 2,
+  });
 });

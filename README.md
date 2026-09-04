@@ -34,7 +34,7 @@ Changing one document never silently fabricates another. Reopening a PO restores
 
 ## Roles
 
-The first authenticated user on an empty private deployment is recorded as the administrator. Later unknown users are read-only viewers until an administrator assigns a role.
+On Render, creating an organization from the public landing page creates its first administrator. Existing private Sites deployments can continue to bootstrap the first trusted upstream-authenticated user as the administrator. Every later role is organization-specific.
 
 - Viewer: read-only operations and permitted exports.
 - Operator: operational documents and stock movement.
@@ -42,7 +42,7 @@ The first authenticated user on an empty private deployment is recorded as the a
 - Manager: operational approvals and exception decisions.
 - Administrator: policy, period, user-access, and master-data administration.
 
-Every write derives its actor from Sites authentication headers; client-supplied actor fields are ignored.
+Every write derives its actor from verified authentication headers supplied by the hosting boundary; client-supplied actor fields are ignored. Render creates those headers only after validating a hashed database session and an active organization membership.
 
 ## Organization isolation
 
@@ -52,7 +52,7 @@ Every company-owned D1 row carries `tenant_id`. The server's D1 facade injects t
 
 The Worker establishes the tenant context for the whole request using `AsyncLocalStorage.run()`. It accepts a requested tenant only when the authenticated user has an active membership; route authorization independently repeats that check. OAuth callbacks, payment links, and signed webhooks resolve their tenant from their one-time state or durable provider record rather than from a browser cookie. Scheduled outbox, QBO, and Helcim processing runs once per active organization in isolated contexts.
 
-Migration `0030` creates the organization registry, assigns existing users and rows to the default organization, and replaces global business-key constraints with tenant-aware ones. Migration `0031` installs cross-tenant relationship guards. Apply the complete migration chain before deploying the matching Worker; do not run new application code against a database that has not reached both migrations.
+Migration `0030` creates the organization registry, assigns existing users and rows to the default organization, and replaces global business-key constraints with tenant-aware ones. Migration `0031` installs cross-tenant relationship guards. Migration `0039` adds password credentials, organization-bound sessions, membership guards, and login throttling for Render. Apply the complete migration chain before deploying the matching application.
 
 ### Document email
 
@@ -77,7 +77,7 @@ In the app, open the account menu and choose **Email sending**:
 
 ## Helcim customer payments
 
-PaneFlow owns the customer invoice and payment ledger. Helcim provides the PCI-scoped checkout, processor transaction, and settlement state; it does not replace the PaneFlow invoice or write accounting entries directly to QBO. Accounting users can create a payment link from an open customer invoice, and invoice emails automatically include one while Helcim is configured. By default, that button opens Helcim's public Online Invoice View, which keeps a private PaneFlow deployment private. PaneFlow polls invoice-linked card and ACH transactions every five minutes so a private deployment does not depend on externally delivered webhooks. An optional embedded mode renders HelcimPay.js on a separately public HTTPS PaneFlow checkout origin. In both modes, card numbers and bank credentials never pass through PaneFlow.
+PaneFlow owns the customer invoice and payment ledger. Helcim provides the PCI-scoped checkout, processor transaction, and settlement state; it does not replace the PaneFlow invoice or write accounting entries directly to QBO. Accounting users can create a payment link from an open customer invoice, and invoice emails automatically include one while Helcim is configured. By default, that button opens Helcim's public Online Invoice View, which keeps a private PaneFlow deployment private. PaneFlow polls invoice-linked card and ACH transactions every five minutes so a private deployment does not depend on externally delivered webhooks; an optional embedded mode renders HelcimPay.js on a separately public HTTPS checkout origin. Counter sale also offers **Card · Helcim secure checkout**: it posts the counter invoice as unpaid, opens a card-only HelcimPay.js modal, and records payment only after verifying Helcim's signed approval. A closed or declined modal leaves the invoice visibly unpaid and retryable. In all modes, card numbers and bank credentials never pass through PaneFlow.
 
 PaneFlow mirrors each payable invoice into Helcim under a `PF-` invoice number. A signed Pay.js success response posts an approved card purchase immediately through the same idempotent payment workflow used by accounting staff. Canadian bank payments remain pending until the five-minute reconciliation job observes approved clearing. Every processor transaction ID is unique in D1; duplicate browser callbacks and webhook deliveries cannot post a second payment. Webhook response data persisted for audit is stripped of cardholder, card-token, and bank-account fields.
 
@@ -85,12 +85,12 @@ To configure Helcim:
 
 Open **Reports & admin → Company connections** in PaneFlow. The Helcim card shows every missing deployment setting and provides a copyable setup request.
 
-1. Start with a Helcim Developer Test account, then use an approved merchant account for production. In the API Access Configuration, enable invoice create/update/read and card/ACH transaction reads. Also enable HelcimPay.js checkout initialization if embedded mode will be used.
+1. Start with a Helcim Developer Test account, then use an approved merchant account for production. In the API Access Configuration, enable invoice create/update/read and card/ACH transaction reads. Enable HelcimPay.js checkout initialization and allowlist the authenticated PaneFlow origin when counter-sale card collection or embedded invoice checkout will be used.
 2. Set `HELCIM_API_TOKEN` and an independent random `HELCIM_TOKEN_ENCRYPTION_KEY` of at least 32 characters as Worker secrets. The last key encrypts each short-lived Pay.js validation secret before D1 storage and must remain stable across deploys.
 3. The private Site uses scheduled API polling and does not require a webhook. If a separately public signed-ingress host is added later, it may forward Helcim card and ACH transaction events to `/api/integrations/helcim/webhook`; set its base64 verifier as `HELCIM_WEBHOOK_VERIFIER_TOKEN`. Do not point Helcim at an owner-only Site URL because private Sites require interactive sign-in.
-4. Leave `HELCIM_CHECKOUT_MODE=hosted` for a private PaneFlow site and set `HELCIM_INVOICE_HOST` to the hostname shown by **Actions → View Online** on any Helcim invoice, for example `your-business.myhelcim.com`. To use PaneFlow's `/pay/...` page instead, set the mode to `embedded`, host that route on a public HTTPS origin, and whitelist the origin in Helcim; Pay.js does not render directly on localhost. `HELCIM_CHECKOUT_PAYMENT_METHODS` accepts `cc`, `ach`, or `cc-ach` and defaults to `cc-ach`; USD embedded checkouts are always limited to cards. `HELCIM_PAYMENT_LINK_TTL_DAYS` defaults to 90 and accepts 1–365 for embedded links.
+4. Leave `HELCIM_CHECKOUT_MODE=hosted` for a private PaneFlow site and set `HELCIM_INVOICE_HOST` to the hostname shown by **Actions → View Online** on any Helcim invoice, for example `your-business.myhelcim.com`. Counter-sale card checkout still renders Pay.js on the authenticated PaneFlow origin, so that HTTPS origin must be allowlisted even in hosted mode. To use PaneFlow's `/pay/...` page for customer invoice links, set the mode to `embedded`, host that route on a public HTTPS origin, and allowlist it in Helcim; Pay.js does not render directly on localhost. `HELCIM_CHECKOUT_PAYMENT_METHODS` accepts `cc`, `ach`, or `cc-ach` and defaults to `cc-ach`; Counter sale requires a value containing `cc`, and USD checkouts are always limited to cards. `HELCIM_PAYMENT_LINK_TTL_DAYS` defaults to 90 and accepts 1–365 for embedded links.
 5. In **Reports & admin → Integrations**, map **Helcim clearing** to a QBO Other Current Asset (or dedicated Bank-type clearing) account, and map local payment methods `helcim_card` and `helcim_eft` to the corresponding QBO methods. Do not map processor receipts directly to the operating bank account: Helcim payouts and fees should reconcile from the clearing account to the bank feed.
-6. Send a low-value test invoice link, complete a card test and a bank-payment test, wait for the latter to clear, then verify the PaneFlow payment, QBO Payment, clearing-account deposit, and fee reconciliation before switching to production credentials.
+6. Run a low-value counter sale through the Helcim card modal, then send a low-value invoice link and complete a bank-payment test. Verify the PaneFlow payment, QBO Payment, clearing-account deposit, and fee reconciliation before switching to production credentials.
 
 The initial connection accepts purchase payments. Refunds, chargebacks, and ACH returns must be initiated in Helcim and handled as explicit accounting corrections in PaneFlow/QBO; they are never silently netted against an invoice by the collection callback.
 
@@ -116,7 +116,7 @@ The Reports workspace still provides an accounting control export and balanced Q
 
 ## Google address autocomplete
 
-Customer, vendor, saved ship-to, and sales-order street-address fields use the current Google Places Autocomplete widget. Choosing a suggestion fills street line 1, address line 2 when Google returns a unit or floor, city, province/state, postal code, and the two-letter country code. Manual entry remains available if Google is not configured or cannot be reached.
+Customer, vendor, saved ship-to, and sales-order address fields use the current Google Places Autocomplete widget. Search by business name (for example, `McDonald's`) or street address; choosing a suggestion fills street line 1, address line 2 when Google returns a unit or floor, city, province/state, postal code, and the two-letter country code. In the sales-order Ship-to block, a business result also fills the recipient/business name. The browser's current location is used as a soft nearby-results bias when location access is available, with Google's ordinary IP-based bias as the fallback. Manual entry remains available if Google is not configured or cannot be reached.
 
 Set `GOOGLE_MAPS_API_KEY` in `.dev.vars` for local development and as a hosted Worker secret for production. In the associated Google Cloud project, enable **Maps JavaScript API** and **Places API (New)**, enable billing, and restrict the browser key to the exact localhost and hosted HTTPS referrers that run PaneFlow. The key is delivered only to authenticated PaneFlow sessions, but it is a browser credential and must still use HTTP-referrer and API restrictions.
 
@@ -135,6 +135,38 @@ Copy `.dev.vars.example` to `.dev.vars` for explicit local Cloudflare runtime fl
 
 `npm start` applies pending local migrations, creates a fresh production build, and serves that build through a project-local Wrangler process so Cloudflare bindings such as D1, R2, and scheduled outbox delivery behave like the deployed application. Wrangler state and diagnostics stay under `.wrangler/`, including in restricted development environments. `vinext start` alone is intentionally not used because Node cannot load the Cloudflare runtime modules directly.
 
+## Deploying to Render
+
+PaneFlow's database contract is SQLite/D1, including SQLite triggers and functions. The Render deployment therefore uses a SQLite database on an attached persistent disk; a Render PostgreSQL `postgresql://` connection string is not interchangeable with `DATABASE_URL`. Use the committed `render.yaml` Blueprint, or configure one paid Node web service manually with these values:
+
+| Setting | Value |
+| --- | --- |
+| Build command | `npm ci --include=dev && npm run build` |
+| Start command | `npm run start:render` |
+| Health check | `/healthz` |
+| Instance count | `1` |
+| Persistent disk mount | `/var/data` (1 GB to start) |
+| Database URL | `file:/var/data/paneflow.sqlite` |
+| Attachment directory | `/var/data/files` |
+
+The persistent disk is required because Render's ordinary service filesystem is ephemeral. Keep the instance count at one: a disk-backed SQLite service cannot be horizontally scaled. Render does not expose a service disk to pre-deploy commands, so `start:render` deliberately performs migrations before opening the HTTP port. On every boot it discovers all ordered `drizzle/*.sql` files, checksum-verifies applied history, transactionally applies only pending migrations, validates foreign keys, and exits without serving if a migration fails. If an existing database needs new migrations, startup first writes a SQLite backup under `/var/data/backups/`.
+
+Copy `.env.render.example` to `.env` only for a local Render-runtime test. In the Render dashboard, set `DATABASE_URL=file:/var/data/paneflow.sqlite`, `ATTACHMENTS_DIR=/var/data/files`, and keep `ALLOW_LOCAL_DEV_AUTH=false` and `BOOTSTRAP_DEMO_DATA=false`. Render does not need shared `APP_AUTH_*` credentials: the landing page creates organization administrators and the database stores only salted password digests and hashed session tokens.
+
+Optional QuickBooks, Helcim, Google Maps, email, and outbox variables are documented in `.env.render.example`. Replace every `YOUR-SERVICE` placeholder with the final Render hostname before enabling the matching integration. The Render runtime also invokes the durable integration processors every five minutes.
+
+To exercise the same path locally:
+
+```bash
+npm ci
+npm run build
+cp .env.render.example .env
+# Edit .env so DATABASE_URL and ATTACHMENTS_DIR point to writable local paths.
+npm run start:render
+```
+
+The health check is public and returns only `{"ok":true}`. Unauthenticated visitors see the sign-in/create-organization landing page. Sign-in requires an organization ID, email, and password; the Render host accepts the session only while the user, organization, and exact membership are all active. Session and tenant cookies are HTTP-only, secure on HTTPS, and same-site. API authorization, tenant SQL scoping, relationship guards, and audit attribution still run independently after login.
+
 ## Transactional outbox delivery
 
 Every externally useful business event is committed to `outbox_events` in the same durable database operation as the workflow change. To deliver those events, configure both `OUTBOX_WEBHOOK_URL` and `OUTBOX_WEBHOOK_SECRET`; leaving both blank keeps ordinary integration events queued and still allows local R2 attachment cleanup events to run. Configure neither or both—setting only one is treated as an error.
@@ -152,7 +184,7 @@ Consumers should verify the signature against the raw body with a constant-time 
 
 ## Database migrations
 
-`db/schema.ts` and the ordered SQL files in `drizzle/` are the canonical schema. Runtime startup only verifies the migrated contract and never creates or alters tables. Generate a new migration with `npm run db:generate` whenever the Drizzle schema changes, review the SQL, and commit both the SQL and `drizzle/meta` updates. Sites applies the committed migration chain before starting the deployed application.
+`db/schema.ts` and the ordered SQL files in `drizzle/` are the canonical schema. Application request handling only verifies the migrated contract and never creates or alters tables. Generate a new migration with `npm run db:generate` whenever the Drizzle schema changes, review the SQL, and commit both the SQL and `drizzle/meta` updates. Sites applies the committed migration chain as part of its deployment; the Render entrypoint applies it before accepting traffic.
 
 ## Verification
 
