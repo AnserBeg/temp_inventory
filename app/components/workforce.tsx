@@ -365,6 +365,67 @@ function TimeEntries({ entries, viewer, now, onEdit, onOpenOrder }: { entries: T
     </tr>)}</tbody></table></div>{!entries.length ? <div className="wf-team-empty"><strong>No time entries yet</strong><p>Completed and active shifts will be listed here.</p></div> : null}</div>;
 }
 
+function MultiOrderSelect({ label, options, values, setValues }: { label: string; options: Lookup[]; values: string[]; setValues: (value: string[]) => void }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const selected = options.filter((option) => values.includes(option.id));
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = options.filter((option) => !normalizedQuery || [option.number, option.partnerName].some((value) => value?.toLowerCase().includes(normalizedQuery)));
+  const placeholder = `Select ${label.toLowerCase()}`;
+  const summary = selected.length
+    ? `${selected.slice(0, 2).map((option) => option.number).join(", ")}${selected.length > 2 ? ` +${selected.length - 2}` : ""}`
+    : options.length ? placeholder : `No ${label.toLowerCase()} available`;
+
+  useEffect(() => {
+    if (!open) return;
+    const focusTimer = window.setTimeout(() => searchRef.current?.focus(), 0);
+    const dismiss = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+        setQuery("");
+      }
+    };
+    document.addEventListener("pointerdown", dismiss);
+    return () => {
+      window.clearTimeout(focusTimer);
+      document.removeEventListener("pointerdown", dismiss);
+    };
+  }, [open]);
+
+  const toggle = (id: string) => setValues(values.includes(id) ? values.filter((value) => value !== id) : [...values, id]);
+  const close = () => {
+    setOpen(false);
+    setQuery("");
+    triggerRef.current?.focus();
+  };
+
+  return <div className="wf-multi-select" ref={rootRef} onKeyDownCapture={(event) => {
+    if (event.key === "Escape" && open) {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+    }
+  }}>
+    <div className="wf-multi-label"><span>{label}</span><small>Optional</small></div>
+    <button ref={triggerRef} type="button" className="wf-multi-trigger" disabled={!options.length} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+      <span className={selected.length ? "" : "placeholder"}>{summary}</span>
+      <span className="wf-multi-trigger-end">{selected.length ? <b>{selected.length}</b> : null}<i aria-hidden="true">⌄</i></span>
+    </button>
+    {selected.length ? <div className="wf-multi-chips" aria-label={`Selected ${label.toLowerCase()}`}>{selected.map((option) => <button key={option.id} type="button" onClick={() => toggle(option.id)} aria-label={`Remove ${option.number}`}><span>{option.number}</span><i aria-hidden="true">×</i></button>)}</div> : null}
+    {open ? <div className="wf-multi-menu">
+      <div className="wf-multi-search"><span aria-hidden="true">⌕</span><input ref={searchRef} type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${label.toLowerCase()}`} aria-label={`Search ${label.toLowerCase()}`} /></div>
+      <div className="wf-multi-options" role="listbox" aria-label={label} aria-multiselectable="true">
+        {filtered.map((option) => <label key={option.id} role="option" aria-selected={values.includes(option.id)}><input type="checkbox" checked={values.includes(option.id)} onChange={() => toggle(option.id)} /><span><strong>{option.number}</strong><small>{option.partnerName || "No customer or vendor"}</small></span></label>)}
+        {!filtered.length ? <p>No matching orders.</p> : null}
+      </div>
+      <div className="wf-multi-actions"><button type="button" className="text-button" disabled={!filtered.length} onClick={() => setValues(Array.from(new Set([...values, ...filtered.map((option) => option.id)])))}>Select all results</button><button type="button" className="text-button" disabled={!values.length} onClick={() => setValues([])}>Clear</button><button type="button" className="button secondary" onClick={close}>Done</button></div>
+    </div> : null}
+  </div>;
+}
+
 function OrderLinksPicker({ snapshot, partnerId, setPartnerId, salesOrderIds, setSalesOrderIds, purchaseOrderIds, setPurchaseOrderIds }: {
   snapshot: WorkforceSnapshot;
   partnerId: string;
@@ -374,11 +435,10 @@ function OrderLinksPicker({ snapshot, partnerId, setPartnerId, salesOrderIds, se
   purchaseOrderIds: string[];
   setPurchaseOrderIds: (value: string[]) => void;
 }) {
-  const toggle = (values: string[], id: string, setValues: (value: string[]) => void) => setValues(values.includes(id) ? values.filter((value) => value !== id) : [...values, id]);
   return <>
     <label>Customer or vendor<select value={partnerId} onChange={(event) => setPartnerId(event.target.value)}><option value="">None</option>{snapshot.lookups.partners.map((partner) => <option key={partner.id} value={partner.id}>{partner.name} · {partner.partnerType}</option>)}</select></label>
-    <fieldset className="wf-link-picker"><legend>Sales orders <span>Optional</span></legend><div>{snapshot.lookups.salesOrders.map((order) => <label key={order.id}><input type="checkbox" checked={salesOrderIds.includes(order.id)} onChange={() => toggle(salesOrderIds, order.id, setSalesOrderIds)} /><span><strong>{order.number}</strong><small>{order.partnerName}</small></span></label>)}</div>{!snapshot.lookups.salesOrders.length ? <p>No sales orders available.</p> : null}</fieldset>
-    <fieldset className="wf-link-picker"><legend>Purchase orders <span>Optional</span></legend><div>{snapshot.lookups.purchaseOrders.map((order) => <label key={order.id}><input type="checkbox" checked={purchaseOrderIds.includes(order.id)} onChange={() => toggle(purchaseOrderIds, order.id, setPurchaseOrderIds)} /><span><strong>{order.number}</strong><small>{order.partnerName}</small></span></label>)}</div>{!snapshot.lookups.purchaseOrders.length ? <p>No purchase orders available.</p> : null}</fieldset>
+    <MultiOrderSelect label="Sales orders" options={snapshot.lookups.salesOrders} values={salesOrderIds} setValues={setSalesOrderIds} />
+    <MultiOrderSelect label="Purchase orders" options={snapshot.lookups.purchaseOrders} values={purchaseOrderIds} setValues={setPurchaseOrderIds} />
   </>;
 }
 
