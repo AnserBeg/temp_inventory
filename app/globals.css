@@ -237,6 +237,7 @@ kbd { padding: 2px 6px; border: 1px solid var(--line); border-bottom-color: #b7c
 .page-heading { min-height: 69px; display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
 .page-heading h1 { margin: 4px 0 2px; font-size: clamp(24px, 2.5vw, 31px); line-height: 1.15; letter-spacing: -.035em; }
 .page-heading p { margin: 0; color: var(--ink-soft); font-size: 13px; }
+.page-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .eyebrow-row { display: flex; align-items: center; gap: 10px; color: #75807b; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
 .connection { display: inline-flex; align-items: center; gap: 6px; width: fit-content; padding: 3px 7px; border-radius: 12px; font-size: 11px; font-weight: 750; letter-spacing: .07em; text-transform: uppercase; }
 .connection.server { background: var(--success-soft); color: var(--success); }
@@ -790,6 +791,7 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
   .main-content { width: calc(100% - 24px); padding: 20px 0 90px; }
   .page-heading { align-items: flex-start; flex-direction: column; margin-bottom: 18px; }
   .page-heading h1 { font-size: 24px; }
+  .page-actions { width: 100%; }
   .urgent-band { padding: 18px; }
   .urgent-actions { grid-template-columns: 1fr; }
   .metric-row, .object-metrics, .object-metrics:has(.metric-display:nth-child(5)), .object-metrics:has(.metric-display:nth-child(6)) { grid-template-columns: repeat(2, minmax(0, 1fr)); }

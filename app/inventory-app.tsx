@@ -17,6 +17,7 @@ import { AddressAutocomplete } from "./components/address-autocomplete";
 import { actorName } from "./components/format";
 import { localDatePlusDays, localDateString } from "./components/local-date";
 import { NumberField } from "./components/number-field";
+import { PlyGemImportButton } from "./components/ply-gem-import";
 import { useDialogDismiss } from "./components/use-dialog-dismiss";
 import { PAYMENT_TERMS, PickerPermissionsContext, QuickCreateDialog, RemoteSearchSelect, SearchableSelect, type LookupKind, type QuickCreateKind } from "./components/reference-picker";
 import { calculateSalesAvailability } from "@/lib/domain/sales-availability";
@@ -1719,7 +1720,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
               <h1>{view === "reports" ? reportsPageTitle(workspaceTab) : viewTitles[view].title}</h1>
               {viewTitles[view].description ? <p>{viewTitles[view].description}</p> : null}
             </div>
-            <PageActions view={view} source={source} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} onNavigate={navigate} onCreate={setCreateOrder} onCreatePartner={() => setEditingPartner("new")} onCreateProduct={() => setCreatingProduct(true)} />
+            <PageActions view={view} source={source} canRead={snapshot.viewer.permissions.canRead} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} onNavigate={navigate} onCreate={setCreateOrder} onCreatePartner={() => setEditingPartner("new")} onCreateProduct={() => setCreatingProduct(true)} onPurchaseOrderImported={async () => { await loadSnapshot(); setWorkflowRefreshToken((current) => current + 1); }} />
           </div>
           <WorkflowGuide view={view} workspaceTab={workspaceTab} onNavigate={navigate} />
           {source === "unavailable" ? <div className="connection-error" role="alert"><div><strong>Couldn&apos;t refresh operations data.</strong><p>{sourceError || "The last successfully loaded records remain on screen; no sample data was substituted."}</p></div><button className="button secondary" onClick={() => void loadSnapshot()}>Retry</button></div> : null}
@@ -1949,13 +1950,13 @@ function isTypingTarget(target: EventTarget | null) {
  * snapshot has confirmed which role that is. Showing "Create sales order" to a viewer just
  * moves the refusal from the button to a server error after they have keyed the whole order.
  */
-function PageActions({ view, source, canOperate, canApprove, onNavigate, onCreate, onCreatePartner, onCreateProduct }: { view: ViewKey; source: "loading" | "server" | "unavailable"; canOperate: boolean; canApprove: boolean; onNavigate: (view: ViewKey) => void; onCreate: (type: "purchaseOrder" | "salesOrder") => void; onCreatePartner: () => void; onCreateProduct: () => void }) {
+function PageActions({ view, source, canRead, canOperate, canApprove, onNavigate, onCreate, onCreatePartner, onCreateProduct, onPurchaseOrderImported }: { view: ViewKey; source: "loading" | "server" | "unavailable"; canRead: boolean; canOperate: boolean; canApprove: boolean; onNavigate: (view: ViewKey) => void; onCreate: (type: "purchaseOrder" | "salesOrder") => void; onCreatePartner: () => void; onCreateProduct: () => void; onPurchaseOrderImported: () => void | Promise<void> }) {
   const ready = source === "server";
   if (view === "home") return <button className="button secondary" onClick={() => onNavigate("reports")}>View reports</button>;
   // Warehouse mode used to repeat the connection pill here, a few pixels from the identical one
   // the page eyebrow already renders for every view.
   if (!ready) return null;
-  if (view === "purchase-orders") return <button className="button primary" onClick={() => onCreate("purchaseOrder")}>Create purchase order</button>;
+  if (view === "purchase-orders") return <div className="page-actions"><PlyGemImportButton className="button secondary" label="Import PDFs" disabled={!canRead} onImported={onPurchaseOrderImported} /><button className="button primary" onClick={() => onCreate("purchaseOrder")}>Create purchase order</button></div>;
   if (view === "sales-orders") return canOperate ? <button className="button primary" onClick={() => onCreate("salesOrder")}>Create sales order</button> : null;
   if (view === "stock") return canOperate ? <button className="button secondary" onClick={() => onNavigate("counts")}>Start inventory count</button> : null;
   // Adding a SKU used to be reachable only from inside an order line or the master-data tab,
