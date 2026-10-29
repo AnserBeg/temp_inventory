@@ -1843,7 +1843,7 @@ export function InventoryApp({ initialView, initialTab = "overview", initialPurc
                 if (purchase) setSelectedPoId(movement.relatedOrderId); else setSelectedSoId(movement.relatedOrderId);
               }} />}
               {view === "counts" && <OperationsWorkspace workspace="inventory" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot}><InventoryCountSessions warehouseId={warehouseId} canOperate={snapshot.viewer.permissions.canOperate} canApprove={snapshot.viewer.permissions.canApprove} canAdminister={snapshot.viewer.permissions.canAdminister} onDurableRefresh={loadSnapshot} /></OperationsWorkspace>}
-              {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><VendorBillsView bills={snapshot.bills} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenPurchaseOrder={(bill) => { if (!bill.purchaseOrderId) return; navigate("purchase-orders"); setWorklistQuery(bill.po); setAppliedWorklistQuery(bill.po); setSelectedPoId(bill.purchaseOrderId); }} /></OperationsWorkspace>}
+              {view === "vendor-bills" && <OperationsWorkspace workspace="vendor-billing" initialTab={workspaceTab} onTabChange={changeWorkspaceTab} onDurableRefresh={loadSnapshot} filterReference={appliedWorklistQuery}><VendorBillsView bills={snapshot.bills} canEmail={snapshot.viewer.permissions.canPostFinancial} sort={worklistSort} setSort={(value) => { setPage(1); setWorklistSort(value); }} onOpenPurchaseOrder={(bill) => { if (!bill.purchaseOrderId) return; navigate("purchase-orders"); setWorklistQuery(bill.po); setAppliedWorklistQuery(bill.po); setSelectedPoId(bill.purchaseOrderId); }} /></OperationsWorkspace>}
               {view === "crm" && <CustomerCrmView
                 customers={snapshot.partners}
                 totalCustomers={pageTotal}
@@ -2545,12 +2545,20 @@ function PurchaseOrderDetail({ po, canDraft, canOperate, canPostFinancial, onBac
     <section className="panel connected-purchase-documents">
       <PanelHeading title="Purchase order & supplier invoices" detail="The source PO and every connected bill stay together in one accounting handoff." />
       <div className="connected-document-grid">
-        <a className="connected-document-card primary-document" href={`/api/documents/pdf?documentType=purchase_order&documentId=${encodeURIComponent(po.id)}`} target="_blank" rel="noreferrer">
+        <article className="connected-document-card primary-document">
           <span>Purchase order</span><strong>{po.number}</strong><small>{po.vendor} · {formatDocumentMoney(po.total, po.currency)}</small>
-        </a>
-        {activeVendorBills.map((bill) => <a className="connected-document-card" key={bill.id} href={`/api/documents/pdf?documentType=vendor_bill&documentId=${encodeURIComponent(bill.id)}`} target="_blank" rel="noreferrer">
+          <div className="connected-document-actions">
+            <DocumentDownloadLink documentType="purchase_order" documentId={po.id} documentNumber={po.number}>Download PDF</DocumentDownloadLink>
+            {approved ? <EmailDocumentButton documentType="purchase_order" documentId={po.id} documentNumber={po.number} disabled={!canOperate}>Email PO</EmailDocumentButton> : null}
+          </div>
+        </article>
+        {activeVendorBills.map((bill) => <article className="connected-document-card" key={bill.id}>
           <span>Supplier invoice</span><strong>{bill.externalReference || bill.number}</strong><small>{bill.number} · {formatDocumentMoney(bill.amount, bill.currency)}</small><StatusBadge>{bill.qboStatus ? `QBO ${bill.qboStatus}` : bill.matchStatus || bill.status}</StatusBadge>
-        </a>)}
+          <div className="connected-document-actions">
+            <DocumentDownloadLink documentType="vendor_bill" documentId={bill.id} documentNumber={bill.number}>Download PDF</DocumentDownloadLink>
+            <EmailDocumentButton documentType="vendor_bill" documentId={bill.id} documentNumber={bill.number} disabled={!canPostFinancial}>Email bill</EmailDocumentButton>
+          </div>
+        </article>)}
         {Boolean(billableLines.length || !activeVendorBills.length) ? <button className="connected-document-card create-document-card" type="button" onClick={() => setBillOpen(true)} disabled={!canPostFinancial || !billableLines.length}>
           <span>Next document</span><strong>Create supplier bill</strong><small>{billableLines.length ? `${billableLines.length} received line${billableLines.length === 1 ? "" : "s"} will be prefilled` : "Receive goods before creating the bill"}</small>
         </button> : null}
@@ -2830,6 +2838,26 @@ function SalesOrderDetail({ so, canOperate, canPostFinancial, onBack, onEdit, on
                           : { title: "Order-to-cash complete", detail: "The order, fulfillment, invoice, and settlement are complete.", tone: "success" };
   return <div className="object-page"><button className="back-button" onClick={onBack}>← Back to sales orders</button><section className="object-header panel"><div className="object-title"><div><span className="section-kicker">Sales order · {so.route}</span><h2>{so.number}</h2><p>{[so.customer, so.project].filter(Boolean).join(" · ")}</p></div><div className="object-total"><span>Total</span><strong>{formatDocumentMoney(so.total, so.currency)}</strong><small>{so.currency}</small></div></div><div className="status-summary"><div><small>Commercial</small><StatusBadge>{so.lifecycle}</StatusBadge></div><div><small>Physical</small><StatusBadge>{so.fulfillment}</StatusBadge></div><div><small>Financial</small><StatusBadge>{so.billing}</StatusBadge></div></div>{so.exception && <div className="exception-banner"><span>!</span><div><strong>Fulfillment exception</strong><p>{so.exception}</p></div></div>}{activateError ? <div className="error-summary" role="alert"><p>{activateError}</p></div> : null}{isDraft && canOperate ? <form className="draft-activation" onSubmit={confirm} noValidate><label><span>Confirmation note (optional)</span><input value={confirmNote} onChange={(event) => setConfirmNote(event.target.value)} placeholder="Customer PO number, or who approved it" /><small className="field-hint">Included in the audit trail when provided.</small></label><button className="button primary" type="submit" disabled={activating}>{activating ? "Confirming…" : "Confirm sales order"}</button><button className="button secondary" type="button" onClick={onEdit} disabled={hasDedicatedSupply} title={hasDedicatedSupply ? "Cancel the linked purchase order before replacing these demand lines." : undefined}>Edit draft lines</button>{hasDedicatedSupply ? <small className="read-only-label">Dedicated supply is linked. Cancel that purchase order before replacing demand lines.</small> : null}</form> : !isDraft && canOperate ? <div className="object-actions">{confirmed ? <DocumentDownloadLink documentType="sales_order" documentId={so.id} documentNumber={so.number}>Download sales order</DocumentDownloadLink> : null}{confirmed ? <EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number}>Email sales order</EmailDocumentButton> : null}{canPostFinancial && so.openToShip > 0 ? <button className="button primary" onClick={onImmediateSale} disabled={!canImmediateSale} title={canImmediateSale ? undefined : "No unreserved stock line has usable inventory to ship and invoice now."}>Ship &amp; invoice now</button> : null}{canShip ? <button className={canPostFinancial ? "button secondary" : "button primary"} onClick={onShip}>Post shipment</button> : null}{canReserve ? <button className="button secondary" onClick={onReserve} disabled={reserveBlocked} title={reserveBlocked ? "No usable stock is available to reserve right now." : undefined}>Reserve available stock</button> : null}{canPostDropShipDelivery ? <button className="button primary" onClick={onOpenDropShip}>Post supplier delivery</button> : null}{!fulfillmentOpen && !canShip ? <span className="read-only-label">{confirmed ? "Fully fulfilled: no fulfillment actions remain." : `No fulfillment actions while the order is ${so.lifecycle.toLowerCase()}.`}</span> : null}</div> : <p className="read-only-label">Read-only access: operational posting actions are hidden.</p>}</section>
     <RecordProgress title={`Order to cash for ${so.number}`} steps={salesProgress} next={nextAction} />
+    <section className="panel connected-purchase-documents">
+      <PanelHeading title="Sales order & customer invoices" detail="Download or email the order and every connected invoice from one place, including settled invoices." />
+      <div className="connected-document-grid">
+        <article className="connected-document-card primary-document">
+          <span>Sales order</span><strong>{so.number}</strong><small>{so.customer} · {formatDocumentMoney(so.total, so.currency)}</small>
+          <div className="connected-document-actions">
+            <DocumentDownloadLink documentType="sales_order" documentId={so.id} documentNumber={so.number}>Download PDF</DocumentDownloadLink>
+            {confirmed ? <EmailDocumentButton documentType="sales_order" documentId={so.id} documentNumber={so.number} disabled={!canOperate}>Email order</EmailDocumentButton> : null}
+          </div>
+        </article>
+        {activeInvoices.map((invoice) => <article className="connected-document-card" key={invoice.id}>
+          <span>Customer invoice</span><strong>{invoice.number}</strong><small>{formatDocumentMoney(invoice.amount, invoice.currency)} · due {formatDocumentDate(invoice.dueOn)}</small><StatusBadge>{invoice.outstanding > 0 ? `${formatDocumentMoney(invoice.outstanding, invoice.currency)} outstanding` : "Settled"}</StatusBadge>
+          <div className="connected-document-actions">
+            <DocumentDownloadLink documentType="customer_invoice" documentId={invoice.id} documentNumber={invoice.number}>Download PDF</DocumentDownloadLink>
+            <EmailDocumentButton documentType="customer_invoice" documentId={invoice.id} documentNumber={invoice.number} disabled={!canPostFinancial}>Email invoice</EmailDocumentButton>
+          </div>
+        </article>)}
+      </div>
+      {activeInvoices.length ? <p className="connected-document-summary">{formatDocumentMoney(invoiceOutstanding, so.currency)} outstanding across {activeInvoices.length} invoice{activeInvoices.length === 1 ? "" : "s"}.</p> : <p className="connected-document-summary">No customer invoice has been posted for this order yet.</p>}
+    </section>
     <section className="panel availability-panel"><PanelHeading title="Availability for requested date" detail={`Requested ${formatDate(so.requestedDate)}`} /><div className="availability-grid"><MetricDisplay label="Required" value={so.open} /><MetricDisplay label="Available now" value={so.availableNow} tone="success" /><MetricDisplay label="Incoming before date" value={so.incomingBeforeDate} tone="info" /><MetricDisplay label="Shortage" value={so.shortage} tone={so.shortage > 0 ? "danger" : "neutral"} /></div>{so.linkedPo && <div className="linked-supply"><span className="section-kicker">Linked supply</span><strong>{so.linkedPo}</strong><p>{so.incomingBeforeDate} units expected before the customer&apos;s requested date.</p></div>}</section>
     {/* The lines are the order. Without them this page showed a total for goods it never named,
         so nobody could check what the customer actually bought. */}
@@ -3612,14 +3640,14 @@ function SalesPersonEditor({ salesPerson, onClose, onSaved }: { salesPerson: Sal
 
 
 
-function VendorBillsView({ bills, sort, setSort, onOpenPurchaseOrder }: { bills: Bill[]; onOpenPurchaseOrder: (bill: Bill) => void } & WorklistSortProps) {
+function VendorBillsView({ bills, canEmail, sort, setSort, onOpenPurchaseOrder }: { bills: Bill[]; canEmail: boolean; onOpenPurchaseOrder: (bill: Bill) => void } & WorklistSortProps) {
   // Exact amounts here: a variance is an exception precisely because it is small, and rounding
   // one to the dollar prints "$0" beside a row that is demanding review.
   const today = localDateString();
   return <section className="panel worklist"><div className="responsive-table"><table><caption className="sr-only">Vendor bills, matching variance, and settlement</caption><thead><tr><SortableHeader label="Bill" column="number" sort={sort} setSort={setSort} /><SortableHeader label="Vendor invoice" column="vendorInvoice" sort={sort} setSort={setSort} /><SortableHeader label="Vendor" column="vendor" sort={sort} setSort={setSort} /><SortableHeader label="Purchase order" column="purchaseOrder" sort={sort} setSort={setSort} /><SortableHeader label="Invoiced" column="invoiced" sort={sort} setSort={setSort} /><SortableHeader label="Due" column="due" sort={sort} setSort={setSort} /><SortableHeader label="Authorized line value" column="authorized" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Billed line value" column="billed" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Line variance" column="variance" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Tax" column="tax" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Bill total" column="total" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Outstanding" column="outstanding" sort={sort} setSort={setSort} className="numeric" defaultDirection="desc" /><SortableHeader label="Match" column="match" sort={sort} setSort={setSort} /><SortableHeader label="Settlement" column="settlement" sort={sort} setSort={setSort} /></tr></thead><tbody>{bills.map((bill) => {
     const overdue = bill.outstanding > 0 && Boolean(bill.dueDate) && bill.dueDate < today;
     return <tr key={bill.id}>
-      <td><a className="table-link" href={`/api/documents/pdf?documentType=vendor_bill&documentId=${encodeURIComponent(bill.id)}`} download title={`Download ${bill.number} as a PDF`}>{bill.number}</a>{bill.holdReason ? <small>{bill.holdReason}</small> : null}</td>
+      <td><a className="table-link" href={`/api/documents/pdf?documentType=vendor_bill&documentId=${encodeURIComponent(bill.id)}`} download title={`Download ${bill.number} as a PDF`}>{bill.number}</a>{canEmail ? <EmailDocumentButton documentType="vendor_bill" documentId={bill.id} documentNumber={bill.number} className="table-link">Email PDF</EmailDocumentButton> : null}{bill.holdReason ? <small>{bill.holdReason}</small> : null}</td>
       {/* AP reconciles against the supplier's own document number, not ours. */}
       <td>{bill.vendorInvoiceNumber ?? <span className="muted">Not recorded</span>}</td>
       <td>{bill.vendor}</td><td>{bill.purchaseOrderId ? <button className="table-link" type="button" onClick={() => onOpenPurchaseOrder(bill)}>{bill.po}</button> : bill.po}</td>

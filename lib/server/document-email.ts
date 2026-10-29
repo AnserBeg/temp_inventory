@@ -32,6 +32,8 @@ type DocumentHeader = {
   region: string | null;
   postalCode: string | null;
   country: string | null;
+  title?: string | null;
+  updatedDate?: string | null;
 };
 
 type DocumentLine = {
@@ -61,15 +63,15 @@ export class DocumentEmailError extends Error {
 }
 
 export function emailDocumentCapability(type: EmailDocumentType): AppCapability {
-  return type === "customer_invoice" ? "financialWrite" : "operationalWrite";
+  return type === "customer_invoice" || type === "vendor_bill" ? "financialWrite" : "operationalWrite";
 }
 
 export function isEmailDocumentType(value: string): value is EmailDocumentType {
-  return ["purchase_order", "sales_order", "customer_invoice"].includes(value);
+  return ["purchase_order", "sales_order", "customer_invoice", "vendor_bill", "work_order"].includes(value);
 }
 
 export function isPrintableDocumentType(value: string): value is PrintableDocumentType {
-  return isEmailDocumentType(value) || value === "vendor_bill";
+  return isEmailDocumentType(value);
 }
 
 async function documentHeader(type: PrintableDocumentType, id: string) {
@@ -90,6 +92,16 @@ async function documentHeader(type: PrintableDocumentType, id: string) {
       COALESCE(so.ship_to_city,bp.city) AS city,COALESCE(so.ship_to_region,bp.region) AS region,
       COALESCE(so.ship_to_postal_code,bp.postal_code) AS postalCode,COALESCE(so.ship_to_country,bp.country) AS country
       FROM sales_orders so JOIN business_partners bp ON bp.id=so.customer_id WHERE so.id=? LIMIT 1`, id);
+  }
+  if (type === "work_order") {
+    return first<DocumentHeader>(`SELECT wo.id,wo.number,wo.status,COALESCE(bp.name,'Unassigned') AS partyName,bp.email AS partyEmail,
+      bp.phone AS partyPhone,COALESCE(bp.currency,'CAD') AS currency,0 AS totalCents,NULL AS subtotalCents,NULL AS taxCents,
+      NULL AS paidCents,NULL AS creditedCents,substr(wo.created_at,1,10) AS documentDate,substr(wo.updated_at,1,10) AS dueOrExpectedDate,
+      NULL AS paymentTerms,(SELECT GROUP_CONCAT(wodl.document_number, ', ') FROM work_order_document_links wodl WHERE wodl.work_order_id=wo.id) AS reference,
+      wo.created_by_name AS preparedBy,NULL AS supplierQuoteNumber,NULL AS supplierReference,wo.notes,
+      bp.address_line_1 AS addressLine1,bp.address_line_2 AS addressLine2,bp.city,bp.region,bp.postal_code AS postalCode,bp.country,
+      wo.title,substr(wo.updated_at,1,10) AS updatedDate
+      FROM work_orders wo LEFT JOIN business_partners bp ON bp.id=wo.partner_id WHERE wo.id=? LIMIT 1`, id);
   }
   if (type === "vendor_bill") {
     return first<DocumentHeader>(`SELECT vb.id,vb.number,vb.status,bp.name AS partyName,bp.email AS partyEmail,
@@ -130,6 +142,16 @@ async function documentLines(type: PrintableDocumentType, id: string) {
       LEFT JOIN units_of_measure u ON u.id=sol.ordered_uom_id
       LEFT JOIN locations bin ON bin.id=sol.bin_location_id WHERE sol.sales_order_id=? ORDER BY sol.rowid`, id);
   }
+  if (type === "work_order") {
+    return all<DocumentLine>(`SELECT li.id AS sku,li.title AS productName,
+      'Workers: ' || COALESCE((SELECT GROUP_CONCAT(DISTINCT te.worker_name) FROM time_entries te WHERE te.labour_item_id=li.id),'Not assigned') ||
+      CASE WHEN EXISTS (SELECT 1 FROM time_entries te WHERE te.labour_item_id=li.id AND te.tech_story IS NOT NULL AND trim(te.tech_story)<>'')
+        THEN '; Technician notes: ' || (SELECT GROUP_CONCAT(te.tech_story, ' | ') FROM time_entries te WHERE te.labour_item_id=li.id AND te.tech_story IS NOT NULL AND trim(te.tech_story)<>'') ELSE '' END AS description,
+      li.status AS binLocationCode,NULL AS binLocationName,
+      ROUND(COALESCE((SELECT SUM(MAX((julianday(COALESCE(te.ended_at,CURRENT_TIMESTAMP))-julianday(te.started_at))*86400,0)) FROM time_entries te WHERE te.labour_item_id=li.id),0)/3600.0,2) AS quantity,
+      'HR' AS uomCode,0 AS unitAmountCents,0 AS discountCents,0 AS taxRateBps,0 AS taxable,0 AS lineTotalCents
+      FROM labour_items li WHERE li.work_order_id=? ORDER BY li.created_at,li.id`, id);
+  }
   if (type === "vendor_bill") {
     return all<DocumentLine>(`SELECT p.sku,p.name AS productName,pol.configuration_snapshot AS description,
       vbl.quantity,u.code AS uomCode,vbl.unit_cost_cents AS unitAmountCents,0 AS discountCents,
@@ -152,6 +174,7 @@ function documentLabel(type: PrintableDocumentType) {
   if (type === "purchase_order") return "Purchase order";
   if (type === "sales_order") return "Sales order";
   if (type === "vendor_bill") return "Vendor bill";
+  if (type === "work_order") return "Work order";
   return "Invoice";
 }
 
@@ -162,13 +185,13 @@ async function loadDocument(type: PrintableDocumentType, id: string): Promise<Lo
   if (type === "purchase_order" && status !== "approved") throw new DocumentEmailError("Only an approved purchase order can be emailed to a vendor.", "DOCUMENT_NOT_SENDABLE", 409);
   if (type === "sales_order" && status !== "confirmed") throw new DocumentEmailError("Only a confirmed sales order can be emailed to a customer.", "DOCUMENT_NOT_SENDABLE", 409);
   if (type === "customer_invoice" && status === "void") throw new DocumentEmailError("A void invoice cannot be emailed.", "DOCUMENT_NOT_SENDABLE", 409);
-  if (type === "vendor_bill" && status === "void") throw new DocumentEmailError("A void vendor bill cannot be printed.", "DOCUMENT_NOT_SENDABLE", 409);
+  if (type === "vendor_bill" && status === "void") throw new DocumentEmailError("A void vendor bill cannot be sent.", "DOCUMENT_NOT_SENDABLE", 409);
   const [lines, charges] = await Promise.all([
     documentLines(type, id),
     all<DocumentCharge>(`SELECT description,amount_cents AS amountCents,direction,tax_amount_cents AS taxAmountCents
       FROM document_charges WHERE document_type=? AND document_id=? ORDER BY created_at,id`, type, id),
   ]);
-  if (!lines.length) throw new DocumentEmailError(`${documentLabel(type)} has no lines to send.`, "DOCUMENT_EMPTY", 409);
+  if (!lines.length && type !== "work_order") throw new DocumentEmailError(`${documentLabel(type)} has no lines to send.`, "DOCUMENT_EMPTY", 409);
   return { type, label: documentLabel(type), header, lines, charges };
 }
 
@@ -179,6 +202,7 @@ function safeFilePart(value: string) {
 export async function getDocumentEmailPreview(type: EmailDocumentType, id: string): Promise<DocumentEmailPreview> {
   const document = await loadDocument(type, id);
   const { header, label } = document;
+  const greeting = header.partyName === "Unassigned" ? "Hello" : `Hello ${header.partyName}`;
   return {
     documentType: type,
     documentId: header.id,
@@ -189,7 +213,7 @@ export async function getDocumentEmailPreview(type: EmailDocumentType, id: strin
     defaultSubject: `${label} ${header.number} from PaneFlow`,
     defaultMessage: type === "customer_invoice"
       ? `Hello ${header.partyName},\n\nPlease find invoice ${header.number} attached. A secure online payment button is included below when available.\n\nThank you.`
-      : `Hello ${header.partyName},\n\nPlease find ${label.toLowerCase()} ${header.number} attached.\n\nThank you.`,
+      : `${greeting},\n\nPlease find ${label.toLowerCase()} ${header.number} attached.\n\nThank you.`,
     fileName: `${safeFilePart(header.number)}.pdf`,
   };
 }
@@ -260,6 +284,8 @@ type PreparedLine = {
   height: number;
 };
 type PdfDocumentPage = { lines: PreparedLine[]; continuation: boolean; summary: boolean };
+type PreparedWorkOrderLine = { index: number; title: string[]; details: string[]; status: string; hours: string; hoursValue: number; height: number };
+type PdfWorkOrderPage = { lines: PreparedWorkOrderLine[]; continuation: boolean; summary: boolean };
 
 const PDF = {
   pageWidth: 612,
@@ -339,22 +365,26 @@ function titleFor(type: PrintableDocumentType) {
   if (type === "purchase_order") return "PURCHASE ORDER";
   if (type === "sales_order") return "SALES ORDER";
   if (type === "vendor_bill") return "VENDOR BILL";
+  if (type === "work_order") return "WORK ORDER";
   return "INVOICE";
 }
 
 function partyLabel(type: PrintableDocumentType) {
   if (type === "purchase_order" || type === "vendor_bill") return "VENDOR";
   if (type === "sales_order") return "CUSTOMER / SHIP TO";
+  if (type === "work_order") return "CUSTOMER / VENDOR";
   return "BILL TO";
 }
 
 function documentDateLabel(type: PrintableDocumentType) {
+  if (type === "work_order") return "Created";
   return type === "customer_invoice" || type === "vendor_bill" ? "Invoice date" : "Order date";
 }
 
 function targetDateLabel(type: PrintableDocumentType) {
   if (type === "purchase_order") return "Expected date";
   if (type === "sales_order") return "Requested date";
+  if (type === "work_order") return "Last updated";
   return "Due date";
 }
 
@@ -362,6 +392,7 @@ function documentNote(type: PrintableDocumentType, number: string) {
   if (type === "purchase_order") return `Please reference purchase order ${number} on shipping documents and invoices.`;
   if (type === "sales_order") return `Please reference sales order ${number} in all order correspondence.`;
   if (type === "customer_invoice") return `Thank you for your business. Please include invoice ${number} with payment.`;
+  if (type === "work_order") return `Please reference work order ${number} in all job correspondence.`;
   return `Recorded against the supplier document for ${number}.`;
 }
 
@@ -372,6 +403,15 @@ function addressLines(header: DocumentHeader) {
 }
 
 function metadataRows(type: PrintableDocumentType, header: DocumentHeader) {
+  if (type === "work_order") {
+    return [
+      ["Job", header.title || "Untitled work"],
+      ["Created", header.documentDate || "-"],
+      ["Last updated", header.updatedDate || header.dueOrExpectedDate || "-"],
+      ["Created by", header.preparedBy || "Not recorded"],
+      ["Linked orders", header.reference || "None"],
+    ] satisfies Array<[string, string]>;
+  }
   const rows: Array<[string, string]> = [
     [documentDateLabel(type), header.documentDate || "-"],
     [targetDateLabel(type), header.dueOrExpectedDate || "-"],
@@ -504,6 +544,97 @@ function drawPreparedLine(commands: string[], line: PreparedLine, top: number) {
   return top - line.height;
 }
 
+function prepareWorkOrderLines(document: LoadedDocument): PreparedWorkOrderLine[] {
+  return document.lines.map((line, index) => {
+    const title = wrapPdfText(line.productName, 300, 9.5, 2);
+    const details = wrapPdfText(printableDescription(line.description), 300, 7.8, 5);
+    const hoursValue = Math.max(Number(line.quantity) || 0, 0);
+    return {
+      index: index + 1,
+      title,
+      details,
+      status: cleanPdfText(line.binLocationCode || "open").replaceAll("_", " ").toUpperCase(),
+      hours: `${hoursValue.toLocaleString("en-CA", { minimumFractionDigits: hoursValue ? 2 : 0, maximumFractionDigits: 2 })} h`,
+      hoursValue,
+      height: Math.max(42, 20 + title.length * 11 + details.length * 9),
+    };
+  });
+}
+
+function paginateWorkOrder(lines: PreparedWorkOrderLine[]) {
+  const pages: PdfWorkOrderPage[] = [{ lines: [], continuation: false, summary: false }];
+  let current = pages[0];
+  let remaining = 464;
+  for (const line of lines) {
+    if (line.height > remaining && current.lines.length) {
+      current = { lines: [], continuation: true, summary: false };
+      pages.push(current);
+      remaining = 622;
+    }
+    current.lines.push(line);
+    remaining -= line.height;
+  }
+  if (remaining < 128) {
+    current = { lines: [], continuation: true, summary: true };
+    pages.push(current);
+  } else current.summary = true;
+  return pages;
+}
+
+function drawWorkOrderTableHeader(commands: string[], top: number) {
+  const [x0, x1, x2, x3] = [44, 400, 478, 568];
+  pdfRect(commands, x0, top, x3 - x0, 26, PDF.ink);
+  pdfText(commands, "LABOUR ITEM / DETAILS", x0 + 8, top - 17, { size: 7.4, bold: true, color: PDF.white });
+  pdfText(commands, "STATUS", x2 - 8, top - 17, { size: 7.4, bold: true, color: PDF.white, align: "right" });
+  pdfText(commands, "RECORDED TIME", x3 - 8, top - 17, { size: 7.4, bold: true, color: PDF.white, align: "right" });
+  [x1, x2].forEach((x) => pdfLine(commands, x, top - 26, x, top, [0.25, 0.37, 0.34], 0.45));
+  return top - 26;
+}
+
+function drawWorkOrderLine(commands: string[], line: PreparedWorkOrderLine, top: number) {
+  const [x0, x1, x2, x3] = [44, 400, 478, 568];
+  if (line.index % 2 === 0) pdfRect(commands, x0, top, x3 - x0, line.height, PDF.wash);
+  pdfText(commands, String(line.index), x0 + 8, top - 16, { size: 8, bold: true, color: PDF.accent });
+  line.title.forEach((value, index) => pdfText(commands, value, x0 + 27, top - 16 - index * 11, { size: 9.2, bold: true, maxWidth: x1 - x0 - 36 }));
+  let detailY = top - 16 - line.title.length * 11;
+  line.details.forEach((value) => { pdfText(commands, value, x0 + 27, detailY, { size: 7.8, color: PDF.muted, maxWidth: x1 - x0 - 36 }); detailY -= 9; });
+  pdfText(commands, line.status, x2 - 8, top - 16, { size: 7.7, bold: true, color: PDF.accent, align: "right", maxWidth: x2 - x1 - 12 });
+  pdfText(commands, line.hours, x3 - 8, top - 16, { size: 8.7, bold: true, align: "right", maxWidth: x3 - x2 - 12 });
+  pdfLine(commands, x0, top - line.height, x3, top - line.height);
+  [x1, x2].forEach((x) => pdfLine(commands, x, top - line.height, x, top, PDF.rule, 0.45));
+  return top - line.height;
+}
+
+function drawWorkOrderSummary(commands: string[], document: LoadedDocument, lines: PreparedWorkOrderLine[], top: number, senderEmail?: string) {
+  pdfText(commands, "WORK ORDER NOTES", PDF.margin, top, { size: 7.5, bold: true, color: PDF.accent });
+  const note = [document.header.notes, documentNote(document.type, document.header.number)].filter(Boolean).join(" - ");
+  const noteLines = wrapPdfText(note, 330, 8, 6);
+  noteLines.forEach((value, index) => pdfText(commands, value, PDF.margin, top - 18 - index * 11, { size: 8, color: PDF.muted, maxWidth: 330 }));
+
+  pdfRect(commands, 400, top + 7, 168, 76, PDF.accentSoft, PDF.rule);
+  pdfText(commands, "TOTAL RECORDED TIME", 554, top - 14, { size: 7.2, bold: true, color: PDF.accent, align: "right" });
+  const totalHours = lines.reduce((sum, line) => sum + line.hoursValue, 0);
+  pdfText(commands, `${totalHours.toLocaleString("en-CA", { minimumFractionDigits: totalHours ? 2 : 0, maximumFractionDigits: 2 })} hours`, 554, top - 42, { size: 17, bold: true, align: "right" });
+  if (senderEmail) pdfText(commands, `Sent by ${senderEmail}`, 568, top - 91, { size: 7, color: PDF.muted, align: "right", maxWidth: 230 });
+}
+
+function renderWorkOrderPdf(document: LoadedDocument, senderEmail?: string) {
+  const companyName = currentTenant()?.tenantName || "PaneFlow";
+  const preparedLines = prepareWorkOrderLines(document);
+  const pageLayout = paginateWorkOrder(preparedLines);
+  return buildPdf(pageLayout.map((page, pageIndex) => {
+    const commands: string[] = [];
+    const tableTop = drawDocumentHeader(commands, document, companyName, page.continuation);
+    let y = drawWorkOrderTableHeader(commands, tableTop);
+    for (const line of page.lines) y = drawWorkOrderLine(commands, line, y);
+    if (page.summary) drawWorkOrderSummary(commands, document, preparedLines, y - 18, senderEmail);
+    pdfLine(commands, PDF.margin, 37, 568, 37, PDF.rule, 0.6);
+    pdfText(commands, `Generated ${new Date().toISOString().slice(0, 10)}`, PDF.margin, 23, { size: 7, color: PDF.muted });
+    pdfText(commands, `Page ${pageIndex + 1} of ${pageLayout.length}`, 568, 23, { size: 7, color: PDF.muted, align: "right" });
+    return commands;
+  }), `WORK-ORDER-${document.header.number}`);
+}
+
 function summaryRows(document: LoadedDocument) {
   const itemSubtotal = document.lines.reduce((sum, line) => sum + lineAmount(line), 0);
   const computedTax = document.lines.reduce((sum, line) => sum + lineTax(line, lineAmount(line)), 0)
@@ -543,6 +674,7 @@ function drawSummary(commands: string[], document: LoadedDocument, top: number, 
 }
 
 function renderDocumentPdf(document: LoadedDocument, senderEmail?: string) {
+  if (document.type === "work_order") return renderWorkOrderPdf(document, senderEmail);
   const companyName = currentTenant()?.tenantName || "PaneFlow";
   const preparedLines = prepareLines(document);
   const pageLayout = paginateDocument(document, preparedLines);

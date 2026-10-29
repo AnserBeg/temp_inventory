@@ -171,6 +171,11 @@ test("posted customer invoices expose their printable document", () => {
   assert.match(sources.suite, /title=\{`Download \$\{record\.number\} as a PDF`\}/);
   assert.match(sources.suite, /<DocumentDownloadLink documentType="customer_invoice"/);
   assert.match(sources.suite, /Paid invoices remain here as completed records\./);
+  assert.match(sources.app, /title="Sales order & customer invoices"/);
+  assert.match(sources.app, /including settled invoices\./);
+  assert.match(sources.app, /<EmailDocumentButton documentType="customer_invoice" documentId=\{invoice\.id\}/);
+  assert.match(sources.app, /<EmailDocumentButton documentType="vendor_bill" documentId=\{bill\.id\}/);
+  assert.match(sources.css, /\.connected-document-actions \{/);
 });
 
 test("sales progression only offers actions whose supply prerequisite is ready", () => {

@@ -56,7 +56,7 @@ Migration `0030` creates the organization registry, assigns existing users and r
 
 ### Document email
 
-Each authenticated user can connect a mailbox from the account menu with SMTP, Google Workspace/Gmail, or Microsoft 365/Outlook. Approved purchase orders, confirmed sales orders, and posted customer invoices can then be sent as PDF attachments from that user's own mailbox. PaneFlow reads the document from D1 at send time, enforces the same operational or financial role as the underlying document, and records the sender, recipients, document, provider result, and audit event without retaining the message body or attachment.
+Each authenticated user can connect a mailbox from the account menu with SMTP, Google Workspace/Gmail, or Microsoft 365/Outlook. Approved purchase orders, confirmed sales orders, customer invoices, vendor bills, and work orders can then be sent as PDF attachments from that user's own mailbox. PaneFlow reads the document from D1 at send time, enforces the same operational or financial role as the underlying document, and records the sender, recipients, document, provider result, and audit event without retaining the message body or attachment.
 
 Configure one or both OAuth providers and a dedicated encryption secret of at least 32 characters:
 

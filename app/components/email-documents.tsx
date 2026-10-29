@@ -6,7 +6,7 @@ import { useDialogDismiss } from "./use-dialog-dismiss";
 type OAuthEmailProvider = "google" | "microsoft";
 type EmailProvider = OAuthEmailProvider | "smtp";
 type EmailSenderType = "company" | "personal";
-type DocumentType = "purchase_order" | "sales_order" | "customer_invoice";
+type DocumentType = "purchase_order" | "sales_order" | "customer_invoice" | "vendor_bill" | "work_order";
 type ConnectionSummary = {
   senderType: EmailSenderType; provider: EmailProvider; providerLabel: string; emailAddress: string; status: string; connectedAt: string; lastError?: string;
 };

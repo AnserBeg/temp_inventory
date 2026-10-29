@@ -1,8 +1,8 @@
 export type OAuthEmailProvider = "google" | "microsoft";
 export type EmailProvider = OAuthEmailProvider | "smtp";
 export type EmailSenderType = "company" | "personal";
-export type EmailDocumentType = "purchase_order" | "sales_order" | "customer_invoice";
-export type PrintableDocumentType = EmailDocumentType | "vendor_bill";
+export type EmailDocumentType = "purchase_order" | "sales_order" | "customer_invoice" | "vendor_bill" | "work_order";
+export type PrintableDocumentType = EmailDocumentType;
 
 export type EmailConnectionSummary = {
   senderType: EmailSenderType;

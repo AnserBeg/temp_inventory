@@ -58,6 +58,10 @@ before(async () => {
   await run("INSERT INTO customer_invoice_lines (id,customer_invoice_id,sales_order_line_id,product_id,quantity,unit_price_cents,line_total_cents) VALUES ('email-cil','email-invoice','email-sol','email-product',2,15000,30000)");
   await run("INSERT INTO vendor_bills (id,number,vendor_invoice_number,vendor_id,purchase_order_id,status,match_status,invoice_date,due_date,subtotal_cents,tax_cents,total_cents,paid_cents,currency,exchange_rate_to_base,base_total_cents,version,posted_at) VALUES ('email-bill','VB-EMAIL','SUP-EMAIL','email-vendor','email-po','approved','matched','2026-08-24','2026-09-23',20000,1000,21000,0,'CAD',1,21000,1,?)", now);
   await run("INSERT INTO vendor_bill_lines (id,vendor_bill_id,purchase_order_line_id,product_id,quantity,unit_cost_cents,line_total_cents,match_status,match_details_json) VALUES ('email-vbl','email-bill','email-pol','email-product',2,10000,20000,'matched','{}')");
+  await run("INSERT INTO work_orders (id,number,title,status,partner_id,notes,created_by_id,created_by_name,version,created_at,updated_at) VALUES ('email-work-order','WO-EMAIL','Install Email Test Window','open','email-customer','Confirm the final fit and operation.','email-operator','Email Operator',1,?,?)", now, now);
+  await run("INSERT INTO work_order_document_links (id,work_order_id,document_type,document_id,document_number,created_at) VALUES ('email-work-order-link','email-work-order','sales_order','email-so','SO-EMAIL',?)", now);
+  await run("INSERT INTO labour_items (id,work_order_id,title,status,created_by_id,version,created_at,updated_at) VALUES ('email-labour','email-work-order','Install and test window','completed','email-operator',1,?,?)", now, now);
+  await run("INSERT INTO time_entries (id,labour_item_id,worker_user_id,worker_name,worker_email,started_at,ended_at,tech_story,version,created_at,updated_at) VALUES ('email-time','email-labour','email-operator','Email Operator','operator@paneflow.test','2026-08-24T18:00:00.000Z','2026-08-24T20:30:00.000Z','Installed, sealed, and tested the unit.',1,?,?)", now, now);
 });
 
 after(() => db.close());
@@ -69,6 +73,7 @@ test("email migration creates constrained sender connections and delivery histor
   assert.ok(db.sqlite.prepare("PRAGMA table_info(document_email_deliveries)").all().some((column) => column.name === "sender_type"));
   assert.throws(() => db.sqlite.prepare("INSERT INTO email_connections (user_id,provider,email_address,status,scopes,encrypted_access_token,encrypted_refresh_token,access_token_expires_at,connected_at,updated_at) VALUES ('bad','imap','bad@example.test','connected','send','a','b','2099-01-01','2026-01-01','2026-01-01')").run(), /CHECK constraint failed/);
   assert.throws(() => db.sqlite.prepare("INSERT INTO smtp_email_connections (user_id,email_address,host,port,username,encrypted_password,connected_at,updated_at) VALUES ('bad','bad@example.test','smtp.example.test',25,'bad','secret','2026-01-01','2026-01-01')").run(), /CHECK constraint failed/);
+  assert.throws(() => db.sqlite.prepare("INSERT INTO document_email_deliveries (id,user_id,provider,sender_type,sender_email,document_type,document_id,document_number,recipients_json,subject,status,created_at) VALUES ('bad-delivery','bad','smtp','personal','bad@example.test','packing_slip','bad','BAD','[]','Bad','pending','2026-01-01')").run(), /CHECK constraint failed/);
 });
 
 test("Google OAuth is user-bound, one-use, and encrypts mailbox tokens at rest", async () => {
@@ -130,10 +135,23 @@ test("authoritative previews default to partner email and reject unapproved docu
   const vendorBill = await documentEmail.getDocumentPdf("vendor_bill", "email-bill");
   assert.equal(vendorBill.fileName, "VB-EMAIL.pdf");
   assert.match(Buffer.from(vendorBill.body).subarray(0, 12).toString("ascii"), /^%PDF-1\.4/);
+  const vendorBillPreview = await documentEmail.getDocumentEmailPreview("vendor_bill", "email-bill");
+  assert.equal(vendorBillPreview.defaultRecipient, "vendor@example.test");
+  const workOrderPreview = await documentEmail.getDocumentEmailPreview("work_order", "email-work-order");
+  assert.equal(workOrderPreview.defaultRecipient, "customer@example.test");
+  assert.equal(workOrderPreview.fileName, "WO-EMAIL.pdf");
+  const workOrderPdf = await documentEmail.getDocumentPdf("work_order", "email-work-order");
+  const workOrderSource = Buffer.from(workOrderPdf.body).toString("latin1");
+  assert.match(workOrderSource, /WORK ORDER/);
+  assert.match(workOrderSource, /LABOUR ITEM \/ DETAILS/);
+  assert.match(workOrderSource, /Install and test window/);
+  assert.match(workOrderSource, /2\.50 hours/);
   await run("UPDATE purchase_orders SET lifecycle_status='draft' WHERE id='email-po'");
   await assert.rejects(documentEmail.getDocumentEmailPreview("purchase_order", "email-po"), /Only an approved purchase order/);
   await run("UPDATE purchase_orders SET lifecycle_status='approved' WHERE id='email-po'");
   assert.equal(documentEmail.emailDocumentCapability("customer_invoice"), "financialWrite");
+  assert.equal(documentEmail.emailDocumentCapability("vendor_bill"), "financialWrite");
+  assert.equal(documentEmail.emailDocumentCapability("work_order"), "operationalWrite");
   assert.equal(documentEmail.emailDocumentCapability("sales_order"), "operationalWrite");
 });
 
@@ -171,6 +189,24 @@ test("document send refreshes expired access, attaches a PDF, and writes deliver
     assert.equal(delivery.messageId, "gmail-message-email-po");
     assert.deepEqual(JSON.parse(delivery.recipients), ["vendor@example.test"]);
     assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE entity_type='purchase_order' AND entity_id='email-po' AND action='document_emailed'").get().count, 1);
+
+    gmailRaw = "";
+    const billSent = await documentEmail.sendDocumentEmail(operator, {
+      documentType: "vendor_bill", documentId: "email-bill", recipients: ["vendor@example.test"],
+      subject: "Vendor bill VB-EMAIL", message: "The bill is attached.",
+    });
+    const billMime = Buffer.from(gmailRaw.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(gmailRaw.length / 4) * 4, "="), "base64").toString("utf8");
+    assert.match(billMime, /filename="VB-EMAIL\.pdf"/);
+    assert.equal(db.sqlite.prepare("SELECT document_type AS documentType,status FROM document_email_deliveries WHERE id=?").get(billSent.deliveryId).documentType, "vendor_bill");
+
+    gmailRaw = "";
+    const workOrderSent = await documentEmail.sendDocumentEmail(operator, {
+      documentType: "work_order", documentId: "email-work-order", recipients: ["customer@example.test"],
+      subject: "Work order WO-EMAIL", message: "The work order is attached.",
+    });
+    const workOrderMime = Buffer.from(gmailRaw.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(gmailRaw.length / 4) * 4, "="), "base64").toString("utf8");
+    assert.match(workOrderMime, /filename="WO-EMAIL\.pdf"/);
+    assert.equal(db.sqlite.prepare("SELECT document_type AS documentType,status FROM document_email_deliveries WHERE id=?").get(workOrderSent.deliveryId).documentType, "work_order");
   } finally { globalThis.fetch = originalFetch; }
 });
 

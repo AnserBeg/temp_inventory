@@ -837,7 +837,7 @@ export const documentEmailDeliveries = sqliteTable("document_email_deliveries", 
   index("idx_document_email_deliveries_user_created").on(table.tenantId, table.userId, table.createdAt),
   check("document_email_deliveries_provider_check", sql`${table.provider} IN ('google','microsoft','smtp')`),
   check("document_email_deliveries_sender_type_check", sql`${table.senderType} IN ('company','personal')`),
-  check("document_email_deliveries_type_check", sql`${table.documentType} IN ('purchase_order','sales_order','customer_invoice')`),
+  check("document_email_deliveries_type_check", sql`${table.documentType} IN ('purchase_order','sales_order','customer_invoice','vendor_bill','work_order')`),
   check("document_email_deliveries_status_check", sql`${table.status} IN ('pending','sent','failed')`),
 ]);
 

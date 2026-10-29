@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DocumentDownloadLink, EmailDocumentButton } from "./email-documents";
 import { useDialogDismiss } from "./use-dialog-dismiss";
 
 type Link = { id: string; documentType: "sales_order" | "purchase_order"; documentId: string; documentNumber: string };
@@ -303,7 +304,7 @@ function WorkOrderDetail({ order, viewerId, canOperate, activeEntry, now, onCloc
   return <>
     <header className="wf-detail-header">
       <div><div className="wf-detail-number"><span>{order.number}</span><span className={`wf-status ${order.status}`}>{statusLabels[order.status]}</span></div><h2>{order.title}</h2><p>{order.partnerName ? `${order.partnerName} · ${order.partnerType === "vendor" ? "Vendor" : order.partnerType === "customer" ? "Customer" : "Customer / vendor"}` : "No customer or vendor assigned"}</p></div>
-      <div className="wf-detail-actions">{canOperate ? <button className="button secondary" onClick={onEdit}>Edit</button> : null}{canOperate && order.status !== "completed" ? <button className="button primary" onClick={onAddLabour}>Add labour</button> : null}</div>
+      <div className="wf-detail-actions"><DocumentDownloadLink documentType="work_order" documentId={order.id} documentNumber={order.number}>Download PDF</DocumentDownloadLink>{canOperate ? <EmailDocumentButton documentType="work_order" documentId={order.id} documentNumber={order.number}>Email work order</EmailDocumentButton> : null}{canOperate ? <button className="button secondary" onClick={onEdit}>Edit</button> : null}{canOperate && order.status !== "completed" ? <button className="button primary" onClick={onAddLabour}>Add labour</button> : null}</div>
     </header>
     <div className="wf-order-meta">
       <div><span>Total labour</span><strong>{formatDuration(order.totalSeconds)}</strong></div>

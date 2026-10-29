@@ -1247,6 +1247,7 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .connected-purchase-documents { overflow: hidden; }
 .connected-document-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; padding: 15px 18px 18px; }
 .connected-document-card { min-width: 0; display: grid; align-content: start; justify-items: start; gap: 4px; min-height: 112px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); font: inherit; text-align: left; text-decoration: none; cursor: pointer; }
+.connected-document-card:not(a):not(button) { cursor: default; }
 .connected-document-card:hover { border-color: #9fc5b5; box-shadow: 0 5px 15px rgba(23, 63, 54, .07); }
 .connected-document-card > span:first-child { color: var(--ink-muted); font-size: 9px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .connected-document-card > strong { color: var(--brand-dark); font-size: 14px; overflow-wrap: anywhere; }
@@ -1255,6 +1256,8 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .connected-document-card.primary-document { border-color: #a9cbb8; background: var(--brand-soft); }
 .connected-document-card.create-document-card { border-style: dashed; background: #fbfdfc; }
 .connected-document-card:disabled { border-color: var(--line); background: var(--surface-soft); color: var(--ink-muted); box-shadow: none; cursor: not-allowed; }
+.connected-document-actions { display: flex; flex-wrap: wrap; gap: 7px; width: 100%; margin-top: 8px; }
+.connected-document-actions .button { min-height: 32px; padding: 7px 10px; font-size: 10.5px; }
 .connected-document-summary { margin: -5px 18px 16px; color: var(--ink-soft); font-size: 11px; }
 .auto-bill-dialog { width: min(780px, 100%); }
 .auto-bill-fields { display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 10px; }

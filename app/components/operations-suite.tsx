@@ -1115,8 +1115,10 @@ function VendorBillingActions({ records, canAction, openAction }: { records: Wor
   return <Section title="Open vendor bill actions" detail="Outstanding and held bills only. Settled bills remain in All bills."><RecordTable records={records} columns={["number", "party", "reference", "issuedOn", "dueOn", "amount", "status", "detail"]} recordHref={(record) => `/api/documents/pdf?documentType=vendor_bill&documentId=${encodeURIComponent(record.id)}`} actions={(record) => {
     const settled = documentStatusIsSettled(record.status);
     const held = Boolean(record.exception) || /hold/i.test(record.status);
-    if (settled) return <span className="read-only-label">Settled</span>;
+    const documentActions = <><DocumentDownloadLink documentType="vendor_bill" documentId={record.id} documentNumber={record.number} className="workflow-action secondary">Download bill</DocumentDownloadLink><EmailDocumentButton documentType="vendor_bill" documentId={record.id} documentNumber={record.number} disabled={!canAction("recordVendorPayment")} className="workflow-action secondary">Email bill</EmailDocumentButton></>;
+    if (settled) return <>{documentActions}<span className="read-only-label">Settled</span></>;
     return <>
+      {documentActions}
       {held ? <ActionButton disabled={!canAction("approveVendorBill")} onClick={() => openAction({ kind: "approveVendorBill", title: `Approve ${record.number}`, description: "Approve this match exception and release the payable from hold.", finalLabel: "Approve bill exception", record })}>Approve exception</ActionButton> : null}
       <ActionButton disabled={held || !canAction("createVendorCredit")} onClick={() => openAction({ kind: "createVendorCredit", title: `Credit ${record.number}`, description: "Post a vendor credit against the remaining payable without moving stock.", finalLabel: "Post vendor credit", record })}>Post vendor credit</ActionButton>
       <ActionButton disabled={held || !canAction("recordVendorPayment")} onClick={() => openAction({ kind: "recordVendorPayment", title: `Pay ${record.number}`, description: "Record an outbound payment against this payable.", finalLabel: "Record vendor payment", record })}>Record payment</ActionButton>
